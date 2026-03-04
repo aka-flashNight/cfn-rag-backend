@@ -55,6 +55,13 @@ def ask_proxy_config():
     print("CFN-RAG 启动器")
     print("=" * 50)
 
+    # 检查代理是否已通过环境变量设置（由 start.exe 设置）
+    existing_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if existing_proxy:
+        print(f"\n[代理] 检测到已通过环境变量设置代理: {existing_proxy}")
+        print("[代理] 跳过代理配置\n")
+        return
+
     # 第一步：询问是否需要代理（10秒超时）
     need_proxy = ask_yes_no_with_timeout(
         "\n是否需要为 HuggingFace/LLM 配置 HTTP 代理？如果开启了全局代理，也请配置。(y/N): ",
