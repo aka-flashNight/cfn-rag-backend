@@ -45,7 +45,7 @@ venv.bak/
 .env.*.local
 
 # Database files (保留目录但忽略db文件)
-
+*.db
 *.sqlite
 *.sqlite3
 
