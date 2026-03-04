@@ -165,7 +165,7 @@ python launcher.py
 | 特点 | 说明 |
 |------|------|
 | 文件大小 | 约 100MB（不含模型） |
-| 使用方式 | 在解压到 `cfn-rag-backend` 文件夹，运行文件夹内的 `start.exe` |
+| 使用方式 | 参考下方目录结构，在解压到 `resources`  外的文件夹中，运行文件夹内的 `start.exe` |
 | 依赖 | 无需 Python 环境，但可能需要下载嵌入模型（首次运行自动下载） |
 | 优点 | 启动速度快，文件体积小，可查看/修改配置 |
 | 缺点 | 需要配合外部的 `resources` 文件夹使用 |
@@ -174,7 +174,7 @@ python launcher.py
 ```
 你的目录/
 ├── resources/                  # 游戏资源文件夹
-└── cfn-rag-backend/            # 解压后的项目文件夹
+└── CFN-RAG-Portable/            # 解压后的项目文件夹
     ├── start.exe              # 启动程序
     ├── .env                   # 配置文件（可手动编辑）
     ├── data/                  # 数据库目录
