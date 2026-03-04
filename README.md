@@ -49,11 +49,11 @@ CFN-RAG 需要配合 **Crazy Flash Night 游戏资源** 使用。请将游戏项
    ```
    你的目录/
    ├── resources/              # 游戏资源文件夹
-   └── cfn-rag-backend/        # 解压后的项目文件夹
+   └── CFN-RAG-Portable/        # 解压后的项目文件夹
        ├── start.exe
        └── ...
    ```
-3. 进入 `cfn-rag-backend` 文件夹，双击运行 `start.exe`
+3. 进入 `CFN-RAG-Portable` 文件夹，双击运行 `start.exe`
 4. 按提示配置代理（如有需要）和 API Key
 
 **优点**：启动速度快，文件结构清晰
@@ -165,7 +165,7 @@ python launcher.py
 | 特点 | 说明 |
 |------|------|
 | 文件大小 | 约 100MB（不含模型） |
-| 使用方式 | 参考下方目录结构，在解压到 `resources`  外的文件夹中，运行文件夹内的 `start.exe` |
+| 使用方式 | 参考下方目录结构，解压到 `resources`  外的文件夹中，运行文件夹内的 `start.exe` |
 | 依赖 | 无需 Python 环境，但可能需要下载嵌入模型（首次运行自动下载） |
 | 优点 | 启动速度快，文件体积小，可查看/修改配置 |
 | 缺点 | 需要配合外部的 `resources` 文件夹使用 |
