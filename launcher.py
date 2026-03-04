@@ -320,7 +320,28 @@ def start_backend():
 def start_frontend():
     """启动前端静态文件服务"""
     try:
-        time.sleep(3)  # 等待后端先启动
+        # 等待后端服务真正就绪（通过检查端口是否可连接）
+        print("\n[前端] 等待后端服务就绪...")
+        import socket
+        backend_ready = False
+        for _ in range(30):  # 最多等待30秒
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            try:
+                result = sock.connect_ex(('127.0.0.1', 8000))
+                sock.close()
+                if result == 0:
+                    backend_ready = True
+                    print("[前端] 后端服务已就绪 ✓")
+                    break
+            except:
+                pass
+            time.sleep(1)
+
+        if not backend_ready:
+            print("[前端] 警告: 后端服务可能未完全就绪，继续启动前端...")
+
+        time.sleep(0.5)  # 额外缓冲时间
         print("\n[前端] 正在启动静态文件服务...")
 
         # 获取dist目录路径（从打包资源或开发目录）
@@ -345,7 +366,7 @@ def start_frontend():
 
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """自定义请求处理器，正确处理MIME类型"""
+    """自定义请求处理器，正确处理MIME类型，并抑制连接错误输出"""
 
     extensions_map = {
         '': 'application/octet-stream',
@@ -388,9 +409,25 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         return mime_type or 'application/octet-stream'
 
+    def log_message(self, format, *args):
+        """重写日志方法，过滤掉常见的连接错误日志"""
+        # 过滤掉连接重置/中断的错误信息，避免污染控制台输出
+        message = format % args
+        if any(err in message for err in ['ConnectionAborted', 'ConnectionReset', 'Broken pipe']):
+            return
+        print(f"[前端] {message}")
+
+    def handle_one_request(self):
+        """重写请求处理方法，捕获连接错误"""
+        try:
+            super().handle_one_request()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # 客户端主动关闭连接，这是正常的浏览器行为，忽略错误
+            pass
+
 
 def start_builtin_server(dist_path):
-    """使用Python内置服务器，带正确的MIME类型处理"""
+    """使用Python内置服务器，带正确的MIME类型处理（多线程版本）"""
     import socket
 
     os.chdir(dist_path)
@@ -407,13 +444,15 @@ def start_builtin_server(dist_path):
                 print(f"[前端] 端口 {port} 被占用，尝试下一个...")
                 continue
 
-            with socketserver.TCPServer(("", port), handler) as httpd:
+            # 使用ThreadingTCPServer替代TCPServer，支持并发处理多个请求
+            with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
                 print(f"[前端] 服务地址: http://127.0.0.1:{port}")
                 print("-" * 50)
 
                 url = f"http://127.0.0.1:{port}"
                 print(f"[系统] 正在打开浏览器: {url}")
-                time.sleep(1)
+                # 增加等待时间，确保服务器完全启动
+                time.sleep(1.5)
                 webbrowser.open(url)
 
                 print("\n" + "=" * 50)
