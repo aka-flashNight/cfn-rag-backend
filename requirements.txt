@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+httpx
+llama-index
+pypdf
+python-docx
+llama-index-llms-google-genai
+llama-index-embeddings-huggingface
+aiofiles
+openai

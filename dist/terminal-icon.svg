@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- 黑色背景 -->
+  <rect width="256" height="256" rx="32" fill="#0a0a0a"/>
+  <!-- 外边框 - 霓虹绿 -->
+  <rect x="8" y="8" width="240" height="240" rx="24" fill="none" stroke="#00ff41" stroke-width="4"/>
+  <!-- 内部终端窗口 -->
+  <rect x="32" y="56" width="192" height="144" rx="8" fill="#111111" stroke="#00ff41" stroke-width="2"/>
+  <!-- 终端标题栏 -->
+  <rect x="32" y="56" width="192" height="24" rx="8" fill="#1a1a1a"/>
+  <rect x="32" y="72" width="192" height="8" fill="#1a1a1a"/>
+  <!-- 终端按钮 -->
+  <circle cx="52" cy="68" r="4" fill="#ff0040"/>
+  <circle cx="68" cy="68" r="4" fill="#ffaa00"/>
+  <circle cx="84" cy="68" r="4" fill="#00ff41"/>
+  <!-- 终端内容 - 通讯符号 -->
+  <text x="56" y="120" font-family="monospace" font-size="20" fill="#00ff41" font-weight="bold">&gt;_</text>
+  <!-- 闪烁光标 -->
+  <rect x="88" y="104" width="12" height="20" fill="#00ff41">
+    <animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/>
+  </rect>
+  <!-- 通讯波纹效果 -->
+  <path d="M160 140c20 0 36-16 36-36s-16-36-36-36" fill="none" stroke="#00ff41" stroke-width="3" stroke-linecap="round" opacity="0.8">
+    <animate attributeName="stroke-width" values="3;5;3" dur="2s" repeatCount="indefinite"/>
+  </path>
+  <path d="M176 140c28 0 52-22 52-52s-22-52-52-52" fill="none" stroke="#00ff41" stroke-width="2" stroke-linecap="round" opacity="0.5">
+    <animate attributeName="stroke-width" values="2;4;2" dur="2s" begin="0.3s" repeatCount="indefinite"/>
+  </path>
+  <!-- 信号点 -->
+  <circle cx="160" cy="140" r="6" fill="#00ffff"/>
+</svg>

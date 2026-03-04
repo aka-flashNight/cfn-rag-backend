@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursorrules
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database files (保留目录但忽略db文件)
+
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache
+.llamaindex_cache/
+
+# Build artifacts
+*.spec
+build_temp/
+*.manifest
+
+# PyInstaller
+*.exe
+/*.exe
+/_internal/
+
+# Keep frontend dist directory
+!dist/
+
+# Model files (large files)
+models/*/pytorch_model.bin
+models/*/model.safetensors
+
+# Test files
+test_*.py
+*_test.py
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude
+.claude/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
