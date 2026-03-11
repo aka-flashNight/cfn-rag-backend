@@ -43,9 +43,15 @@ LOCAL_MODEL_DIR = _get_model_dir()
 
 
 def _is_local_model_valid() -> bool:
-    """检查本地模型是否完整（通过检查关键文件是否存在）。"""
-    required_files = ["config.json", "pytorch_model.bin"]
-    return all((LOCAL_MODEL_DIR / f).exists() for f in required_files)
+    """检查本地模型是否完整。"""
+    required_files = ["config.json"]
+    # 支持 safetensors 或 pytorch 格式
+    model_files = ["model.safetensors", "pytorch_model.bin"]
+    
+    has_config = all((LOCAL_MODEL_DIR / f).exists() for f in required_files)
+    has_model = any((LOCAL_MODEL_DIR / f).exists() for f in model_files)
+    
+    return has_config and has_model
 
 
 def ensure_embed_model(offline: bool = True) -> None:

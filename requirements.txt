@@ -10,3 +10,4 @@ llama-index-llms-google-genai
 llama-index-embeddings-huggingface
 aiofiles
 openai
+docx2txt>=0.8
