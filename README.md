@@ -137,23 +137,27 @@ python launcher.py
 
 我们在 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面提供以下三种发布包，请根据你的需求选择：
 
-### 1. CFN-RAG.exe（单文件版）
+### 1. CFN-RAG-Full.zip（完整独立版）
 
-**面向人群**：普通用户，追求最简单使用方式
+**面向人群**：想独立体验功能，不想下载完整游戏项目的用户
 
 | 特点 | 说明 |
 |------|------|
-| 文件大小 | 约 350MB |
-| 使用方式 | 将 `CFN-RAG.exe` 放到与 `resources` 文件夹同一目录，双击运行 |
-| 依赖 | 无需 Python 环境，无需安装依赖 |
-| 优点 | 单个文件，下载即用，移动方便 |
-| 缺点 | 启动时需要解压到临时目录，启动速度稍慢，且关闭后聊天历史可能无法保存 |
+| 文件大小 | 约 150MB+（含必要的资源文件） |
+| 使用方式 | 解压到任意位置，进入项目文件夹运行 `start.exe` |
+| 依赖 | 无需外部 `resources` 文件夹，无需 Python 环境 |
+| 优点 | 完全独立运行，不依赖游戏项目 |
+| 缺点 | 无法随游戏更新获取最新数据，仅包含基础资源 |
 
 **目录结构**：
 ```
-你的游戏目录/
-├── resources/              # 游戏资源文件夹
-└── CFN-RAG.exe            # 单文件可执行程序
+任意位置/
+├── resources/                  # 包含必要的游戏数据文件
+└── cfn-rag-backend/            # 解压后的项目文件夹
+    ├── start.exe              # 启动程序
+    ├── .env                   # 配置文件（可手动编辑）
+    ├── data/                  # 数据库目录
+    └── ...
 ```
 
 ---
@@ -183,27 +187,23 @@ python launcher.py
 
 ---
 
-### 3. CFN-RAG-Full.zip（完整独立版）
+### 3. CFN-RAG.exe（单文件版）
 
-**面向人群**：想独立体验功能，不想下载完整游戏项目的用户
+**面向人群**：普通用户，追求最简单使用方式
 
 | 特点 | 说明 |
 |------|------|
-| 文件大小 | 约 150MB+（含必要的资源文件） |
-| 使用方式 | 解压到任意位置，进入项目文件夹运行 `start.exe` |
-| 依赖 | 无需外部 `resources` 文件夹，无需 Python 环境 |
-| 优点 | 完全独立运行，不依赖游戏项目 |
-| 缺点 | 无法随游戏更新获取最新数据，仅包含基础资源 |
+| 文件大小 | 约 350MB |
+| 使用方式 | 将 `CFN-RAG.exe` 放到与 `resources` 文件夹同一目录，双击运行 |
+| 依赖 | 无需 Python 环境，无需安装依赖 |
+| 优点 | 单个文件，下载即用，移动方便 |
+| 缺点 | 启动时需要解压到临时目录，启动速度稍慢，且关闭后聊天历史可能无法保存 |
 
 **目录结构**：
 ```
-任意位置/
-├── resources/                  # 包含必要的游戏数据文件
-└── cfn-rag-backend/            # 解压后的项目文件夹
-    ├── start.exe              # 启动程序
-    ├── .env                   # 配置文件（可手动编辑）
-    ├── data/                  # 数据库目录
-    └── ...
+你的游戏目录/
+├── resources/              # 游戏资源文件夹
+└── CFN-RAG.exe            # 单文件可执行程序
 ```
 
 ---
@@ -212,9 +212,9 @@ python launcher.py
 
 | 你的情况 | 推荐版本 |
 |---------|---------|
-| 只是想快速体验，不想折腾 | **CFN-RAG.exe** |
+| 没有游戏项目，想独立体验功能 | **CFN-RAG-Full.zip** |
 | 有游戏项目，想体验完整功能 | **CFN-RAG-Portable.zip** |
-| 没有游戏项目，想独立体验 | **CFN-RAG-Full.zip** |
+| 有游戏项目，只是想临时体验 | **CFN-RAG.exe** |
 | 开发者，需要修改代码 | **源码克隆** |
 
 ## 配置说明
@@ -223,7 +223,47 @@ python launcher.py
 
 本项目需要配置 LLM API Key 才能使用。以下是几种获取免费 API Key 的方式：
 
-#### Google Gemini（推荐，免费额度充足）
+#### ModelScope 魔搭社区（首推，国内访问稳定，免费额度充足）
+
+ModelScope 提供每日刷新的免费额度，单模型50~500 次，总共 2000 次，足以支持日常聊天使用。单个模型达到额度后可切换其他模型名称。
+
+**获取步骤**：
+
+1. **注册并绑定阿里云实名账户**
+   - 访问 [ModelScope 官网](https://www.modelscope.cn/) 注册账号
+   - 进入[账号绑定页面](https://www.modelscope.cn/my/settings/account)，绑定阿里云实名认证的账号（必须先完成阿里云实名认证）
+
+2. **获取 API Key（访问令牌）**
+   - 进入 [访问控制 - 访问令牌](https://modelscope.cn/my/access/token) 页面
+   - 点击 "创建新的访问令牌"作为api_key
+
+3. **选择模型并获取配置信息**
+   - 进入 [模型库](https://www.modelscope.cn/models)
+   - 在筛选条件中勾选 **"支持体验" → "推理 API-Inference"**，筛选出支持免费 API 调用的模型
+   - 点击感兴趣的模型进入详情页
+   - 在"推理 API" 或 "代码范例" 标签页中查看：
+     - `model`：模型名称（如 `moonshotai/Kimi-K2.5`）
+     - `base_url`：API Base地址（固定为 `https://api-inference.modelscope.cn/v1`）
+
+**推荐模型**：
+- `moonshotai/Kimi-K2.5`：Moonshot 的 Kimi K2.5 多模态模型，性能优秀，每日约50次免费调用次数（2026.3.11测试）
+- `Qwen/Qwen3.5-397B-A17B`：阿里 Qwen3.5 多模态moe大模型，每日约100次免费调用次数（2026.3.11测试）
+- `MiniMax/MiniMax-M2.5`：纯文本生成模型，每日约100次免费调用次数（2026.3.11测试）
+- `ZhipuAI/GLM-5`：智谱文本生成模型，参数最大（但可能稍慢），每日约100次免费调用次数（2026.3.11测试）
+- `deepseek-ai/DeepSeek-V3.2`：DeepSeek文本生成模型，参数大，每日约20次免费调用次数（2026.3.11测试）
+- `Qwen/Qwen3.5-27B`：阿里 Qwen3.5 多模态模型，参数较小的版本，每日约**500**次免费调用次数（2026.3.11测试）
+- `Qwen/Qwen3.5-122B-A10B`：阿里 Qwen3.5 多模态模型，参数中等的moe版本，每日约200次免费调用次数（2026.3.11测试）
+
+**免费额度**：绑定阿里云实名账户后，每日 2000 次免费调用（单模型上限 500 次，但部分模型可能更少，达到上限后可更换模型）。
+
+**配置示例**：
+```env
+GEMINI_API_KEY=your_modelscope_token_here
+LLM_API_BASE=https://api-inference.modelscope.cn/v1
+LLM_MODEL_NAME=moonshotai/Kimi-K2.5
+```
+
+#### Google Gemini（免费额度充足，需代理）
 
 1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikey)
 2. 使用 Google 账号登录
@@ -236,9 +276,9 @@ python launcher.py
 
 #### 其他推荐平台
 
-- **[SiliconFlow](https://siliconflow.cn/)**：国内友好的大模型 API 平台，注册即送免费额度
+- **[Moonshot AI](https://platform.moonshot.cn/)**：月之暗面 Kimi API，注册有15元免费额度
+- **[QWEN](https://bailian.console.aliyun.com/cn-beijing/?tab=model#/api-key)**：阿里云百炼 QWEN API，每个模型百万token免费额度
 - **[DeepSeek](https://platform.deepseek.com/)**：国产大模型，价格便宜且有免费额度
-- **[Moonshot AI](https://platform.moonshot.cn/)**：月之暗面 Kimi API
 
 ### 配置文件说明
 
