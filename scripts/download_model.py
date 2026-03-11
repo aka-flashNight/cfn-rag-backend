@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 下载 HuggingFace 模型到本地项目目录
-用法: python download_model.py [--proxy http://127.0.0.1:10809] [--mirror]
+用法: python scripts/download_model.py [--proxy http://127.0.0.1:10809] [--mirror]
 """
 
 import argparse
@@ -13,6 +13,10 @@ from pathlib import Path
 def main():
     # 确定项目根目录（脚本所在目录的父目录）
     project_root = Path(__file__).resolve().parent.parent
+    
+    # 🔧 修复：将项目根目录添加到 Python 路径
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
     parser = argparse.ArgumentParser(description="下载 HuggingFace 模型到本地")
     parser.add_argument(
         "--proxy",

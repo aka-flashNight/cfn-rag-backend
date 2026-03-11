@@ -80,7 +80,7 @@ def ensure_embed_model(offline: bool = True) -> None:
         if offline:
             raise FileNotFoundError(
                 f"本地模型不存在或不完整: {LOCAL_MODEL_DIR}\n"
-                f"请先运行: python download_model.py 下载模型。"
+                f"请先运行: python scripts/download_model.py 下载模型。"
             )
         print(f"[模型] 本地模型不存在，尝试从 HuggingFace 下载: {MODEL_NAME}")
         Settings.embed_model = HuggingFaceEmbedding(model_name=MODEL_NAME)
