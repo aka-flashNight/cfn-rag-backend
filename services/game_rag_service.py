@@ -82,6 +82,8 @@ class GameRAGService:
         relationship_level: str = current_state.relationship_level
         sex: str | None = current_state.sex
         emotions: list[str] = current_state.emotions or ["普通"]
+        faction: str | None = current_state.faction
+        titles: list[str] = current_state.titles or []
 
         # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定
         retrieved_context: str = await asyncio.to_thread(
@@ -96,6 +98,8 @@ class GameRAGService:
         )
 
         sex_desc = f"（性别：{sex}）" if sex else ""
+        faction_desc = f"（阵营：{faction}）" if faction else ""
+        titles_desc = f"（身份：{'、'.join(titles)}）" if titles else ""
 
         # 3. 从记忆库中加载该会话最近的历史消息
         history_records = await memory.get_history(payload.session_id, limit=10)
@@ -121,7 +125,7 @@ class GameRAGService:
         emotions_str = "、".join(emotions)
 
         system_prompt = (
-            f"你现在扮演游戏角色「{npc_name}」{sex_desc}。\n"
+            f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
             f"玩家的身份是：{player_identity}。\n\n"
             "下面是与你相关的世界观设定和你的过往台词片段"
             "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
@@ -131,7 +135,7 @@ class GameRAGService:
             "请以符合你身份、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
             f"{history_str}"
             "输出格式必须严格为两行：\n"
-            "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀）。\n"
+            "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀，不要有第一行：的字样）。\n"
             "第二行：一个 JSON 对象，必须且仅包含两个字段：\n"
             "  - \"favorability_change\"：一个整数字段，取值范围 -5 到 5，例如："
             "{\"favorability_change\": 1, \"emotion\": \"普通\"}\n"

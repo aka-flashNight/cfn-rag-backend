@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -85,6 +85,8 @@ class NPCState:
     relationship_level: str
     sex: Optional[str] = None
     emotions: list[str] = field(default_factory=list)
+    faction: Optional[str] = None
+    titles: list[str] = field(default_factory=list)
 
 
 class NPCManager:
@@ -143,11 +145,21 @@ class NPCManager:
                         emotions.append(e.strip())
             if not emotions:
                 emotions = ["普通"]
+            faction_raw = str(item.get("faction") or "").strip()
+            faction: Optional[str] = faction_raw or None
+            titles_raw = item.get("titles")
+            titles: list[str] = []
+            if isinstance(titles_raw, list):
+                for t in titles_raw:
+                    if isinstance(t, str) and t.strip():
+                        titles.append(t.strip())
             state[name] = NPCState(
                 favorability=favorability,
                 relationship_level=level,
                 sex=sex,
                 emotions=emotions,
+                faction=faction,
+                titles=titles,
             )
 
         manager = cls(state=state)
@@ -223,6 +235,8 @@ class NPCManager:
                     relationship_level="陌生",
                     sex=None,
                     emotions=["普通"],
+                    faction=None,
+                    titles=[],
                 )
 
             print(f"[NPCManager] 从对话数据初始化了 {len(npc_names)} 个NPC")
@@ -258,7 +272,7 @@ class NPCManager:
 
         current: NPCState = self._state.get(
             npc_name,
-            NPCState(favorability=0, relationship_level="陌生", emotions=["普通"]),
+            NPCState(favorability=0, relationship_level="陌生", emotions=["普通"], faction=None, titles=[]),
         )
 
         new_favorability: int = current.favorability + int(change_value)
@@ -267,11 +281,11 @@ class NPCManager:
 
         new_level: str = self._compute_relationship_level(new_favorability)
 
-        updated = NPCState(
+        # 使用 dataclasses.replace 只修改好感度相关字段，保留其他所有字段
+        updated = replace(
+            current,
             favorability=new_favorability,
             relationship_level=new_level,
-            sex=current.sex,
-            emotions=list(current.emotions) if current.emotions else ["普通"],
         )
         self._state[npc_name] = updated
         return updated
@@ -310,6 +324,11 @@ class NPCManager:
             if state.emotions:
                 item["emotions"] = list(state.emotions)
             serializable[name] = item
+
+            if state.faction:
+                item["faction"] = state.faction
+            if state.titles:
+                item["titles"] = list(state.titles)
 
         async with aiofiles.open(path, "w", encoding="utf-8") as f:
             await f.write(json.dumps(serializable, ensure_ascii=False, indent=2))
