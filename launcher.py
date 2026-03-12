@@ -209,6 +209,13 @@ def start_backend():
 
         print(f"[后端] 工作目录: {os.getcwd()}")
 
+        # 执行同步初始化任务（如检查 npc_state_db.json）
+        try:
+            from core.startup import run_startup_tasks_sync
+            run_startup_tasks_sync()
+        except Exception as e:
+            print(f"[后端] 同步初始化任务失败: {e}")
+
         # 清除可能的模块缓存（开发环境需要）
         if not is_packaged_environment():
             modules_to_clear = [key for key in sys.modules.keys() if key in ['main', 'api', 'core', 'services', 'ai_engine']]

@@ -6,6 +6,7 @@ import os
 
 from fastapi import APIRouter, Depends, Query
 
+from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
     ChatMessage,
     NPCChatRequest,
@@ -85,6 +86,9 @@ async def ask_game_knowledge(
     基于游戏资料（剧情、人物、世界观设定等）进行 RAG 问答，
     扮演指定 NPC 与玩家对话，并驱动好感度变化。
     """
+    # 确保嵌入模型已加载完成（会阻塞等待）
+    await ensure_embed_model_ready()
+
     # 设置代理（如果前端传入了 proxy_url）
     apply_proxy_config(payload.proxy_url)
 
@@ -123,6 +127,9 @@ async def list_sessions(
     memory: MemoryManager = Depends(get_memory_manager),
     npc_manager: NPCManager = Depends(get_npc_manager),
 ) -> SessionListResponse:
+    # 触发嵌入模型预加载，但不阻塞返回
+    await trigger_embed_model_preload()
+
     sessions_raw = await memory.list_sessions()
     sessions: list[SessionInfo] = [
         SessionInfo(
