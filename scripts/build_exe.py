@@ -245,8 +245,8 @@ def main():
 
         print("\n使用方法:")
         print("  双击 CFN-RAG.exe 即可启动服务")
-        print("  - 后端API: http://127.0.0.1:8000")
-        print("  - 前端页面: http://127.0.0.1:8080")
+        print("  - 后端API: http://127.0.0.1:7077")
+        print("  - 前端页面: http://127.0.0.1:7080")
         print("\n注意事项:")
         print("  1. 首次运行需要安装依赖，请确保网络畅通")
         print("  2. 需要Node.js环境来启动前端服务")

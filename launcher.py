@@ -275,7 +275,7 @@ def start_backend():
         import uvicorn
 
         print("\n[后端] 正在启动 FastAPI 服务...")
-        print("[后端] 服务地址: http://127.0.0.1:8000")
+        print("[后端] 服务地址: http://127.0.0.1:7077")
         print("-" * 50)
 
         # 设置环境
@@ -307,7 +307,7 @@ def start_backend():
         uvicorn.run(
             "main:app",
             host="127.0.0.1",
-            port=8000,
+            port=7077,
             reload=False,
             log_level="info"
         )
@@ -328,7 +328,7 @@ def start_frontend():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             try:
-                result = sock.connect_ex(('127.0.0.1', 8000))
+                result = sock.connect_ex(('127.0.0.1', 7077))
                 sock.close()
                 if result == 0:
                     backend_ready = True
@@ -433,7 +433,7 @@ def start_builtin_server(dist_path):
     os.chdir(dist_path)
     handler = CustomHTTPRequestHandler
 
-    for port in range(8080, 8090):
+    for port in range(7080, 7090):
         try:
             # 检查端口是否被占用
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -457,7 +457,7 @@ def start_builtin_server(dist_path):
 
                 print("\n" + "=" * 50)
                 print("服务启动完成！")
-                print("后端API: http://127.0.0.1:8000")
+                print("后端API: http://127.0.0.1:7077")
                 print(f"前端页面: {url}")
                 print("=" * 50 + "\n")
 
