@@ -18,93 +18,19 @@ import signal
 import http.server
 
 
-def ask_yes_no_with_timeout(question, timeout=10, default='n'):
-    """询问用户是/否，带超时功能"""
-    print(question, end='', flush=True)
-    print(f" ({timeout}秒后默认: {default})")
-
-    result = {"value": None}
-
-    def input_thread():
-        try:
-            user_input = input().strip().lower()
-            if user_input in ['y', 'yes']:
-                result["value"] = True
-            elif user_input in ['n', 'no', '']:
-                result["value"] = False
-            else:
-                result["value"] = default == 'y'
-        except:
-            result["value"] = default == 'y'
-
-    thread = threading.Thread(target=input_thread)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout)
-
-    if result["value"] is None:
-        print(f"超时，使用默认值: {default}")
-        return default == 'y'
-
-    return result["value"]
-
-
-def ask_proxy_config():
-    """配置代理"""
-    print("=" * 50)
-    print("CFN-RAG 启动器")
-    print("=" * 50)
-
-    # 检查代理是否已通过环境变量设置（由 start.exe 设置）
-    existing_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
-    if existing_proxy:
-        print(f"\n[代理] 检测到已通过环境变量设置代理: {existing_proxy}")
-        print("[代理] 跳过代理配置\n")
-        return
-
-    # 第一步：询问是否需要代理（10秒超时）
-    need_proxy = ask_yes_no_with_timeout(
-        "\n是否需要为 HuggingFace/LLM 配置 HTTP 代理？如果开启了全局代理，也请配置。(y/N): ",
-        timeout=10,
-        default='n'
-    )
-
-    if not need_proxy:
-        print("跳过代理配置\n")
-        return
-
-    # 第二步：询问代理地址（不限时，有默认值）
-    default_proxy = "http://127.0.0.1:10809"
-    print(f"\n请输入代理地址（默认为 {default_proxy}）: ", end='', flush=True)
-
-    try:
-        proxy = input().strip()
-        if not proxy:
-            proxy = default_proxy
-        else:
-            # 确保代理地址有 http:// 前缀
-            if not proxy.startswith("http://") and not proxy.startswith("https://"):
-                proxy = "http://" + proxy
-    except:
-        proxy = default_proxy
-
-    # 设置代理环境变量
-    os.environ["HTTP_PROXY"] = proxy
-    os.environ["HTTPS_PROXY"] = proxy
-    print(f"已设置代理: {proxy}\n")
 
 
 def check_python_environment():
     """检查Python环境是否满足要求"""
-    print("[检查] 检查Python环境...")
+    print("[检查] 检查Python环境...", flush=True)
 
     # 检查Python版本
     if sys.version_info < (3, 8):
-        print("[错误] Python版本过低，需要Python 3.8或更高版本")
-        print(f"当前版本: {sys.version}")
+        print("[错误] Python版本过低，需要Python 3.8或更高版本", flush=True)
+        print(f"当前版本: {sys.version}", flush=True)
         return False
 
-    print(f"[检查] Python版本: {sys.version.split()[0]} ✓")
+    print(f"[检查] Python版本: {sys.version.split()[0]} ✓", flush=True)
 
     # 检查必要的包
     required_packages = ['fastapi', 'uvicorn', 'pydantic']
@@ -117,11 +43,11 @@ def check_python_environment():
             missing_packages.append(package)
 
     if missing_packages:
-        print(f"[错误] 缺少必要的Python包: {', '.join(missing_packages)}")
-        print("[提示] 请运行: pip install -r requirements.txt")
+        print(f"[错误] 缺少必要的Python包: {', '.join(missing_packages)}", flush=True)
+        print("[提示] 请运行: pip install -r requirements.txt", flush=True)
         return False
 
-    print("[检查] 必要的Python包已安装 ✓")
+    print("[检查] 必要的Python包已安装 ✓", flush=True)
     return True
 
 
@@ -482,18 +408,23 @@ def main():
     # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
 
-    # 配置代理
-    ask_proxy_config()
+    # 禁用输出缓冲，确保print立即显示（解决Windows下黑屏问题）
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    print("=" * 50, flush=True)
+    print("CFN-RAG 启动器", flush=True)
+    print("=" * 50, flush=True)
 
     # 检查Python环境
     if not check_python_environment():
-        print("\nPython环境检查未通过，请修复后重试")
+        print("\nPython环境检查未通过，请修复后重试", flush=True)
         input("按回车键退出...")
         sys.exit(1)
 
-    print("\n" + "=" * 50)
-    print("正在启动服务...")
-    print("=" * 50)
+    print("\n" + "=" * 50, flush=True)
+    print("正在启动服务...", flush=True)
+    print("=" * 50, flush=True)
 
     # 创建并启动后端线程
     backend_thread = threading.Thread(target=start_backend, daemon=True)

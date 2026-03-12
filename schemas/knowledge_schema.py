@@ -30,6 +30,10 @@ class NPCChatRequest(BaseModel):
         default=None,
         description="可选的大模型名称，优先级高于后端 .env 中的默认配置",
     )
+    proxy_url: Optional[str] = Field(
+        default=None,
+        description="可选的 HTTP 代理地址，例如 http://127.0.0.1:10809",
+    )
 
 
 class NPCChatResponse(BaseModel):
@@ -66,6 +70,10 @@ class SessionCreateRequest(BaseModel):
 
     npc_name: str = Field(..., description="本会话绑定的 NPC 名称")
     title: str = Field(..., description="会话标题 / 对话名称，供前端展示")
+    proxy_url: Optional[str] = Field(
+        default=None,
+        description="可选的 HTTP 代理地址，例如 http://127.0.0.1:10809",
+    )
 
 
 class SessionCreateResponse(BaseModel):

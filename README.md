@@ -35,8 +35,7 @@ Crazy Flash Night 游戏项目地址：https://github.com/FlashNightModReborn/Cr
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG.exe`
 2. 确保 `resources` 文件夹与 `CFN-RAG.exe` 在同一目录
 3. 双击运行 `CFN-RAG.exe`
-4. 按提示配置代理（如有需要）
-5. 浏览器将自动打开界面
+4. 浏览器将自动打开界面
 
 **注意**：必须配合`resources`游戏项目文件夹，且是github上的最新版本
 
@@ -48,8 +47,7 @@ Crazy Flash Night 游戏项目地址：https://github.com/FlashNightModReborn/Cr
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG-Full.zip`
 2. 解压到任意位置
 3. 双击运行 `CFN-RAG.exe`
-4. 按提示配置代理（如有需要）
-5. 浏览器将自动打开界面
+4. 浏览器将自动打开界面
 
 **优点**：无需额外下载游戏资源，独立运行
 **注意**：内置资源可能不是最新版本
@@ -252,26 +250,14 @@ LLM_MODEL_NAME=gemini-2.5-flash
 
 ### 代理配置
 
-**如果你使用国外模型（如 Gemini、OpenAI）或开启了全局代理，需要在启动时配置代理。**
+**如果你使用国外模型（如 Gemini、OpenAI）或开启了全局代理，需要在前端界面中配置代理。**
 
-运行 `launcher.py` 或 `CFN-RAG.exe` 时，第一步会询问是否需要配置代理：
+代理配置已集成到前端界面中，启动服务后，在前端界面的设置区域填写代理地址即可，例如：
+- `http://127.0.0.1:7890`（Clash 默认端口）
+- `http://127.0.0.1:10809`（v2rayN 默认端口）
+- `http://127.0.0.1:1080`（Shadowsocks 默认端口）
 
-```
-==================================================
-CFN-RAG 启动器
-==================================================
-
-是否需要为 HuggingFace/LLM 配置 HTTP 代理？如果开启了全局代理，也请配置。(y/N):
-```
-
-- 输入 `y` 启用代理配置
-- 默认代理地址为 `http://127.0.0.1:10809`
-- 可根据你的代理软件实际端口进行修改
-
-常见代理软件默认端口：
-- Clash: `http://127.0.0.1:7890`
-- v2rayN: `http://127.0.0.1:10809`
-- Shadowsocks: `http://127.0.0.1:1080`
+配置后，代理会立即生效，对后续所有 LLM API 调用及网络请求生效。
 
 ## 项目结构
 

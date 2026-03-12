@@ -2,6 +2,8 @@
 游戏知识库 RAG API，供 Web 端调用。
 """
 
+import os
+
 from fastapi import APIRouter, Depends, Query
 
 from schemas.knowledge_schema import (
@@ -19,6 +21,29 @@ from services.memory_manager import MemoryManager
 from services.npc_manager import NPCManager
 
 router: APIRouter = APIRouter()
+
+
+def apply_proxy_config(proxy_url: str | None) -> None:
+    """
+    设置或清除代理环境变量。
+    - proxy_url 非空：设置代理
+    - proxy_url 为空或空字符串：清除代理
+    """
+    if not proxy_url or not proxy_url.strip():
+        # 清除代理配置
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        print("[代理] 已清除代理配置")
+        return
+
+    proxy = proxy_url.strip()
+    # 确保代理地址有 http:// 前缀
+    if not proxy.startswith("http://") and not proxy.startswith("https://"):
+        proxy = "http://" + proxy
+
+    os.environ["HTTP_PROXY"] = proxy
+    os.environ["HTTPS_PROXY"] = proxy
+    print(f"[代理] 已设置代理: {proxy}")
 
 _game_rag_service: GameRAGService | None = None
 _memory_manager: MemoryManager | None = None
@@ -60,6 +85,9 @@ async def ask_game_knowledge(
     基于游戏资料（剧情、人物、世界观设定等）进行 RAG 问答，
     扮演指定 NPC 与玩家对话，并驱动好感度变化。
     """
+    # 设置代理（如果前端传入了 proxy_url）
+    apply_proxy_config(payload.proxy_url)
+
     return await service.ask(payload, npc_manager=npc_manager, memory=memory)
 
 
@@ -123,6 +151,9 @@ async def create_session(
     payload: SessionCreateRequest,
     memory: MemoryManager = Depends(get_memory_manager),
 ) -> SessionCreateResponse:
+    # 设置代理（如果前端传入了 proxy_url）
+    apply_proxy_config(payload.proxy_url)
+
     info = await memory.create_session(npc_name=payload.npc_name, title=payload.title)
     return SessionCreateResponse(
         session_id=info["session_id"],

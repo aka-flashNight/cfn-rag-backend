@@ -251,7 +251,6 @@ def main():
         print("\n注意事项:")
         print("  1. 首次运行需要安装依赖，请确保网络畅通")
         print("  2. 需要Node.js环境来启动前端服务")
-        print("  3. 如需代理访问国外API，启动时会提示配置")
 
         # 检查模型是否已打包
         models_dir = os.path.join(project_root, 'models')

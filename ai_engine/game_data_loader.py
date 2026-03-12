@@ -479,11 +479,11 @@ def build_index() -> VectorStoreIndex:
 
     ensure_embed_model(offline=True)
 
-    # 设置简单的 node parser，避免 tiktoken 编码问题
-    from llama_index.core.node_parser import SentenceSplitter
+    # 使用 TokenTextSplitter 替代 SentenceSplitter，避免 NLTK punkt 依赖
+    # SentenceSplitter 内部使用 NLTK 的 punkt tokenizer，容易出问题
+    from llama_index.core.text_splitter import TokenTextSplitter
     from llama_index.core import Settings
 
-    # 使用简单的字符分割器，完全避免 tiktoken
     # 针对中英文混合优化：英文按单词，中文按字符
     def simple_tokenizer(text: str) -> list[str]:
         """简单tokenizer：空格分割英文，字符分割中文"""
@@ -492,12 +492,15 @@ def build_index() -> VectorStoreIndex:
         tokens = re.findall(r'[a-zA-Z]+|\d+|[^\s\w]', text)
         return tokens if tokens else text.split()
 
-    node_parser = SentenceSplitter(
-        chunk_size=512,  # 减小chunk大小，因为中文字符分割比tiktoken细
+    text_splitter = TokenTextSplitter(
+        separator=" ",
+        chunk_size=512,
         chunk_overlap=50,
         tokenizer=simple_tokenizer,
     )
-    Settings.node_parser = node_parser
+
+    # 直接设置 text_splitter，VectorStoreIndex.from_documents 会自动使用
+    Settings.text_splitter = text_splitter
 
     dialogue_docs = load_dialogue_documents()
     task_docs = load_task_documents()
