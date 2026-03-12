@@ -1,16 +1,71 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
 
-BASE_DIR: Path = Path(__file__).resolve().parent.parent
-DATA_DIR: Path = BASE_DIR / "data"
-DB_PATH: Path = DATA_DIR / "memory.db"
+def is_packaged_environment() -> bool:
+    """检查是否在PyInstaller打包环境中运行"""
+    return hasattr(sys, '_MEIPASS') or getattr(sys, 'frozen', False)
+
+
+def get_db_path() -> Path:
+    """
+    获取memory.db的路径。
+
+    数据库现在存储在resources/tools/memory.db，这样可以避免打包后数据库被删除的问题。
+
+    目录结构：
+        开发环境：
+            父目录/
+            ├── resources/tools/memory.db  <-- 数据库存储在这里
+            └── cfn-rag-backend/           <-- 本项目
+                └── ...
+
+        打包后：
+            部署目录/
+            ├── resources/tools/memory.db  <-- 数据库存储在这里
+            └── CFN-RAG.exe                <-- 打包后的exe
+    """
+    # 获取基础目录
+    if is_packaged_environment():
+        # 打包环境：exe所在目录
+        base_dir = Path(os.path.dirname(sys.executable))
+    else:
+        # 开发环境：当前文件所在目录的父目录的父目录
+        # memory_manager.py 位置: cfn-rag-backend/services/memory_manager.py
+        # resources 位置: cfn-rag-backend/../resources
+        script_dir = Path(__file__).resolve().parent
+        base_dir = script_dir.parent.parent
+
+    # 情况1: base_dir/resources/tools/memory.db（打包后或resources和项目同级）
+    db_path = base_dir / "resources" / "tools" / "memory.db"
+    if db_path.parent.exists():
+        return db_path
+
+    # 情况2: 开发环境特殊情况，resources在当前工作目录
+    cwd = Path(os.getcwd()).resolve()
+    cwd_db_path = cwd / "resources" / "tools" / "memory.db"
+    if cwd_db_path.parent.exists():
+        return cwd_db_path
+
+    # 情况3: 尝试查找工作目录的父目录
+    parent_cwd_db_path = cwd.parent / "resources" / "tools" / "memory.db"
+    if parent_cwd_db_path.parent.exists():
+        return parent_cwd_db_path
+
+    # 如果都找不到，使用默认路径（base_dir），并创建目录
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return db_path
+
+
+DB_PATH: Path = get_db_path()
 
 
 class MemoryManager:
@@ -37,7 +92,8 @@ class MemoryManager:
         """
 
         def _inner() -> None:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            # 确保数据库目录存在
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self._db_path)
             try:
                 cur = conn.cursor()
