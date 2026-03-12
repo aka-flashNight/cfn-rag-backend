@@ -528,30 +528,4 @@ def get_cached_index() -> VectorStoreIndex:
     return _index_cache
 
 
-def get_query_engine():
-    """
-    获取游戏知识库 RAG 查询引擎，使用 .env 中的 GEMINI_API_KEY 作为 LLM。
-
-    使用示例：
-
-        from ai_engine.game_data_loader import get_query_engine
-        qe = get_query_engine()
-        resp = qe.query("冷兵器商人是怎样评价冷兵器的？")
-    """
-    from llama_index.llms.google_genai import GoogleGenAI
-
-    from core.config import get_settings
-
-    settings = get_settings()
-    if not settings.gemini_api_key:
-        raise ValueError(
-            "GEMINI_API_KEY 未配置，请在 .env 中设置。"
-        )
-
-    llm = GoogleGenAI(
-        model=settings.gemini_model,
-        api_key=settings.gemini_api_key,
-    )
-    index = get_cached_index()
-    return index.as_query_engine(llm=llm)
 

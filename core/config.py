@@ -17,12 +17,8 @@ class Settings(BaseSettings):
     app_name: str = "FastAPI AI Scaffold"
     debug: bool = False
 
-    # Gemini / AIStudio 相关配置
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_api_base: str = "https://generativelanguage.googleapis.com/v1beta"
-
     # 通用 OpenAI 兼容 LLM 配置（默认为 Gemini OpenAI 兼容端点）
+    llm_api_key: str | None = None
     llm_api_base: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_model_name: str = "gemini-2.5-flash"
 

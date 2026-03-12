@@ -60,13 +60,13 @@ class GameRAGService:
             else None
         )
 
-        effective_api_key: str | None = request_api_key or settings.gemini_api_key
+        effective_api_key: str | None = request_api_key or settings.llm_api_key
         effective_api_base: str = request_api_base or settings.llm_api_base
         effective_model: str = request_model or settings.llm_model_name
 
         if not effective_api_key:
             raise ValueError(
-                "未提供可用的大模型 API Key，请在请求中传入 api_key 或在 .env 中配置 GEMINI_API_KEY。"
+                "未提供可用的大模型 API Key，请在请求中传入 api_key 或在 .env 中配置 LLM_API_KEY。"
             )
 
         # 1. 读取 / 初始化 NPC 当前好感度
@@ -137,7 +137,7 @@ class GameRAGService:
             "{\"favorability_change\": 1, \"emotion\": \"普通\"}\n"
             "  - \"emotion\"：一个字符串字段，值必须从上文提供的情绪标签中选择；"
             "如果没有特别合适的情绪，请使用 \"普通\"。\n"
-            "常规对话无需调整好感度。如果本次对话不应影响好感度，请输出 {\"favorability_change\": 0}。\n"
+            "常规对话无需调整好感度，小幅度的情绪起伏可以只+或-1点好感度。如果本次对话不应影响好感度，请输出 {\"favorability_change\": 0}。\n"
             "不要输出第三行及更多内容，不要添加多余的空行或注释。"
         )
 

@@ -3,30 +3,6 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
-class AskRequest(BaseModel):
-    """
-    用户提问请求体。
-    """
-
-    query: str = Field(..., description="用户问题内容")
-    session_id: Optional[str] = Field(
-        default=None,
-        description="可选对话会话标识，用于多轮上下文",
-    )
-
-
-class AskResponse(BaseModel):
-    """
-    知识库问答响应体。
-    """
-
-    answer: str = Field(..., description="LLM 生成的回答")
-    sources: List[str] = Field(
-        default_factory=list,
-        description="回答参考的知识库来源（文档 ID、URL 等）",
-    )
-
-
 class NPCChatRequest(BaseModel):
     """
     游戏 NPC 对话请求体。

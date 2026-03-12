@@ -1,7 +1,6 @@
 from fastapi import APIRouter
 
 from core.config import Settings, get_settings
-from .knowledge_api import router as knowledge_router
 from .game_api import router as game_router
 from .assets_api import router as assets_router
 
@@ -20,6 +19,5 @@ async def health_check(settings: Settings = get_settings()) -> dict[str, str]:
     }
 
 
-api_router.include_router(knowledge_router, prefix="/knowledge", tags=["Knowledge"])
 api_router.include_router(game_router, prefix="/game", tags=["GameRAG"])
 api_router.include_router(assets_router, prefix="/assets", tags=["Assets"])

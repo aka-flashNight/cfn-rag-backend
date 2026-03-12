@@ -258,7 +258,7 @@ ModelScope 提供每日刷新的免费额度，单模型20~500 次，总共 2000
 
 **配置示例**：
 ```env
-GEMINI_API_KEY=your_modelscope_token_here
+LLM_API_KEY=your_modelscope_token_here
 LLM_API_BASE=https://api-inference.modelscope.cn/v1
 LLM_MODEL_NAME=moonshotai/Kimi-K2.5
 ```
@@ -285,8 +285,8 @@ LLM_MODEL_NAME=moonshotai/Kimi-K2.5
 创建 `.env` 文件，参考以下配置：
 
 ```env
-# Gemini 配置（默认）
-GEMINI_API_KEY=your_gemini_api_key_here
+# LLM 配置（默认使用 Gemini）
+LLM_API_KEY=your_api_key_here
 LLM_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai
 LLM_MODEL_NAME=gemini-2.5-flash
 
@@ -324,8 +324,7 @@ CFN-RAG 启动器
 cfn-rag-backend/
 ├── api/                    # API 路由层
 │   ├── assets_api.py       # 静态资源 API
-│   ├── game_api.py         # 游戏相关 API
-│   └── knowledge_api.py    # 知识库 API
+│   └── game_api.py         # 游戏相关 API
 ├── ai_engine/              # AI 引擎核心
 │   └── game_data_loader.py # 游戏数据加载器
 ├── core/                   # 核心配置
@@ -342,7 +341,6 @@ cfn-rag-backend/
 │   └── download_model.py   # 模型下载脚本
 ├── services/               # 业务逻辑层
 │   ├── game_rag_service.py # RAG 服务
-│   ├── knowledge_service.py# 知识库服务
 │   ├── memory_manager.py   # 记忆管理
 │   └── npc_manager.py      # NPC 管理
 ├── launcher.py             # 启动器（同时启动前后端）
