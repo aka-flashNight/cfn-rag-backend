@@ -33,7 +33,7 @@ def collect_all_py_files():
     return dirs_to_include, root_py_files
 
 
-def create_spec_file(dirs_to_include, root_py_files):
+def create_spec_file(dirs_to_include, root_py_files, script_dir):
     """创建PyInstaller的spec文件"""
 
     # 构建add-data参数
@@ -140,6 +140,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=r'{os.path.join(script_dir, 'icon.ico')}',
 )
 '''
 
@@ -196,7 +197,7 @@ def main():
 
     # 创建spec文件
     print("\n生成打包配置文件...")
-    spec_content = create_spec_file(dirs_to_include, root_py_files)
+    spec_content = create_spec_file(dirs_to_include, root_py_files, script_dir)
     spec_path = os.path.join('build_temp', 'CFN-RAG.spec')
 
     os.makedirs('build_temp', exist_ok=True)

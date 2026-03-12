@@ -26,7 +26,7 @@ CFN-RAG 需要配合 **Crazy Flash Night 游戏资源** 使用。请将游戏项
     └── ...
 ```
 
-游戏项目地址：https://github.com/FlashNightModReborn/CrazyFlashNight
+Crazy Flash Night 游戏项目地址：https://github.com/FlashNightModReborn/CrazyFlashNight
 
 ## 快速开始
 
@@ -38,40 +38,23 @@ CFN-RAG 需要配合 **Crazy Flash Night 游戏资源** 使用。请将游戏项
 4. 按提示配置代理（如有需要）
 5. 浏览器将自动打开界面
 
-**注意**：该方式数据库文件位于临时文件夹，停止运行exe后，聊天记录可能不会保存。
+**注意**：必须配合`resources`游戏项目文件夹，且是github上的最新版本
 
-### 方式二：使用便携版（推荐有基础的用户）
 
-适合想要快速运行但不需要修改代码的用户。
-
-1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG-Portable.zip`
-2. 解压到与 `resources` 文件夹同一层级：
-   ```
-   你的目录/
-   ├── resources/              # 游戏资源文件夹
-   └── CFN-RAG-Portable/        # 解压后的项目文件夹
-       ├── start.exe
-       └── ...
-   ```
-3. 进入 `CFN-RAG-Portable` 文件夹，双击运行 `start.exe`
-4. 按提示配置代理（如有需要）和 API Key
-
-**优点**：启动速度快，文件结构清晰
-**注意**：需要配合外部的 `resources` 文件夹使用
-
-### 方式三：使用完整独立版（推荐无游戏项目的用户）
+### 方式二：使用完整独立版（推荐无游戏项目的用户）
 
 适合没有下载游戏项目，但想体验功能的用户。
 
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG-Full.zip`
 2. 解压到任意位置
-3. 进入 `cfn-rag-backend` 文件夹，双击运行 `start.exe`
-4. 按提示配置代理（如有需要）和 API Key
+3. 双击运行 `CFN-RAG.exe`
+4. 按提示配置代理（如有需要）
+5. 浏览器将自动打开界面
 
 **优点**：无需额外下载游戏资源，独立运行
 **注意**：内置资源可能不是最新版本
 
-### 方式四：从源码运行（推荐开发者）
+### 方式三：从源码运行（推荐开发者）
 
 #### 环境要求
 
@@ -135,7 +118,7 @@ python launcher.py
 
 ## 发布版本说明
 
-我们在 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面提供以下三种发布包，请根据你的需求选择：
+我们在 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面提供以下两种发布包，请根据你的需求选择：
 
 ### 1. CFN-RAG-Full.zip（完整独立版）
 
@@ -143,36 +126,34 @@ python launcher.py
 
 | 特点 | 说明 |
 |------|------|
-| 文件大小 | 约 150MB+（含必要的资源文件） |
-| 使用方式 | 解压到任意位置，进入项目文件夹运行 `start.exe` |
+| 文件大小 | 约 350MB+（含必要的资源文件） |
+| 使用方式 | 解压到任意位置，进入文件夹运行 `CFN-RAG.exe` |
 | 依赖 | 无需外部 `resources` 文件夹，无需 Python 环境 |
 | 优点 | 完全独立运行，不依赖游戏项目 |
 | 缺点 | 无法随游戏更新获取最新数据，仅包含基础资源 |
+| 缺点 | 启动时需要解压到临时目录，启动速度稍慢 |
 
 **目录结构**：
 ```
 任意位置/
 ├── resources/                  # 包含必要的游戏数据文件
-└── cfn-rag-backend/            # 解压后的项目文件夹
-    ├── start.exe              # 启动程序
-    ├── .env                   # 配置文件（可手动编辑）
-    ├── data/                  # 数据库目录
-    └── ...
+└── CFN-RAG.exe                 # 单文件可执行程序
 ```
 
 ---
 
 ### 2. CFN-RAG.exe（单文件版）
 
-**面向人群**：普通用户，追求最简单使用方式
+**面向人群**：有完整游戏项目的用户
 
 | 特点 | 说明 |
 |------|------|
-| 文件大小 | 约 350MB |
+| 文件大小 | 约 300MB |
 | 使用方式 | 将 `CFN-RAG.exe` 放到与 `resources` 文件夹同一目录，双击运行 |
-| 依赖 | 无需 Python 环境，无需安装依赖 |
+| 依赖 | 需要完整的游戏项目 `resources` 文件夹，无需 Python 环境 |
 | 优点 | 单个文件，下载即用，移动方便 |
-| 缺点 | 启动时需要解压到临时目录，启动速度稍慢，且关闭后聊天历史可能无法保存 |
+| 缺点 | 必须配合 `resources` 文件夹，且是github上的最新版本 |
+| 缺点 | 启动时需要解压到临时目录，启动速度稍慢 |
 
 **目录结构**：
 ```
@@ -183,38 +164,12 @@ python launcher.py
 
 ---
 
-### 3. CFN-RAG-Portable.zip（便携版）
-
-**面向人群**：有一定基础的用户
-
-| 特点 | 说明 |
-|------|------|
-| 文件大小 | 约 100MB（不含模型） |
-| 使用方式 | 参考下方目录结构，解压到 `resources`  外的文件夹中，运行文件夹内的 `start.exe` |
-| 依赖 | 无需 Python 环境，但可能需要下载嵌入模型（首次运行自动下载） |
-| 优点 | 启动速度快，文件体积小，可查看/修改配置 |
-| 缺点 | 需要配合外部的 `resources` 文件夹使用 |
-
-**目录结构**：
-```
-你的目录/
-├── resources/                  # 游戏资源文件夹
-└── CFN-RAG-Portable/            # 解压后的项目文件夹
-    ├── start.exe              # 启动程序
-    ├── .env                   # 配置文件（可手动编辑）
-    ├── data/                  # 数据库目录
-    └── ...
-```
-
----
-
 ### 版本选择建议
 
 | 你的情况 | 推荐版本 |
 |---------|---------|
 | 没有游戏项目，想独立体验功能 | **CFN-RAG-Full.zip** |
-| 有游戏项目，只是想临时体验 | **CFN-RAG.exe** |
-| 有游戏项目，想体验完整功能 | **CFN-RAG-Portable.zip** |
+| 有游戏项目，想体验完整功能 | **CFN-RAG.exe** |
 | 开发者，需要修改代码 | **源码克隆** |
 
 ## 配置说明
@@ -330,8 +285,6 @@ cfn-rag-backend/
 ├── core/                   # 核心配置
 │   ├── config.py           # 全局配置
 │   └── exceptions.py       # 异常处理
-├── data/                   # 数据存储
-│   └── memory.db           # SQLite 数据库（会话记录）
 ├── dist/                   # 前端构建产物
 ├── models/                 # 本地模型存储
 │   └── bge-small-zh-v1.5/  # 中文嵌入模型
