@@ -285,3 +285,99 @@ class MemoryManager:
 
         return await asyncio.to_thread(_inner)
 
+    async def update_session_title(self, session_id: str, title: str) -> Dict[str, Any]:
+        """
+        更新指定会话的标题。
+
+        Args:
+            session_id: 会话 ID
+            title: 新的标题
+
+        Returns:
+            更新后的会话信息
+
+        Raises:
+            ValueError: 当会话不存在或标题为空时
+        """
+        session_id = session_id.strip()
+        title = title.strip()
+
+        if not session_id:
+            raise ValueError("session_id 不能为空。")
+        if not title:
+            raise ValueError("title 不能为空。")
+
+        def _inner() -> Dict[str, Any]:
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                cur = conn.cursor()
+                # 检查会话是否存在
+                cur.execute(
+                    "SELECT session_id, npc_name, title, created_at FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"会话 '{session_id}' 不存在。")
+
+                # 更新标题
+                cur.execute(
+                    "UPDATE sessions SET title = ? WHERE session_id = ?",
+                    (title, session_id),
+                )
+                conn.commit()
+
+                return {
+                    "session_id": str(row["session_id"]),
+                    "npc_name": str(row["npc_name"]),
+                    "title": title,
+                    "created_at": float(row["created_at"]),
+                }
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_inner)
+
+    async def delete_session(self, session_id: str) -> None:
+        """
+        删除指定的会话及其所有聊天记录。
+
+        Args:
+            session_id: 会话 ID
+
+        Raises:
+            ValueError: 当会话不存在时
+        """
+        session_id = session_id.strip()
+        if not session_id:
+            raise ValueError("session_id 不能为空。")
+
+        def _inner() -> bool:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                # 检查会话是否存在
+                cur.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError(f"会话 '{session_id}' 不存在。")
+
+                # 删除会话元数据
+                cur.execute(
+                    "DELETE FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                # 删除相关聊天记录
+                cur.execute(
+                    "DELETE FROM chat_history WHERE session_id = ?",
+                    (session_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(_inner)
+

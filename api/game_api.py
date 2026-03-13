@@ -11,11 +11,14 @@ from schemas.knowledge_schema import (
     ChatMessage,
     NPCChatRequest,
     NPCChatResponse,
+    NPCFavorabilityResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionHistoryResponse,
     SessionListResponse,
     SessionInfo,
+    SessionTitleUpdateRequest,
+    SessionTitleUpdateResponse,
 )
 from services.game_rag_service import GameRAGService
 from services.memory_manager import MemoryManager
@@ -168,3 +171,89 @@ async def create_session(
         title=info["title"],
         created_at=info["created_at"],
     )
+
+
+@router.get(
+    "/npc/{npc_name}/favorability",
+    response_model=NPCFavorabilityResponse,
+    summary="获取 NPC 好感度信息",
+)
+async def get_npc_favorability(
+    npc_name: str,
+    service: GameRAGService = Depends(get_game_rag_service),
+    npc_manager: NPCManager = Depends(get_npc_manager),
+) -> NPCFavorabilityResponse:
+    """
+    获取指定 NPC 对玩家的好感度、关系等级和当前情绪状态。
+    """
+    from fastapi import HTTPException
+
+    try:
+        npc_name_decoded = npc_name  # FastAPI 会自动进行 URL 解码
+        name, favorability, relationship_level = await service.get_npc_favorability(
+            npc_name_decoded, npc_manager=npc_manager
+        )
+        return NPCFavorabilityResponse(
+            npc_name=name,
+            favorability=favorability,
+            relationship_level=relationship_level,
+        )
+    except ValueError as e:
+        if "不存在" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+
+
+@router.put(
+    "/sessions/{session_id}/title",
+    response_model=SessionTitleUpdateResponse,
+    summary="更新会话标题",
+)
+async def update_session_title(
+    session_id: str,
+    payload: SessionTitleUpdateRequest,
+    memory: MemoryManager = Depends(get_memory_manager),
+) -> SessionTitleUpdateResponse:
+    """
+    修改指定会话的标题。
+    """
+    from fastapi import HTTPException
+
+    try:
+        result = await memory.update_session_title(session_id, payload.title)
+        return SessionTitleUpdateResponse(
+            session_id=result["session_id"],
+            title=result["title"],
+        )
+    except ValueError as e:
+        if "不存在" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=204,
+    summary="删除会话",
+)
+async def delete_session(
+    session_id: str,
+    memory: MemoryManager = Depends(get_memory_manager),
+) -> None:
+    """
+    删除指定的会话及其所有聊天记录。
+    """
+    from fastapi import HTTPException
+
+    try:
+        await memory.delete_session(session_id)
+    except ValueError as e:
+        if "不存在" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")

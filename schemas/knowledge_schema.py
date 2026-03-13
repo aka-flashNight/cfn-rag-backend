@@ -124,3 +124,30 @@ class SessionListResponse(BaseModel):
         description="可供选择的 NPC 名称候选，来自 npc_state_db.json",
     )
 
+
+class NPCFavorabilityResponse(BaseModel):
+    """
+    获取 NPC 好感度信息的响应。
+    """
+
+    npc_name: str = Field(..., description="NPC 名称")
+    favorability: int = Field(..., description="好感度数值（0-100）")
+    relationship_level: str = Field(..., description="关系等级（如：陌生、熟悉、朋友、生死之交）")
+
+
+class SessionTitleUpdateRequest(BaseModel):
+    """
+    更新会话标题的请求体。
+    """
+
+    title: str = Field(..., description="新的会话标题（1-100 字符）", min_length=1, max_length=100)
+
+
+class SessionTitleUpdateResponse(BaseModel):
+    """
+    更新会话标题的响应。
+    """
+
+    session_id: str = Field(..., description="会话 ID")
+    title: str = Field(..., description="更新后的标题")
+

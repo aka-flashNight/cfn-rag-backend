@@ -221,7 +221,7 @@ class GameRAGService:
             model_name=effective_model,
             prompt=full_prompt,
         )
-        # print(full_prompt)
+        print(full_prompt)
         # 4. 解析回复与好感度变化与情绪
         reply, delta, emotion = self._parse_reply_and_delta(
             reply_text, allowed_emotions=emotions
@@ -468,3 +468,35 @@ class GameRAGService:
             emotion = "普通"
 
         return reply_line, delta, emotion
+
+    async def get_npc_favorability(
+        self,
+        npc_name: str,
+        npc_manager: NPCManager,
+    ) -> Tuple[str, int, str]:
+        """
+        获取指定 NPC 的好感度信息。
+
+        Args:
+            npc_name: NPC 名称
+            npc_manager: NPCManager 实例
+
+        Returns:
+            (npc_name, favorability, relationship_level) 元组
+
+        Raises:
+            ValueError: 当 NPC 不存在时
+        """
+        npc_name = npc_name.strip()
+        if not npc_name:
+            raise ValueError("npc_name 不能为空。")
+
+        current_state: NPCState | None = npc_manager.state.get(npc_name)
+        if current_state is None:
+            raise ValueError(f"NPC '{npc_name}' 不存在。")
+
+        return (
+            npc_name,
+            current_state.favorability,
+            current_state.relationship_level,
+        )
