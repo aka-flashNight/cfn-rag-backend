@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Set
 
 from llama_index.core import Document, SimpleDirectoryReader, VectorStoreIndex
-from llama_index.core import Settings
+from llama_index.core import Settings, StorageContext, load_index_from_storage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+from services.memory_manager import get_db_path
 
 _EMBED_MODEL_CONFIGURED: bool = False
 
@@ -213,6 +215,22 @@ def _ensure_resources_dir() -> None:
     resources_dir = _get_resources_dir()
     if not resources_dir.exists():
         raise FileNotFoundError(f"resources 目录不存在: {resources_dir}")
+
+
+def get_vector_index_dir() -> Path:
+    """
+    获取知识库向量索引的持久化目录，与 memory.db 同位于 resources/tools 下。
+    开发环境与 exe 运行时均使用同一套路径解析逻辑（通过 get_db_path 复用）。
+    """
+    return get_db_path().parent / "vector_index"
+
+
+def _is_vector_index_valid(persist_dir: Path) -> bool:
+    """检查 persist_dir 下是否存在有效的 LlamaIndex 持久化索引（至少需有 index_store）。"""
+    if not persist_dir.is_dir():
+        return False
+    # LlamaIndex 默认会持久化 docstore.json、index_store.json 等
+    return (persist_dir / "index_store.json").exists() or (persist_dir / "docstore.json").exists()
 
 
 def load_dialogue_documents() -> List[Document]:
@@ -548,9 +566,10 @@ def load_lore_documents() -> List[Document]:
     return documents
 
 
-def build_index() -> VectorStoreIndex:
+def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     """
-    统一构建内存向量索引，将对话、任务、世界观设定全部加入。
+    统一构建向量索引（对话、任务、世界观设定等）。
+    若传入 persist_dir，则使用 StorageContext 构建并持久化到该目录。
     """
 
     ensure_embed_model(offline=True)
@@ -611,7 +630,16 @@ def build_index() -> VectorStoreIndex:
     if not all_docs:
         raise ValueError("没有加载到任何 Document，无法构建索引。")
 
-    index: VectorStoreIndex = VectorStoreIndex.from_documents(all_docs)
+    if persist_dir is not None:
+        persist_dir = Path(persist_dir)
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        storage_context = StorageContext.from_defaults()
+        index = VectorStoreIndex.from_documents(all_docs, storage_context=storage_context)
+        storage_context.persist(persist_dir=str(persist_dir))
+        print(f"[知识库] 索引已持久化到: {persist_dir}")
+    else:
+        index = VectorStoreIndex.from_documents(all_docs)
+
     return index
 
 
@@ -619,13 +647,51 @@ def build_index() -> VectorStoreIndex:
 _index_cache: VectorStoreIndex | None = None
 
 
-def get_cached_index() -> VectorStoreIndex:
-    """获取或构建并缓存索引。"""
+def get_cached_index(force_rebuild: bool = False) -> VectorStoreIndex:
+    """
+    获取或构建并缓存索引。
+    - 若 force_rebuild=True：清除缓存并强制重新构建，写入 resources/tools/vector_index。
+    - 否则：若本地已存在有效索引则从 resources/tools/vector_index 加载；不存在则构建并持久化后再缓存。
+    """
     global _index_cache
-    if _index_cache is None:
+
+    persist_dir = get_vector_index_dir()
+
+    if force_rebuild:
+        _index_cache = None
+        if persist_dir.exists():
+            import shutil
+            shutil.rmtree(persist_dir)
+            print("[知识库] 已清除本地向量索引目录，准备重新构建")
         ensure_embed_model(offline=True)
-        _index_cache = build_index()
+        _index_cache = build_index(persist_dir=persist_dir)
+        return _index_cache
+
+    if _index_cache is not None:
+        return _index_cache
+
+    ensure_embed_model(offline=True)
+
+    if _is_vector_index_valid(persist_dir):
+        try:
+            storage_context = StorageContext.from_defaults(persist_dir=str(persist_dir))
+            _index_cache = load_index_from_storage(storage_context)
+            print(f"[知识库] 已从本地加载向量索引: {persist_dir}")
+            return _index_cache
+        except Exception as e:
+            print(f"[知识库] 从本地加载索引失败，将重新构建: {e}")
+            _index_cache = None
+
+    _index_cache = build_index(persist_dir=persist_dir)
     return _index_cache
+
+
+def rebuild_vector_index() -> VectorStoreIndex:
+    """
+    强制重新构建知识库向量索引并持久化到 resources/tools/vector_index。
+    供打包脚本或需要重建索引的场景调用。
+    """
+    return get_cached_index(force_rebuild=True)
 
 
 

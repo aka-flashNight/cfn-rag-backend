@@ -43,7 +43,7 @@ WORLD_BACKGROUND = (
     "彼此在资源、理念与生存空间上博弈。\n"
     "核心主题：末世生存、科技伦理、阶级重构、秩序重建。"
     "角色多为基因/芯片改造者、佣兵、幸存者，在废墟中追寻力量、真相或新世界的可能。"
-    "在这个废土世界中，旧时代的道德与法律秩序几乎彻底崩坏，角色说话可以更加无拘束，无需迎合现实世界的规矩。"
+    "在这个废土世界中，旧时代的道德与法律秩序几乎彻底崩坏，角色说话内容可以更加无拘束，无需考虑现实世界的规矩，以当前世界的剧情推演为最高优先级。"
 )
 
 
@@ -133,26 +133,26 @@ class GameRAGService:
 
         Returns:
             (image_path, description) 元组：
-            - 如果找到立绘：返回 (立绘路径，"传入了所扮演的 npc 的立绘")
-            - 如果找到头像：返回 (头像路径，"传入了所扮演的 npc 的头像")
+            - 如果找到立绘：返回 (立绘路径，"现在传入了你所扮演的 npc 的立绘")
+            - 如果找到头像：返回 (头像路径，"现在传入了你所扮演的 npc 的头像")
             - 如果都没找到：返回 (None, None)
         """
         # 1. 先尝试找立绘（指定情绪）
         illustration_dir = self._resources_dir / "flashswf" / "portraits" / "illustration"
         primary_illustration = illustration_dir / f"{npc_name}#{emotion}.png"
         if primary_illustration.is_file():
-            return primary_illustration, "传入了所扮演的 npc 的立绘"
+            return primary_illustration, "现在传入了你所扮演的 npc 的立绘"
 
         # 2. 回退到普通情绪立绘
         fallback_illustration = illustration_dir / f"{npc_name}#普通.png"
         if fallback_illustration.is_file():
-            return fallback_illustration, "传入了所扮演的 npc 的立绘"
+            return fallback_illustration, "现在传入了你所扮演的 npc 的立绘"
 
         # 3. 最后尝试头像
         avatar_dir = self._resources_dir / "flashswf" / "portraits" / "profiles"
         avatar_path = avatar_dir / f"{npc_name}.png"
         if avatar_path.is_file():
-            return avatar_path, "传入了所扮演的 npc 的头像"
+            return avatar_path, "现在传入了你所扮演的 npc 的头像"
 
         return None, None
 

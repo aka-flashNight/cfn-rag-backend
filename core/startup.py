@@ -212,7 +212,7 @@ async def _preload_index_async() -> None:
         return
 
     _INDEX_BUILDING = True
-    print("[初始化] 正在后台构建知识库索引...")
+    print("[初始化] 正在后台加载或构建知识库索引（存在则从 resources/tools/vector_index 加载）...")
 
     def _build():
         from ai_engine.game_data_loader import get_cached_index

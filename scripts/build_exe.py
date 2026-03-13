@@ -147,6 +147,33 @@ exe = EXE(
     return spec_content
 
 
+def _ensure_resources_tools_and_rebuild_index(project_root):
+    """
+    确保 resources/tools 存在，并强制重建知识库向量索引到该目录。
+    与 memory.db 同位于外部 resources/tools，exe 不打包索引，full zip 可将其与 exe 一起分发；
+    若用户仅下载单 exe，首次运行会在同目录下 resources/tools/vector_index 生成。
+    """
+    from pathlib import Path
+    resources_dir = Path(project_root) / "resources"
+    if not resources_dir.exists():
+        resources_dir = Path(project_root).parent / "resources"
+    resources_dir.mkdir(parents=True, exist_ok=True)
+    tools_dir = resources_dir / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    # 与 memory_manager.get_db_path() 一致：开发/脚本时可能用 project_root 或 cwd
+    # 通过环境变量固定 resources 位置，避免脚本与 exe 解析不一致
+    os.environ["CFN_RESOURCES_DIR"] = str(resources_dir.resolve())
+    print(f"  使用 resources 目录: {resources_dir.resolve()}")
+    print("  正在强制重建知识库向量索引（写入 resources/tools/vector_index）...")
+    try:
+        sys.path.insert(0, str(project_root))
+        from ai_engine.game_data_loader import rebuild_vector_index
+        rebuild_vector_index()
+        print("  知识库向量索引重建完成 ✓")
+    except Exception as e:
+        print(f"  [警告] 向量索引重建失败（可忽略，exe 首次运行时会自动生成）: {e}")
+
+
 def main():
     """打包主函数"""
     # 切换到项目根目录
@@ -158,6 +185,10 @@ def main():
     print("CFN-RAG 完整打包工具")
     print(f"项目根目录: {project_root}")
     print("=" * 50)
+
+    # 打包前：强制重建向量索引到外部 resources/tools（与 db 同位置），不打进 exe
+    print("\n预处理：知识库向量索引...")
+    _ensure_resources_tools_and_rebuild_index(project_root)
 
     # 检查是否安装了 PyInstaller
     try:
@@ -251,6 +282,8 @@ def main():
         print("\n注意事项:")
         print("  1. 首次运行需要安装依赖，请确保网络畅通")
         print("  2. 需要Node.js环境来启动前端服务")
+        print("  3. 知识库向量索引在 resources/tools/vector_index，未打包进 exe；")
+        print("     单 exe 首次运行会自动生成，full zip 可将该目录与 exe 一起分发。")
 
         # 检查模型是否已打包
         models_dir = os.path.join(project_root, 'models')
