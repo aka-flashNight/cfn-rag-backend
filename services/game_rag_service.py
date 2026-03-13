@@ -246,8 +246,10 @@ class GameRAGService:
                 + "\n\n"
             )
 
-        # 3-b. 从记忆库中加载该会话最近的历史消息
+        # 3-b. 从记忆库中加载该会话最近的历史消息与摘要
         history_records = await memory.get_history(payload.session_id, limit=10)
+        summary_text = await memory.get_summary(payload.session_id)
+
         history_lines: List[str] = []
         for msg in history_records:
             role = msg["role"]
@@ -259,13 +261,25 @@ class GameRAGService:
             history_lines.append(f"{prefix}: {content}")
 
         history_str = ""
+        if summary_text:
+            history_str += (
+                "当前对话历史较长，早期对话已整理为以下摘要：\n"
+                f"{summary_text}\n\n"
+            )
         if history_lines:
             joined_history = "\n".join(history_lines)
-            history_str = (
-                "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
-                "请在保持人物性格与情节连贯的前提下继续对话：\n"
-                f"{joined_history}\n\n"
-            )
+            if summary_text:
+                history_str += (
+                    "以下是最近的对话记录（按时间从早到晚排列），"
+                    "请结合上述摘要与近期记录，在保持人物性格与情节连贯的前提下继续对话：\n"
+                    f"{joined_history}\n\n"
+                )
+            else:
+                history_str += (
+                    "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
+                    "请在保持人物性格与情节连贯的前提下继续对话：\n"
+                    f"{joined_history}\n\n"
+                )
 
         emotions_str = "、".join(emotions)
 
@@ -314,7 +328,15 @@ class GameRAGService:
 
         # 5. 写入对话记忆（玩家+NPC）
         await memory.add_message(payload.session_id, "user", payload.query)
-        await memory.add_message(payload.session_id, "assistant", reply)
+        await memory.add_message(
+            payload.session_id, "assistant", reply,
+            llm_config={
+                "api_key": effective_api_key,
+                "api_base": effective_api_base,
+                "model_name": effective_model,
+            },
+            npc_name=npc_name,
+        )
 
         # 6. 更新好感度并落盘
         updated_state: NPCState = npc_manager.update_favorability(npc_name, delta)
@@ -522,7 +544,7 @@ class GameRAGService:
                     ],
                 }
             ]
-            print(prompt_with_desc)
+            # print(prompt_with_desc)
         else:
             # 纯文本输入
             messages = [

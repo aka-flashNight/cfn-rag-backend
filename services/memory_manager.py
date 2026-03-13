@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 import sys
@@ -8,6 +9,12 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
+
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+SUMMARIZE_INTERVAL = 10
 
 
 def is_packaged_environment() -> bool:
@@ -129,15 +136,42 @@ class MemoryManager:
                     "ON sessions(session_id)"
                 )
 
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_summaries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL UNIQUE,
+                        summary TEXT NOT NULL,
+                        message_count INTEGER NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_summaries_session_id "
+                    "ON session_summaries(session_id)"
+                )
+
                 conn.commit()
             finally:
                 conn.close()
 
         await asyncio.to_thread(_inner)
 
-    async def add_message(self, session_id: str, role: str, content: str) -> None:
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        llm_config: Dict[str, str] | None = None,
+        npc_name: str = "",
+    ) -> None:
         """
         新增一条对话消息。
+
+        当提供 llm_config 且该会话消息总数达到 SUMMARIZE_INTERVAL 的倍数时，
+        异步触发对话摘要生成（fire-and-forget）。
         """
 
         session_id = session_id.strip()
@@ -165,6 +199,14 @@ class MemoryManager:
                 conn.close()
 
         await asyncio.to_thread(_inner)
+
+        if llm_config is not None:
+            count = await self._get_message_count(session_id)
+            if count > 0 and count % SUMMARIZE_INTERVAL == 0:
+                recent = await self.get_history(session_id, limit=SUMMARIZE_INTERVAL)
+                asyncio.create_task(
+                    self._safe_summarize(session_id, recent, llm_config, npc_name)
+                )
 
     async def get_history(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
@@ -210,6 +252,150 @@ class MemoryManager:
             return result
 
         return await asyncio.to_thread(_inner)
+
+    # ------------------------------------------------------------------
+    # 摘要相关方法
+    # ------------------------------------------------------------------
+
+    async def _get_message_count(self, session_id: str) -> int:
+        """获取指定会话的消息总数。"""
+
+        def _inner() -> int:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) FROM chat_history WHERE session_id = ?",
+                    (session_id,),
+                )
+                return cur.fetchone()[0]
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_inner)
+
+    async def get_summary(self, session_id: str) -> str | None:
+        """获取指定会话的对话摘要，不存在则返回 None。"""
+
+        session_id = session_id.strip()
+        if not session_id:
+            return None
+
+        def _inner() -> str | None:
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT summary FROM session_summaries WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return str(row["summary"]) if row else None
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_inner)
+
+    async def _save_summary(self, session_id: str, summary: str, message_count: int) -> None:
+        """保存或更新会话摘要（UPSERT）。"""
+
+        ts = time.time()
+
+        def _inner() -> None:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO session_summaries (session_id, summary, message_count, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(session_id)
+                    DO UPDATE SET summary = excluded.summary,
+                                  message_count = excluded.message_count,
+                                  updated_at = excluded.updated_at
+                    """,
+                    (session_id, summary, message_count, ts),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(_inner)
+
+    async def _safe_summarize(
+        self,
+        session_id: str,
+        recent_messages: List[Dict[str, Any]],
+        llm_config: Dict[str, str],
+        npc_name: str,
+    ) -> None:
+        """安全地执行摘要生成，捕获并记录异常。"""
+        try:
+            await self._summarize_history(session_id, recent_messages, llm_config, npc_name)
+        except Exception as e:
+            logger.error("会话 %s 摘要生成失败: %s", session_id, e, exc_info=True)
+
+    async def _summarize_history(
+        self,
+        session_id: str,
+        recent_messages: List[Dict[str, Any]],
+        llm_config: Dict[str, str],
+        npc_name: str,
+    ) -> None:
+        """
+        调用 LLM 将最近的对话记录浓缩为摘要。
+        如果已有摘要，则在其基础上整合新内容。
+
+        不使用结构化输出——摘要仅作为 prompt 上下文注入，纯文本即可满足需求。
+        """
+
+        lines: List[str] = []
+        for msg in recent_messages:
+            prefix = "玩家" if msg["role"] == "user" else (npc_name or "NPC")
+            lines.append(f"{prefix}: {msg['content']}")
+        history_text = "\n".join(lines)
+
+        existing_summary = await self.get_summary(session_id)
+
+        if existing_summary:
+            prompt = (
+                f"以下是玩家与游戏NPC「{npc_name}」之前对话的摘要：\n"
+                f"{existing_summary}\n\n"
+                "请在此摘要的基础上，补充以下最近对话的内容，"
+                "将新旧信息整合成一段完整且连贯的摘要。\n"
+                "注意：不要丢弃已有摘要中的重要信息，而是在其基础上追加新内容并统一整理。\n"
+                "保留关键信息：讨论的主要话题、双方态度与情感变化、"
+                "玩家提出的重要问题或请求、涉及的剧情信息和承诺。\n"
+                "请用第三人称客观视角撰写，直接输出摘要文本，不要添加标题或额外格式。\n\n"
+                f"最近的对话记录：\n{history_text}"
+            )
+        else:
+            prompt = (
+                f"请将以下玩家与游戏NPC「{npc_name}」的对话记录整理成一段简洁但信息完整的摘要。\n"
+                "保留关键信息：讨论的主要话题、双方态度与情感变化、"
+                "玩家提出的重要问题或请求、涉及的剧情信息和承诺。\n"
+                "请用第三人称客观视角撰写，直接输出摘要文本，不要添加标题或额外格式。\n\n"
+                f"对话记录：\n{history_text}"
+            )
+
+        client = AsyncOpenAI(
+            api_key=llm_config["api_key"],
+            base_url=llm_config["api_base"],
+        )
+        completion = await client.chat.completions.create(
+            model=llm_config["model_name"],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary = (completion.choices[0].message.content or "").strip()
+
+        if not summary:
+            logger.warning("会话 %s 摘要生成返回空内容，跳过保存", session_id)
+            return
+
+        count = await self._get_message_count(session_id)
+        await self._save_summary(session_id, summary, count)
+        logger.info("会话 %s 摘要已更新（消息数: %d）", session_id, count)
 
     async def create_session(self, npc_name: str, title: str) -> Dict[str, Any]:
         """
@@ -373,6 +559,11 @@ class MemoryManager:
                 # 删除相关聊天记录
                 cur.execute(
                     "DELETE FROM chat_history WHERE session_id = ?",
+                    (session_id,),
+                )
+                # 删除相关摘要
+                cur.execute(
+                    "DELETE FROM session_summaries WHERE session_id = ?",
                     (session_id,),
                 )
                 conn.commit()
