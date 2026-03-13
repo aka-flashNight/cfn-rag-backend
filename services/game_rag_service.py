@@ -476,18 +476,47 @@ class GameRAGService:
 
         # --- 拼装上下文 ---
         def _nodes_to_text(nodes, max_chars: int | None = None) -> str:
-            chunks: List[str] = []
+            """
+            将检索到的节点文本拼接为上下文片段：
+            - 按行去重：相同的非空台词行只保留一条
+            - 压缩空行：连续空行折叠为最多一个空行
+            - 可选截断每个节点的最大字符数
+            """
+            seen_lines: set[str] = set()
+            output_lines: List[str] = []
+            last_blank = False
+
             for node in nodes:
                 text = getattr(node, "text", None)
                 if text is None and hasattr(node, "get_content"):
                     text = node.get_content()
                 if not text:
                     continue
+
                 text = str(text).strip()
                 if max_chars and len(text) > max_chars:
                     text = text[:max_chars] + "…"
-                chunks.append(text)
-            return "\n\n".join(chunks)
+
+                for raw_line in text.splitlines():
+                    line = raw_line.strip()
+
+                    # 空行：最多保留一个连续空行
+                    if not line:
+                        if output_lines and not last_blank:
+                            output_lines.append("")
+                            last_blank = True
+                        continue
+
+                    last_blank = False
+
+                    # 按行去重：相同的非空台词行只保留一次
+                    if line in seen_lines:
+                        continue
+                    seen_lines.add(line)
+
+                    output_lines.append(line)
+
+            return "\n".join(output_lines)
 
         parts: List[str] = []
         if npc_nodes:
