@@ -13,7 +13,6 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Callable
 
 # 模型加载状态
 _EMBED_MODEL_LOADING = False
@@ -201,41 +200,26 @@ async def trigger_embed_model_preload() -> None:
 
 async def run_startup_tasks() -> None:
     """
-    执行所有启动初始化任务。
+    执行所有启动初始化任务（全部非阻塞）。
 
-    应该在 FastAPI 应用启动时调用。
+    所有重型任务均在后台执行，不阻塞 uvicorn 接受连接。
+    这样前端可以在后端初始化完成之前就正常访问轻量接口（如会话列表）。
     """
     print("\n" + "=" * 50)
     print("[初始化] 开始执行后端启动任务...")
     print("=" * 50)
 
-    # 1. 检查并生成 NPC 状态数据库
-    ensure_npc_state_db()
+    # 1. 在后台线程中检查/生成 NPC 状态数据库（不阻塞服务器启动）
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, ensure_npc_state_db)
 
-    # 2. 初始化数据库（MemoryManager.create 会自动创建）
-    print("[初始化] 数据库将自动初始化...")
+    # 2. 初始化数据库（MemoryManager.create 会在首次请求时自动创建）
+    print("[初始化] 数据库将在首次请求时自动初始化...")
 
     # 3. 启动嵌入模型预加载（异步后台）
     start_embed_model_preload()
 
     print("=" * 50)
-    print("[初始化] 启动任务已提交，嵌入模型正在后台加载...")
+    print("[初始化] 所有启动任务已提交到后台，服务器即将就绪...")
     print("=" * 50 + "\n")
 
-
-def run_startup_tasks_sync() -> None:
-    """
-    同步版本的启动任务（用于非异步上下文，如 launcher.py）
-
-    只执行不依赖事件循环的初始化任务。
-    """
-    print("\n" + "=" * 50)
-    print("[初始化] 开始执行后端启动任务（同步）...")
-    print("=" * 50)
-
-    # 1. 检查并生成 NPC 状态数据库
-    ensure_npc_state_db()
-
-    print("=" * 50)
-    print("[初始化] 同步启动任务完成")
-    print("=" * 50 + "\n")

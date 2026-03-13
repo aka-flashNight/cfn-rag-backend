@@ -99,7 +99,7 @@ class GameRAGService:
 
         sex_desc = f"（性别：{sex}）" if sex else ""
         faction_desc = f"（阵营：{faction}）" if faction else ""
-        titles_desc = f"（身份：{'、'.join(titles)}）" if titles else ""
+        titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
 
         # 3. 从记忆库中加载该会话最近的历史消息
         history_records = await memory.get_history(payload.session_id, limit=10)
@@ -126,7 +126,7 @@ class GameRAGService:
 
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
-            f"玩家的身份是：{player_identity}。\n\n"
+            f"玩家的身份是：{player_identity}\n\n"
             "下面是与你相关的世界观设定和你的过往台词片段"
             "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
             f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
@@ -154,7 +154,7 @@ class GameRAGService:
             model_name=effective_model,
             prompt=full_prompt,
         )
-
+        # print(full_prompt)
         # 4. 解析回复与好感度变化与情绪
         reply, delta, emotion = self._parse_reply_and_delta(
             reply_text, allowed_emotions=emotions

@@ -204,18 +204,6 @@ def start_backend():
         print("[后端] 服务地址: http://127.0.0.1:7077")
         print("-" * 50)
 
-        # 设置环境
-        base_path = setup_environment()
-
-        print(f"[后端] 工作目录: {os.getcwd()}")
-
-        # 执行同步初始化任务（如检查 npc_state_db.json）
-        try:
-            from core.startup import run_startup_tasks_sync
-            run_startup_tasks_sync()
-        except Exception as e:
-            print(f"[后端] 同步初始化任务失败: {e}")
-
         # 清除可能的模块缓存（开发环境需要）
         if not is_packaged_environment():
             modules_to_clear = [key for key in sys.modules.keys() if key in ['main', 'api', 'core', 'services', 'ai_engine']]
@@ -223,7 +211,6 @@ def start_backend():
                 if mod in sys.modules:
                     del sys.modules[mod]
 
-        # 尝试导入main模块
         try:
             import main
             print("[后端] 成功导入main模块 ✓")
@@ -235,7 +222,6 @@ def start_backend():
             traceback.print_exc()
             return
 
-        # 启动uvicorn服务
         print("[后端] 正在启动Uvicorn服务器...")
         uvicorn.run(
             "main:app",
@@ -251,33 +237,10 @@ def start_backend():
 
 
 def start_frontend():
-    """启动前端静态文件服务"""
+    """启动前端静态文件服务（不等待后端，立即启动）"""
     try:
-        # 等待后端服务真正就绪（通过检查端口是否可连接）
-        print("\n[前端] 等待后端服务就绪...")
-        import socket
-        backend_ready = False
-        for _ in range(30):  # 最多等待30秒
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            try:
-                result = sock.connect_ex(('127.0.0.1', 7077))
-                sock.close()
-                if result == 0:
-                    backend_ready = True
-                    print("[前端] 后端服务已就绪 ✓")
-                    break
-            except:
-                pass
-            time.sleep(1)
-
-        if not backend_ready:
-            print("[前端] 警告: 后端服务可能未完全就绪，继续启动前端...")
-
-        time.sleep(0.5)  # 额外缓冲时间
         print("\n[前端] 正在启动静态文件服务...")
 
-        # 获取dist目录路径（从打包资源或开发目录）
         dist_path = get_resource_path("dist")
 
         if not os.path.exists(dist_path):
@@ -287,7 +250,6 @@ def start_frontend():
 
         print(f"[前端] 静态文件目录: {dist_path}")
 
-        # 直接使用Python内置服务器（简单可靠）
         start_builtin_server(dist_path)
 
     except Exception as e:
@@ -359,16 +321,44 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             pass
 
 
+def open_browser_when_ready(frontend_port):
+    """在独立线程中等待后端就绪后打开浏览器，超时也会直接打开"""
+    import socket
+
+    url = f"http://127.0.0.1:{frontend_port}"
+
+    for _ in range(10):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            result = sock.connect_ex(('127.0.0.1', 7077))
+            sock.close()
+            if result == 0:
+                print("[系统] 后端服务已就绪 ✓")
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    print(f"[系统] 正在打开浏览器: {url}")
+    webbrowser.open(url)
+
+    print("\n" + "=" * 50)
+    print("服务启动完成！")
+    print("后端API: http://127.0.0.1:7077")
+    print(f"前端页面: {url}")
+    print("=" * 50 + "\n")
+
+
 def start_builtin_server(dist_path):
     """使用Python内置服务器，带正确的MIME类型处理（多线程版本）"""
     import socket
+    from functools import partial
 
-    os.chdir(dist_path)
-    handler = CustomHTTPRequestHandler
+    handler = partial(CustomHTTPRequestHandler, directory=dist_path)
 
     for port in range(7080, 7090):
         try:
-            # 检查端口是否被占用
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             result = sock.connect_ex(('127.0.0.1', port))
             sock.close()
@@ -377,22 +367,16 @@ def start_builtin_server(dist_path):
                 print(f"[前端] 端口 {port} 被占用，尝试下一个...")
                 continue
 
-            # 使用ThreadingTCPServer替代TCPServer，支持并发处理多个请求
             with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
                 print(f"[前端] 服务地址: http://127.0.0.1:{port}")
                 print("-" * 50)
 
-                url = f"http://127.0.0.1:{port}"
-                print(f"[系统] 正在打开浏览器: {url}")
-                # 增加等待时间，确保服务器完全启动
-                time.sleep(1.5)
-                webbrowser.open(url)
-
-                print("\n" + "=" * 50)
-                print("服务启动完成！")
-                print("后端API: http://127.0.0.1:7077")
-                print(f"前端页面: {url}")
-                print("=" * 50 + "\n")
+                browser_thread = threading.Thread(
+                    target=open_browser_when_ready,
+                    args=(port,),
+                    daemon=True,
+                )
+                browser_thread.start()
 
                 httpd.serve_forever()
                 break
@@ -429,16 +413,19 @@ def main():
         input("按回车键退出...")
         sys.exit(1)
 
+    # 在主线程中完成环境设置（避免多线程竞争修改 sys.path / 环境变量）
+    print("\n[环境] 正在设置运行环境...", flush=True)
+    setup_environment()
+
     print("\n" + "=" * 50, flush=True)
     print("正在启动服务...", flush=True)
     print("=" * 50, flush=True)
 
-    # 创建并启动后端线程
+    # 同时启动前后端线程，互不阻塞
     backend_thread = threading.Thread(target=start_backend, daemon=True)
-    backend_thread.start()
-
-    # 创建并启动前端线程
     frontend_thread = threading.Thread(target=start_frontend, daemon=True)
+
+    backend_thread.start()
     frontend_thread.start()
 
     try:
