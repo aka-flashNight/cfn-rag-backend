@@ -588,9 +588,9 @@ class GameRAGService:
                     ],
                 },
             ]
-            print(system_prompt)
-            print("——————")
-            print(prompt_with_desc)
+            # print(system_prompt)
+            # print("——————")
+            # print(prompt_with_desc)
         else:
             # 纯文本输入
             messages = [
