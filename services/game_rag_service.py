@@ -241,7 +241,7 @@ class GameRAGService:
         mentioned_npcs_str = ""
         if mentioned_npcs:
             mentioned_npcs_str = (
-                "可能涉及到的其他角色的设定（注意，和你不是一个阵营的角色你可能了解不多）：\n"
+                "可能涉及到的其他角色的设定（注意，如果和你不是一个阵营的角色你可能了解的不多）：\n"
                 + "\n".join(mentioned_npcs)
                 + "\n\n"
             )
@@ -283,31 +283,36 @@ class GameRAGService:
 
         emotions_str = "、".join(emotions)
 
+        # system 消息：身份设定 + 世界观 + 输出格式与硬性规则
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
             f"玩家的身份是：{player_identity}\n\n"
             "【世界观背景概要】\n"
             f"{WORLD_BACKGROUND}\n\n"
-            f"{mentioned_npcs_str}"
-            "下面是与你相关的检索设定和你的过往台词片段"
-            "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
-            f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
             f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
             f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。\n"
-            "请以符合你身份、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
-            f"{history_str}"
+            "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
             "输出格式必须严格为两行：\n"
-            "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀，不要有第一行：的字样）。\n"
+            "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀，不要有“第一行：”的字样）。\n"
             "第二行：一个 JSON 对象，必须且仅包含两个字段：\n"
             "  - \"favorability_change\"：一个整数字段，取值范围 -5 到 5，例如："
             "{\"favorability_change\": 1, \"emotion\": \"普通\"}\n"
             "  - \"emotion\"：一个字符串字段，值必须从上文提供的情绪标签中选择；"
             "如果没有特别合适的情绪，请使用 \"普通\"。\n"
-            "常规对话无需调整好感度，小幅度的情绪起伏可以只+或-1点好感度。如果本次对话不应影响好感度，请输出 {\"favorability_change\": 0}。\n"
-            "不要输出第三行及更多内容，不要添加多余的空行或注释。"
+            "常规对话无需调整好感度，小幅度的情绪起伏可以只 +1 或 -1 点好感度。"
+            "如果本次对话不应影响好感度，请输出 {\"favorability_change\": 0}。\n"
+            "禁止输出第三行及更多内容，禁止添加多余的空行或注释。"
         )
 
-        full_prompt = f"{system_prompt}\n\n玩家：{payload.query}\n"
+        # user 消息：检索上下文 + 其他 NPC 提示 + 对话历史 + 玩家本次发言
+        context_prompt = (
+            f"{mentioned_npcs_str}"
+            "下面是与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
+            f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
+            f"{history_str}"
+        )
+
+        user_prompt = f"{context_prompt}\n玩家：{payload.query}"
 
         # 获取 NPC 图像（优先立绘，其次头像）
         image_path, image_description = self._get_npc_image_path(npc_name, "普通")
@@ -317,7 +322,8 @@ class GameRAGService:
             api_key=effective_api_key,
             api_base=effective_api_base,
             model_name=effective_model,
-            prompt=full_prompt,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             image_path=image_path,
             image_description=image_description,
         )
@@ -536,7 +542,8 @@ class GameRAGService:
         api_key: str,
         api_base: str,
         model_name: str,
-        prompt: str,
+        system_prompt: str,
+        user_prompt: str,
         image_path: Path | None = None,
         image_description: str | None = None,
     ) -> str:
@@ -554,9 +561,17 @@ class GameRAGService:
         if image_path and image_path.is_file():
             # 多模态输入：图像 + 文本
             image_data = self._encode_image_to_base64(image_path)
-            # 在 prompt 前添加图像说明
-            prompt_with_desc = f"{image_description}。\n\n{prompt}" if image_description else prompt
+            # 在用户提示前添加图像说明
+            prompt_with_desc = (
+                f"{image_description}。\n\n{user_prompt}"
+                if image_description
+                else user_prompt
+            )
             messages = [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
                 {
                     "role": "user",
                     "content": [
@@ -571,16 +586,22 @@ class GameRAGService:
                             "text": prompt_with_desc,
                         },
                     ],
-                }
+                },
             ]
-            # print(prompt_with_desc)
+            print(system_prompt)
+            print("——————")
+            print(prompt_with_desc)
         else:
             # 纯文本输入
             messages = [
                 {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
                     "role": "user",
-                    "content": prompt,
-                }
+                    "content": user_prompt,
+                },
             ]
 
         completion = await client.chat.completions.create(
