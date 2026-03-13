@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from llama_index.core import VectorStoreIndex
@@ -41,6 +43,7 @@ WORLD_BACKGROUND = (
     "彼此在资源、理念与生存空间上博弈。\n"
     "核心主题：末世生存、科技伦理、阶级重构、秩序重建。"
     "角色多为基因/芯片改造者、佣兵、幸存者，在废墟中追寻力量、真相或新世界的可能。"
+    "在这个废土世界中，旧时代的道德与法律秩序几乎彻底崩坏，角色说话可以更加无拘束，无需迎合现实世界的规矩。"
 )
 
 
@@ -70,6 +73,42 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+def _get_resources_dir() -> Path:
+    """
+    获取 resources 目录路径。
+    resources 是外部项目文件夹，和本项目放在同一目录下。
+    """
+    import os
+    import sys
+
+    # 1. 检查环境变量（由 launcher.py 设置）
+    env_path = os.environ.get('CFN_RESOURCES_DIR')
+    if env_path:
+        return Path(env_path)
+
+    # 2. 检查是否在 PyInstaller 打包环境
+    if getattr(sys, 'frozen', False):
+        exe_dir = Path(sys.executable).parent
+        resources_path = exe_dir / "resources"
+        if resources_path.exists():
+            return resources_path
+
+    # 3. 开发环境：resources 在父目录
+    project_dir = Path(__file__).resolve().parent.parent
+    parent_dir = project_dir.parent
+    resources_path = parent_dir / "resources"
+
+    if resources_path.exists():
+        return resources_path
+
+    # 如果父目录没有，再检查同级目录
+    sibling_path = project_dir / "resources"
+    if sibling_path.exists():
+        return sibling_path
+
+    raise FileNotFoundError(f"开发环境未找到 resources 目录")
+
+
 class GameRAGService:
     """
     游戏世界观 / NPC 知识库 RAG 服务 + 好感度 Agent。
@@ -77,11 +116,53 @@ class GameRAGService:
 
     def __init__(self) -> None:
         self._index: VectorStoreIndex | None = None
+        self._resources_dir: Path = _get_resources_dir()
 
     def _get_index(self) -> VectorStoreIndex:
         if self._index is None:
             self._index = get_cached_index()
         return self._index
+
+    def _get_npc_image_path(self, npc_name: str, emotion: str = "普通") -> Tuple[Path | None, str | None]:
+        """
+        获取 NPC 的图像路径（优先立绘，其次头像）。
+
+        Args:
+            npc_name: NPC 名称
+            emotion: 情绪标签，用于查找对应立绘
+
+        Returns:
+            (image_path, description) 元组：
+            - 如果找到立绘：返回 (立绘路径，"传入了所扮演的 npc 的立绘")
+            - 如果找到头像：返回 (头像路径，"传入了所扮演的 npc 的头像")
+            - 如果都没找到：返回 (None, None)
+        """
+        # 1. 先尝试找立绘（指定情绪）
+        illustration_dir = self._resources_dir / "flashswf" / "portraits" / "illustration"
+        primary_illustration = illustration_dir / f"{npc_name}#{emotion}.png"
+        if primary_illustration.is_file():
+            return primary_illustration, "传入了所扮演的 npc 的立绘"
+
+        # 2. 回退到普通情绪立绘
+        fallback_illustration = illustration_dir / f"{npc_name}#普通.png"
+        if fallback_illustration.is_file():
+            return fallback_illustration, "传入了所扮演的 npc 的立绘"
+
+        # 3. 最后尝试头像
+        avatar_dir = self._resources_dir / "flashswf" / "portraits" / "profiles"
+        avatar_path = avatar_dir / f"{npc_name}.png"
+        if avatar_path.is_file():
+            return avatar_path, "传入了所扮演的 npc 的头像"
+
+        return None, None
+
+    def _encode_image_to_base64(self, image_path: Path) -> str:
+        """
+        将 PNG 图像编码为 base64 字符串。
+        """
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return image_data
 
     async def ask(
         self,
@@ -214,14 +295,18 @@ class GameRAGService:
 
         full_prompt = f"{system_prompt}\n\n玩家：{payload.query}\n"
 
+        # 获取 NPC 图像（优先立绘，其次头像）
+        image_path, image_description = self._get_npc_image_path(npc_name, "普通")
+
         reply_text: str = await self._call_llm(
             settings,
             api_key=effective_api_key,
             api_base=effective_api_base,
             model_name=effective_model,
             prompt=full_prompt,
+            image_path=image_path,
+            image_description=image_description,
         )
-        print(full_prompt)
         # 4. 解析回复与好感度变化与情绪
         reply, delta, emotion = self._parse_reply_and_delta(
             reply_text, allowed_emotions=emotions
@@ -401,21 +486,55 @@ class GameRAGService:
         api_base: str,
         model_name: str,
         prompt: str,
+        image_path: Path | None = None,
+        image_description: str | None = None,
     ) -> str:
         """
         调用任意 OpenAI 兼容的大模型生成回复。
+
+        Args:
+            image_path: 可选的图像文件路径，如果提供则会将图像作为多模态输入传给模型
+            image_description: 图像描述，用于在提示中说明传入了什么图像
         """
 
         client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
-        completion = await client.chat.completions.create(
-            model=model_name,
-            messages=[
+        # 构建消息内容
+        if image_path and image_path.is_file():
+            # 多模态输入：图像 + 文本
+            image_data = self._encode_image_to_base64(image_path)
+            # 在 prompt 前添加图像说明
+            prompt_with_desc = f"{image_description}。\n\n{prompt}" if image_description else prompt
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_data}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt_with_desc,
+                        },
+                    ],
+                }
+            ]
+            print(prompt_with_desc)
+        else:
+            # 纯文本输入
+            messages = [
                 {
                     "role": "user",
                     "content": prompt,
                 }
-            ],
+            ]
+
+        completion = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
         )
 
         message = completion.choices[0].message
