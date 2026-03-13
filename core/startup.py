@@ -19,6 +19,10 @@ _EMBED_MODEL_LOADING = False
 _EMBED_MODEL_LOADED = False
 _EMBED_MODEL_LOAD_TASK: asyncio.Task | None = None
 
+# 索引构建状态
+_INDEX_BUILT = False
+_INDEX_BUILDING = False
+
 
 def get_npc_state_db_path() -> Path:
     """
@@ -198,6 +202,36 @@ async def trigger_embed_model_preload() -> None:
     start_embed_model_preload()
 
 
+async def _preload_index_async() -> None:
+    """
+    在嵌入模型加载完成后，异步构建知识库向量索引。
+    """
+    global _INDEX_BUILT, _INDEX_BUILDING
+
+    if _INDEX_BUILT or _INDEX_BUILDING:
+        return
+
+    _INDEX_BUILDING = True
+    print("[初始化] 正在后台构建知识库索引...")
+
+    def _build():
+        from ai_engine.game_data_loader import get_cached_index
+        get_cached_index()
+
+    try:
+        await asyncio.to_thread(_build)
+        _INDEX_BUILT = True
+        print("[初始化] 知识库索引构建完成 ✓")
+    except Exception as e:
+        print(f"[初始化] 知识库索引构建失败（将在首次请求时重试）: {e}")
+    finally:
+        _INDEX_BUILDING = False
+
+
+def is_index_built() -> bool:
+    return _INDEX_BUILT
+
+
 async def run_startup_tasks() -> None:
     """
     执行所有启动初始化任务（全部非阻塞）。
@@ -216,8 +250,13 @@ async def run_startup_tasks() -> None:
     # 2. 初始化数据库（MemoryManager.create 会在首次请求时自动创建）
     print("[初始化] 数据库将在首次请求时自动初始化...")
 
-    # 3. 启动嵌入模型预加载（异步后台）
-    start_embed_model_preload()
+    # 3. 链式后台预加载：嵌入模型 → 知识库索引
+    async def _chained_preload():
+        await preload_embed_model_async()
+        if _EMBED_MODEL_LOADED:
+            await _preload_index_async()
+
+    loop.create_task(_chained_preload())
 
     print("=" * 50)
     print("[初始化] 所有启动任务已提交到后台，服务器即将就绪...")

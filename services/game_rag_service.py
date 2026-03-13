@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
@@ -17,6 +17,57 @@ from core.config import Settings, get_settings
 from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
 from services.memory_manager import MemoryManager
+
+# ---------------------------------------------------------------------------
+# 固定世界观背景（始终注入 prompt，不依赖 RAG 检索）
+# ---------------------------------------------------------------------------
+WORLD_BACKGROUND = (
+    "近未来末世废土世界。曾经历科技爆发的\u201c统合时代\u201d，"
+    "因基因编辑实用化和生化技术发展引发阶级大洗牌，社会矛盾激化。"
+    "统合政府推行\u201c天网计划\u201d（全球监控网络）与"
+    "\u201c诺亚方舟计划\u201d（超级战士研发）以维持统治，"
+    "却因系统被病毒入侵、激光武器失控而在2012年触发\u201c审判日\u201d灾难："
+    "卫星轰击、地层武器、天网机器人暴走、僵尸病毒、天灾，"
+    "导致文明崩溃、环境荒漠化。\n"
+    "灾后世界以\u201c尘都\u201d为剧情主要聚焦的区域（地理原型为成都），"
+    "分裂为废城（丧尸肆虐）、堕落城（人类势力割据）、荒漠（军阀控制）等废墟地带。"
+    "贵金属、纳米机器人、强化石、加密货币成为新世界的资源与货币基础。\n"
+    "主要势力包括：佣兵组织A兵团（前期在废城活动）、"
+    "军政府军阀（荒漠活动并对抗失控天网）、"
+    "政教合一黑铁会（堕落城实控者，冷兵器、肉体强化）、"
+    "商业偶像团体摇滚公园（堕落城二号组织，全女、高科技武器，名义上效忠黑铁会）、"
+    "科技至上诺亚组织（在尘都之外，神秘重重）、"
+    "宪政残余军警派（失势）、联合大学（堕落城组织），"
+    "彼此在资源、理念与生存空间上博弈。\n"
+    "核心主题：末世生存、科技伦理、阶级重构、秩序重建。"
+    "角色多为基因/芯片改造者、佣兵、幸存者，在废墟中追寻力量、真相或新世界的可能。"
+)
+
+
+# ---------------------------------------------------------------------------
+# 阵营别名配置（用于模糊匹配用户输入）
+# ---------------------------------------------------------------------------
+FACTION_ALIASES: Dict[str, List[str]] = {
+    # 联合大学 -> 别名包含"大学"
+    "联合大学": ["大学"],
+    # 摇滚公园 -> 别名包含"摇滚"
+    "摇滚公园": ["摇滚"],
+}
+
+
+def _normalize_text(text: str) -> str:
+    """
+    标准化文本：转为小写并移除所有空格（包括全角/半角空格、制表符等）。
+
+    用于 NPC 名称、阵营、头衔的模糊匹配，提高检索鲁棒性。
+    """
+    if not text:
+        return ""
+    # 转为小写
+    text = text.lower()
+    # 移除所有空白字符（空格、制表符、换行等）
+    text = "".join(text.split())
+    return text
 
 
 class GameRAGService:
@@ -90,7 +141,7 @@ class GameRAGService:
             self._retrieve_context, npc_name, payload.query
         )
 
-        # 3. 构造 Prompt，并调用 Gemini
+        # 3. 构造 Prompt
         player_identity: str = (
             payload.player_identity.strip()
             if payload.player_identity and payload.player_identity.strip()
@@ -101,7 +152,20 @@ class GameRAGService:
         faction_desc = f"（阵营：{faction}）" if faction else ""
         titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
 
-        # 3. 从记忆库中加载该会话最近的历史消息
+        # 3-a. NPC 交叉引用：检测玩家输入中提及的其他角色
+        all_npc_states = npc_manager.state
+        mentioned_npcs: List[str] = self._find_mentioned_npcs(
+            payload.query, npc_name, all_npc_states, faction
+        )
+        mentioned_npcs_str = ""
+        if mentioned_npcs:
+            mentioned_npcs_str = (
+                "可能涉及到的其他角色的设定（注意，和你不是一个阵营的角色你可能了解不多）：\n"
+                + "\n".join(mentioned_npcs)
+                + "\n\n"
+            )
+
+        # 3-b. 从记忆库中加载该会话最近的历史消息
         history_records = await memory.get_history(payload.session_id, limit=10)
         history_lines: List[str] = []
         for msg in history_records:
@@ -127,7 +191,10 @@ class GameRAGService:
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
             f"玩家的身份是：{player_identity}\n\n"
-            "下面是与你相关的世界观设定和你的过往台词片段"
+            "【世界观背景概要】\n"
+            f"{WORLD_BACKGROUND}\n\n"
+            f"{mentioned_npcs_str}"
+            "下面是与你相关的检索设定和你的过往台词片段"
             "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
             f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
             f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
@@ -177,33 +244,131 @@ class GameRAGService:
             emotion=emotion,
         )
 
+    # ------------------------------------------------------------------
+    # NPC 交叉引用：从用户输入中发现提及的其他角色
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_mentioned_npcs(
+        query: str,
+        current_npc: str,
+        all_npc_states: Dict[str, NPCState],
+        current_faction: str | None,
+    ) -> str:
+        """
+        扫描用户输入，如果提到了其他 NPC 的名称 / 阵营 / 头衔，
+        返回其基本信息字符串供 prompt 使用。
+
+        跳过阵营为 "成员" 或 "彩蛋" 的 NPC（除非当前 NPC 自己也属于这两个阵营）。
+
+        匹配时会统一大小写并去空格，以处理用户输入中的大小写和空格差异。
+        同时支持阵营别名匹配（如"大学"匹配"联合大学"，"摇滚"匹配"摇滚公园"）。
+        """
+        skip_factions = {"成员", "彩蛋"}
+        if current_faction in skip_factions:
+            skip_factions = set()
+
+        mentioned: List[str] = []
+
+        # 标准化玩家输入
+        normalized_query = _normalize_text(query)
+
+        for name, state in all_npc_states.items():
+            if name == current_npc:
+                continue
+            if state.faction in skip_factions:
+                continue
+
+            # 收集所有匹配项：名称、阵营、头衔
+            terms: List[str] = [name]
+            if state.faction:
+                terms.append(state.faction)
+                # 添加阵营别名
+                for faction_name, aliases in FACTION_ALIASES.items():
+                    if state.faction == faction_name:
+                        terms.extend(aliases)
+            terms.extend(state.titles or [])
+
+            # 标准化所有匹配项并进行匹配
+            normalized_terms = [_normalize_text(t) for t in terms]
+
+            if any(term in normalized_query for term in normalized_terms):
+                parts = [f"「{name}」"]
+                if state.sex:
+                    parts.append(f"（性别：{state.sex}）")
+                if state.faction:
+                    parts.append(f"（阵营：{state.faction}）")
+                if state.titles:
+                    parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+                mentioned.append("".join(parts))
+
+        return mentioned
+
+    # ------------------------------------------------------------------
+    # 检索
+    # ------------------------------------------------------------------
     def _retrieve_context(self, npc_name: str, query: str) -> str:
         """
-        在同步线程中使用 LlamaIndex 检索 NPC 台词 + 世界观设定。
+        在同步线程中使用 LlamaIndex 检索：
+          1. NPC 过往台词 (character=npc_name)
+          2. 核心世界观 (type=world_lore)
+          3. 任务对话 (type=task)
+          4. 补充设定 + 情报（pool: supplementary_lore & intelligence）
         """
 
         index: VectorStoreIndex = self._get_index()
 
-        npc_filters = MetadataFilters(
-            filters=[MetadataFilter(key="character", value=npc_name)]
-        )
-        lore_filters = MetadataFilters(
-            filters=[MetadataFilter(key="type", value="world_lore")]
-        )
-
+        # --- 构建各类检索器 ---
         npc_retriever = index.as_retriever(
-            similarity_top_k=6,
-            filters=npc_filters,
+            similarity_top_k=5,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="character", value=npc_name)]
+            ),
         )
-        lore_retriever = index.as_retriever(
-            similarity_top_k=4,
-            filters=lore_filters,
+        world_lore_retriever = index.as_retriever(
+            similarity_top_k=2,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="world_lore")]
+            ),
+        )
+        task_retriever = index.as_retriever(
+            similarity_top_k=2,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="task")]
+            ),
+        )
+        supp_retriever = index.as_retriever(
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="supplementary_lore")]
+            ),
+        )
+        intel_retriever = index.as_retriever(
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="intelligence")]
+            ),
         )
 
+        # --- 执行检索 ---
         npc_nodes = npc_retriever.retrieve(query)
-        lore_nodes = lore_retriever.retrieve(query)
+        world_lore_nodes = world_lore_retriever.retrieve(query)
+        task_nodes = task_retriever.retrieve(query)
+        supp_nodes = supp_retriever.retrieve(query)
+        intel_nodes = intel_retriever.retrieve(query)
 
-        def _nodes_to_text(nodes) -> str:
+        # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 2 条
+        SUPP_SCORE_THRESHOLD = 0.30
+        pooled = sorted(
+            [
+                n for n in (supp_nodes + intel_nodes)
+                if (getattr(n, "score", None) or 0) >= SUPP_SCORE_THRESHOLD
+            ],
+            key=lambda n: getattr(n, "score", 0),
+            reverse=True,
+        )[:2]
+
+        # --- 拼装上下文 ---
+        def _nodes_to_text(nodes, max_chars: int | None = None) -> str:
             chunks: List[str] = []
             for node in nodes:
                 text = getattr(node, "text", None)
@@ -211,14 +376,21 @@ class GameRAGService:
                     text = node.get_content()
                 if not text:
                     continue
-                chunks.append(str(text))
+                text = str(text).strip()
+                if max_chars and len(text) > max_chars:
+                    text = text[:max_chars] + "…"
+                chunks.append(text)
             return "\n\n".join(chunks)
 
         parts: List[str] = []
         if npc_nodes:
             parts.append("【NPC 过往台词示例】\n" + _nodes_to_text(npc_nodes))
-        if lore_nodes:
-            parts.append("【世界观设定节选】\n" + _nodes_to_text(lore_nodes))
+        if world_lore_nodes:
+            parts.append("【世界观设定摘取片段】\n" + _nodes_to_text(world_lore_nodes, max_chars=350))
+        if task_nodes:
+            parts.append("【参考任务对话(任务可能超过玩家当前进度，仅参考语气)】\n" + _nodes_to_text(task_nodes[:2], max_chars=250))
+        if pooled:
+            parts.append("【补充设定与情报参考】\n" + _nodes_to_text(pooled, max_chars=200))
 
         return "\n\n".join(parts)
 

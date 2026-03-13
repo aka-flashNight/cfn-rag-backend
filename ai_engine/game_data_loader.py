@@ -444,10 +444,65 @@ def load_task_documents() -> List[Document]:
     return documents
 
 
+def load_intelligence_documents() -> List[Document]:
+    """
+    读取 resources/data/intelligence/ 下的 TXT 情报文件。
+
+    如果文件内含 @@@X_Y@@@ 分节标记，则按标记拆分为多个文档片段；
+    否则整个文件作为一个 Document。
+    """
+
+    _ensure_resources_dir()
+
+    resources_dir = _get_resources_dir()
+    intel_dir: Path = resources_dir / "data" / "intelligence"
+    if not intel_dir.exists():
+        print("[知识库] 情报目录不存在，跳过: " + str(intel_dir))
+        return []
+
+    import re
+    _SECTION_RE = re.compile(r'@@@\d+(?:_\d+)?@@@')
+
+    documents: List[Document] = []
+    for txt_file in sorted(intel_dir.glob("*.txt")):
+        try:
+            content = txt_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if len(content) < 10:
+            continue
+
+        source_name = txt_file.stem
+
+        if _SECTION_RE.search(content):
+            sections = _SECTION_RE.split(content)
+            for sec in sections:
+                sec = sec.strip()
+                if len(sec) < 10:
+                    continue
+                documents.append(Document(
+                    text=sec,
+                    metadata={"type": "intelligence", "source_file": source_name},
+                ))
+        else:
+            documents.append(Document(
+                text=content,
+                metadata={"type": "intelligence", "source_file": source_name},
+            ))
+
+    print(f"[知识库] 情报文件: {len(documents)} 个文档片段，"
+          f"来自 {len(list(intel_dir.glob('*.txt')))} 个 txt 文件")
+    return documents
+
+
 def load_lore_documents() -> List[Document]:
     """
     使用 SimpleDirectoryReader 读取 ../resources/docs 下的
-    PDF / DOCX 世界观设定文档。
+    PDF / DOCX 文档，并根据文件名区分核心世界观与补充设定。
+
+    命名规则：
+      - 文件名含 "核心设定与世界合理性补足" → type = "world_lore"（核心世界观）
+      - 其余文件 → type = "supplementary_lore"（补充/局部设定，检索优先级较低）
     """
 
     _ensure_resources_dir()
@@ -455,7 +510,16 @@ def load_lore_documents() -> List[Document]:
     resources_dir = _get_resources_dir()
     docs_dir: Path = resources_dir / "docs"
     if not docs_dir.exists():
-        raise FileNotFoundError(f"未找到世界观设定目录: {docs_dir}")
+        print("[知识库] 世界观设定目录不存在，跳过: " + str(docs_dir))
+        return []
+
+    matching_files = [
+        f for f in docs_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in (".pdf", ".docx")
+    ]
+    if not matching_files:
+        print("[知识库] docs 目录中无 PDF/DOCX 文件，跳过世界观文档加载")
+        return []
 
     reader = SimpleDirectoryReader(
         input_dir=str(docs_dir),
@@ -463,11 +527,23 @@ def load_lore_documents() -> List[Document]:
     )
     documents = reader.load_data()
 
-    # 为了更好地区分类型，在 metadata 中统一标记 type
     for doc in documents:
         meta = dict(doc.metadata or {})
-        meta.setdefault("type", "world_lore")
+        file_path = Path(meta.get("file_path", meta.get("file_name", "")))
+        if "核心设定与世界合理性补足" in file_path.stem:
+            meta["type"] = "world_lore"
+        else:
+            meta["type"] = "supplementary_lore"
         doc.metadata = meta
+
+    loaded_types = {}
+    for doc in documents:
+        t = doc.metadata.get("type", "unknown")
+        fn = Path(doc.metadata.get("file_path", doc.metadata.get("file_name", "?"))).name
+        loaded_types.setdefault(t, set()).add(fn)
+
+    for t, fnames in loaded_types.items():
+        print(f"[知识库] 类型 {t}: {', '.join(sorted(fnames))}")
 
     return documents
 
@@ -479,37 +555,58 @@ def build_index() -> VectorStoreIndex:
 
     ensure_embed_model(offline=True)
 
-    # 使用 TokenTextSplitter 替代 SentenceSplitter，避免 NLTK punkt 依赖
-    # SentenceSplitter 内部使用 NLTK 的 punkt tokenizer，容易出问题
     from llama_index.core.text_splitter import TokenTextSplitter
     from llama_index.core import Settings
 
-    # 针对中英文混合优化：英文按单词，中文按字符
-    def simple_tokenizer(text: str) -> list[str]:
-        """简单tokenizer：空格分割英文，字符分割中文"""
-        import re
-        # 匹配英文单词或单个字符（包括中文）
-        tokens = re.findall(r'[a-zA-Z]+|\d+|[^\s\w]', text)
-        return tokens if tokens else text.split()
-
-    text_splitter = TokenTextSplitter(
-        separator=" ",
-        chunk_size=512,
-        chunk_overlap=50,
-        tokenizer=simple_tokenizer,
+    import re
+    _CJK_TOKEN_RE = re.compile(
+        r'[a-zA-Z]+'       # 英文单词
+        r'|\d+'             # 数字
+        r'|[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]'  # CJK 汉字（每字一 token）
+        r'|[^\s]'           # 其余非空白字符（标点等）
     )
 
-    # 直接设置 text_splitter，VectorStoreIndex.from_documents 会自动使用
+    def cjk_tokenizer(text: str) -> list[str]:
+        """中英文混合 tokenizer：英文按词、中文按字、标点逐个。"""
+        tokens = _CJK_TOKEN_RE.findall(text)
+        return tokens if tokens else ['']
+
+    text_splitter = TokenTextSplitter(
+        separator="\n",
+        chunk_size=256,
+        chunk_overlap=48,
+        tokenizer=cjk_tokenizer,
+        backup_separators=["。", "！", "？", ".", "!", "?", "；", "，", " "],
+    )
+
     Settings.text_splitter = text_splitter
 
     dialogue_docs = load_dialogue_documents()
     task_docs = load_task_documents()
-    lore_docs = load_lore_documents()
+
+    try:
+        lore_docs = load_lore_documents()
+    except Exception as exc:
+        print(f"[知识库] 加载世界观文档时出错，跳过: {exc}")
+        lore_docs = []
+
+    try:
+        intel_docs = load_intelligence_documents()
+    except Exception as exc:
+        print(f"[知识库] 加载情报文件时出错，跳过: {exc}")
+        intel_docs = []
 
     all_docs: List[Document] = []
     all_docs.extend(dialogue_docs)
     all_docs.extend(task_docs)
     all_docs.extend(lore_docs)
+    all_docs.extend(intel_docs)
+
+    print(
+        f"[知识库] 共加载 {len(all_docs)} 个文档 "
+        f"(对话={len(dialogue_docs)}, 任务={len(task_docs)}, "
+        f"设定={len(lore_docs)}, 情报={len(intel_docs)})"
+    )
 
     if not all_docs:
         raise ValueError("没有加载到任何 Document，无法构建索引。")
