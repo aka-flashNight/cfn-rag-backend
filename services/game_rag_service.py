@@ -18,7 +18,7 @@ from ai_engine.game_data_loader import get_cached_index
 from core.config import Settings, get_settings
 from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
-from services.memory_manager import MemoryManager
+from services.memory_manager import MemoryManager, SUMMARIZE_INTERVAL
 
 # ---------------------------------------------------------------------------
 # 固定世界观背景（始终注入 prompt，不依赖 RAG 检索）
@@ -141,12 +141,12 @@ class GameRAGService:
         illustration_dir = self._resources_dir / "flashswf" / "portraits" / "illustration"
         primary_illustration = illustration_dir / f"{npc_name}#{emotion}.png"
         if primary_illustration.is_file():
-            return primary_illustration, "现在传入了你所扮演的 npc 的立绘"
+            return primary_illustration, "现在传入了你所扮演的 npc 的肖像"
 
         # 2. 回退到普通情绪立绘
         fallback_illustration = illustration_dir / f"{npc_name}#普通.png"
         if fallback_illustration.is_file():
-            return fallback_illustration, "现在传入了你所扮演的 npc 的立绘"
+            return fallback_illustration, "现在传入了你所扮演的 npc 的肖像"
 
         # 3. 最后尝试头像
         avatar_dir = self._resources_dir / "flashswf" / "portraits" / "profiles"
@@ -247,7 +247,9 @@ class GameRAGService:
             )
 
         # 3-b. 从记忆库中加载该会话最近的历史消息与摘要
-        history_records = await memory.get_history(payload.session_id, limit=10)
+        history_records = await memory.get_history(
+            payload.session_id, limit=SUMMARIZE_INTERVAL
+        )
         summary_text = await memory.get_summary(payload.session_id)
 
         history_lines: List[str] = []
@@ -588,9 +590,9 @@ class GameRAGService:
                     ],
                 },
             ]
-            # print(system_prompt)
-            # print("——————")
-            # print(prompt_with_desc)
+            print(system_prompt)
+            print("——————")
+            print(prompt_with_desc)
         else:
             # 纯文本输入
             messages = [

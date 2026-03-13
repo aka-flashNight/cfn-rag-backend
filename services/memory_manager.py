@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-SUMMARIZE_INTERVAL = 10
+SUMMARIZE_INTERVAL = 20
 
 
 def is_packaged_environment() -> bool:
@@ -208,7 +208,7 @@ class MemoryManager:
                     self._safe_summarize(session_id, recent, llm_config, npc_name)
                 )
 
-    async def get_history(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_history(self, session_id: str, limit: int = SUMMARIZE_INTERVAL) -> List[Dict[str, Any]]:
         """
         获取指定会话最近的对话记录，按时间正序返回。
         """
