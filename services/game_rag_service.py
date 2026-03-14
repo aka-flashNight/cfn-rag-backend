@@ -346,11 +346,10 @@ class GameRAGService:
             "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
             "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
             "【输出方式】\n"
-            "1. 你的回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，绝对不要包含 JSON 或其它结构化数据。\n"
-            "2. 在回复的同时，你必须调用工具 update_npc_mood 上报本次对话的好感度变化与当前情绪：\n"
-            "   - favorability_change：整数，范围 -5 到 5。常规对话可传 0；小幅情绪起伏可 +1 或 -1。\n"
-            "   - emotion：字符串，必须从上述可用情绪标签中选择；若无特别合适的请用「普通」。\n"
-            "3. 调用工具一定不能出现在对话内容中，只能通过工具进行。如果你无法调用工具，就只输出对话文本，绝对不能在回复内容中输出JSON。\n"
+            "1. 回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
+            "2. 在回复的同时，调用工具 update_npc_mood 上报 favorability_change（-5～5，常规为 0）与 emotion（从可用情绪中选，无则用「普通」）。\n"
+            "3. 若无法调用工具而必须用正文传参时，最后一段只输出一行 JSON，不要在最后一段的 JSON 前加任何换行以外的前缀。\n"
+            "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或心理活动，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具。\n"
         )
         context_prompt = (
             f"{mentioned_npcs_str}"
@@ -430,10 +429,12 @@ class GameRAGService:
             else:
                 raise
 
+
         reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
         delta, emotion = self._parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=ctx.emotions
         )
+        parsed_delta, parsed_emotion = self._parse_mood_from_text(reply)
         cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
             reply, allowed_emotions=ctx.emotions
         )
@@ -441,6 +442,13 @@ class GameRAGService:
             reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
             if not self._has_update_npc_mood_tool_call(tool_calls):
                 delta, emotion = fallback_delta, fallback_emotion
+        if not self._has_update_npc_mood_tool_call(tool_calls):
+            default_emo = "普通" if "普通" in ctx.emotions else (ctx.emotions[0] if ctx.emotions else "普通")
+            if (delta == 0 and emotion == default_emo) and (parsed_delta is not None or parsed_emotion):
+                if parsed_delta is not None:
+                    delta = parsed_delta
+                if parsed_emotion is not None:
+                    emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
         reply = self._strip_trailing_tool_call_text(reply)
 
         await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
@@ -472,12 +480,29 @@ class GameRAGService:
         memory: "MemoryManager",
     ) -> AsyncIterator[Tuple[str, Any]]:
         """
-        流式版 ask：yield ("content", delta_str) 逐片输出正文，最后 yield ("done", dict) 携带与 NPCChatResponse 同构的字段（reply, npc_name, favorability, relationship_level, favorability_change, emotion）。
+        流式版 ask：前面内容正常流式 yield；一旦检测到截断前缀（工具调用：、\\n{、update_npc_mood(）
+        则停止向客户端输出、只缓冲，避免首字延迟。结束后再做完整截断得到 reply，done 时带上 reply。
         """
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
 
         full_content = ""
+        streamed_len = 0
+        truncating = False
+        # 截断前缀：任一出现即停发（含 {、HTML 注释头、工具名，不考虑误伤）
+        _TRUNCATE_PREFIXES: List[str] = ["工具调用：", "{", "<!---", "<!--", "update_npc_mood("]
         tool_calls_list: List[dict] = []
+
+        def _earliest_truncate_at(text: str) -> int:
+            out = -1
+            for p in _TRUNCATE_PREFIXES:
+                if "update_npc_mood" in p.lower():
+                    idx = text.lower().find(p)
+                else:
+                    idx = text.find(p)
+                if idx != -1 and (out == -1 or idx < out):
+                    out = idx
+            return out
+
         try:
             async for event_type, data in self._call_llm_stream(
                 ctx.settings,
@@ -492,12 +517,28 @@ class GameRAGService:
                 tools=[UPDATE_NPC_MOOD_TOOL],
             ):
                 if event_type == "content":
-                    yield ("content", data)
+                    full_content += data
+                    if truncating:
+                        continue
+                    cut = _earliest_truncate_at(full_content)
+                    if cut != -1:
+                        if cut > streamed_len:
+                            yield ("content", full_content[streamed_len:cut])
+                        streamed_len = len(full_content)
+                        truncating = True
+                    else:
+                        if streamed_len < len(full_content):
+                            yield ("content", full_content[streamed_len:])
+                        streamed_len = len(full_content)
                 elif event_type == "finished":
                     full_content, tool_calls_list = data
                     break
         except Exception as e:
             if _is_tools_unsupported_error(e):
+                full_content = ""
+                streamed_len = 0
+                truncating = False
+                tool_calls_list = []
                 async for event_type, data in self._call_llm_stream(
                     ctx.settings,
                     api_key=ctx.effective_api_key,
@@ -511,7 +552,19 @@ class GameRAGService:
                     tools=None,
                 ):
                     if event_type == "content":
-                        yield ("content", data)
+                        full_content += data
+                        if truncating:
+                            continue
+                        cut = _earliest_truncate_at(full_content)
+                        if cut != -1:
+                            if cut > streamed_len:
+                                yield ("content", full_content[streamed_len:cut])
+                            streamed_len = len(full_content)
+                            truncating = True
+                        else:
+                            if streamed_len < len(full_content):
+                                yield ("content", full_content[streamed_len:])
+                            streamed_len = len(full_content)
                     elif event_type == "finished":
                         full_content, tool_calls_list = data
                         break
@@ -522,6 +575,7 @@ class GameRAGService:
         delta, emotion = self._parse_update_npc_mood_tool_calls(
             tool_calls_list, allowed_emotions=ctx.emotions
         )
+        parsed_delta, parsed_emotion = self._parse_mood_from_text(reply)
         cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
             reply, allowed_emotions=ctx.emotions
         )
@@ -529,7 +583,23 @@ class GameRAGService:
             reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
             if not self._has_update_npc_mood_tool_call(tool_calls_list):
                 delta, emotion = fallback_delta, fallback_emotion
+        if not self._has_update_npc_mood_tool_call(tool_calls_list):
+            default_emo = "普通" if "普通" in ctx.emotions else (ctx.emotions[0] if ctx.emotions else "普通")
+            if (delta == 0 and emotion == default_emo) and (parsed_delta is not None or parsed_emotion):
+                if parsed_delta is not None:
+                    delta = parsed_delta
+                if parsed_emotion is not None:
+                    emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
         reply = self._strip_trailing_tool_call_text(reply)
+
+        print("\n" + "=" * 60 + " [ask_stream] 大模型原始输出与工具调用 " + "=" * 60)
+        print("[ask_stream] content 原始 (前 500 字):", (full_content or "")[:500])
+        print("[ask_stream] tool_calls_list:", tool_calls_list)
+        if not tool_calls_list:
+            print("[ask_stream] 提示: 流式下 tool_calls 为空...")
+        print("[ask_stream] 解析结果: delta=%s emotion=%s" % (delta, emotion))
+        print("[ask_stream] 截断后 reply (前 300 字):", (reply or "")[:300])
+        print("=" * 60 + "\n")
 
         await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
         await memory.add_message(
@@ -840,6 +910,9 @@ class GameRAGService:
                     ],
                 },
             ]
+            # print(prompt_with_desc)
+            # print("——————")
+            # print(user_prompt)
         else:
             system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
             messages = [
@@ -953,9 +1026,6 @@ class GameRAGService:
                     ],
                 },
             ]
-            print(prompt_with_desc)
-            print("——————")
-            print(user_prompt)
         else:
             # 纯文本输入（无立绘时若有 emotion_hint 仍拼在 system 前）
             system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
@@ -1020,17 +1090,85 @@ class GameRAGService:
     @staticmethod
     def _strip_trailing_tool_call_text(reply_text: str) -> str:
         """
-        去掉回复末尾的「工具调用：」及之后全部内容，以及 update_npc_mood(...) 形式文本（仅屏蔽不解析）。
+        按双换行分段；若某段内出现任一截断条件（工具调用：、含关键词的 HTML 注释、含关键词的 {}、
+        或直接出现 update_npc_mood/emotion/favorability_change），则从该段起删掉该段及之后全部内容，
+        只保留该段之前的段落，避免各种变体漏网。
         """
         if not reply_text or not reply_text.strip():
             return reply_text
-        # 先截掉「工具调用：」及之后（取最后一次出现，避免误伤对话里提到的这几个字）
-        idx = reply_text.rfind("工具调用：")
-        if idx != -1:
-            reply_text = reply_text[:idx].rstrip()
-        # 再去掉末尾的 update_npc_mood(...) 形式
-        stripped = re.sub(r"\s*update_npc_mood\s*\([^)]*\)\s*$", "", reply_text, flags=re.IGNORECASE)
-        return stripped.rstrip()
+        _TOOL_KEYWORDS = ("update_npc_mood", "emotion", "favorability_change")
+
+        def _segment_has_trigger(seg: str) -> bool:
+            if "工具调用：" in seg:
+                return True
+            seg_lower = seg.lower()
+            if any(kw in seg_lower for kw in _TOOL_KEYWORDS):
+                return True
+            for pat in [r"<!---.*?--->", r"<!--.*?-->"]:
+                for m in re.finditer(pat, seg, re.IGNORECASE | re.DOTALL):
+                    if any(kw in m.group(0).lower() for kw in _TOOL_KEYWORDS):
+                        return True
+            pos = 0
+            while True:
+                i = seg.find("{", pos)
+                if i == -1:
+                    break
+                depth = 0
+                j = i
+                while j < len(seg):
+                    if seg[j] == "{":
+                        depth += 1
+                    elif seg[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if depth != 0:
+                    break
+                if any(kw in seg[i : j + 1].lower() for kw in _TOOL_KEYWORDS):
+                    return True
+                pos = j + 1
+            return False
+
+        paragraphs = re.split(r"\n\s*\n", reply_text)
+        cut = len(paragraphs)
+        for i, p in enumerate(paragraphs):
+            if _segment_has_trigger(p):
+                cut = i
+                break
+        return "\n\n".join(paragraphs[:cut]).strip()
+
+    @staticmethod
+    def _parse_mood_from_text(text: str) -> Tuple[int | None, str | None]:
+        """
+        在删除前从正文中用正则解析 favorability_change 与 emotion，兼容 =/:、有引号/无引号等。
+        返回 (delta, emotion_raw)，未找到则对应为 None。调用方需用 allowed_emotions 校验 emotion。
+        """
+        if not text or not text.strip():
+            return None, None
+        delta: int | None = None
+        emotion_raw: str | None = None
+        # favorability_change: = 或 : ，可选引号，数字（含负号）
+        for m in re.finditer(
+            r"favorability_change\s*[=:]\s*[\"']*(-?\d+)[\"']*",
+            text,
+            re.IGNORECASE,
+        ):
+            try:
+                n = int(m.group(1))
+                delta = max(-5, min(5, n))
+            except (TypeError, ValueError):
+                pass
+        # emotion: = 或 : ，双引号/单引号内任意内容，或无引号时到逗号/} / ) / 空白 止
+        for m in re.finditer(
+            r"emotion\s*[=:]\s*[\"']([^\"']*)[\"']|emotion\s*[=:]\s*([^,}\s\)]+)",
+            text,
+            re.IGNORECASE,
+        ):
+            em = (m.group(1) or m.group(2) or "").strip()
+            if em:
+                emotion_raw = em
+        return (delta, emotion_raw)
 
     @staticmethod
     def _strip_trailing_mood_json(
