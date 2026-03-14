@@ -8,7 +8,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
@@ -47,6 +47,12 @@ WORLD_BACKGROUND = (
     "在这个废土世界中，旧时代的道德与法律秩序几乎彻底崩坏，角色说话内容可以更加无拘束，无需考虑现实世界的规矩，以当前世界的剧情推演为最高优先级。"
 )
 
+
+# 不同阵营间无关联，不检索同阵营角色
+SKIP_FACTION_SAME_CAMP = "闲杂人等"
+
+# 玩家占位符，在 NPC 列表中存在但表示玩家本人，获取「可能涉及的其他角色」与「同阵营角色」时需排除
+PC_CHAR_PLACEHOLDER = "$PC_CHAR"
 
 # ---------------------------------------------------------------------------
 # 阵营别名配置（用于模糊匹配用户输入）
@@ -212,9 +218,10 @@ class GameRAGService:
         faction: str | None = current_state.faction
         titles: list[str] = current_state.titles or []
 
-        # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定
+        # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定（检索时加入 NPC 姓名与称号，提高与当前角色相关内容的召回）
+        retrieve_query = self._build_retrieve_query(payload.query, npc_name, titles)
         retrieved_context: str = await asyncio.to_thread(
-            self._retrieve_context, npc_name, payload.query
+            self._retrieve_context, npc_name, payload.query, retrieve_query
         )
 
         # 3. 构造 Prompt
@@ -228,11 +235,17 @@ class GameRAGService:
         faction_desc = f"（阵营：{faction}）" if faction else ""
         titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
 
-        # 3-a. NPC 交叉引用：检测玩家输入中提及的其他角色
+        # 3-a. NPC 交叉引用：检测玩家输入中提及的其他角色 + 同阵营角色（阵营名完全一致，排除「闲杂人等」）
         all_npc_states = npc_manager.state
-        mentioned_npcs: List[str] = self._find_mentioned_npcs(
+        mentioned_npcs: List[str]
+        mentioned_names: Set[str]
+        mentioned_npcs, mentioned_names = self._find_mentioned_npcs(
             payload.query, npc_name, all_npc_states, faction
         )
+        same_faction_npcs: List[str] = self._get_same_faction_npcs(
+            npc_name, faction, all_npc_states, exclude_names=mentioned_names
+        )
+
         mentioned_npcs_str = ""
         if mentioned_npcs:
             mentioned_npcs_str = (
@@ -240,6 +253,19 @@ class GameRAGService:
                 + "\n".join(mentioned_npcs)
                 + "\n\n"
             )
+        if same_faction_npcs:
+            if mentioned_npcs:
+                mentioned_npcs_str += (
+                    "其他同阵营角色：\n"
+                    + "\n".join(same_faction_npcs)
+                    + "\n\n"
+                )
+            else:
+                mentioned_npcs_str += (
+                    "同阵营角色：\n"
+                    + "\n".join(same_faction_npcs)
+                    + "\n\n"
+                )
 
         # 3-b. 从记忆库中加载该会话最近的历史消息与摘要
         history_records = await memory.get_history(
@@ -289,6 +315,7 @@ class GameRAGService:
             f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
             f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。\n"
             "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
+            "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
             "输出格式必须严格为两行：\n"
             "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀，不要有“第一行：”的字样）。\n"
             "第二行：一个 JSON 对象，必须且仅包含两个字段：\n"
@@ -304,7 +331,7 @@ class GameRAGService:
         # user 消息：检索上下文 + 其他 NPC 提示 + 对话历史 + 玩家本次发言
         context_prompt = (
             f"{mentioned_npcs_str}"
-            "下面是与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
+            "下面是可能与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
             f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
             f"{history_str}"
         )
@@ -363,10 +390,10 @@ class GameRAGService:
         current_npc: str,
         all_npc_states: Dict[str, NPCState],
         current_faction: str | None,
-    ) -> str:
+    ) -> Tuple[List[str], Set[str]]:
         """
         扫描用户输入，如果提到了其他 NPC 的名称 / 阵营 / 头衔，
-        返回其基本信息字符串供 prompt 使用。
+        返回 (格式化字符串列表, 被提及的 NPC 名称集合) 供 prompt 使用。
 
         跳过阵营为 "成员" 或 "彩蛋" 的 NPC（除非当前 NPC 自己也属于这两个阵营）。
 
@@ -378,12 +405,15 @@ class GameRAGService:
             skip_factions = set()
 
         mentioned: List[str] = []
+        mentioned_names: Set[str] = set()
 
         # 标准化玩家输入
         normalized_query = _normalize_text(query)
 
         for name, state in all_npc_states.items():
             if name == current_npc:
+                continue
+            if name == PC_CHAR_PLACEHOLDER:
                 continue
             if state.faction in skip_factions:
                 continue
@@ -402,6 +432,7 @@ class GameRAGService:
             normalized_terms = [_normalize_text(t) for t in terms]
 
             if any(term in normalized_query for term in normalized_terms):
+                mentioned_names.add(name)
                 parts = [f"「{name}」"]
                 if state.sex:
                     parts.append(f"（性别：{state.sex}）")
@@ -411,19 +442,77 @@ class GameRAGService:
                     parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
                 mentioned.append("".join(parts))
 
-        return mentioned
+        return mentioned, mentioned_names
+
+    # ------------------------------------------------------------------
+    # 同阵营角色：阵营名完全相同的其他 NPC（排除「闲杂人等」）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_same_faction_npcs(
+        current_npc: str,
+        current_faction: str | None,
+        all_npc_states: Dict[str, NPCState],
+        exclude_names: Set[str],
+    ) -> List[str]:
+        """
+        获取与当前 NPC 阵营名完全相同的其他角色，格式与 _find_mentioned_npcs 一致。
+        - 不检索阵营为 SKIP_FACTION_SAME_CAMP（如「闲杂人等」）的同阵营角色。
+        - 只匹配阵营名完全一致（如「A兵团元老」与「A兵团」不视为同阵营）。
+        - exclude_names 中已出现的 NPC 不再列入，避免重复。
+        """
+        if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
+            return []
+
+        result: List[str] = []
+        for name, state in all_npc_states.items():
+            if name == current_npc:
+                continue
+            if name == PC_CHAR_PLACEHOLDER:
+                continue
+            if name in exclude_names:
+                continue
+            if (state.faction or "").strip() != current_faction.strip():
+                continue
+            parts = [f"「{name}」"]
+            if state.sex:
+                parts.append(f"（性别：{state.sex}）")
+            if state.faction:
+                parts.append(f"（阵营：{state.faction}）")
+            if state.titles:
+                parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+            result.append("".join(parts))
+        return result
 
     # ------------------------------------------------------------------
     # 检索
     # ------------------------------------------------------------------
-    def _retrieve_context(self, npc_name: str, query: str) -> str:
+    @staticmethod
+    def _build_retrieve_query(user_query: str, npc_name: str, titles: List[str]) -> str:
+        """
+        构造用于「世界观 / 任务 / 补充设定与情报」向量检索的 query。
+
+        将用户输入、当前 NPC 姓名、称号用空格拼成一段文本。检索时这段整句会被
+        嵌入成一条向量，与库中文档向量做相似度比较，**没有**对某一段落（如姓名、
+        称号）单独设权重或分隔符语义；逗号、分号等只相当于多几个字符，一般不改变
+        召回逻辑。用空格拼接即可，简洁且与常见分词方式兼容。
+        """
+        parts = [user_query.strip(), npc_name.strip()] if user_query.strip() else [npc_name.strip()]
+        if titles:
+            parts.append(" ".join(t.strip() for t in titles if t and t.strip()))
+        return " ".join(p for p in parts if p)
+
+    def _retrieve_context(
+        self, npc_name: str, user_query: str, retrieve_query: str
+    ) -> str:
         """
         在同步线程中使用 LlamaIndex 检索：
-          1. NPC 过往台词 (character=npc_name)
-          2. 核心世界观 (type=world_lore)
-          3. 任务对话 (type=task)
-          4. 补充设定 + 情报（pool: supplementary_lore & intelligence）
+          1. NPC 过往台词 (character=npc_name)，已限定为该角色，相似度仅用 user_query
+          2. 核心世界观 (type=world_lore)，相似度用 retrieve_query（用户输入 + NPC 姓名 + 称号）
+          3. 任务对话 (type=task)，相似度用 retrieve_query
+          4. 补充设定 + 情报（pool: supplementary_lore & intelligence），相似度用 retrieve_query
         """
+        if not retrieve_query.strip():
+            retrieve_query = user_query.strip() or npc_name
 
         index: VectorStoreIndex = self._get_index()
 
@@ -435,7 +524,7 @@ class GameRAGService:
             ),
         )
         world_lore_retriever = index.as_retriever(
-            similarity_top_k=2,
+            similarity_top_k=3,
             filters=MetadataFilters(
                 filters=[MetadataFilter(key="type", value="world_lore")]
             ),
@@ -459,14 +548,14 @@ class GameRAGService:
             ),
         )
 
-        # --- 执行检索 ---
-        npc_nodes = npc_retriever.retrieve(query)
-        world_lore_nodes = world_lore_retriever.retrieve(query)
-        task_nodes = task_retriever.retrieve(query)
-        supp_nodes = supp_retriever.retrieve(query)
-        intel_nodes = intel_retriever.retrieve(query)
+        # --- 执行检索：NPC 台词已按 character 限定，仅用用户输入做相似度；其余用 retrieve_query（含姓名与称号）---
+        npc_nodes = npc_retriever.retrieve(user_query)
+        world_lore_nodes = world_lore_retriever.retrieve(retrieve_query)
+        task_nodes = task_retriever.retrieve(retrieve_query)
+        supp_nodes = supp_retriever.retrieve(retrieve_query)
+        intel_nodes = intel_retriever.retrieve(retrieve_query)
 
-        # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 2 条
+        # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 3 条
         SUPP_SCORE_THRESHOLD = 0.30
         pooled = sorted(
             [
@@ -475,7 +564,7 @@ class GameRAGService:
             ],
             key=lambda n: getattr(n, "score", 0),
             reverse=True,
-        )[:2]
+        )[:3]
 
         # --- 拼装上下文 ---
         def _nodes_to_text(nodes, max_chars: int | None = None) -> str:
@@ -525,11 +614,12 @@ class GameRAGService:
         if npc_nodes:
             parts.append("【NPC 过往台词示例】\n" + _nodes_to_text(npc_nodes))
         if world_lore_nodes:
-            parts.append("【世界观设定摘取片段】\n" + _nodes_to_text(world_lore_nodes, max_chars=350))
+            # 暂不截断，观察长度；需恢复时可传 max_chars=375 等
+            parts.append("【世界观设定摘取片段（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(world_lore_nodes))
         if task_nodes:
-            parts.append("【参考任务对话(任务可能超过玩家当前进度，仅参考语气)】\n" + _nodes_to_text(task_nodes[:2], max_chars=250))
+            parts.append("【参考任务对话(任务可能超过玩家当前进度，仅参考语气，忽略具体内容。)】\n" + _nodes_to_text(task_nodes[:2], max_chars=350))
         if pooled:
-            parts.append("【补充设定与情报参考】\n" + _nodes_to_text(pooled, max_chars=200))
+            parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 
         return "\n\n".join(parts)
 

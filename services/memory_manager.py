@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-SUMMARIZE_INTERVAL = 20
+SUMMARIZE_INTERVAL = 30
 
 
 def is_packaged_environment() -> bool:
