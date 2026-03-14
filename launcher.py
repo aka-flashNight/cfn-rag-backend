@@ -376,17 +376,32 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(502, f"后端不可达: {e.reason if hasattr(e, 'reason') else e}")
             return
 
-        # 写回状态
+        # 判断是否为流式响应（如 SSE），需边收边转不能整段缓冲
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        is_streaming = "text/event-stream" in content_type
+
         self.send_response(resp.status)
-        # 转发响应头（去掉 hop-by-hop 等）
+        # 转发响应头（去掉 hop-by-hop 等）；流式时不转发 Content-Length，让客户端按流读取
         skip_headers = {"transfer-encoding", "connection", "content-encoding"}
+        if is_streaming:
+            skip_headers = skip_headers | {"content-length"}
         for name, value in resp.headers.items():
             if name.lower() in skip_headers:
                 continue
             self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(resp.read())
+            if is_streaming:
+                # 按块读取后端流并立即写回客户端，保证 SSE 等流式接口在 exe 下也逐段到达
+                chunk_size = 8192
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            else:
+                self.wfile.write(resp.read())
 
     def do_GET(self):
         if self._should_proxy_to_backend():

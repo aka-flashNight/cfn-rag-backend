@@ -2,9 +2,11 @@
 游戏知识库 RAG API，供 Web 端调用。
 """
 
+import json
 import os
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 
 from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
@@ -78,26 +80,53 @@ async def get_npc_manager() -> NPCManager:
 
 @router.post(
     "/ask",
-    response_model=NPCChatResponse,
-    summary="游戏 NPC RAG + 好感度对话",
+    summary="游戏 NPC RAG + 好感度对话（支持流式）",
 )
 async def ask_game_knowledge(
     payload: NPCChatRequest,
+    stream: bool = Query(False, description="为 true 时返回 SSE 流式响应，前端可做打字机效果"),
     service: GameRAGService = Depends(get_game_rag_service),
     memory: MemoryManager = Depends(get_memory_manager),
     npc_manager: NPCManager = Depends(get_npc_manager),
-) -> NPCChatResponse:
+):
     """
     基于游戏资料（剧情、人物、世界观设定等）进行 RAG 问答，
     扮演指定 NPC 与玩家对话，并驱动好感度变化。
+    - stream=false（默认）：返回 JSON 体 NPCChatResponse。
+    - stream=true：返回 text/event-stream，事件类型为 content（正文片段）与 done（结尾携带 reply/emotion/favorability 等）。
     """
-    # 确保嵌入模型已加载完成（会阻塞等待）
     await ensure_embed_model_ready()
-
-    # 设置代理（如果前端传入了 proxy_url）
     apply_proxy_config(payload.proxy_url)
 
-    return await service.ask(payload, npc_manager=npc_manager, memory=memory)
+    if not stream:
+        return await service.ask(payload, npc_manager=npc_manager, memory=memory)
+
+    async def sse_generate():
+        # 先发一条 SSE 注释，促使代理/服务器立即刷新缓冲，避免整段响应被缓冲后再返回
+        yield b":\n\n"
+        try:
+            async for event_type, data in service.ask_stream(
+                payload, npc_manager=npc_manager, memory=memory
+            ):
+                if event_type == "content":
+                    line = json.dumps({"delta": data}, ensure_ascii=False)
+                    yield f"event: content\ndata: {line}\n\n".encode("utf-8")
+                elif event_type == "done":
+                    line = json.dumps(data, ensure_ascii=False)
+                    yield f"event: done\ndata: {line}\n\n".encode("utf-8")
+        except Exception as e:
+            err_line = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {err_line}\n\n".encode("utf-8")
+
+    return StreamingResponse(
+        sse_generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get(

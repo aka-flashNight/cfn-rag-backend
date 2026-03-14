@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, AsyncIterator, Dict, List, Set, Tuple
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
@@ -20,6 +22,27 @@ from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
 from services.memory_manager import MemoryManager, SUMMARIZE_INTERVAL
 from services.portrait_utils import prepare_portrait_for_ai
+
+
+@dataclass
+class _AskContext:
+    """ask / ask_stream 共用的准备结果：LLM 入参与后处理所需状态。"""
+
+    settings: Settings
+    effective_api_key: str | None
+    effective_api_base: str
+    effective_model: str
+    system_prompt: str
+    user_prompt: str
+    image_path: Path | None
+    image_description: str | None
+    emotion_hint: str
+    emotions: List[str]
+    npc_name: str
+    favorability: int
+    relationship_level: str
+    payload: NPCChatRequest
+
 
 # ---------------------------------------------------------------------------
 # 固定世界观背景（始终注入 prompt，不依赖 RAG 检索）
@@ -215,87 +238,69 @@ class GameRAGService:
 
         return None, None
 
-    async def ask(
+    async def _prepare_ask_context(
         self,
         payload: NPCChatRequest,
         npc_manager: NPCManager,
         memory: "MemoryManager",
-    ) -> NPCChatResponse:
-        """
-        基于游戏知识库进行 RAG + Agent 对话，并更新 NPC 好感度。
-        """
-
-        npc_name: str = payload.npc_name.strip()
+    ) -> _AskContext:
+        """准备 ask / ask_stream 共用的上下文：校验、检索、构造 prompt 与立绘等。"""
+        npc_name = payload.npc_name.strip()
         if not npc_name:
             raise ValueError("npc_name 不能为空。")
-
-        settings: Settings = get_settings()
-        # 支持前端传入大模型配置，未提供则回退到 .env；Key 必须存在
-        request_api_key: str | None = (
+        settings = get_settings()
+        request_api_key = (
             payload.api_key.strip() if payload.api_key and payload.api_key.strip() else None
         )
-        request_api_base: str | None = (
+        request_api_base = (
             payload.api_base.strip() if payload.api_base and payload.api_base.strip() else None
         )
-        request_model: str | None = (
+        request_model = (
             payload.model_name.strip()
             if payload.model_name and payload.model_name.strip()
             else None
         )
-
-        effective_api_key: str | None = request_api_key or settings.llm_api_key
-        effective_api_base: str = request_api_base or settings.llm_api_base
-        effective_model: str = request_model or settings.llm_model_name
-
+        effective_api_key = request_api_key or settings.llm_api_key
+        effective_api_base = request_api_base or settings.llm_api_base
+        effective_model = request_model or settings.llm_model_name
         if not effective_api_key:
             raise ValueError(
                 "未提供可用的大模型 API Key，请在请求中传入 api_key 或在 .env 中配置 LLM_API_KEY。"
             )
 
-        # 1. 读取 / 初始化 NPC 当前好感度
-        current_state: NPCState | None = npc_manager.state.get(npc_name)
+        current_state = npc_manager.state.get(npc_name)
         if current_state is None:
             current_state = NPCState(
                 favorability=0,
                 relationship_level="陌生",
                 emotions=["普通"],
             )
+        favorability = current_state.favorability
+        relationship_level = current_state.relationship_level
+        sex = current_state.sex
+        emotions = current_state.emotions or ["普通"]
+        faction = current_state.faction
+        titles = current_state.titles or []
 
-        favorability: int = current_state.favorability
-        relationship_level: str = current_state.relationship_level
-        sex: str | None = current_state.sex
-        emotions: list[str] = current_state.emotions or ["普通"]
-        faction: str | None = current_state.faction
-        titles: list[str] = current_state.titles or []
-
-        # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定（检索时加入 NPC 姓名、称号与阵营，提高与当前角色及同阵营相关内容的召回）
         retrieve_query = self._build_retrieve_query(payload.query, npc_name, titles, faction)
-        retrieved_context: str = await asyncio.to_thread(
+        retrieved_context = await asyncio.to_thread(
             self._retrieve_context, npc_name, payload.query, retrieve_query
         )
-
-        # 3. 构造 Prompt
-        player_identity: str = (
+        player_identity = (
             payload.player_identity.strip()
             if payload.player_identity and payload.player_identity.strip()
             else "一个末日后加入A兵团成为佣兵的幸存者"
         )
-
         sex_desc = f"（性别：{sex}）" if sex else ""
         faction_desc = f"（阵营：{faction}）" if faction else ""
         titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
-
-        # 3-a. NPC 交叉引用：检测玩家输入中提及的其他角色 + 同阵营角色（阵营名完全一致，排除「闲杂人等」）
         all_npc_states = npc_manager.state
-        mentioned_npcs: List[str]
-        mentioned_names: Set[str]
         mentioned_npcs, mentioned_names = self._find_mentioned_npcs(
             payload.query, npc_name, all_npc_states, faction
         )
-        same_faction_npcs: List[str] = self._get_same_faction_npcs(
+        same_faction_npcs = self._get_same_faction_npcs(
             npc_name, faction, all_npc_states, exclude_names=mentioned_names
         )
-
         mentioned_npcs_str = ""
         if mentioned_npcs:
             mentioned_npcs_str = (
@@ -304,59 +309,33 @@ class GameRAGService:
                 + "\n\n"
             )
         if same_faction_npcs:
-            if mentioned_npcs:
-                mentioned_npcs_str += (
-                    "其他同阵营角色：\n"
-                    + "\n".join(same_faction_npcs)
-                    + "\n\n"
-                )
-            else:
-                mentioned_npcs_str += (
-                    "同阵营角色：\n"
-                    + "\n".join(same_faction_npcs)
-                    + "\n\n"
-                )
+            mentioned_npcs_str += (
+                "其他同阵营角色：\n" if mentioned_npcs else "同阵营角色：\n"
+            ) + "\n".join(same_faction_npcs) + "\n\n"
 
-        # 3-b. 从记忆库中加载该会话最近的历史消息与摘要
         history_records = await memory.get_history(
             payload.session_id, limit=SUMMARIZE_INTERVAL
         )
         summary_text = await memory.get_summary(payload.session_id)
-
-        history_lines: List[str] = []
+        history_lines = []
         for msg in history_records:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "user":
-                prefix = "玩家"
-            else:
-                prefix = npc_name
+            role, content = msg["role"], msg["content"]
+            prefix = "玩家" if role == "user" else npc_name
             history_lines.append(f"{prefix}: {content}")
-
         history_str = ""
         if summary_text:
-            history_str += (
-                "当前对话历史较长，早期对话已整理为以下摘要：\n"
-                f"{summary_text}\n\n"
-            )
+            history_str += "当前对话历史较长，早期对话已整理为以下摘要：\n" + summary_text + "\n\n"
         if history_lines:
             joined_history = "\n".join(history_lines)
-            if summary_text:
-                history_str += (
-                    "以下是最近的对话记录（按时间从早到晚排列），"
-                    "请结合上述摘要与近期记录，在保持人物性格与情节连贯的前提下继续对话：\n"
-                    f"{joined_history}\n\n"
-                )
-            else:
-                history_str += (
-                    "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
-                    "请在保持人物性格与情节连贯的前提下继续对话：\n"
-                    f"{joined_history}\n\n"
-                )
+            history_str += (
+                "以下是最近的对话记录（按时间从早到晚排列），"
+                "请结合上述摘要与近期记录，在保持人物性格与情节连贯的前提下继续对话：\n"
+                if summary_text
+                else "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
+                "请在保持人物性格与情节连贯的前提下继续对话：\n"
+            ) + joined_history + "\n\n"
 
         emotions_str = "、".join(emotions)
-
-        # system 消息：身份设定 + 世界观 + 输出方式（对话正文 + 工具调用上报情绪与好感度）
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
             f"玩家的身份是：{player_identity}\n\n"
@@ -373,116 +352,206 @@ class GameRAGService:
             "   - emotion：字符串，必须从上述可用情绪标签中选择；若无特别合适的请用「普通」。\n"
             "3. 调用工具一定不能出现在对话内容中，只能通过工具进行。如果你无法调用工具，就只输出对话文本，绝对不能在回复内容中输出JSON。\n"
         )
-
-        # user 消息：检索上下文 + 其他 NPC 提示 + 对话历史 + 玩家本次发言
         context_prompt = (
             f"{mentioned_npcs_str}"
             "下面是可能与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
             f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
             f"{history_str}"
         )
-
         user_prompt = f"{context_prompt}\n玩家：{payload.query}"
 
-        # 解析上一轮情绪：可选、可空，用于立绘选择与 prompt 连贯
         raw_emotion = getattr(payload, "current_emotion", None)
-        current_emotion_for_use: str | None = None
+        current_emotion_for_use = None
         if raw_emotion is not None and isinstance(raw_emotion, str):
             s = raw_emotion.strip()
             if s and s.lower() not in ("null", "undefined"):
                 current_emotion_for_use = s
-
-        # 获取 NPC 图像：有 current_emotion 则优先该情绪立绘，否则普通；_get_npc_image_path 内已退化 情绪→普通→头像
-        emotion_for_portrait = current_emotion_for_use if current_emotion_for_use else "普通"
+        emotion_for_portrait = current_emotion_for_use or "普通"
         image_path, image_description = self._get_npc_image_path(npc_name, emotion_for_portrait)
-
-        # 上一轮情绪说明（非「普通」时写入 prompt，便于 AI 做情绪过渡）
         emotion_hint = ""
         if current_emotion_for_use and current_emotion_for_use != "普通":
             emotion_hint = f"你之前的情绪是「{current_emotion_for_use}」。"
 
-        # 先带 tools 调用；若 API 不支持 tools（如远古模型），降级为不带 tools，好感度不变
+        return _AskContext(
+            settings=settings,
+            effective_api_key=effective_api_key,
+            effective_api_base=effective_api_base,
+            effective_model=effective_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_path=image_path,
+            image_description=image_description,
+            emotion_hint=emotion_hint,
+            emotions=emotions,
+            npc_name=npc_name,
+            favorability=favorability,
+            relationship_level=relationship_level,
+            payload=payload,
+        )
+
+    async def ask(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> NPCChatResponse:
+        """
+        基于游戏知识库进行 RAG + Agent 对话，并更新 NPC 好感度。
+        """
+        ctx = await self._prepare_ask_context(payload, npc_manager, memory)
+
         try:
             reply_text, tool_calls = await self._call_llm(
-                settings,
-                api_key=effective_api_key,
-                api_base=effective_api_base,
-                model_name=effective_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                image_path=image_path,
-                image_description=image_description,
-                emotion_hint=emotion_hint or None,
+                ctx.settings,
+                api_key=ctx.effective_api_key,
+                api_base=ctx.effective_api_base,
+                model_name=ctx.effective_model,
+                system_prompt=ctx.system_prompt,
+                user_prompt=ctx.user_prompt,
+                image_path=ctx.image_path,
+                image_description=ctx.image_description,
+                emotion_hint=ctx.emotion_hint or None,
                 tools=[UPDATE_NPC_MOOD_TOOL],
             )
         except Exception as e:
             if _is_tools_unsupported_error(e):
                 reply_text, tool_calls = await self._call_llm(
-                    settings,
-                    api_key=effective_api_key,
-                    api_base=effective_api_base,
-                    model_name=effective_model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    image_path=image_path,
-                    image_description=image_description,
-                    emotion_hint=emotion_hint or None,
+                    ctx.settings,
+                    api_key=ctx.effective_api_key,
+                    api_base=ctx.effective_api_base,
+                    model_name=ctx.effective_model,
+                    system_prompt=ctx.system_prompt,
+                    user_prompt=ctx.user_prompt,
+                    image_path=ctx.image_path,
+                    image_description=ctx.image_description,
+                    emotion_hint=ctx.emotion_hint or None,
                     tools=None,
                 )
             else:
                 raise
 
-        # 输出 AI 原始返回，便于直观观察对话内容与工具调用
-        # print("\n" + "=" * 60 + " AI 原始返回 " + "=" * 60)
-        # print("[对话内容 content]")
-        # print(reply_text or "(空)")
-        # print("[工具调用 tool_calls]")
-        # if tool_calls:
-        #     for i, tc in enumerate(tool_calls):
-        #         fn = tc.get("function") or {}
-        #         print(f"  [{i}] name={fn.get('name', '')}  arguments={fn.get('arguments', '')}")
-        # else:
-        #     print("  (无)")
-        # print("=" * 60 + "\n")
-
-        # 4. 回复正文：纯对话内容；好感度与情绪优先从工具调用解析，无工具调用时尝试从回复末尾剥离 mood JSON 作为后备（流式时同样可对最终拼接文本做此处理）
         reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
         delta, emotion = self._parse_update_npc_mood_tool_calls(
-            tool_calls, allowed_emotions=emotions
+            tool_calls, allowed_emotions=ctx.emotions
         )
-        # 无论是否调用了工具，都尝试从回复末尾剥离 mood 形 JSON，避免模型「既调工具又在正文里重复写 JSON」时正文未清理
         cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
-            reply, allowed_emotions=emotions
+            reply, allowed_emotions=ctx.emotions
         )
         if fallback_delta is not None and fallback_emotion is not None:
             reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
             if not self._has_update_npc_mood_tool_call(tool_calls):
                 delta, emotion = fallback_delta, fallback_emotion
+        reply = self._strip_trailing_tool_call_text(reply)
 
-        # 5. 写入对话记忆（玩家+NPC）
-        await memory.add_message(payload.session_id, "user", payload.query)
+        await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
         await memory.add_message(
-            payload.session_id, "assistant", reply,
+            ctx.payload.session_id, "assistant", reply,
             llm_config={
-                "api_key": effective_api_key,
-                "api_base": effective_api_base,
-                "model_name": effective_model,
+                "api_key": ctx.effective_api_key,
+                "api_base": ctx.effective_api_base,
+                "model_name": ctx.effective_model,
             },
-            npc_name=npc_name,
+            npc_name=ctx.npc_name,
         )
-
-        # 6. 更新好感度并落盘
-        updated_state: NPCState = npc_manager.update_favorability(npc_name, delta)
+        updated_state = npc_manager.update_favorability(ctx.npc_name, delta)
         await npc_manager.save()
 
         return NPCChatResponse(
             reply=reply,
-            npc_name=npc_name,
+            npc_name=ctx.npc_name,
             favorability=updated_state.favorability,
             relationship_level=updated_state.relationship_level,
             favorability_change=delta,
             emotion=emotion,
         )
+
+    async def ask_stream(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """
+        流式版 ask：yield ("content", delta_str) 逐片输出正文，最后 yield ("done", dict) 携带与 NPCChatResponse 同构的字段（reply, npc_name, favorability, relationship_level, favorability_change, emotion）。
+        """
+        ctx = await self._prepare_ask_context(payload, npc_manager, memory)
+
+        full_content = ""
+        tool_calls_list: List[dict] = []
+        try:
+            async for event_type, data in self._call_llm_stream(
+                ctx.settings,
+                api_key=ctx.effective_api_key,
+                api_base=ctx.effective_api_base,
+                model_name=ctx.effective_model,
+                system_prompt=ctx.system_prompt,
+                user_prompt=ctx.user_prompt,
+                image_path=ctx.image_path,
+                image_description=ctx.image_description,
+                emotion_hint=ctx.emotion_hint or None,
+                tools=[UPDATE_NPC_MOOD_TOOL],
+            ):
+                if event_type == "content":
+                    yield ("content", data)
+                elif event_type == "finished":
+                    full_content, tool_calls_list = data
+                    break
+        except Exception as e:
+            if _is_tools_unsupported_error(e):
+                async for event_type, data in self._call_llm_stream(
+                    ctx.settings,
+                    api_key=ctx.effective_api_key,
+                    api_base=ctx.effective_api_base,
+                    model_name=ctx.effective_model,
+                    system_prompt=ctx.system_prompt,
+                    user_prompt=ctx.user_prompt,
+                    image_path=ctx.image_path,
+                    image_description=ctx.image_description,
+                    emotion_hint=ctx.emotion_hint or None,
+                    tools=None,
+                ):
+                    if event_type == "content":
+                        yield ("content", data)
+                    elif event_type == "finished":
+                        full_content, tool_calls_list = data
+                        break
+            else:
+                raise
+
+        reply = (full_content or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+        delta, emotion = self._parse_update_npc_mood_tool_calls(
+            tool_calls_list, allowed_emotions=ctx.emotions
+        )
+        cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
+            reply, allowed_emotions=ctx.emotions
+        )
+        if fallback_delta is not None and fallback_emotion is not None:
+            reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+            if not self._has_update_npc_mood_tool_call(tool_calls_list):
+                delta, emotion = fallback_delta, fallback_emotion
+        reply = self._strip_trailing_tool_call_text(reply)
+
+        await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
+        await memory.add_message(
+            ctx.payload.session_id, "assistant", reply,
+            llm_config={
+                "api_key": ctx.effective_api_key,
+                "api_base": ctx.effective_api_base,
+                "model_name": ctx.effective_model,
+            },
+            npc_name=ctx.npc_name,
+        )
+        updated_state = npc_manager.update_favorability(ctx.npc_name, delta)
+        await npc_manager.save()
+
+        yield ("done", {
+            "reply": reply,
+            "npc_name": ctx.npc_name,
+            "favorability": updated_state.favorability,
+            "relationship_level": updated_state.relationship_level,
+            "favorability_change": delta,
+            "emotion": emotion,
+        })
 
     # ------------------------------------------------------------------
     # NPC 交叉引用：从用户输入中发现提及的其他角色
@@ -732,6 +801,95 @@ class GameRAGService:
 
         return "\n\n".join(parts)
 
+    async def _call_llm_stream(
+        self,
+        settings: Settings,
+        api_key: str,
+        api_base: str,
+        model_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        image_path: Path | None = None,
+        image_description: str | None = None,
+        emotion_hint: str | None = None,
+        tools: List[dict] | None = None,
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """
+        流式调用 LLM：yield ("content", delta_str) 逐片输出正文；
+        结束时 yield ("finished", (full_content, tool_calls_list)) 供调用方做后处理。
+        """
+        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+        prefix_parts: List[str] = []
+        if image_description and image_description.strip():
+            prefix_parts.append(image_description.strip() + "。")
+        if emotion_hint and emotion_hint.strip():
+            prefix_parts.append(emotion_hint.strip())
+        prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
+
+        if image_path and image_path.is_file():
+            portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
+            image_data = base64.b64encode(portrait_bytes).decode("utf-8")
+            prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
+            messages = [
+                {"role": "system", "content": prompt_with_desc},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                },
+            ]
+        else:
+            system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_prompt},
+            ]
+
+        kwargs: dict = {"model": model_name, "messages": messages, "stream": True}
+        if tools:
+            kwargs["tools"] = tools
+
+        stream = await client.chat.completions.create(**kwargs)
+        content_parts: List[str] = []
+        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None) and delta.content:
+                content_parts.append(delta.content)
+                yield ("content", delta.content)
+            tool_calls_delta = getattr(delta, "tool_calls", None) or []
+            for tc in tool_calls_delta:
+                idx = getattr(tc, "index", None)
+                if idx is None:
+                    continue
+                if idx not in tool_calls_acc:
+                    tool_calls_acc[idx] = {"id": getattr(tc, "id", "") or "", "name": "", "arguments": ""}
+                fn = getattr(tc, "function", None)
+                if fn:
+                    if getattr(fn, "name", None):
+                        tool_calls_acc[idx]["name"] = (tool_calls_acc[idx].get("name") or "") + (fn.name or "")
+                    if getattr(fn, "arguments", None):
+                        tool_calls_acc[idx]["arguments"] = (tool_calls_acc[idx].get("arguments") or "") + (fn.arguments or "")
+
+        full_content = "".join(content_parts)
+        tool_calls_list = []
+        for i in sorted(tool_calls_acc.keys()):
+            acc = tool_calls_acc[i]
+            tool_calls_list.append({
+                "type": "function",
+                "id": acc.get("id", ""),
+                "function": {
+                    "name": acc.get("name", ""),
+                    "arguments": acc.get("arguments", ""),
+                },
+            })
+        yield ("finished", (full_content, tool_calls_list))
+
     async def _call_llm(
         self,
         settings: Settings,
@@ -858,6 +1016,21 @@ class GameRAGService:
             if isinstance(f, dict) and f.get("name") == "update_npc_mood":
                 return True
         return False
+
+    @staticmethod
+    def _strip_trailing_tool_call_text(reply_text: str) -> str:
+        """
+        去掉回复末尾的「工具调用：」及之后全部内容，以及 update_npc_mood(...) 形式文本（仅屏蔽不解析）。
+        """
+        if not reply_text or not reply_text.strip():
+            return reply_text
+        # 先截掉「工具调用：」及之后（取最后一次出现，避免误伤对话里提到的这几个字）
+        idx = reply_text.rfind("工具调用：")
+        if idx != -1:
+            reply_text = reply_text[:idx].rstrip()
+        # 再去掉末尾的 update_npc_mood(...) 形式
+        stripped = re.sub(r"\s*update_npc_mood\s*\([^)]*\)\s*$", "", reply_text, flags=re.IGNORECASE)
+        return stripped.rstrip()
 
     @staticmethod
     def _strip_trailing_mood_json(
