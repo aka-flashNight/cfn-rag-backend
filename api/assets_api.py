@@ -54,6 +54,7 @@ def _extract_illustration_zip() -> tuple[bool, str]:
     target_dir = _get_illustration_extract_target()
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
+        # 使用默认编码（UTF-8）：请用 UTF-8 制作 illustration.zip，避免解压后文件名乱码
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(target_dir)
         return True, f"已从 {zip_path.name} 解压到 {target_dir}"

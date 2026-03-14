@@ -51,6 +51,34 @@ WORLD_BACKGROUND = (
 # 不同阵营间无关联，不检索同阵营角色
 SKIP_FACTION_SAME_CAMP = "闲杂人等"
 
+# ---------------------------------------------------------------------------
+# Function Calling：update_npc_mood 工具定义（为流式输出解耦 JSON 拼装，后续可扩展 agent）
+# ---------------------------------------------------------------------------
+UPDATE_NPC_MOOD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "update_npc_mood",
+        "description": (
+            "在每次以 NPC 身份回复玩家后调用，用于上报本次对话的好感度变化与当前情绪。"
+            "好感度变化取值范围为 -5 到 5，常规对话可传 0；情绪必须从当前 NPC 的可用情绪标签中选择。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "favorability_change": {
+                    "type": "integer",
+                    "description": "本次对话对玩家的好感度变化，范围 -5 到 5。0 表示不变，正数增加好感，负数减少。",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "当前回复对应的情绪标签，用于立绘展示，必须从系统提供的可用情绪列表中选择。",
+                },
+            },
+            "required": ["favorability_change", "emotion"],
+        },
+    },
+}
+
 # 玩家占位符，在 NPC 列表中存在但表示玩家本人，获取「可能涉及的其他角色」与「同阵营角色」时需排除
 PC_CHAR_PLACEHOLDER = "$PC_CHAR"
 
@@ -140,8 +168,8 @@ class GameRAGService:
 
         Returns:
             (image_path, description) 元组：
-            - 如果找到立绘：返回 (立绘路径，"现在传入了你所扮演的 npc 的立绘")
-            - 如果找到头像：返回 (头像路径，"现在传入了你所扮演的 npc 的头像")
+            - 如果找到立绘：返回 (立绘路径，"现在传入了你所扮演的角色的立绘")
+            - 如果找到头像：返回 (头像路径，"现在传入了你所扮演的角色的头像")
             - 如果都没找到：返回 (None, None)
         """
         # 1. 先尝试找立绘（指定情绪）：优先 WebP，其次 PNG
@@ -149,19 +177,19 @@ class GameRAGService:
         for ext in (".webp", ".png"):
             primary_illustration = illustration_dir / f"{npc_name}#{emotion}{ext}"
             if primary_illustration.is_file():
-                return primary_illustration, "现在传入了你所扮演的 npc 的肖像（但不需要强行通过你的肖像内容开启话题）"
+                return primary_illustration, "现在传入了你所扮演的角色的肖像（但不需要强行通过你的肖像内容开启话题）"
 
         # 2. 回退到普通情绪立绘
         for ext in (".webp", ".png"):
             fallback_illustration = illustration_dir / f"{npc_name}#普通{ext}"
             if fallback_illustration.is_file():
-                return fallback_illustration, "现在传入了你所扮演的 npc 的肖像（但不需要强行通过你的肖像内容开启话题）"
+                return fallback_illustration, "现在传入了你所扮演的角色的肖像（但不需要强行通过你的肖像内容开启话题）"
 
         # 3. 最后尝试头像
         avatar_dir = self._resources_dir / "flashswf" / "portraits" / "profiles"
         avatar_path = avatar_dir / f"{npc_name}.png"
         if avatar_path.is_file():
-            return avatar_path, "现在传入了你所扮演的 npc 的头像"
+            return avatar_path, "现在传入了你所扮演的角色的头像"
 
         return None, None
 
@@ -306,7 +334,7 @@ class GameRAGService:
 
         emotions_str = "、".join(emotions)
 
-        # system 消息：身份设定 + 世界观 + 输出格式与硬性规则
+        # system 消息：身份设定 + 世界观 + 输出方式（对话正文 + 工具调用上报情绪与好感度）
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
             f"玩家的身份是：{player_identity}\n\n"
@@ -316,16 +344,11 @@ class GameRAGService:
             f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。\n"
             "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
             "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
-            "输出格式必须严格为两行：\n"
-            "第一行：你的回复内容（只包含对话文本，不要包含 JSON，不要带前缀，不要有“第一行：”的字样）。\n"
-            "第二行：一个 JSON 对象，必须且仅包含两个字段：\n"
-            "  - \"favorability_change\"：一个整数字段，取值范围 -5 到 5，例如："
-            "{\"favorability_change\": 1, \"emotion\": \"普通\"}\n"
-            "  - \"emotion\"：一个字符串字段，值必须从上文提供的情绪标签中选择；"
-            "如果没有特别合适的情绪，请使用 \"普通\"。\n"
-            "常规对话无需调整好感度，小幅度的情绪起伏可以只 +1 或 -1 点好感度。"
-            "如果本次对话不应影响好感度，请输出 {\"favorability_change\": 0}。\n"
-            "禁止输出第三行及更多内容，禁止添加多余的空行或注释。"
+            "【输出方式】\n"
+            "1. 你的回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
+            "2. 在回复的同时，你必须调用工具 update_npc_mood 上报本次对话的好感度变化与当前情绪：\n"
+            "   - favorability_change：整数，范围 -5 到 5。常规对话可传 0；小幅情绪起伏可 +1 或 -1。\n"
+            "   - emotion：字符串，必须从上述可用情绪标签中选择；若无特别合适的请用「普通」。\n"
         )
 
         # user 消息：检索上下文 + 其他 NPC 提示 + 对话历史 + 玩家本次发言
@@ -341,7 +364,7 @@ class GameRAGService:
         # 获取 NPC 图像（优先立绘，其次头像）
         image_path, image_description = self._get_npc_image_path(npc_name, "普通")
 
-        reply_text: str = await self._call_llm(
+        reply_text, tool_calls = await self._call_llm(
             settings,
             api_key=effective_api_key,
             api_base=effective_api_base,
@@ -350,11 +373,27 @@ class GameRAGService:
             user_prompt=user_prompt,
             image_path=image_path,
             image_description=image_description,
+            tools=[UPDATE_NPC_MOOD_TOOL],
         )
-        # 4. 解析回复与好感度变化与情绪
-        reply, delta, emotion = self._parse_reply_and_delta(
-            reply_text, allowed_emotions=emotions
+        # 输出 AI 原始返回，便于直观观察对话内容与工具调用
+        # print("\n" + "=" * 60 + " AI 原始返回 " + "=" * 60)
+        # print("[对话内容 content]")
+        # print(reply_text or "(空)")
+        # print("[工具调用 tool_calls]")
+        # if tool_calls:
+        #     for i, tc in enumerate(tool_calls):
+        #         fn = tc.get("function") or {}
+        #         print(f"  [{i}] name={fn.get('name', '')}  arguments={fn.get('arguments', '')}")
+        # else:
+        #     print("  (无)")
+        # print("=" * 60 + "\n")
+
+        # 4. 回复正文：纯对话内容；好感度与情绪由工具调用解析（格式解耦，便于后续流式）
+        reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+        delta, emotion = self._parse_update_npc_mood_tool_calls(
+            tool_calls, allowed_emotions=emotions
         )
+        # print(f"[解析结果] favorability_change={delta}  emotion={emotion}\n")
 
         # 5. 写入对话记忆（玩家+NPC）
         await memory.add_message(payload.session_id, "user", payload.query)
@@ -633,13 +672,17 @@ class GameRAGService:
         user_prompt: str,
         image_path: Path | None = None,
         image_description: str | None = None,
-    ) -> str:
+        tools: List[dict] | None = None,
+    ) -> Tuple[str, List[dict]]:
         """
         调用任意 OpenAI 兼容的大模型生成回复。
+        支持 Function Calling：传入 tools 时，返回 (回复正文, tool_calls 列表)；未传时 tool_calls 为空列表。
+        为后续流式输出预留：流式时由调用方收集 content delta 与 tool_calls 再解析。
 
         Args:
             image_path: 可选的图像文件路径，如果提供则会将图像作为多模态输入传给模型
             image_description: 图像描述，用于在提示中说明传入了什么图像
+            tools: 可选的工具定义列表（OpenAI tools 格式），用于 Function Calling
         """
 
         client = AsyncOpenAI(api_key=api_key, base_url=api_base)
@@ -651,14 +694,14 @@ class GameRAGService:
             image_data = base64.b64encode(portrait_bytes).decode("utf-8")
             # 在用户提示前添加图像说明
             prompt_with_desc = (
-                f"{image_description}。\n\n{user_prompt}"
+                f"{image_description}。\n\n{system_prompt}"
                 if image_description
-                else user_prompt
+                else system_prompt
             )
             messages = [
                 {
                     "role": "system",
-                    "content": system_prompt,
+                    "content": prompt_with_desc,
                 },
                 {
                     "role": "user",
@@ -671,14 +714,14 @@ class GameRAGService:
                         },
                         {
                             "type": "text",
-                            "text": prompt_with_desc,
+                            "text": user_prompt,
                         },
                     ],
                 },
             ]
-            print(system_prompt)
-            print("——————")
             print(prompt_with_desc)
+            print("——————")
+            print(user_prompt)
         else:
             # 纯文本输入
             messages = [
@@ -692,61 +735,90 @@ class GameRAGService:
                 },
             ]
 
-        completion = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-        )
+        kwargs: dict = {"model": model_name, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+
+        completion = await client.chat.completions.create(**kwargs)
 
         message = completion.choices[0].message
         content = message.content or ""
-        if isinstance(content, str):
-            return content
+        if not isinstance(content, str):
+            try:
+                content = "".join(part.get("text", "") for part in content)  # type: ignore[arg-type]
+            except Exception:
+                content = str(content)
 
-        # OpenAI 兼容协议中 content 通常为 str；此处兜底处理为字符串拼接
-        try:
-            return "".join(part.get("text", "") for part in content)  # type: ignore[arg-type]
-        except Exception:
-            return str(content)
+        tool_calls_raw = getattr(message, "tool_calls", None) or []
+        # 转为可 JSON 序列化的 dict 列表，便于统一处理（含流式后续收集）
+        tool_calls_list: List[dict] = []
+        for tc in tool_calls_raw:
+            if hasattr(tc, "model_dump"):
+                tool_calls_list.append(tc.model_dump())
+            elif hasattr(tc, "dict"):
+                tool_calls_list.append(tc.dict())
+            elif isinstance(tc, dict):
+                tool_calls_list.append(tc)
+            else:
+                fn = getattr(tc, "function", None)
+                tool_calls_list.append({
+                    "type": getattr(tc, "type", "function"),
+                    "function": {
+                        "name": getattr(fn, "name", "") if fn else "",
+                        "arguments": getattr(fn, "arguments", "") if fn else "",
+                    },
+                })
+
+        return content, tool_calls_list
 
     @staticmethod
-    def _parse_reply_and_delta(
-        full_text: str,
+    def _parse_update_npc_mood_tool_calls(
+        tool_calls: List[dict],
         allowed_emotions: List[str],
-    ) -> Tuple[str, int, str]:
+    ) -> Tuple[int, str]:
         """
-        将大模型输出解析为 (回复内容, 好感度变化值, 情绪)。
+        从 Function Calling 的 tool_calls 中解析并校验 update_npc_mood 的 (好感度变化, 情绪)。
+        校验规则：favorability_change 非数字或超出 [-5,5] 则钳位/置 0；emotion 不在允许列表则用「普通」。
+        未找到有效调用时返回 (0, "普通")。为后续流式输出预留：流式时由后端收集完整 tool_calls 再调用本方法。
         """
+        if not allowed_emotions:
+            allowed_emotions = ["普通"]
+        default_emotion = "普通" if "普通" in allowed_emotions else allowed_emotions[0]
 
-        if not full_text.strip():
-            return "（当前未能生成有效回复，请稍后再试。）", 0, "普通"
+        delta = 0
+        emotion = default_emotion
 
-        lines = [line for line in full_text.splitlines() if line.strip()]
-        if not lines:
-            return "（当前未能生成有效回复，请稍后再试。）", 0, "普通"
-
-        reply_line = lines[0].strip()
-        json_line = lines[-1].strip()
-
-        delta: int = 0
-        emotion: str = "普通"
-        try:
-            obj = json.loads(json_line)
-            value = int(obj.get("favorability_change", 0))
-            # 限制在 -5 到 5 之间
-            delta = max(-5, min(5, value))
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            f = tc.get("function") if tc.get("type") == "function" else None
+            if not f or f.get("name") != "update_npc_mood":
+                continue
+            args_str = f.get("arguments")
+            if not args_str:
+                break
+            try:
+                obj = json.loads(args_str)
+            except Exception:
+                break
+            # 好感度：非数字或超出范围则钳位或置 0
+            raw_delta = obj.get("favorability_change", 0)
+            try:
+                delta = int(raw_delta)
+            except (TypeError, ValueError):
+                delta = 0
+            delta = max(-5, min(5, delta))
+            # 情绪：必须在允许列表中，否则用默认
             emo_raw = obj.get("emotion")
             if isinstance(emo_raw, str) and emo_raw.strip():
                 emo_candidate = emo_raw.strip()
                 if emo_candidate in allowed_emotions:
                     emotion = emo_candidate
-        except Exception:
-            delta = 0
-            emotion = "普通"
+            break
 
         if emotion not in allowed_emotions:
-            emotion = "普通"
-
-        return reply_line, delta, emotion
+            emotion = default_emotion
+        return delta, emotion
 
     async def get_npc_favorability(
         self,

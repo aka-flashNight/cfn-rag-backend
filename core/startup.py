@@ -144,6 +144,7 @@ def _extract_illustration_zip_if_present() -> None:
     target_dir = base / "resources" / "flashswf" / "portraits" / "illustration"
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
+        # 使用默认编码（UTF-8）：请用 UTF-8 制作 illustration.zip，避免解压后文件名乱码
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(target_dir)
         print(f"[初始化] 已从 illustration.zip 解压立绘到 {target_dir}")
