@@ -128,22 +128,28 @@ async def get_avatar(npc_name: str) -> FileResponse:
     return FileResponse(path=str(avatar_path), media_type="image/png")
 
 
+def _illustration_paths(base_dir: Path, npc_name: str, emotion: str) -> list[tuple[Path, str]]:
+    """返回 (路径, media_type) 列表：先尝试 WebP，再尝试 PNG。"""
+    return [
+        (base_dir / f"{npc_name}#{emotion}.webp", "image/webp"),
+        (base_dir / f"{npc_name}#{emotion}.png", "image/png"),
+        (base_dir / f"{npc_name}#普通.webp", "image/webp"),
+        (base_dir / f"{npc_name}#普通.png", "image/png"),
+    ]
+
+
 @router.get("/illustration/{npc_name}/{emotion}", summary="获取 NPC 情绪立绘")
 async def get_illustration(npc_name: str, emotion: str) -> FileResponse:
     """
-    返回指定 NPC + 情绪的立绘 PNG；找不到时回退到“普通”，仍失败则 404。
+    返回指定 NPC + 情绪的立绘（优先 WebP，其次 PNG）；找不到时回退到“普通”，仍失败则 404。
     """
 
     resources_dir = _get_resources_dir()
     base_dir: Path = resources_dir / "flashswf" / "portraits" / "illustration"
 
-    primary: Path = base_dir / f"{npc_name}#{emotion}.png"
-    if primary.is_file():
-        return FileResponse(path=str(primary), media_type="image/png")
-
-    fallback: Path = base_dir / f"{npc_name}#普通.png"
-    if fallback.is_file():
-        return FileResponse(path=str(fallback), media_type="image/png")
+    for path, media_type in _illustration_paths(base_dir, npc_name, emotion):
+        if path.is_file():
+            return FileResponse(path=str(path), media_type=media_type)
 
     raise HTTPException(status_code=404, detail="立绘资源不存在")
 
@@ -206,7 +212,7 @@ async def export_illustrations(body: ExportIllustrationsRequest) -> ExportIllust
     if not has_java:
         raise HTTPException(status_code=503, detail=MSG_NO_JAVA_HAS_FFDEC)
 
-    # 有 zip 时已返回；此处为无 zip、有 FFDec 且有 Java，开始从 SWF 导出（耗时长）
+    # 有 zip 时已返回；此处为无 zip、有 FFDec 且有 Java，开始从 SWF 导出（耗时长），默认输出 WebP
     result = await asyncio.to_thread(
         run_extract,
         ffdec_path=ffdec_path,
@@ -216,6 +222,8 @@ async def export_illustrations(body: ExportIllustrationsRequest) -> ExportIllust
         smooth=True,
         crop_rect=None,
         only_npc=None,
+        webp=True,
+        webp_quality=0.85,
     )
     success = bool(result.get("success"))
     processed = int(result.get("processed", 0))

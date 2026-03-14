@@ -273,22 +273,22 @@ LLM_MODEL_NAME=gemini-2.5-flash
 2. 将 **illustration.zip** 与 **CFN-RAG.exe** 放在**同一目录**
 3. 启动程序后会自动解压到 `resources/flashswf/portraits/illustration`，无需 Java，解压很快
 
-也可手动解压：将 zip 内容的png图片解压到 `resources/flashswf/portraits/illustration` 目录下。
+也可手动解压：将 zip 内的立绘图片（WebP 或 PNG）解压到 `resources/flashswf/portraits/illustration` 目录下。
 
 #### 方式二：从 SWF 导成立绘（需 Java 与 tools）
 
-若你有游戏资源中的 SWF 立绘（位于 `resources/flashswf/portraits/*.swf`），且本机已安装 **JRE**、项目 **tools** 目录下已放置 **ffdec.jar**（JPEXS FFDec 完整版），可在前端或通过接口触发「从 SWF 导成立绘」。导出约需数分钟，请耐心等待。
+若你有游戏资源中的 SWF 立绘（位于 `resources/flashswf/portraits/*.swf`），且本机已安装 **JRE**、项目 **tools** 目录下已放置 **ffdec.jar**（JPEXS FFDec 完整版），可在前端或通过接口触发「从 SWF 导成立绘」。导出结果为 **WebP** 格式（约 0.85 质量），约需数分钟，请耐心等待。
 
 #### 方式三：自行准备图片
 
-将立绘 PNG 直接放入 `resources/flashswf/portraits/illustration` 目录。
+将立绘图片（WebP 或 PNG）直接放入 `resources/flashswf/portraits/illustration` 目录。
 
 **文件命名与格式**：
 
 | 项目 | 说明 |
 |------|------|
-| 文件名格式 | `{NPC名称}#{情绪}.png`，例如：`凯特#普通.png`、`凯特#开心.png` |
-| 文件格式 | PNG |
+| 文件名格式 | `{NPC名称}#{情绪}.webp`（推荐）或 `.png`，例如：`凯特#普通.webp`、`凯特#开心.webp` |
+| 文件格式 | WebP（推荐，体积小）/ PNG（兼容） |
 | 文件大小 | 建议控制在 1M 以内，过大的图片会消耗大量 Token |
 
 **情绪标签**：需与 NPC 拥有的情绪一致；至少提供 `普通`，其余如 `微笑`、`严肃`、`悲伤`、`愤怒` 等按需制作。若请求的情绪无对应文件，会自动回退到 `普通`；若仍无立绘，会尝试使用 `profiles` 目录下的头像。
@@ -299,8 +299,8 @@ resources/
 └── flashswf/
     └── portraits/
         ├── illustration/           # 立绘目录（zip 解压或 SWF 导出/手动放置）
-        │   ├── Andy Law#普通.png
-        │   └── Andy Law#微笑.png
+        │   ├── Andy Law#普通.webp
+        │   └── Andy Law#微笑.webp
         └── profiles/               # 头像目录（游戏自带）
             └── Andy Law.png
 ```
@@ -383,7 +383,7 @@ A: 删除 `resources/tools/vector_index` 文件夹，下次启动时会自动重
 A: 推荐方式：
 1. **使用立绘拓展包**：下载 illustration.zip，与 exe 同目录放置，在前端点击生成立绘，程序会自动解压到立绘目录
 2. **从 SWF 导出**：若有游戏 SWF 立绘且已配置 Java 与 tools/ffdec.jar，在前端或通过接口触发立绘生成（约需数分钟）
-3. 自行从游戏资源提取或自行绘制后，放入 `resources/flashswf/portraits/illustration/`，文件名格式为 `NPC名#情绪.png`
+3. 自行从游戏资源提取或自行绘制后，放入 `resources/flashswf/portraits/illustration/`，文件名格式为 `NPC名#情绪.webp`（或 .png）
 
 详见上方【立绘包】章节。
 

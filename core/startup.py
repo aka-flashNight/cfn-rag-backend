@@ -86,7 +86,7 @@ def _get_portraits_dir() -> Path:
 def _has_valid_illustrations() -> bool:
     """
     检查是否已经存在至少一张符合命名规则的立绘：
-    <NPC名>#<情绪>.png
+    <NPC名>#<情绪>.png 或 .webp
     """
     try:
         portraits_dir = _get_portraits_dir()
@@ -94,10 +94,11 @@ def _has_valid_illustrations() -> bool:
         if not illustration_dir.exists():
             return False
 
-        # 简单判定：存在任何包含 '#' 的 png 文件即可视为已初始化
-        for p in illustration_dir.glob("*.png"):
-            if "#" in p.stem:
-                return True
+        # 简单判定：存在任何包含 '#' 的 png 或 webp 文件即可视为已初始化
+        for pattern in ("*.png", "*.webp"):
+            for p in illustration_dir.glob(pattern):
+                if "#" in p.stem:
+                    return True
         return False
     except Exception as e:
         print(f"[初始化] 检查立绘时出错，将在后续重试: {e}")
@@ -230,6 +231,7 @@ def _run_portraits_extraction_blocking() -> None:
             str(script_path),
             "--ffdec-path",
             str(tools_ffdec),
+            "--webp",
         ]
         # 在独立进程中阻塞执行；由于调用发生在线程池，不会阻塞事件循环
         completed = subprocess.run(

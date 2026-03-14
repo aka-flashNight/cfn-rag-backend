@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-从 resources\\flashswf\\portraits 下的 SWF 中批量导出带帧标签的立绘 PNG，
-并生成形如「NPC名#情绪.png」的文件到 resources\\flashswf\\portraits\\illustration 目录。
+从 resources\\flashswf\\portraits 下的 SWF 中批量导出带帧标签的立绘 PNG 或 WebP，
+并生成形如「NPC名#情绪.png」或「NPC名#情绪.webp」的文件到 resources\\flashswf\\portraits\\illustration 目录。
+可选 --webp 以 0.85 质量输出 WebP，节省空间且便于发给 AI 大模型。
 
 依赖：JPEXS Free Flash Decompiler（FFDec）命令行工具。
 
@@ -25,7 +26,7 @@
      建立「帧号 -> 帧标签」映射。
    - 将带标签的帧号对应到导出的 PNG，重命名并复制到
      resources\\flashswf\\portraits\\illustration 下，命名为
-     <NPC名称>#<帧标签>.png。
+     <NPC名称>#<帧标签>.png 或 .webp（使用 --webp 时）。
 
 注意：
 - 脚本假设 FrameLabel 标签的顺序与 FFDec 导出的帧顺序一致：
@@ -132,17 +133,20 @@ def _run_ffdec(ffdec_path: Path, args: List[str]) -> Tuple[int, str, str]:
 
 def _process_frame_image(
     src_png: Path,
-    dst_png: Path,
+    dst_path: Path,
     crop_rect: Tuple[int, int, int, int] | None,
     zoom: int,
     smooth: bool,
+    save_webp: bool = False,
+    webp_quality: float = 0.85,
 ) -> None:
     """
     将导出的帧 PNG 做可选裁剪与轻度平滑后写入目标路径。
     crop_rect: (left, top, right, bottom) 为原始画布坐标，需乘以 zoom 得到导出图上的像素框。
+    save_webp: 为 True 时保存为 WebP（节省空间、便于发给 AI）；否则保存为 PNG。
     """
     if Image is None:
-        shutil.copy2(src_png, dst_png)
+        shutil.copy2(src_png, dst_path)
         return
     img = Image.open(src_png).convert("RGBA")
     if crop_rect is not None:
@@ -156,7 +160,11 @@ def _process_frame_image(
         img = img.crop(box)
     if smooth:
         img = img.filter(ImageFilter.SMOOTH)
-    img.save(dst_png, "PNG")
+    if save_webp:
+        quality = max(1, min(100, int(webp_quality * 100)))
+        img.save(dst_path, "WEBP", quality=quality)
+    else:
+        img.save(dst_path, "PNG")
 
 
 def _frame_png_sort_key(path: Path) -> Tuple[int, str]:
@@ -275,13 +283,16 @@ def process_single_swf(
     zoom: int = 1,
     crop_rect: Tuple[int, int, int, int] | None = None,
     smooth: bool = False,
+    webp: bool = False,
+    webp_quality: float = 0.85,
 ) -> None:
     """
     处理单个 NPC 的 SWF：
     1. 导出所有帧 PNG（可选 zoom 提高分辨率）
     2. 解析帧标签（若无标签则用第一帧作为「普通」）
-    3. 将有标签的帧经可选裁剪/平滑后保存为 <npc_name>#<label>.png
+    3. 将有标签的帧经可选裁剪/平滑后保存为 <npc_name>#<label>.png 或 .webp
     overwrite=False 时已存在的文件不覆盖，True 时覆盖。
+    webp=True 时输出 WebP（默认 quality=0.85），节省空间且便于发给 AI 大模型。
     """
     npc_name = swf_path.stem
     print(f"\n===== 处理 SWF：{swf_path.name}（NPC: {npc_name}）=====")
@@ -297,10 +308,11 @@ def process_single_swf(
         return
 
     frame_labels = _extract_labels_with_ffdec(ffdec_path, swf_path)
+    ext = ".webp" if webp else ".png"
     if not frame_labels:
         # 无帧标签时，将第一帧作为「普通」导出
         frame_labels = {1: "普通"}
-        print(f"[信息] 未解析到帧标签，将第一帧导出为「{npc_name}#普通.png」")
+        print(f"[信息] 未解析到帧标签，将第一帧导出为「{npc_name}#普通{ext}」")
 
     illustration_dir.mkdir(parents=True, exist_ok=True)
 
@@ -316,22 +328,25 @@ def process_single_swf(
             continue
 
         src_png = png_frames[idx]
-        out_name = f"{npc_name}#{label}.png"
-        dst_png = illustration_dir / out_name
+        out_name = f"{npc_name}#{label}{ext}"
+        dst_path = illustration_dir / out_name
 
-        if dst_png.exists() and not overwrite:
-            print(f"[跳过] 已存在，未覆盖：{dst_png.name}")
+        if dst_path.exists() and not overwrite:
+            print(f"[跳过] 已存在，未覆盖：{dst_path.name}")
             continue
 
-        if crop_rect is not None or smooth:
-            _process_frame_image(src_png, dst_png, crop_rect, zoom, smooth)
+        if crop_rect is not None or smooth or webp:
+            _process_frame_image(
+                src_png, dst_path, crop_rect, zoom, smooth,
+                save_webp=webp, webp_quality=webp_quality,
+            )
         else:
-            shutil.copy2(src_png, dst_png)
+            shutil.copy2(src_png, dst_path)
         copied_count += 1
-        print(f"[OK] 生成立绘：{dst_png}")
+        print(f"[OK] 生成立绘：{dst_path}")
 
     print(
-        f"[完成] SWF={swf_path.name}：成功生成 {copied_count} 张带标签立绘 PNG，"
+        f"[完成] SWF={swf_path.name}：成功生成 {copied_count} 张带标签立绘 {ext.lstrip('.').upper()}，"
         f"输出目录={illustration_dir}"
     )
 
@@ -344,6 +359,8 @@ def run_extract(
     smooth: bool = True,
     crop_rect: Tuple[int, int, int, int] | None = None,
     only_npc: str | None = None,
+    webp: bool = False,
+    webp_quality: float = 0.85,
 ) -> Dict[str, object]:
     """
     立绘导出入口，可供 API 或脚本 main 调用。
@@ -366,35 +383,46 @@ def run_extract(
         temp_root = portraits_dir / "_tmp_export_frames"
         temp_root.mkdir(parents=True, exist_ok=True)
 
-        swf_files = sorted(portraits_dir.glob("*.swf"))
-        if only_npc:
-            target = only_npc.strip()
-            swf_files = [p for p in swf_files if p.stem == target]
+        try:
+            swf_files = sorted(portraits_dir.glob("*.swf"))
+            if only_npc:
+                target = only_npc.strip()
+                swf_files = [p for p in swf_files if p.stem == target]
+                if not swf_files:
+                    return {"success": False, "processed": 0, "total": 0, "error": f"未找到 NPC 对应 SWF: {target}"}
             if not swf_files:
-                return {"success": False, "processed": 0, "total": 0, "error": f"未找到 NPC 对应 SWF: {target}"}
-        if not swf_files:
-            return {"success": True, "processed": 0, "total": 0, "error": None}
+                return {"success": True, "processed": 0, "total": 0, "error": None}
 
-        if smooth and Image is None:
-            return {"success": False, "processed": 0, "total": len(swf_files), "error": "启用 smooth 需要安装 Pillow"}
+            if (smooth or webp) and Image is None:
+                return {"success": False, "processed": 0, "total": len(swf_files), "error": "启用 smooth 或 webp 需要安装 Pillow"}
 
-        total_processed = 0
-        for swf_path in swf_files:
-            try:
-                process_single_swf(
-                    ffdec_path, swf_path, illustration_dir, temp_root,
-                    overwrite=overwrite,
-                    zoom=zoom,
-                    crop_rect=crop_rect,
-                    smooth=smooth,
-                )
-                total_processed += 1
-            except Exception as e:
-                print(f"[错误] 处理 SWF={swf_path.name} 时发生异常：{e}")
-                import traceback
-                traceback.print_exc()
+            total_processed = 0
+            for swf_path in swf_files:
+                try:
+                    process_single_swf(
+                        ffdec_path, swf_path, illustration_dir, temp_root,
+                        overwrite=overwrite,
+                        zoom=zoom,
+                        crop_rect=crop_rect,
+                        smooth=smooth,
+                        webp=webp,
+                        webp_quality=webp_quality,
+                    )
+                    total_processed += 1
+                except Exception as e:
+                    print(f"[错误] 处理 SWF={swf_path.name} 时发生异常：{e}")
+                    import traceback
+                    traceback.print_exc()
 
-        return {"success": True, "processed": total_processed, "total": len(swf_files), "error": None}
+            return {"success": True, "processed": total_processed, "total": len(swf_files), "error": None}
+        finally:
+            # 脚本执行完毕后删除临时帧导出目录
+            if temp_root.exists():
+                try:
+                    shutil.rmtree(temp_root)
+                    print(f"[信息] 已删除临时目录：{temp_root}")
+                except Exception as e:
+                    print(f"[警告] 删除临时目录失败：{temp_root}，{e}")
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -432,11 +460,6 @@ def main() -> None:
         help="可选：只处理指定 NPC 名称对应的 SWF（不含扩展名），如：Andy Law",
     )
     parser.add_argument(
-        "--clean-temp",
-        action="store_true",
-        help="运行结束后删除临时导出目录（默认保留以便排查问题）。",
-    )
-    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="覆盖已存在的立绘 PNG；默认不覆盖已存在的文件。",
@@ -462,6 +485,18 @@ def main() -> None:
         "--smooth",
         action="store_true",
         help="对导出图做轻度平滑，减轻位图边缘锯齿（需安装 Pillow）。",
+    )
+    parser.add_argument(
+        "--webp",
+        action="store_true",
+        help="输出为 WebP 格式（默认 quality=0.85），节省空间且便于发给 AI 大模型；需安装 Pillow。",
+    )
+    parser.add_argument(
+        "--webp-quality",
+        type=float,
+        default=0.85,
+        metavar="Q",
+        help="WebP 压缩质量 0.0～1.0，默认 0.85；仅当 --webp 时生效。",
     )
 
     args = parser.parse_args()
@@ -522,6 +557,10 @@ def main() -> None:
         print("[错误] 使用 --crop 或 --smooth 需要安装 Pillow：pip install Pillow")
         sys.exit(1)
 
+    if args.webp and Image is None:
+        print("[错误] 使用 --webp 需要安装 Pillow：pip install Pillow")
+        sys.exit(1)
+
     result = run_extract(
         ffdec_path=ffdec_path,
         resources_dir=resources_dir,
@@ -530,17 +569,14 @@ def main() -> None:
         smooth=args.smooth,
         crop_rect=crop_rect,
         only_npc=args.only_npc,
+        webp=args.webp,
+        webp_quality=args.webp_quality,
     )
 
     if not result["success"]:
         print(f"[错误] {result.get('error', '未知错误')}")
         sys.exit(1)
     print(f"\n===== 全部处理完成，成功处理 SWF 数量：{result['processed']} / {result['total']} =====")
-    if args.clean_temp:
-        temp_root = (resources_dir or _get_resources_dir()) / "flashswf" / "portraits" / "_tmp_export_frames"
-        if temp_root.exists():
-            shutil.rmtree(temp_root)
-            print(f"[信息] 已删除临时目录：{temp_root}")
 
 
 if __name__ == "__main__":

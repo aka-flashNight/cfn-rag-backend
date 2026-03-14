@@ -268,7 +268,7 @@ API_PREFIX = "/api"
 # 普通接口代理超时（秒）
 PROXY_TIMEOUT = 60
 # 长时间任务接口（如立绘导出）代理超时（秒），预留至少 10 分钟
-PROXY_TIMEOUT_LONG = 600
+PROXY_TIMEOUT_LONG = 900
 # 需要长超时的路径前缀（不含 query）
 LONG_TIMEOUT_PATH_PREFIX = API_PREFIX + "/assets/export-illustrations"
 
@@ -286,6 +286,7 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         '.json': 'application/json',
         '.svg': 'image/svg+xml',
         '.png': 'image/png',
+        '.webp': 'image/webp',
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
         '.gif': 'image/gif',
