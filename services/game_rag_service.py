@@ -349,7 +349,7 @@ class GameRAGService:
             "1. 回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
             "2. 在回复的同时，调用工具 update_npc_mood 上报 favorability_change（-5～5，常规为 0）与 emotion（从可用情绪中选，无则用「普通」）。\n"
             "3. 若无法调用工具而必须用正文传参时，最后一段只输出一行 JSON，不要在最后一段的 JSON 前加任何换行以外的前缀。\n"
-            "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或心理活动，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具。\n"
+            "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或心理活动，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具，输出tool_calls_list。\n"
         )
         context_prompt = (
             f"{mentioned_npcs_str}"
@@ -592,14 +592,14 @@ class GameRAGService:
                     emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
         reply = self._strip_trailing_tool_call_text(reply)
 
-        print("\n" + "=" * 60 + " [ask_stream] 大模型原始输出与工具调用 " + "=" * 60)
-        print("[ask_stream] content 原始 (前 500 字):", (full_content or "")[:500])
-        print("[ask_stream] tool_calls_list:", tool_calls_list)
-        if not tool_calls_list:
-            print("[ask_stream] 提示: 流式下 tool_calls 为空...")
-        print("[ask_stream] 解析结果: delta=%s emotion=%s" % (delta, emotion))
-        print("[ask_stream] 截断后 reply (前 300 字):", (reply or "")[:300])
-        print("=" * 60 + "\n")
+        # print("\n" + "=" * 60 + " [ask_stream] 大模型原始输出与工具调用 " + "=" * 60)
+        # print("[ask_stream] content 原始 (前 500 字):", (full_content or "")[:500])
+        # print("[ask_stream] tool_calls_list:", tool_calls_list)
+        # if not tool_calls_list:
+        #     print("[ask_stream] 提示: 流式下 tool_calls 为空...")
+        # print("[ask_stream] 解析结果: delta=%s emotion=%s" % (delta, emotion))
+        # print("[ask_stream] 截断后 reply (前 300 字):", (reply or "")[:300])
+        # print("=" * 60 + "\n")
 
         await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
         await memory.add_message(
@@ -910,9 +910,9 @@ class GameRAGService:
                     ],
                 },
             ]
-            # print(prompt_with_desc)
-            # print("——————")
-            # print(user_prompt)
+            print(prompt_with_desc)
+            print("——————")
+            print(user_prompt)
         else:
             system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
             messages = [
