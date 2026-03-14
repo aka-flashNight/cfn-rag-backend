@@ -445,11 +445,19 @@ class GameRAGService:
         #     print("  (无)")
         # print("=" * 60 + "\n")
 
-        # 4. 回复正文：纯对话内容；好感度与情绪由工具调用解析（无工具调用时解析结果为 0 / 普通）
+        # 4. 回复正文：纯对话内容；好感度与情绪优先从工具调用解析，无工具调用时尝试从回复末尾剥离 mood JSON 作为后备（流式时同样可对最终拼接文本做此处理）
         reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
         delta, emotion = self._parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=emotions
         )
+        # 无论是否调用了工具，都尝试从回复末尾剥离 mood 形 JSON，避免模型「既调工具又在正文里重复写 JSON」时正文未清理
+        cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
+            reply, allowed_emotions=emotions
+        )
+        if fallback_delta is not None and fallback_emotion is not None:
+            reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+            if not self._has_update_npc_mood_tool_call(tool_calls):
+                delta, emotion = fallback_delta, fallback_emotion
 
         # 5. 写入对话记忆（玩家+NPC）
         await memory.add_message(payload.session_id, "user", payload.query)
@@ -839,6 +847,81 @@ class GameRAGService:
                 })
 
         return content, tool_calls_list
+
+    @staticmethod
+    def _has_update_npc_mood_tool_call(tool_calls: List[dict]) -> bool:
+        """判断 tool_calls 中是否包含 update_npc_mood 调用。"""
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            f = tc.get("function") if tc.get("type") == "function" else tc.get("function")
+            if isinstance(f, dict) and f.get("name") == "update_npc_mood":
+                return True
+        return False
+
+    @staticmethod
+    def _strip_trailing_mood_json(
+        reply_text: str, allowed_emotions: List[str]
+    ) -> Tuple[str, int | None, str | None]:
+        """
+        若回复末尾是类似 update_npc_mood 的 JSON（模型未走工具而把参数写在内容里），
+        则剥离并解析为 (delta, emotion)，返回 (剥离后的回复, delta, emotion)；
+        否则返回 (原回复, None, None)。
+        支持两种格式：
+        1) 平铺：{"favorability_change": 2, "emotion": "微笑"} 或换行缩进形式；
+        2) 与调用一致之嵌套：{"name": "update_npc_mood", "arguments": "{\"favorability_change\": 2, \"emotion\": \"微笑\"}"}。
+        流式输出时可在最终拼接的完整文本上同样调用此方法。
+        """
+        if not reply_text or not reply_text.strip():
+            return reply_text, None, None
+        text = reply_text
+        default_emotion = (
+            "普通" if "普通" in allowed_emotions else (allowed_emotions[0] if allowed_emotions else "普通")
+        )
+
+        def _delta_emotion_from_obj(obj: dict) -> Tuple[int, str] | None:
+            if not isinstance(obj, dict) or "emotion" not in obj:
+                return None
+            emo_raw = obj.get("emotion")
+            if not isinstance(emo_raw, str) or not emo_raw.strip():
+                return None
+            try:
+                delta = max(-5, min(5, int(obj.get("favorability_change", 0))))
+            except (TypeError, ValueError):
+                delta = 0
+            emotion = (
+                emo_raw.strip()
+                if emo_raw.strip() in allowed_emotions
+                else default_emotion
+            )
+            return delta, emotion
+
+        brace_indices = [i for i, c in enumerate(text) if c == "{"]
+        for idx in reversed(brace_indices):
+            suffix = text[idx:]
+            try:
+                obj = json.loads(suffix)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            # 1) 平铺：直接含 emotion（及可选 favorability_change）
+            mood = _delta_emotion_from_obj(obj)
+            if mood is not None:
+                cleaned = text[:idx].rstrip()
+                return cleaned, mood[0], mood[1]
+            # 2) 嵌套：含 arguments 字符串，内层为 mood JSON
+            args_str = obj.get("arguments")
+            if isinstance(args_str, str) and args_str.strip():
+                try:
+                    inner = json.loads(args_str)
+                    mood = _delta_emotion_from_obj(inner) if isinstance(inner, dict) else None
+                    if mood is not None:
+                        cleaned = text[:idx].rstrip()
+                        return cleaned, mood[0], mood[1]
+                except Exception:
+                    pass
+        return reply_text, None, None
 
     @staticmethod
     def _parse_update_npc_mood_tool_calls(
