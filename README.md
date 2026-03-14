@@ -134,7 +134,6 @@ python launcher.py
 | 依赖 | 无需外部 `resources` 文件夹，无需 Python 环境 |
 | 优点 | 完全独立运行，不依赖游戏项目 |
 | 缺点 | 无法随游戏更新获取最新数据，仅包含基础资源 |
-| 缺点 | 启动时需要解压到临时目录，启动速度稍慢 |
 
 **目录结构**：
 ```
@@ -156,7 +155,6 @@ python launcher.py
 | 依赖 | 需要完整的游戏项目 `resources` 文件夹，无需 Python 环境 |
 | 优点 | 单个文件，下载即用，移动方便 |
 | 缺点 | 必须配合 `resources` 文件夹，且是github上的最新版本 |
-| 缺点 | 启动时需要解压到临时目录，启动速度稍慢 |
 
 **目录结构**：
 ```
@@ -270,9 +268,9 @@ LLM_MODEL_NAME=gemini-2.5-flash
 
 #### 方式一：立绘拓展包 illustration.zip（推荐）
 
-1. 下载立绘拓展包 **illustration.zip**（若发行方提供）
+1. 下载立绘拓展包 **illustration.zip**
 2. 将 **illustration.zip** 与 **CFN-RAG.exe** 放在**同一目录**
-3. 启动程序后会自动解压到 `resources/flashswf/portraits/illustration`，无需 Java，解压很快
+3. 启动程序后在页面上点击立绘生成，会自动解压到 `resources/flashswf/portraits/illustration`，无需 Java，解压很快
 
 也可手动解压：将 zip 内的立绘图片（WebP 或 PNG）解压到 `resources/flashswf/portraits/illustration` 目录下。
 
