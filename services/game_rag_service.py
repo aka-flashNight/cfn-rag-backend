@@ -176,6 +176,10 @@ class GameRAGService:
             self._index = get_cached_index()
         return self._index
 
+    def invalidate_index(self) -> None:
+        """重置或重建向量库后调用，使下次请求使用最新索引。"""
+        self._index = None
+
     def _get_npc_image_path(self, npc_name: str, emotion: str = "普通") -> Tuple[Path | None, str | None]:
         """
         获取 NPC 的图像路径（优先立绘，其次头像）。

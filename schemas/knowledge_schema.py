@@ -155,3 +155,12 @@ class SessionTitleUpdateResponse(BaseModel):
     session_id: str = Field(..., description="会话 ID")
     title: str = Field(..., description="更新后的标题")
 
+
+class ResetKnowledgeBaseResponse(BaseModel):
+    """
+    重置知识库接口的响应。前端根据 success 显示成功/失败，并展示 message（若有）。
+    """
+
+    success: bool = Field(..., description="是否成功")
+    message: str | None = Field(None, description="说明信息，如失败原因或成功提示")
+

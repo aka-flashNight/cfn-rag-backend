@@ -12,6 +12,7 @@ from schemas.knowledge_schema import (
     NPCChatRequest,
     NPCChatResponse,
     NPCFavorabilityResponse,
+    ResetKnowledgeBaseResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionHistoryResponse,
@@ -20,6 +21,7 @@ from schemas.knowledge_schema import (
     SessionTitleUpdateRequest,
     SessionTitleUpdateResponse,
 )
+from ai_engine.game_data_loader import reset_knowledge_base
 from services.game_rag_service import GameRAGService
 from services.memory_manager import MemoryManager
 from services.npc_manager import NPCManager
@@ -257,3 +259,23 @@ async def delete_session(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+
+
+@router.post(
+    "/knowledge-base/reset",
+    response_model=ResetKnowledgeBaseResponse,
+    summary="重置知识库",
+)
+async def reset_knowledge_base_endpoint(
+    service: GameRAGService = Depends(get_game_rag_service),
+) -> ResetKnowledgeBaseResponse:
+    """
+    供用户手动重置/重新生成向量库（单 exe 无法在打包时重置时使用）。
+    若 docs 中存在「核心设定与世界合理性补足」文档则强制覆盖重建；
+    否则仅当尚无向量库时生成，已有则返回数据文档不全错误。
+    """
+    await ensure_embed_model_ready()
+    success, message = reset_knowledge_base()
+    if success:
+        service.invalidate_index()
+    return ResetKnowledgeBaseResponse(success=success, message=message)

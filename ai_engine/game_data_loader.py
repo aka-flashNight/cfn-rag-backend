@@ -694,4 +694,56 @@ def rebuild_vector_index() -> VectorStoreIndex:
     return get_cached_index(force_rebuild=True)
 
 
+# 核心设定文档文件名需包含的标识，用于判断是否允许重置知识库
+CORE_LORE_DOC_MARKER = "核心设定与世界合理性补足"
+
+
+def has_core_lore_document() -> bool:
+    """
+    检查 resources/docs 下是否存在文件名（不含扩展名）包含
+    「核心设定与世界合理性补足」的文档（仅看 .pdf / .docx）。
+    用于决定是否允许强制重置向量库。
+    """
+    try:
+        _ensure_resources_dir()
+    except FileNotFoundError:
+        return False
+    resources_dir = _get_resources_dir()
+    docs_dir: Path = resources_dir / "docs"
+    if not docs_dir.exists() or not docs_dir.is_dir():
+        return False
+    for f in docs_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in (".pdf", ".docx"):
+            if CORE_LORE_DOC_MARKER in f.stem:
+                return True
+    return False
+
+
+def reset_knowledge_base() -> tuple[bool, str]:
+    """
+    按业务规则执行「重置知识库」：
+    - 若 docs 中存在「核心设定与世界合理性补足」文档：强制重建向量库并覆盖，返回 (True, 成功说明)。
+    - 若不存在该文档：
+      - 若当前已有向量库：不允许重置，返回 (False, 数据文档不全错误说明)。
+      - 若当前没有向量库：生成一次向量库，返回 (True, 成功说明)。
+
+    Returns:
+        (success, message) 供 API 返回给前端。
+    """
+    if has_core_lore_document():
+        rebuild_vector_index()
+        return True, "知识库已重置并重新生成。"
+    persist_dir = get_vector_index_dir()
+    if _is_vector_index_valid(persist_dir):
+        return (
+            False,
+            "数据文档不全：未找到「核心设定与世界合理性补足」设定文档，且当前已有向量库，无法重置。"
+            "请先放入该文档于 resources\docs 后再重置，或删除现有向量库目录后重新生成。",
+        )
+    # 无核心文档、且尚无向量库：生成一次
+    ensure_embed_model(offline=True)
+    get_cached_index()
+    return True, "知识库已生成（未检测到核心设定文档，仅根据现有数据生成）。"
+
+
 
