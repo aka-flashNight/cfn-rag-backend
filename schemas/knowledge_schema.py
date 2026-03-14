@@ -18,6 +18,10 @@ class NPCChatRequest(BaseModel):
         ...,
         description="会话 ID，由后端创建并返回，后续对话必须携带",
     )
+    current_emotion: Optional[str] = Field(
+        default=None,
+        description="上一轮 ask 返回的 NPC 情绪，供后端/AI 做连贯回复与情绪过渡；可选、可空",
+    )
     api_key: Optional[str] = Field(
         default=None,
         description="可选的大模型 API Key，优先级高于后端 .env 中的默认配置",

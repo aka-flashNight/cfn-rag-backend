@@ -93,6 +93,24 @@ FACTION_ALIASES: Dict[str, List[str]] = {
 }
 
 
+def _is_tools_unsupported_error(exc: BaseException) -> bool:
+    """
+    判断是否为「API 不支持 tools/function calling」类错误。
+    用于降级：带 tools 请求失败时重试不带 tools，保证远古模型也能正常返回对话。
+    """
+    raw = getattr(exc, "message", None) or getattr(exc, "body", None) or str(exc)
+    if isinstance(raw, dict):
+        msg = str(raw.get("error", raw)).lower()
+    else:
+        msg = str(raw).lower()
+    if getattr(exc, "status_code", None) in (400, 422):
+        return True
+    for kw in ("tool", "function_call", "function call", "not support"):
+        if kw in msg:
+            return True
+    return False
+
+
 def _normalize_text(text: str) -> str:
     """
     标准化文本：转为小写并移除所有空格（包括全角/半角空格、制表符等）。
@@ -246,8 +264,8 @@ class GameRAGService:
         faction: str | None = current_state.faction
         titles: list[str] = current_state.titles or []
 
-        # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定（检索时加入 NPC 姓名与称号，提高与当前角色相关内容的召回）
-        retrieve_query = self._build_retrieve_query(payload.query, npc_name, titles)
+        # 2. 使用 LlamaIndex 检索 NPC 过往台词 + 世界观设定（检索时加入 NPC 姓名、称号与阵营，提高与当前角色及同阵营相关内容的召回）
+        retrieve_query = self._build_retrieve_query(payload.query, npc_name, titles, faction)
         retrieved_context: str = await asyncio.to_thread(
             self._retrieve_context, npc_name, payload.query, retrieve_query
         )
@@ -345,10 +363,11 @@ class GameRAGService:
             "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
             "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
             "【输出方式】\n"
-            "1. 你的回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
+            "1. 你的回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，绝对不要包含 JSON 或其它结构化数据。\n"
             "2. 在回复的同时，你必须调用工具 update_npc_mood 上报本次对话的好感度变化与当前情绪：\n"
             "   - favorability_change：整数，范围 -5 到 5。常规对话可传 0；小幅情绪起伏可 +1 或 -1。\n"
             "   - emotion：字符串，必须从上述可用情绪标签中选择；若无特别合适的请用「普通」。\n"
+            "3. 调用工具一定不能出现在对话内容中，只能通过工具进行。如果你无法调用工具，就只输出对话文本，绝对不能在回复内容中输出JSON。\n"
         )
 
         # user 消息：检索上下文 + 其他 NPC 提示 + 对话历史 + 玩家本次发言
@@ -361,20 +380,54 @@ class GameRAGService:
 
         user_prompt = f"{context_prompt}\n玩家：{payload.query}"
 
-        # 获取 NPC 图像（优先立绘，其次头像）
-        image_path, image_description = self._get_npc_image_path(npc_name, "普通")
+        # 解析上一轮情绪：可选、可空，用于立绘选择与 prompt 连贯
+        raw_emotion = getattr(payload, "current_emotion", None)
+        current_emotion_for_use: str | None = None
+        if raw_emotion is not None and isinstance(raw_emotion, str):
+            s = raw_emotion.strip()
+            if s and s.lower() not in ("null", "undefined"):
+                current_emotion_for_use = s
 
-        reply_text, tool_calls = await self._call_llm(
-            settings,
-            api_key=effective_api_key,
-            api_base=effective_api_base,
-            model_name=effective_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            image_path=image_path,
-            image_description=image_description,
-            tools=[UPDATE_NPC_MOOD_TOOL],
-        )
+        # 获取 NPC 图像：有 current_emotion 则优先该情绪立绘，否则普通；_get_npc_image_path 内已退化 情绪→普通→头像
+        emotion_for_portrait = current_emotion_for_use if current_emotion_for_use else "普通"
+        image_path, image_description = self._get_npc_image_path(npc_name, emotion_for_portrait)
+
+        # 上一轮情绪说明（非「普通」时写入 prompt，便于 AI 做情绪过渡）
+        emotion_hint = ""
+        if current_emotion_for_use and current_emotion_for_use != "普通":
+            emotion_hint = f"你之前的情绪是「{current_emotion_for_use}」。"
+
+        # 先带 tools 调用；若 API 不支持 tools（如远古模型），降级为不带 tools，好感度不变
+        try:
+            reply_text, tool_calls = await self._call_llm(
+                settings,
+                api_key=effective_api_key,
+                api_base=effective_api_base,
+                model_name=effective_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_path=image_path,
+                image_description=image_description,
+                emotion_hint=emotion_hint or None,
+                tools=[UPDATE_NPC_MOOD_TOOL],
+            )
+        except Exception as e:
+            if _is_tools_unsupported_error(e):
+                reply_text, tool_calls = await self._call_llm(
+                    settings,
+                    api_key=effective_api_key,
+                    api_base=effective_api_base,
+                    model_name=effective_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    image_path=image_path,
+                    image_description=image_description,
+                    emotion_hint=emotion_hint or None,
+                    tools=None,
+                )
+            else:
+                raise
+
         # 输出 AI 原始返回，便于直观观察对话内容与工具调用
         # print("\n" + "=" * 60 + " AI 原始返回 " + "=" * 60)
         # print("[对话内容 content]")
@@ -388,12 +441,11 @@ class GameRAGService:
         #     print("  (无)")
         # print("=" * 60 + "\n")
 
-        # 4. 回复正文：纯对话内容；好感度与情绪由工具调用解析（格式解耦，便于后续流式）
+        # 4. 回复正文：纯对话内容；好感度与情绪由工具调用解析（无工具调用时解析结果为 0 / 普通）
         reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
         delta, emotion = self._parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=emotions
         )
-        # print(f"[解析结果] favorability_change={delta}  emotion={emotion}\n")
 
         # 5. 写入对话记忆（玩家+NPC）
         await memory.add_message(payload.session_id, "user", payload.query)
@@ -526,18 +578,24 @@ class GameRAGService:
     # 检索
     # ------------------------------------------------------------------
     @staticmethod
-    def _build_retrieve_query(user_query: str, npc_name: str, titles: List[str]) -> str:
+    def _build_retrieve_query(
+        user_query: str,
+        npc_name: str,
+        titles: List[str],
+        faction: str | None = None,
+    ) -> str:
         """
         构造用于「世界观 / 任务 / 补充设定与情报」向量检索的 query。
 
-        将用户输入、当前 NPC 姓名、称号用空格拼成一段文本。检索时这段整句会被
-        嵌入成一条向量，与库中文档向量做相似度比较，**没有**对某一段落（如姓名、
-        称号）单独设权重或分隔符语义；逗号、分号等只相当于多几个字符，一般不改变
-        召回逻辑。用空格拼接即可，简洁且与常见分词方式兼容。
+        将用户输入、当前 NPC 姓名、称号、阵营用空格拼成一段文本，便于召回与当前角色
+        及同阵营相关的设定与情报。检索时这段整句会被嵌入成一条向量，与库中文档向量做
+        相似度比较；用空格拼接即可，简洁且与常见分词方式兼容。
         """
         parts = [user_query.strip(), npc_name.strip()] if user_query.strip() else [npc_name.strip()]
         if titles:
             parts.append(" ".join(t.strip() for t in titles if t and t.strip()))
+        if faction and faction.strip():
+            parts.append(faction.strip())
         return " ".join(p for p in parts if p)
 
     def _retrieve_context(
@@ -546,7 +604,7 @@ class GameRAGService:
         """
         在同步线程中使用 LlamaIndex 检索：
           1. NPC 过往台词 (character=npc_name)，已限定为该角色，相似度仅用 user_query
-          2. 核心世界观 (type=world_lore)，相似度用 retrieve_query（用户输入 + NPC 姓名 + 称号）
+          2. 核心世界观 (type=world_lore)，相似度用 retrieve_query（用户输入 + NPC 姓名 + 称号 + 阵营）
           3. 任务对话 (type=task)，相似度用 retrieve_query
           4. 补充设定 + 情报（pool: supplementary_lore & intelligence），相似度用 retrieve_query
         """
@@ -587,7 +645,7 @@ class GameRAGService:
             ),
         )
 
-        # --- 执行检索：NPC 台词已按 character 限定，仅用用户输入做相似度；其余用 retrieve_query（含姓名与称号）---
+        # --- 执行检索：NPC 台词已按 character 限定，仅用用户输入做相似度；其余用 retrieve_query（含姓名、称号与阵营）---
         npc_nodes = npc_retriever.retrieve(user_query)
         world_lore_nodes = world_lore_retriever.retrieve(retrieve_query)
         task_nodes = task_retriever.retrieve(retrieve_query)
@@ -672,6 +730,7 @@ class GameRAGService:
         user_prompt: str,
         image_path: Path | None = None,
         image_description: str | None = None,
+        emotion_hint: str | None = None,
         tools: List[dict] | None = None,
     ) -> Tuple[str, List[dict]]:
         """
@@ -682,22 +741,27 @@ class GameRAGService:
         Args:
             image_path: 可选的图像文件路径，如果提供则会将图像作为多模态输入传给模型
             image_description: 图像描述，用于在提示中说明传入了什么图像
+            emotion_hint: 可选的上一轮情绪说明（如「你之前的情绪是「开心」。」），用于连贯与情绪过渡
             tools: 可选的工具定义列表（OpenAI tools 格式），用于 Function Calling
         """
 
         client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+
+        # 在 system 前拼接成一行：立绘说明与上一轮情绪同一行，便于 AI 关联情绪与立绘；缺其一时提示词也正常
+        prefix_parts: List[str] = []
+        if image_description and image_description.strip():
+            prefix_parts.append(image_description.strip() + "。")
+        if emotion_hint and emotion_hint.strip():
+            prefix_parts.append(emotion_hint.strip())
+        prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
 
         # 构建消息内容
         if image_path and image_path.is_file():
             # 多模态输入：立绘先裁剪+压缩再传 AI，统一输出 WebP；Base64 格式 data:image/webp;base64,...
             portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
             image_data = base64.b64encode(portrait_bytes).decode("utf-8")
-            # 在用户提示前添加图像说明
-            prompt_with_desc = (
-                f"{image_description}。\n\n{system_prompt}"
-                if image_description
-                else system_prompt
-            )
+            # 在 system 前添加图像说明与上一轮情绪
+            prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
             messages = [
                 {
                     "role": "system",
@@ -723,11 +787,12 @@ class GameRAGService:
             print("——————")
             print(user_prompt)
         else:
-            # 纯文本输入
+            # 纯文本输入（无立绘时若有 emotion_hint 仍拼在 system 前）
+            system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
             messages = [
                 {
                     "role": "system",
-                    "content": system_prompt,
+                    "content": system_content,
                 },
                 {
                     "role": "user",
