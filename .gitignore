@@ -92,3 +92,6 @@ htmlcov/
 .coverage
 .coverage.*
 .pytest_cache/
+
+# tools
+tools/

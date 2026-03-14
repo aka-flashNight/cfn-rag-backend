@@ -16,6 +16,8 @@ import webbrowser
 import socketserver
 import signal
 import http.server
+import urllib.request
+import urllib.error
 
 
 
@@ -260,8 +262,19 @@ def start_frontend():
 
 
 
+# 后端 API 地址，前端收到的 /api 请求会转发到此地址以规避跨域
+BACKEND_PROXY_TARGET = "http://127.0.0.1:7077"
+API_PREFIX = "/api"
+# 普通接口代理超时（秒）
+PROXY_TIMEOUT = 60
+# 长时间任务接口（如立绘导出）代理超时（秒），预留至少 10 分钟
+PROXY_TIMEOUT_LONG = 600
+# 需要长超时的路径前缀（不含 query）
+LONG_TIMEOUT_PATH_PREFIX = API_PREFIX + "/assets/export-illustrations"
+
+
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """自定义请求处理器，正确处理MIME类型，并抑制连接错误输出"""
+    """自定义请求处理器：静态文件 + /api 请求转发到后端 7077，正确处理 MIME，抑制连接错误"""
 
     extensions_map = {
         '': 'application/octet-stream',
@@ -320,12 +333,104 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             # 客户端主动关闭连接，这是正常的浏览器行为，忽略错误
             pass
 
+    def _should_proxy_to_backend(self):
+        """请求路径是否应转发到后端（避免前端跨域）"""
+        return self.path.startswith(API_PREFIX)
+
+    def _proxy_to_backend(self):
+        """将当前请求转发到后端 7077，并把响应写回客户端"""
+        # 构建后端 URL（path + query）
+        path = self.path.split("?", 1)
+        url = BACKEND_PROXY_TARGET + path[0]
+        if len(path) == 2:
+            url += "?" + path[1]
+
+        try:
+            # 读取请求体（POST/PUT/PATCH）
+            body = None
+            if self.command in ("POST", "PUT", "PATCH"):
+                content_length = self.headers.get("Content-Length")
+                if content_length:
+                    body = self.rfile.read(int(content_length))
+
+            # 构造转发请求
+            req_headers = {}
+            for key, value in self.headers.items():
+                key_lower = key.lower()
+                if key_lower in ("host", "connection"):  # 不转发 Host，避免后端拒绝
+                    continue
+                req_headers[key] = value
+
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers=req_headers,
+                method=self.command,
+            )
+            timeout = PROXY_TIMEOUT_LONG if path[0].rstrip("/") == LONG_TIMEOUT_PATH_PREFIX.rstrip("/") else PROXY_TIMEOUT
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            resp = e  # 4xx/5xx 也有 read() 和 headers
+        except (urllib.error.URLError, OSError) as e:
+            self.send_error(502, f"后端不可达: {e.reason if hasattr(e, 'reason') else e}")
+            return
+
+        # 写回状态
+        self.send_response(resp.status)
+        # 转发响应头（去掉 hop-by-hop 等）
+        skip_headers = {"transfer-encoding", "connection", "content-encoding"}
+        for name, value in resp.headers.items():
+            if name.lower() in skip_headers:
+                continue
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(resp.read())
+
+    def do_GET(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            super().do_GET()
+
+    def do_HEAD(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            super().do_HEAD()
+
+    def do_POST(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_PUT(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_DELETE(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_PATCH(self):
+        if self._should_proxy_to_backend():
+            self._proxy_to_backend()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
 
 def open_browser_when_ready(frontend_port):
     """在独立线程中等待后端就绪后打开浏览器，超时也会直接打开"""
     import socket
 
     url = f"http://127.0.0.1:{frontend_port}"
+    # 端口就绪后多等一会再开浏览器，避免首请求时应用尚未完成初始化
+    BROWSER_OPEN_DELAY = 1.0
 
     for _ in range(10):
         try:
@@ -335,6 +440,7 @@ def open_browser_when_ready(frontend_port):
             sock.close()
             if result == 0:
                 print("[系统] 后端服务已就绪 ✓")
+                time.sleep(BROWSER_OPEN_DELAY)
                 break
         except Exception:
             pass

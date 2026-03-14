@@ -49,6 +49,17 @@ def create_spec_file(dirs_to_include, root_py_files, script_dir):
         add_data_lines.append(f"             (r'{models_dir}', 'models'),")
         print(f"  包含模型目录: models/")
 
+    # 添加 tools 目录（FFDec 等，供立绘从 SWF 导出使用）
+    tools_dir = os.path.abspath('tools')
+    if os.path.exists(tools_dir):
+        add_data_lines.append(f"             (r'{tools_dir}', 'tools'),")
+        print(f"  包含目录: tools/")
+
+    # 添加 scripts 目录（立绘导出脚本等，供 API 进程内调用）
+    scripts_dir = os.path.abspath('scripts')
+    if os.path.exists(scripts_dir):
+        add_data_lines.append(f"             (r'{scripts_dir}', 'scripts'),")
+        print(f"  包含目录: scripts/")
 
     # 添加后端Python目录
     for dir_name in dirs_to_include:
@@ -108,6 +119,7 @@ a = Analysis(
         'docx',
         'sqlalchemy',
         'sqlite3',
+        'scripts.extract_portraits_from_swf',
     ],
     hookspath=[],
     hooksconfig={{}},
