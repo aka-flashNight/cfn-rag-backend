@@ -104,7 +104,19 @@ python scripts/download_model.py --mirror
 python scripts/download_model.py --proxy http://127.0.0.1:10809
 ```
 
-5. 配置 API Key
+5. tools 目录（可选，未随仓库提供）
+
+本仓库**不包含** `tools` 目录（未上传至 GitHub）。仅当需要使用「从 SWF 导成立绘」功能时，需在项目根目录下创建 `tools` 文件夹并放入以下内容：
+
+| 内容 | 说明 |
+|------|------|
+| **ffdec.jar** | 主程序。从 [JPEXS Free Flash Decompiler Releases](https://github.com/jindrapetrik/jpexs-decompiler/releases) 下载 `ffdec_*.zip`，解压后将其中的 `ffdec.jar` 或 `ffdec_<版本>.jar` 放入 `tools`（可重命名为 `ffdec.jar`） |
+| **lib/** | 依赖库。官方 ZIP 内与 ffdec.jar 同级的 `lib` 文件夹**需一并**复制到 `tools` 下，保持 `tools/lib/` 与 `tools/ffdec.jar` 同级，否则 `java -jar` 无法解析 Class-Path |
+| **运行环境** | 本机需安装 **JRE**，并将 `java` 加入 PATH 或配置 `JAVA_HOME` |
+
+不需要此功能时可跳过。
+
+6. 配置 API Key
 
 复制 `.env` 文件并配置你的 API Key：
 
@@ -113,7 +125,7 @@ cp .env.example .env
 # 编辑 .env 文件，填入你的 API Key
 ```
 
-6. 启动服务
+7. 启动服务
 
 ```bash
 python launcher.py

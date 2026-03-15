@@ -20,8 +20,13 @@ from ai_engine.game_data_loader import get_cached_index
 from core.config import Settings, get_settings
 from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
-from services.memory_manager import MemoryManager, SUMMARIZE_INTERVAL
+from services.memory_manager import MemoryManager
 from services.portrait_utils import prepare_portrait_for_ai
+
+
+# 前端档位对应的总结间隔（短/中/长/几乎无限），未传或非法值时用默认 30
+ALLOWED_SUMMARIZE_INTERVALS = (10, 30, 100, 500)
+DEFAULT_SUMMARIZE_INTERVAL = 30
 
 
 @dataclass
@@ -32,6 +37,7 @@ class _AskContext:
     effective_api_key: str | None
     effective_api_base: str
     effective_model: str
+    effective_summarize_interval: int
     system_prompt: str
     user_prompt: str
     image_path: Path | None
@@ -313,8 +319,14 @@ class GameRAGService:
                 "其他同阵营角色：\n" if mentioned_npcs else "同阵营角色：\n"
             ) + "\n".join(same_faction_npcs) + "\n\n"
 
+        effective_interval = (
+            payload.summarize_interval
+            if payload.summarize_interval is not None
+            and payload.summarize_interval in ALLOWED_SUMMARIZE_INTERVALS
+            else DEFAULT_SUMMARIZE_INTERVAL
+        )
         history_records = await memory.get_history(
-            payload.session_id, limit=SUMMARIZE_INTERVAL
+            payload.session_id, limit=effective_interval
         )
         summary_text = await memory.get_summary(payload.session_id)
         history_lines = []
@@ -376,6 +388,7 @@ class GameRAGService:
             effective_api_key=effective_api_key,
             effective_api_base=effective_api_base,
             effective_model=effective_model,
+            effective_summarize_interval=effective_interval,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             image_path=image_path,
@@ -460,6 +473,7 @@ class GameRAGService:
                 "model_name": ctx.effective_model,
             },
             npc_name=ctx.npc_name,
+            summarize_interval=ctx.effective_summarize_interval,
         )
         updated_state = npc_manager.update_favorability(ctx.npc_name, delta)
         await npc_manager.save()
@@ -610,6 +624,7 @@ class GameRAGService:
                 "model_name": ctx.effective_model,
             },
             npc_name=ctx.npc_name,
+            summarize_interval=ctx.effective_summarize_interval,
         )
         updated_state = npc_manager.update_favorability(ctx.npc_name, delta)
         await npc_manager.save()
@@ -910,9 +925,9 @@ class GameRAGService:
                     ],
                 },
             ]
-            print(prompt_with_desc)
-            print("——————")
-            print(user_prompt)
+            # print(prompt_with_desc)
+            # print("——————")
+            # print(user_prompt)
         else:
             system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
             messages = [

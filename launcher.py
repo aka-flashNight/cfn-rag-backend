@@ -392,10 +392,9 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             if is_streaming:
-                # 按小块读取并立即写回，避免缓冲导致“大段输出”；用较小 chunk 才能接近逐 token 的打字机效果
-                chunk_size = 256
+                # 不缓冲：每次读 1 字节并立即写回，后端来多少就转多少（仅 OS/内核仍有缓冲，应用层零缓冲）
                 while True:
-                    chunk = resp.read(chunk_size)
+                    chunk = resp.read(1)
                     if not chunk:
                         break
                     self.wfile.write(chunk)

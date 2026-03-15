@@ -132,14 +132,15 @@ async def ask_game_knowledge(
 @router.get(
     "/history/{session_id}",
     response_model=SessionHistoryResponse,
-    summary="获取指定会话的历史对话记录",
+    summary="获取指定会话的历史对话记录（分页，倒序）",
 )
 async def get_session_history(
     session_id: str,
-    limit: int = Query(50, ge=1, le=200, description="返回的最大历史条数"),
+    limit: int = Query(50, ge=1, le=2500, description="单页条数，前端固定 50"),
+    offset: int = Query(0, ge=0, description="跳过条数，0=最新一页，50=更早一页"),
     memory: MemoryManager = Depends(get_memory_manager),
 ) -> SessionHistoryResponse:
-    records = await memory.get_history(session_id, limit=limit)
+    records = await memory.get_history(session_id, limit=limit, offset=offset, order="desc")
     messages: list[ChatMessage] = [
         ChatMessage(
             id=rec["id"],

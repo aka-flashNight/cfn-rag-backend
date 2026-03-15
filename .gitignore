@@ -75,9 +75,10 @@ build_temp/
 models/*/pytorch_model.bin
 models/*/model.safetensors
 
-# Test files
+# Test files and test directory (not packed into exe)
 test_*.py
 *_test.py
+test/
 
 # OS
 .DS_Store
@@ -98,3 +99,6 @@ tools/
 
 # illustration
 illustration.zip
+
+# release_notes
+release_notes_*.md

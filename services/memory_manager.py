@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 from openai import AsyncOpenAI
 
@@ -166,13 +166,15 @@ class MemoryManager:
         *,
         llm_config: Dict[str, str] | None = None,
         npc_name: str = "",
+        summarize_interval: int | None = None,
     ) -> None:
         """
         新增一条对话消息。
 
-        当提供 llm_config 且该会话消息总数达到 SUMMARIZE_INTERVAL 的倍数时，
+        当提供 llm_config 且该会话消息总数达到 summarize_interval（或默认 SUMMARIZE_INTERVAL）的倍数时，
         异步触发对话摘要生成（fire-and-forget）。
         """
+        interval = summarize_interval if summarize_interval is not None else SUMMARIZE_INTERVAL
 
         session_id = session_id.strip()
         role = role.strip()
@@ -202,22 +204,33 @@ class MemoryManager:
 
         if llm_config is not None:
             count = await self._get_message_count(session_id)
-            if count > 0 and count % SUMMARIZE_INTERVAL == 0:
-                recent = await self.get_history(session_id, limit=SUMMARIZE_INTERVAL)
+            if count > 0 and count % interval == 0:
+                recent = await self.get_history(session_id, limit=interval)
                 asyncio.create_task(
                     self._safe_summarize(session_id, recent, llm_config, npc_name)
                 )
 
-    async def get_history(self, session_id: str, limit: int = SUMMARIZE_INTERVAL) -> List[Dict[str, Any]]:
+    async def get_history(
+        self,
+        session_id: str,
+        limit: int = SUMMARIZE_INTERVAL,
+        offset: int = 0,
+        order: Literal["asc", "desc"] = "asc",
+    ) -> List[Dict[str, Any]]:
         """
-        获取指定会话最近的对话记录，按时间正序返回。
-        """
+        获取指定会话的对话记录，支持分页。
 
+        - offset=0, limit=N：从「最新一条」开始取 N 条。
+        - order="desc"：返回倒序（messages[0] 为最新），用于 history API 分页。
+        - order="asc"：返回正序（messages[0] 为最旧），用于 ask 上下文拼 prompt。
+        """
         session_id = session_id.strip()
         if not session_id:
             raise ValueError("session_id 不能为空。")
         if limit <= 0:
             return []
+        if offset < 0:
+            offset = 0
 
         def _inner() -> List[Dict[str, Any]]:
             conn = sqlite3.connect(self._db_path)
@@ -230,17 +243,16 @@ class MemoryManager:
                     FROM chat_history
                     WHERE session_id = ?
                     ORDER BY timestamp DESC, id DESC
-                    LIMIT ?
+                    LIMIT ? OFFSET ?
                     """,
-                    (session_id, limit),
+                    (session_id, limit, offset),
                 )
                 rows = cur.fetchall()
             finally:
                 conn.close()
 
-            # 目前 rows 是倒序（最新在前），需要反转成正序
             result: List[Dict[str, Any]] = []
-            for row in reversed(rows):
+            for row in (reversed(rows) if order == "asc" else rows):
                 result.append(
                     {
                         "id": int(row["id"]),

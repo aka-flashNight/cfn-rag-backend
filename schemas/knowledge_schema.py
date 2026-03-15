@@ -38,6 +38,10 @@ class NPCChatRequest(BaseModel):
         default=None,
         description="可选的 HTTP 代理地址，例如 http://127.0.0.1:10809",
     )
+    summarize_interval: Optional[int] = Field(
+        default=None,
+        description="精确短期记忆的总结间隔/历史长度档位。取值 10/30/100/500，对应前端短/中/长/几乎无限。不传时后端使用默认值 30。",
+    )
 
 
 class NPCChatResponse(BaseModel):
