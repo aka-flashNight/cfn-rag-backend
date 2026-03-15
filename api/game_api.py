@@ -136,7 +136,7 @@ async def ask_game_knowledge(
 )
 async def get_session_history(
     session_id: str,
-    limit: int = Query(50, ge=1, le=2500, description="单页条数，前端固定 50"),
+    limit: int = Query(50, ge=1, description="单页条数，前端固定 50；分页后不设上限，可逐页查看全部记录"),
     offset: int = Query(0, ge=0, description="跳过条数，0=最新一页，50=更早一页"),
     memory: MemoryManager = Depends(get_memory_manager),
 ) -> SessionHistoryResponse:
