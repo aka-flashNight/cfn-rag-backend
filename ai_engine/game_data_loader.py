@@ -6,7 +6,7 @@ import json
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Set
 
 from llama_index.core import Document, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core import Settings, StorageContext, load_index_from_storage
@@ -323,30 +323,39 @@ def load_dialogue_documents() -> List[Document]:
     return documents
 
 
-def _flatten_task_dialogues(dialogues: Iterable[dict]) -> str:
-    """将 challenge_text.json 中的对话数组拼接为可阅读文本。"""
+def _is_player_dialogue_item(item: dict) -> bool:
+    """判断对话条是否为玩家（$PC / $PC_TITLE / $PC_CHAR），此类不进入任务台词检索。"""
+    if not isinstance(item, dict):
+        return True
+    name = str(item.get("name") or "").strip()
+    title = str(item.get("title") or "").strip()
+    char = str(item.get("char") or "").strip()
+    if name == "$PC" or title == "$PC_TITLE":
+        return True
+    if char and (char == "$PC_CHAR" or char.startswith("$PC_CHAR#")):
+        return True
+    return False
 
-    parts: List[str] = []
-    for item in dialogues:
-        if not isinstance(item, dict):
-            continue
-        speaker: str = str(item.get("name") or "").strip()
-        text: str = str(item.get("text") or "").strip()
-        if not text:
-            continue
 
-        if speaker:
-            parts.append(f"{speaker}: {text}")
-        else:
-            parts.append(text)
-
-    return "\n".join(parts)
+def _task_character_from_item(item: dict) -> str | None:
+    """从对话条取 NPC 角色名（Name 优先），规范化为小写；玩家条返回 None。"""
+    if _is_player_dialogue_item(item):
+        return None
+    name = str(item.get("name") or "").strip()
+    if not name:
+        char = str(item.get("char") or "").strip()
+        if char and not char.startswith("$PC"):
+            name = char.split("#", maxsplit=1)[0].strip()
+    if not name:
+        return None
+    return name.lower()
 
 
 def load_task_documents() -> List[Document]:
     """
-    读取挑战任务数据 challenge_tasks.json 和 challenge_text.json，
-    按任务拼接剧情并构建 Document，metadata 中写入相关角色信息。
+    读取所有任务配置（*tasks*.json）与剧情文本（text/*.json），
+    将任务对话拆成「单条 NPC 台词」为一份 Document，仅保留 NPC 发言（排除 $PC/$PC_TITLE 等），
+    并打上 character（小写角色名），便于检索时按当前 NPC 过滤且仅按对话内容相似度检索。
     """
 
     _ensure_resources_dir()
@@ -355,110 +364,75 @@ def load_task_documents() -> List[Document]:
     task_dir: Path = resources_dir / "data" / "task"
     text_dir: Path = task_dir / "text"
 
-    tasks_path: Path = task_dir / "challenge_tasks.json"
-    text_path: Path = text_dir / "challenge_text.json"
+    if not task_dir.exists() or not text_dir.exists():
+        return []
 
-    if not tasks_path.exists():
-        raise FileNotFoundError(f"未找到任务配置: {tasks_path}")
-    if not text_path.exists():
-        raise FileNotFoundError(f"未找到任务文本配置: {text_path}")
+    # 合并所有 text/*.json 的 key，使 $SIDE_GET_50001 等可从 logistics_text 等任意文件解析
+    text_data: Dict[str, Any] = {}
+    for jpath in sorted(text_dir.glob("*.json")):
+        try:
+            with jpath.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                text_data.update(data)
+        except Exception as e:
+            print(f"[知识库] 跳过任务文本 {jpath.name}: {e}")
+            continue
 
-    with tasks_path.open("r", encoding="utf-8") as f:
-        tasks_data = json.load(f)
-    with text_path.open("r", encoding="utf-8") as f:
-        text_data = json.load(f)
-
-    tasks: List[dict] = tasks_data.get("tasks") or []
+    # 收集所有任务（来自所有 *tasks*.json），并标注来源以便检索时区分（如教学引导类提高分数要求）
+    all_tasks: List[dict] = []
+    for jpath in sorted(task_dir.glob("*tasks*.json")):
+        try:
+            with jpath.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            tasks = data.get("tasks") if isinstance(data, dict) else []
+            if not isinstance(tasks, list):
+                continue
+            # 根据文件名打标：guide 类任务仅在高分时才采用，避免教学引导与 NPC 形象弱关联时混入
+            task_source = "guide" if "guide" in jpath.name.lower() else None
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                t = dict(task)
+                if task_source:
+                    t["_task_source"] = task_source
+                all_tasks.append(t)
+        except Exception as e:
+            print(f"[知识库] 跳过任务配置 {jpath.name}: {e}")
+            continue
 
     documents: List[Document] = []
 
-    for task in tasks:
+    for task in all_tasks:
         if not isinstance(task, dict):
             continue
 
-        task_id = task.get("id")
-        title_key: str | None = task.get("title")
-        desc_key: str | None = task.get("description")
-
         get_conv_key: str | None = task.get("get_conversation")
         finish_conv_key: str | None = task.get("finish_conversation")
+        task_source: str | None = task.get("_task_source")  # "guide" 或 None
 
-        get_npc: str | None = task.get("get_npc")
-        finish_npc: str | None = task.get("finish_npc")
-
-        # 解析标题和描述（从 challenge_text.json 中的字符串）
-        title: str = str(text_data.get(title_key, title_key or "")).strip()
-        description: str = str(text_data.get(desc_key, desc_key or "")).strip()
-
-        # 解析获取/完成阶段对话
-        get_dialogues_raw = text_data.get(get_conv_key) or []
-        finish_dialogues_raw = text_data.get(finish_conv_key) or []
-
-        get_dialogues_text = (
-            _flatten_task_dialogues(get_dialogues_raw)
-            if isinstance(get_dialogues_raw, list)
-            else str(get_dialogues_raw)
-        )
-        finish_dialogues_text = (
-            _flatten_task_dialogues(finish_dialogues_raw)
-            if isinstance(finish_dialogues_raw, list)
-            else str(finish_dialogues_raw)
-        )
-
-        # 收集涉及到的角色
-        characters: Set[str] = set()
-        for npc in (get_npc, finish_npc):
-            if isinstance(npc, str) and npc.strip():
-                characters.add(npc.strip())
-
-        def _collect_characters_from_dialogues(items: Iterable[dict]) -> None:
-            for item in items:
+        for key in (get_conv_key, finish_conv_key):
+            if not key:
+                continue
+            raw = text_data.get(key)
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
                 if not isinstance(item, dict):
                     continue
-                char = str(item.get("char") or "").strip()
-                if not char:
+                text = str(item.get("text") or "").strip()
+                if not text:
                     continue
-                # 排除玩家占位符
-                if char.startswith("$PC"):
+                character = _task_character_from_item(item)
+                if not character:
                     continue
-                # 去掉表情后缀，如 "Andy Law#微笑"
-                base_char = char.split("#", maxsplit=1)[0].strip()
-                if base_char:
-                    characters.add(base_char)
-
-        if isinstance(get_dialogues_raw, list):
-            _collect_characters_from_dialogues(get_dialogues_raw)
-        if isinstance(finish_dialogues_raw, list):
-            _collect_characters_from_dialogues(finish_dialogues_raw)
-
-        # 组合成一个可阅读的任务剧情文本
-        text_sections: List[str] = []
-        if title:
-            text_sections.append(f"任务标题: {title}")
-        if description:
-            text_sections.append(f"任务描述: {description}")
-        if get_dialogues_text:
-            text_sections.append("[获取任务阶段]\n" + get_dialogues_text)
-        if finish_dialogues_text:
-            text_sections.append("[完成任务阶段]\n" + finish_dialogues_text)
-
-        if not text_sections:
-            continue
-
-        full_text: str = "\n\n".join(text_sections)
-
-        metadata = {
-            "type": "task",
-            "task_id": task_id,
-            "task_chain": task.get("chain"),
-            "task_title_key": title_key,
-            "task_description_key": desc_key,
-            "get_conversation_key": get_conv_key,
-            "finish_conversation_key": finish_conv_key,
-            "characters": sorted(characters) if characters else [],
-        }
-
-        documents.append(Document(text=full_text, metadata=metadata))
+                metadata: Dict[str, Any] = {
+                    "type": "task",
+                    "character": character,
+                }
+                if task_source:
+                    metadata["task_source"] = task_source
+                documents.append(Document(text=text, metadata=metadata))
 
     return documents
 

@@ -99,6 +99,8 @@ FACTION_ALIASES: Dict[str, List[str]] = {
     "联合大学": ["大学"],
     # 摇滚公园 -> 别名包含"摇滚"
     "摇滚公园": ["摇滚"],
+    # A兵团元老 -> 别名包含"A兵团"
+    "A兵团元老": ["A兵团"],
 }
 
 
@@ -251,8 +253,26 @@ class GameRAGService:
         titles = current_state.titles or []
 
         retrieve_query = self._build_retrieve_query(payload.query, npc_name, titles, faction)
+        effective_interval = (
+            payload.summarize_interval
+            if payload.summarize_interval is not None
+            and payload.summarize_interval in ALLOWED_SUMMARIZE_INTERVALS
+            else DEFAULT_SUMMARIZE_INTERVAL
+        )
+        history_records = await memory.get_history(
+            payload.session_id, limit=effective_interval
+        )
+        last_npc_message: str | None = None
+        for msg in reversed(history_records):
+            if msg.get("role") != "user":
+                last_npc_message = (msg.get("content") or "").strip()
+                break
         retrieved_context = await asyncio.to_thread(
-            self._retrieve_context, npc_name, payload.query, retrieve_query
+            self._retrieve_context,
+            npc_name,
+            payload.query,
+            retrieve_query,
+            npc_last_message=last_npc_message,
         )
         player_identity = (
             payload.player_identity.strip()
@@ -281,15 +301,6 @@ class GameRAGService:
                 "其他同阵营角色：\n" if mentioned_npcs else "同阵营角色：\n"
             ) + "\n".join(same_faction_npcs) + "\n\n"
 
-        effective_interval = (
-            payload.summarize_interval
-            if payload.summarize_interval is not None
-            and payload.summarize_interval in ALLOWED_SUMMARIZE_INTERVALS
-            else DEFAULT_SUMMARIZE_INTERVAL
-        )
-        history_records = await memory.get_history(
-            payload.session_id, limit=effective_interval
-        )
         summary_text = await memory.get_summary(payload.session_id)
         history_lines = []
         for msg in history_records:
@@ -454,7 +465,7 @@ class GameRAGService:
         memory: "MemoryManager",
     ) -> AsyncIterator[Tuple[str, Any]]:
         """
-        流式版 ask：前面内容正常流式 yield；一旦检测到截断前缀（工具调用：、\\n{、update_npc_mood(）
+        流式版 ask：前面内容正常流式 yield；一旦检测到截断前缀（工具调用、{、tool_calls_list、update_npc_mood( 等）
         则停止向客户端输出、只缓冲，避免首字延迟。结束后再做完整截断得到 reply，done 时带上 reply。
         """
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
@@ -462,15 +473,15 @@ class GameRAGService:
         full_content = ""
         streamed_len = 0
         truncating = False
-        # 截断前缀：任一出现即停发（含 {、HTML 注释头、工具名，不考虑误伤）
-        _TRUNCATE_PREFIXES: List[str] = ["工具调用：", "{", "<!---", "<!--", "update_npc_mood("]
+        # 截断前缀：任一出现即停发（含 工具调用、{、HTML 注释头、工具名、tool_calls_list，不考虑误伤）
+        _TRUNCATE_PREFIXES: List[str] = ["工具调用", "{", "<!---", "<!--", "update_npc_mood(", "tool_calls_list"]
         tool_calls_list: List[dict] = []
 
         def _earliest_truncate_at(text: str) -> int:
             out = -1
             for p in _TRUNCATE_PREFIXES:
-                if "update_npc_mood" in p.lower():
-                    idx = text.lower().find(p)
+                if "update_npc_mood" in p.lower() or "tool_calls_list" in p.lower():
+                    idx = text.lower().find(p.lower())
                 else:
                     idx = text.find(p)
                 if idx != -1 and (out == -1 or idx < out):
@@ -723,13 +734,17 @@ class GameRAGService:
         return " ".join(p for p in parts if p)
 
     def _retrieve_context(
-        self, npc_name: str, user_query: str, retrieve_query: str
+        self,
+        npc_name: str,
+        user_query: str,
+        retrieve_query: str,
+        npc_last_message: str | None = None,
     ) -> str:
         """
         在同步线程中使用 LlamaIndex 检索：
-          1. NPC 过往台词 (character=npc_name)，已限定为该角色，相似度仅用 user_query
+          1. NPC 过往台词 (type=dialogue, character=npc_name)，仅日常对话 dialogues，相似度用 user_query
           2. 核心世界观 (type=world_lore)，相似度用 retrieve_query（用户输入 + NPC 姓名 + 称号 + 阵营）
-          3. 任务对话 (type=task)，相似度用 retrieve_query
+          3. 任务对话 (type=task, character=npc_name)，仅当前 NPC 的任务台词，相似度用 user_query + NPC 上一条（若有）
           4. 补充设定 + 情报（pool: supplementary_lore & intelligence），相似度用 retrieve_query
         """
         if not retrieve_query.strip():
@@ -738,12 +753,15 @@ class GameRAGService:
         index: VectorStoreIndex = self._get_index()
 
         # --- 构建各类检索器 ---
-        # 与入库时一致：character 存为小写，此处用规范化后的 npc_name 过滤
+        # 与入库时一致：character 存为小写；过往台词仅指日常对话 dialogues，与任务对话严格区分
         npc_char = (npc_name or "").strip().lower()
         npc_retriever = index.as_retriever(
             similarity_top_k=5,
             filters=MetadataFilters(
-                filters=[MetadataFilter(key="character", value=npc_char)]
+                filters=[
+                    MetadataFilter(key="type", value="dialogue"),
+                    MetadataFilter(key="character", value=npc_char),
+                ]
             ),
         )
         world_lore_retriever = index.as_retriever(
@@ -752,10 +770,14 @@ class GameRAGService:
                 filters=[MetadataFilter(key="type", value="world_lore")]
             ),
         )
+        # 任务对话：玩家输入主导(8条)+NPC上一条辅助(2条)，避免 NPC 长句稀释玩家意图
         task_retriever = index.as_retriever(
-            similarity_top_k=2,
+            similarity_top_k=10,
             filters=MetadataFilters(
-                filters=[MetadataFilter(key="type", value="task")]
+                filters=[
+                    MetadataFilter(key="type", value="task"),
+                    MetadataFilter(key="character", value=npc_char),
+                ]
             ),
         )
         supp_retriever = index.as_retriever(
@@ -771,15 +793,64 @@ class GameRAGService:
             ),
         )
 
-        # --- 执行检索：NPC 台词已按 character 限定，仅用用户输入做相似度；其余用 retrieve_query（含姓名、称号与阵营）---
+        # --- 执行检索 ---
         npc_nodes = npc_retriever.retrieve(user_query)
-        world_lore_nodes = world_lore_retriever.retrieve(retrieve_query)
-        task_nodes = task_retriever.retrieve(retrieve_query)
+        raw_world_lore_nodes = world_lore_retriever.retrieve(retrieve_query)
+        # 任务对话：玩家检索 8 条 + NPC 上一条检索 2 条，合并去重后应用分数阈值（玩家主导约 80%）
+        raw_task_by_user = task_retriever.retrieve(user_query)
+        if (npc_last_message or "").strip():
+            raw_task_by_npc = task_retriever.retrieve(npc_last_message.strip())
+        else:
+            raw_task_by_npc = []
         supp_nodes = supp_retriever.retrieve(retrieve_query)
         intel_nodes = intel_retriever.retrieve(retrieve_query)
 
-        # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 3 条
+        # 通用：取节点唯一 id，用于去重
+        def _node_id(n: Any) -> str:
+            node = getattr(n, "node", n)
+            return getattr(node, "node_id", None) or getattr(node, "id_", None) or str(id(n))
+
+        # 检索返回的 score 为查询向量与文档向量的相似度（如余弦相似度），取值约 [0,1]，越高越相关；设阈值可过滤明显无关结果
+        WORLD_LORE_SCORE_THRESHOLD = 0.22  # 世界观稍宽松，避免完全无关片段混入
+        WORLD_LORE_NPC_SCORE_THRESHOLD = 0.28  # 用 NPC 上一条检索时要求更严
+        world_lore_nodes = [
+            n for n in raw_world_lore_nodes
+            if (getattr(n, "score", None) or 0) >= WORLD_LORE_SCORE_THRESHOLD
+        ]
+        if (npc_last_message or "").strip():
+            raw_world_lore_by_npc = world_lore_retriever.retrieve(npc_last_message.strip())
+            seen_wl = {_node_id(n) for n in world_lore_nodes}
+            for n in raw_world_lore_by_npc:
+                if (getattr(n, "score", None) or 0) >= WORLD_LORE_NPC_SCORE_THRESHOLD and _node_id(n) not in seen_wl:
+                    world_lore_nodes.append(n)
+                    seen_wl.add(_node_id(n))
+                    break
+
+        TASK_SCORE_THRESHOLD = 0.28
+        TASK_GUIDE_SCORE_THRESHOLD = 0.36  # 教学引导类与 NPC 形象弱关联，需更高分数才采用
+        def _task_node_ok(n: Any) -> bool:
+            score = getattr(n, "score", None) or 0
+            meta = getattr(n, "metadata", None) or getattr(getattr(n, "node", n), "metadata", None) or {}
+            th = TASK_GUIDE_SCORE_THRESHOLD if meta.get("task_source") == "guide" else TASK_SCORE_THRESHOLD
+            return score >= th
+
+        # 玩家检索取前 8 条并过滤
+        task_from_user = [n for n in raw_task_by_user[:8] if _task_node_ok(n)]
+        seen_ids = {_node_id(n) for n in task_from_user}
+        # NPC 检索最多补 2 条，且不与玩家结果重复
+        task_from_npc = []
+        for n in raw_task_by_npc:
+            if len(task_from_npc) >= 2:
+                break
+            if _task_node_ok(n) and _node_id(n) not in seen_ids:
+                seen_ids.add(_node_id(n))
+                task_from_npc.append(n)
+        task_nodes = task_from_user + task_from_npc
+        task_nodes = sorted(task_nodes, key=lambda n: getattr(n, "score", 0), reverse=True)
+
+        # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 3 条；若有 NPC 上一条则用其再各查一条，分数要求更严，去重后并入
         SUPP_SCORE_THRESHOLD = 0.30
+        SUPP_NPC_SCORE_THRESHOLD = 0.36  # 用 NPC 上一条检索时要求更严
         pooled = sorted(
             [
                 n for n in (supp_nodes + intel_nodes)
@@ -788,6 +859,16 @@ class GameRAGService:
             key=lambda n: getattr(n, "score", 0),
             reverse=True,
         )[:3]
+        if (npc_last_message or "").strip():
+            supp_by_npc = supp_retriever.retrieve(npc_last_message.strip())
+            intel_by_npc = intel_retriever.retrieve(npc_last_message.strip())
+            seen_pooled = {_node_id(n) for n in pooled}
+            for n in sorted(supp_by_npc + intel_by_npc, key=lambda x: getattr(x, "score", 0), reverse=True):
+                if (getattr(n, "score", None) or 0) >= SUPP_NPC_SCORE_THRESHOLD and _node_id(n) not in seen_pooled:
+                    pooled.append(n)
+                    seen_pooled.add(_node_id(n))
+                    break
+            pooled = sorted(pooled, key=lambda n: getattr(n, "score", 0), reverse=True)[:3]
 
         # --- 拼装上下文 ---
         def _nodes_to_text(nodes, max_chars: int | None = None) -> str:
@@ -835,12 +916,12 @@ class GameRAGService:
 
         parts: List[str] = []
         if npc_nodes:
-            parts.append("【NPC 过往台词示例】\n" + _nodes_to_text(npc_nodes))
+            parts.append("【你的过往台词示例】\n" + _nodes_to_text(npc_nodes))
         if world_lore_nodes:
             # 暂不截断，观察长度；需恢复时可传 max_chars=375 等
             parts.append("【世界观设定摘取片段（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(world_lore_nodes))
         if task_nodes:
-            parts.append("【参考任务对话(任务可能超过玩家当前进度，仅参考语气，忽略具体内容。)】\n" + _nodes_to_text(task_nodes[:2], max_chars=350))
+            parts.append("【你的参考任务对话(任务可能超过玩家当前进度，仅参考语气和设定，忽略具体剧情，避免剧透)】\n" + _nodes_to_text(task_nodes, max_chars=350))
         if pooled:
             parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 

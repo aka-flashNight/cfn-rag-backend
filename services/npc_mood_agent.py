@@ -71,16 +71,16 @@ def has_update_npc_mood_tool_call(tool_calls: List[dict]) -> bool:
 
 def strip_trailing_tool_call_text(reply_text: str) -> str:
     """
-    按双换行分段；若某段内出现任一截断条件（工具调用：、含关键词的 HTML 注释、含关键词的 {}、
-    或直接出现 update_npc_mood/emotion/favorability_change），则从该段起删掉该段及之后全部内容，
-    只保留该段之前的段落，避免各种变体漏网。
+    按双换行分段；若某段内出现任一截断条件（工具调用、tool_calls_list、含关键词的 HTML 注释、
+    含关键词的 {}、或直接出现 update_npc_mood/emotion/favorability_change），则从该段起删掉该段及之后全部内容，
+    只保留该段之前的段落，避免各种变体漏网。移除前调用方应先对全文做 parse_mood_from_text / strip_trailing_mood_json 以解析工具参数。
     """
     if not reply_text or not reply_text.strip():
         return reply_text
-    _TOOL_KEYWORDS = ("update_npc_mood", "emotion", "favorability_change")
+    _TOOL_KEYWORDS = ("update_npc_mood", "emotion", "favorability_change", "tool_calls_list")
 
     def _segment_has_trigger(seg: str) -> bool:
-        if "工具调用：" in seg:
+        if "工具调用" in seg:
             return True
         seg_lower = seg.lower()
         if any(kw in seg_lower for kw in _TOOL_KEYWORDS):
