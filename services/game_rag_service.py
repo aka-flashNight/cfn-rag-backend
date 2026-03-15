@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +20,15 @@ from core.config import Settings, get_settings
 from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
 from services.memory_manager import MemoryManager
+from services.npc_mood_agent import (
+    UPDATE_NPC_MOOD_TOOL,
+    is_tools_unsupported_error,
+    has_update_npc_mood_tool_call,
+    parse_mood_from_text,
+    parse_update_npc_mood_tool_calls,
+    strip_trailing_mood_json,
+    strip_trailing_tool_call_text,
+)
 from services.portrait_utils import prepare_portrait_for_ai
 
 
@@ -80,34 +88,6 @@ WORLD_BACKGROUND = (
 # 不同阵营间无关联，不检索同阵营角色
 SKIP_FACTION_SAME_CAMP = "闲杂人等"
 
-# ---------------------------------------------------------------------------
-# Function Calling：update_npc_mood 工具定义（为流式输出解耦 JSON 拼装，后续可扩展 agent）
-# ---------------------------------------------------------------------------
-UPDATE_NPC_MOOD_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "update_npc_mood",
-        "description": (
-            "在每次以 NPC 身份回复玩家后调用，用于上报本次对话的好感度变化与当前情绪。"
-            "好感度变化取值范围为 -5 到 5，常规对话可传 0；情绪必须从当前 NPC 的可用情绪标签中选择。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "favorability_change": {
-                    "type": "integer",
-                    "description": "本次对话对玩家的好感度变化，范围 -5 到 5。0 表示不变，正数增加好感，负数减少。",
-                },
-                "emotion": {
-                    "type": "string",
-                    "description": "当前回复对应的情绪标签，用于立绘展示，必须从系统提供的可用情绪列表中选择。",
-                },
-            },
-            "required": ["favorability_change", "emotion"],
-        },
-    },
-}
-
 # 玩家占位符，在 NPC 列表中存在但表示玩家本人，获取「可能涉及的其他角色」与「同阵营角色」时需排除
 PC_CHAR_PLACEHOLDER = "$PC_CHAR"
 
@@ -120,24 +100,6 @@ FACTION_ALIASES: Dict[str, List[str]] = {
     # 摇滚公园 -> 别名包含"摇滚"
     "摇滚公园": ["摇滚"],
 }
-
-
-def _is_tools_unsupported_error(exc: BaseException) -> bool:
-    """
-    判断是否为「API 不支持 tools/function calling」类错误。
-    用于降级：带 tools 请求失败时重试不带 tools，保证远古模型也能正常返回对话。
-    """
-    raw = getattr(exc, "message", None) or getattr(exc, "body", None) or str(exc)
-    if isinstance(raw, dict):
-        msg = str(raw.get("error", raw)).lower()
-    else:
-        msg = str(raw).lower()
-    if getattr(exc, "status_code", None) in (400, 422):
-        return True
-    for kw in ("tool", "function_call", "function call", "not support"):
-        if kw in msg:
-            return True
-    return False
 
 
 def _normalize_text(text: str) -> str:
@@ -426,7 +388,7 @@ class GameRAGService:
                 tools=[UPDATE_NPC_MOOD_TOOL],
             )
         except Exception as e:
-            if _is_tools_unsupported_error(e):
+            if is_tools_unsupported_error(e):
                 reply_text, tool_calls = await self._call_llm(
                     ctx.settings,
                     api_key=ctx.effective_api_key,
@@ -444,25 +406,25 @@ class GameRAGService:
 
 
         reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
-        delta, emotion = self._parse_update_npc_mood_tool_calls(
+        delta, emotion = parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=ctx.emotions
         )
-        parsed_delta, parsed_emotion = self._parse_mood_from_text(reply)
-        cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
+        parsed_delta, parsed_emotion = parse_mood_from_text(reply)
+        cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
             reply, allowed_emotions=ctx.emotions
         )
         if fallback_delta is not None and fallback_emotion is not None:
             reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
-            if not self._has_update_npc_mood_tool_call(tool_calls):
+            if not has_update_npc_mood_tool_call(tool_calls):
                 delta, emotion = fallback_delta, fallback_emotion
-        if not self._has_update_npc_mood_tool_call(tool_calls):
+        if not has_update_npc_mood_tool_call(tool_calls):
             default_emo = "普通" if "普通" in ctx.emotions else (ctx.emotions[0] if ctx.emotions else "普通")
             if (delta == 0 and emotion == default_emo) and (parsed_delta is not None or parsed_emotion):
                 if parsed_delta is not None:
                     delta = parsed_delta
                 if parsed_emotion is not None:
                     emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
-        reply = self._strip_trailing_tool_call_text(reply)
+        reply = strip_trailing_tool_call_text(reply)
 
         await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
         await memory.add_message(
@@ -548,7 +510,7 @@ class GameRAGService:
                     full_content, tool_calls_list = data
                     break
         except Exception as e:
-            if _is_tools_unsupported_error(e):
+            if is_tools_unsupported_error(e):
                 full_content = ""
                 streamed_len = 0
                 truncating = False
@@ -586,25 +548,25 @@ class GameRAGService:
                 raise
 
         reply = (full_content or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
-        delta, emotion = self._parse_update_npc_mood_tool_calls(
+        delta, emotion = parse_update_npc_mood_tool_calls(
             tool_calls_list, allowed_emotions=ctx.emotions
         )
-        parsed_delta, parsed_emotion = self._parse_mood_from_text(reply)
-        cleaned, fallback_delta, fallback_emotion = self._strip_trailing_mood_json(
+        parsed_delta, parsed_emotion = parse_mood_from_text(reply)
+        cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
             reply, allowed_emotions=ctx.emotions
         )
         if fallback_delta is not None and fallback_emotion is not None:
             reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
-            if not self._has_update_npc_mood_tool_call(tool_calls_list):
+            if not has_update_npc_mood_tool_call(tool_calls_list):
                 delta, emotion = fallback_delta, fallback_emotion
-        if not self._has_update_npc_mood_tool_call(tool_calls_list):
+        if not has_update_npc_mood_tool_call(tool_calls_list):
             default_emo = "普通" if "普通" in ctx.emotions else (ctx.emotions[0] if ctx.emotions else "普通")
             if (delta == 0 and emotion == default_emo) and (parsed_delta is not None or parsed_emotion):
                 if parsed_delta is not None:
                     delta = parsed_delta
                 if parsed_emotion is not None:
                     emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
-        reply = self._strip_trailing_tool_call_text(reply)
+        reply = strip_trailing_tool_call_text(reply)
 
         # print("\n" + "=" * 60 + " [ask_stream] 大模型原始输出与工具调用 " + "=" * 60)
         # print("[ask_stream] content 原始 (前 500 字):", (full_content or "")[:500])
@@ -1090,213 +1052,6 @@ class GameRAGService:
                 })
 
         return content, tool_calls_list
-
-    @staticmethod
-    def _has_update_npc_mood_tool_call(tool_calls: List[dict]) -> bool:
-        """判断 tool_calls 中是否包含 update_npc_mood 调用。"""
-        for tc in tool_calls or []:
-            if not isinstance(tc, dict):
-                continue
-            f = tc.get("function") if tc.get("type") == "function" else tc.get("function")
-            if isinstance(f, dict) and f.get("name") == "update_npc_mood":
-                return True
-        return False
-
-    @staticmethod
-    def _strip_trailing_tool_call_text(reply_text: str) -> str:
-        """
-        按双换行分段；若某段内出现任一截断条件（工具调用：、含关键词的 HTML 注释、含关键词的 {}、
-        或直接出现 update_npc_mood/emotion/favorability_change），则从该段起删掉该段及之后全部内容，
-        只保留该段之前的段落，避免各种变体漏网。
-        """
-        if not reply_text or not reply_text.strip():
-            return reply_text
-        _TOOL_KEYWORDS = ("update_npc_mood", "emotion", "favorability_change")
-
-        def _segment_has_trigger(seg: str) -> bool:
-            if "工具调用：" in seg:
-                return True
-            seg_lower = seg.lower()
-            if any(kw in seg_lower for kw in _TOOL_KEYWORDS):
-                return True
-            for pat in [r"<!---.*?--->", r"<!--.*?-->"]:
-                for m in re.finditer(pat, seg, re.IGNORECASE | re.DOTALL):
-                    if any(kw in m.group(0).lower() for kw in _TOOL_KEYWORDS):
-                        return True
-            pos = 0
-            while True:
-                i = seg.find("{", pos)
-                if i == -1:
-                    break
-                depth = 0
-                j = i
-                while j < len(seg):
-                    if seg[j] == "{":
-                        depth += 1
-                    elif seg[j] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            break
-                    j += 1
-                if depth != 0:
-                    break
-                if any(kw in seg[i : j + 1].lower() for kw in _TOOL_KEYWORDS):
-                    return True
-                pos = j + 1
-            return False
-
-        paragraphs = re.split(r"\n\s*\n", reply_text)
-        cut = len(paragraphs)
-        for i, p in enumerate(paragraphs):
-            if _segment_has_trigger(p):
-                cut = i
-                break
-        return "\n\n".join(paragraphs[:cut]).strip()
-
-    @staticmethod
-    def _parse_mood_from_text(text: str) -> Tuple[int | None, str | None]:
-        """
-        在删除前从正文中用正则解析 favorability_change 与 emotion，兼容 =/:、有引号/无引号等。
-        返回 (delta, emotion_raw)，未找到则对应为 None。调用方需用 allowed_emotions 校验 emotion。
-        """
-        if not text or not text.strip():
-            return None, None
-        delta: int | None = None
-        emotion_raw: str | None = None
-        # favorability_change: = 或 : ，可选引号，数字（含负号）
-        for m in re.finditer(
-            r"favorability_change\s*[=:]\s*[\"']*(-?\d+)[\"']*",
-            text,
-            re.IGNORECASE,
-        ):
-            try:
-                n = int(m.group(1))
-                delta = max(-5, min(5, n))
-            except (TypeError, ValueError):
-                pass
-        # emotion: = 或 : ，双引号/单引号内任意内容，或无引号时到逗号/} / ) / 空白 止
-        for m in re.finditer(
-            r"emotion\s*[=:]\s*[\"']([^\"']*)[\"']|emotion\s*[=:]\s*([^,}\s\)]+)",
-            text,
-            re.IGNORECASE,
-        ):
-            em = (m.group(1) or m.group(2) or "").strip()
-            if em:
-                emotion_raw = em
-        return (delta, emotion_raw)
-
-    @staticmethod
-    def _strip_trailing_mood_json(
-        reply_text: str, allowed_emotions: List[str]
-    ) -> Tuple[str, int | None, str | None]:
-        """
-        若回复末尾是类似 update_npc_mood 的 JSON（模型未走工具而把参数写在内容里），
-        则剥离并解析为 (delta, emotion)，返回 (剥离后的回复, delta, emotion)；
-        否则返回 (原回复, None, None)。
-        支持两种格式：
-        1) 平铺：{"favorability_change": 2, "emotion": "微笑"} 或换行缩进形式；
-        2) 与调用一致之嵌套：{"name": "update_npc_mood", "arguments": "{\"favorability_change\": 2, \"emotion\": \"微笑\"}"}。
-        流式输出时可在最终拼接的完整文本上同样调用此方法。
-        """
-        if not reply_text or not reply_text.strip():
-            return reply_text, None, None
-        text = reply_text
-        default_emotion = (
-            "普通" if "普通" in allowed_emotions else (allowed_emotions[0] if allowed_emotions else "普通")
-        )
-
-        def _delta_emotion_from_obj(obj: dict) -> Tuple[int, str] | None:
-            if not isinstance(obj, dict) or "emotion" not in obj:
-                return None
-            emo_raw = obj.get("emotion")
-            if not isinstance(emo_raw, str) or not emo_raw.strip():
-                return None
-            try:
-                delta = max(-5, min(5, int(obj.get("favorability_change", 0))))
-            except (TypeError, ValueError):
-                delta = 0
-            emotion = (
-                emo_raw.strip()
-                if emo_raw.strip() in allowed_emotions
-                else default_emotion
-            )
-            return delta, emotion
-
-        brace_indices = [i for i, c in enumerate(text) if c == "{"]
-        for idx in reversed(brace_indices):
-            suffix = text[idx:]
-            try:
-                obj = json.loads(suffix)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            # 1) 平铺：直接含 emotion（及可选 favorability_change）
-            mood = _delta_emotion_from_obj(obj)
-            if mood is not None:
-                cleaned = text[:idx].rstrip()
-                return cleaned, mood[0], mood[1]
-            # 2) 嵌套：含 arguments 字符串，内层为 mood JSON
-            args_str = obj.get("arguments")
-            if isinstance(args_str, str) and args_str.strip():
-                try:
-                    inner = json.loads(args_str)
-                    mood = _delta_emotion_from_obj(inner) if isinstance(inner, dict) else None
-                    if mood is not None:
-                        cleaned = text[:idx].rstrip()
-                        return cleaned, mood[0], mood[1]
-                except Exception:
-                    pass
-        return reply_text, None, None
-
-    @staticmethod
-    def _parse_update_npc_mood_tool_calls(
-        tool_calls: List[dict],
-        allowed_emotions: List[str],
-    ) -> Tuple[int, str]:
-        """
-        从 Function Calling 的 tool_calls 中解析并校验 update_npc_mood 的 (好感度变化, 情绪)。
-        校验规则：favorability_change 非数字或超出 [-5,5] 则钳位/置 0；emotion 不在允许列表则用「普通」。
-        未找到有效调用时返回 (0, "普通")。为后续流式输出预留：流式时由后端收集完整 tool_calls 再调用本方法。
-        """
-        if not allowed_emotions:
-            allowed_emotions = ["普通"]
-        default_emotion = "普通" if "普通" in allowed_emotions else allowed_emotions[0]
-
-        delta = 0
-        emotion = default_emotion
-
-        for tc in tool_calls or []:
-            if not isinstance(tc, dict):
-                continue
-            f = tc.get("function") if tc.get("type") == "function" else None
-            if not f or f.get("name") != "update_npc_mood":
-                continue
-            args_str = f.get("arguments")
-            if not args_str:
-                break
-            try:
-                obj = json.loads(args_str)
-            except Exception:
-                break
-            # 好感度：非数字或超出范围则钳位或置 0
-            raw_delta = obj.get("favorability_change", 0)
-            try:
-                delta = int(raw_delta)
-            except (TypeError, ValueError):
-                delta = 0
-            delta = max(-5, min(5, delta))
-            # 情绪：必须在允许列表中，否则用默认
-            emo_raw = obj.get("emotion")
-            if isinstance(emo_raw, str) and emo_raw.strip():
-                emo_candidate = emo_raw.strip()
-                if emo_candidate in allowed_emotions:
-                    emotion = emo_candidate
-            break
-
-        if emotion not in allowed_emotions:
-            emotion = default_emotion
-        return delta, emotion
 
     async def get_npc_favorability(
         self,
