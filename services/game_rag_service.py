@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,13 +12,13 @@ from typing import Any, AsyncIterator, Dict, List, Set, Tuple
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
-from openai import AsyncOpenAI
 
 from ai_engine.game_data_loader import get_cached_index
 from core.config import Settings, get_settings
 from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
 from services.memory_manager import MemoryManager
+from services.llm_client import call_llm, call_llm_stream
 from services.npc_mood_agent import (
     UPDATE_NPC_MOOD_TOOL,
     is_tools_unsupported_error,
@@ -29,7 +28,6 @@ from services.npc_mood_agent import (
     strip_trailing_mood_json,
     strip_trailing_tool_call_text,
 )
-from services.portrait_utils import prepare_portrait_for_ai
 
 
 # 前端档位对应的总结间隔（短/中/长/几乎无限），未传或非法值时用默认 30
@@ -71,7 +69,9 @@ WORLD_BACKGROUND = (
     "导致文明崩溃、环境荒漠化。\n"
     "灾后世界以\u201c尘都\u201d为剧情主要聚焦的区域（地理原型为成都），"
     "分裂为废城（丧尸肆虐）、堕落城（人类势力割据）、荒漠（军阀控制）等废墟地带。"
-    "贵金属、纳米机器人、强化石、加密货币成为新世界的资源与货币基础。\n"
+    "以物换物、贵金属、加密货币成为新世界的货币基础。\n"
+    "A兵团发行并在内部和部分周边流通的【金币】、联合大学研制的纳米机器+加密货币【K点】（价值和流通性较高）是两种主要货币。"
+    "强化石、食品药品与各种类型的材料成为重要资源。\n"
     "主要势力包括：佣兵组织A兵团（前期在废城活动）、"
     "军政府军阀（荒漠活动并对抗失控天网）、"
     "政教合一黑铁会（堕落城实控者，冷兵器、肉体强化）、"
@@ -375,8 +375,7 @@ class GameRAGService:
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
 
         try:
-            reply_text, tool_calls = await self._call_llm(
-                ctx.settings,
+            reply_text, tool_calls = await call_llm(
                 api_key=ctx.effective_api_key,
                 api_base=ctx.effective_api_base,
                 model_name=ctx.effective_model,
@@ -389,8 +388,7 @@ class GameRAGService:
             )
         except Exception as e:
             if is_tools_unsupported_error(e):
-                reply_text, tool_calls = await self._call_llm(
-                    ctx.settings,
+                reply_text, tool_calls = await call_llm(
                     api_key=ctx.effective_api_key,
                     api_base=ctx.effective_api_base,
                     model_name=ctx.effective_model,
@@ -480,8 +478,7 @@ class GameRAGService:
             return out
 
         try:
-            async for event_type, data in self._call_llm_stream(
-                ctx.settings,
+            async for event_type, data in call_llm_stream(
                 api_key=ctx.effective_api_key,
                 api_base=ctx.effective_api_base,
                 model_name=ctx.effective_model,
@@ -515,8 +512,7 @@ class GameRAGService:
                 streamed_len = 0
                 truncating = False
                 tool_calls_list = []
-                async for event_type, data in self._call_llm_stream(
-                    ctx.settings,
+                async for event_type, data in call_llm_stream(
                     api_key=ctx.effective_api_key,
                     api_base=ctx.effective_api_base,
                     model_name=ctx.effective_model,
@@ -847,211 +843,6 @@ class GameRAGService:
             parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 
         return "\n\n".join(parts)
-
-    async def _call_llm_stream(
-        self,
-        settings: Settings,
-        api_key: str,
-        api_base: str,
-        model_name: str,
-        system_prompt: str,
-        user_prompt: str,
-        image_path: Path | None = None,
-        image_description: str | None = None,
-        emotion_hint: str | None = None,
-        tools: List[dict] | None = None,
-    ) -> AsyncIterator[Tuple[str, Any]]:
-        """
-        流式调用 LLM：yield ("content", delta_str) 逐片输出正文；
-        结束时 yield ("finished", (full_content, tool_calls_list)) 供调用方做后处理。
-        """
-        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
-        prefix_parts: List[str] = []
-        if image_description and image_description.strip():
-            prefix_parts.append(image_description.strip() + "。")
-        if emotion_hint and emotion_hint.strip():
-            prefix_parts.append(emotion_hint.strip())
-        prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
-
-        if image_path and image_path.is_file():
-            portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
-            image_data = base64.b64encode(portrait_bytes).decode("utf-8")
-            prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
-            messages = [
-                {"role": "system", "content": prompt_with_desc},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
-                        {"type": "text", "text": user_prompt},
-                    ],
-                },
-            ]
-            # print(prompt_with_desc)
-            # print("——————")
-            # print(user_prompt)
-        else:
-            system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
-            messages = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_prompt},
-            ]
-
-        kwargs: dict = {"model": model_name, "messages": messages, "stream": True}
-        if tools:
-            kwargs["tools"] = tools
-
-        stream = await client.chat.completions.create(**kwargs)
-        content_parts: List[str] = []
-        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if getattr(delta, "content", None) and delta.content:
-                content_parts.append(delta.content)
-                yield ("content", delta.content)
-            tool_calls_delta = getattr(delta, "tool_calls", None) or []
-            for tc in tool_calls_delta:
-                idx = getattr(tc, "index", None)
-                if idx is None:
-                    continue
-                if idx not in tool_calls_acc:
-                    tool_calls_acc[idx] = {"id": getattr(tc, "id", "") or "", "name": "", "arguments": ""}
-                fn = getattr(tc, "function", None)
-                if fn:
-                    if getattr(fn, "name", None):
-                        tool_calls_acc[idx]["name"] = (tool_calls_acc[idx].get("name") or "") + (fn.name or "")
-                    if getattr(fn, "arguments", None):
-                        tool_calls_acc[idx]["arguments"] = (tool_calls_acc[idx].get("arguments") or "") + (fn.arguments or "")
-
-        full_content = "".join(content_parts)
-        tool_calls_list = []
-        for i in sorted(tool_calls_acc.keys()):
-            acc = tool_calls_acc[i]
-            tool_calls_list.append({
-                "type": "function",
-                "id": acc.get("id", ""),
-                "function": {
-                    "name": acc.get("name", ""),
-                    "arguments": acc.get("arguments", ""),
-                },
-            })
-        yield ("finished", (full_content, tool_calls_list))
-
-    async def _call_llm(
-        self,
-        settings: Settings,
-        api_key: str,
-        api_base: str,
-        model_name: str,
-        system_prompt: str,
-        user_prompt: str,
-        image_path: Path | None = None,
-        image_description: str | None = None,
-        emotion_hint: str | None = None,
-        tools: List[dict] | None = None,
-    ) -> Tuple[str, List[dict]]:
-        """
-        调用任意 OpenAI 兼容的大模型生成回复。
-        支持 Function Calling：传入 tools 时，返回 (回复正文, tool_calls 列表)；未传时 tool_calls 为空列表。
-        为后续流式输出预留：流式时由调用方收集 content delta 与 tool_calls 再解析。
-
-        Args:
-            image_path: 可选的图像文件路径，如果提供则会将图像作为多模态输入传给模型
-            image_description: 图像描述，用于在提示中说明传入了什么图像
-            emotion_hint: 可选的上一轮情绪说明（如「你之前的情绪是「开心」。」），用于连贯与情绪过渡
-            tools: 可选的工具定义列表（OpenAI tools 格式），用于 Function Calling
-        """
-
-        client = AsyncOpenAI(api_key=api_key, base_url=api_base)
-
-        # 在 system 前拼接成一行：立绘说明与上一轮情绪同一行，便于 AI 关联情绪与立绘；缺其一时提示词也正常
-        prefix_parts: List[str] = []
-        if image_description and image_description.strip():
-            prefix_parts.append(image_description.strip() + "。")
-        if emotion_hint and emotion_hint.strip():
-            prefix_parts.append(emotion_hint.strip())
-        prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
-
-        # 构建消息内容
-        if image_path and image_path.is_file():
-            # 多模态输入：立绘先裁剪+压缩再传 AI，统一输出 WebP；Base64 格式 data:image/webp;base64,...
-            portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
-            image_data = base64.b64encode(portrait_bytes).decode("utf-8")
-            # 在 system 前添加图像说明与上一轮情绪
-            prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
-            messages = [
-                {
-                    "role": "system",
-                    "content": prompt_with_desc,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{image_data}",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": user_prompt,
-                        },
-                    ],
-                },
-            ]
-        else:
-            # 纯文本输入（无立绘时若有 emotion_hint 仍拼在 system 前）
-            system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_content,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ]
-
-        kwargs: dict = {"model": model_name, "messages": messages}
-        if tools:
-            kwargs["tools"] = tools
-
-        completion = await client.chat.completions.create(**kwargs)
-
-        message = completion.choices[0].message
-        content = message.content or ""
-        if not isinstance(content, str):
-            try:
-                content = "".join(part.get("text", "") for part in content)  # type: ignore[arg-type]
-            except Exception:
-                content = str(content)
-
-        tool_calls_raw = getattr(message, "tool_calls", None) or []
-        # 转为可 JSON 序列化的 dict 列表，便于统一处理（含流式后续收集）
-        tool_calls_list: List[dict] = []
-        for tc in tool_calls_raw:
-            if hasattr(tc, "model_dump"):
-                tool_calls_list.append(tc.model_dump())
-            elif hasattr(tc, "dict"):
-                tool_calls_list.append(tc.dict())
-            elif isinstance(tc, dict):
-                tool_calls_list.append(tc)
-            else:
-                fn = getattr(tc, "function", None)
-                tool_calls_list.append({
-                    "type": getattr(tc, "type", "function"),
-                    "function": {
-                        "name": getattr(fn, "name", "") if fn else "",
-                        "arguments": getattr(fn, "arguments", "") if fn else "",
-                    },
-                })
-
-        return content, tool_calls_list
 
     async def get_npc_favorability(
         self,
