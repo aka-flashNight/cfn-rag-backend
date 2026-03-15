@@ -265,12 +265,15 @@ def start_frontend():
 # 后端 API 地址，前端收到的 /api 请求会转发到此地址以规避跨域
 BACKEND_PROXY_TARGET = "http://127.0.0.1:7077"
 API_PREFIX = "/api"
-# 普通接口代理超时（秒）
-PROXY_TIMEOUT = 60
-# 长时间任务接口（如立绘导出）代理超时（秒），预留至少 10 分钟
+# 普通接口代理超时（秒），至少 2 分钟
+PROXY_TIMEOUT = 120
+# 长时间任务接口（如立绘导出）代理超时（秒），15 分钟，满足 10min 以上
 PROXY_TIMEOUT_LONG = 900
-# 需要长超时的路径前缀（不含 query）
-LONG_TIMEOUT_PATH_PREFIX = API_PREFIX + "/assets/export-illustrations"
+# 需要 15 分钟长超时的路径（不含 query），立绘导出、重置向量库等
+LONG_TIMEOUT_PATHS = (
+    API_PREFIX + "/assets/export-illustrations",
+    API_PREFIX + "/game/knowledge-base/reset",
+)
 
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -368,7 +371,8 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 headers=req_headers,
                 method=self.command,
             )
-            timeout = PROXY_TIMEOUT_LONG if path[0].rstrip("/") == LONG_TIMEOUT_PATH_PREFIX.rstrip("/") else PROXY_TIMEOUT
+            path_normalized = path[0].rstrip("/")
+timeout = PROXY_TIMEOUT_LONG if path_normalized in {p.rstrip("/") for p in LONG_TIMEOUT_PATHS} else PROXY_TIMEOUT
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             resp = e  # 4xx/5xx 也有 read() 和 headers

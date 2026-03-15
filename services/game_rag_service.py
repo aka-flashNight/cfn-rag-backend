@@ -738,10 +738,12 @@ class GameRAGService:
         index: VectorStoreIndex = self._get_index()
 
         # --- 构建各类检索器 ---
+        # 与入库时一致：character 存为小写，此处用规范化后的 npc_name 过滤
+        npc_char = (npc_name or "").strip().lower()
         npc_retriever = index.as_retriever(
             similarity_top_k=5,
             filters=MetadataFilters(
-                filters=[MetadataFilter(key="character", value=npc_name)]
+                filters=[MetadataFilter(key="character", value=npc_char)]
             ),
         )
         world_lore_retriever = index.as_retriever(

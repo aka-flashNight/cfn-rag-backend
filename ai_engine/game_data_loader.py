@@ -296,25 +296,26 @@ def load_dialogue_documents() -> List[Document]:
             if not text:
                 continue
 
-            # 优先 Char，其次 SubDialogue 内 Name，最后文件级 Name
-            char_name: str | None = None
-            if sub_char_elem is not None and (sub_char := (sub_char_elem.text or "").strip()):
-                char_name = sub_char
-            elif sub_name_elem is not None and (sub_name := (sub_name_elem.text or "").strip()):
-                char_name = sub_name
+            # 角色标注使用 Name（角色名），不用 Char（资源/表情标识）；缺省时再回退到文件级 Name 或 Char
+            character_key: str | None = None
+            if sub_name_elem is not None and (sub_name := (sub_name_elem.text or "").strip()):
+                character_key = sub_name
+            elif file_level_name:
+                character_key = file_level_name
+            elif sub_char_elem is not None and (sub_char := (sub_char_elem.text or "").strip()):
+                character_key = sub_char.split("#")[0].strip() if "#" in sub_char else sub_char
             else:
-                char_name = file_level_name
+                character_key = "Unknown"
 
-            if not char_name:
-                char_name = "Unknown"
-
-            character_lines[char_name].append(text)
+            character_lines[character_key].append(text)
 
     documents: List[Document] = []
     for character, lines in character_lines.items():
         merged_text: str = "\n".join(lines)
+        # 使用小写规范化，与检索端 npc_name 过滤一致，避免 "King" vs "king" 导致命中为空
+        character_normalized = (character or "").strip().lower()
         metadata = {
-            "character": character,
+            "character": character_normalized,
             "type": "dialogue",
         }
         documents.append(Document(text=merged_text, metadata=metadata))
