@@ -372,7 +372,7 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 method=self.command,
             )
             path_normalized = path[0].rstrip("/")
-timeout = PROXY_TIMEOUT_LONG if path_normalized in {p.rstrip("/") for p in LONG_TIMEOUT_PATHS} else PROXY_TIMEOUT
+            timeout = PROXY_TIMEOUT_LONG if path_normalized in {p.rstrip("/") for p in LONG_TIMEOUT_PATHS} else PROXY_TIMEOUT
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             resp = e  # 4xx/5xx 也有 read() 和 headers
