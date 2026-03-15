@@ -392,8 +392,8 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             if is_streaming:
-                # 按块读取后端流并立即写回客户端，保证 SSE 等流式接口在 exe 下也逐段到达
-                chunk_size = 8192
+                # 按小块读取并立即写回，避免缓冲导致“大段输出”；用较小 chunk 才能接近逐 token 的打字机效果
+                chunk_size = 256
                 while True:
                     chunk = resp.read(chunk_size)
                     if not chunk:
