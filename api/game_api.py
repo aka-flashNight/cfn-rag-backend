@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
     ChatMessage,
+    NPCCandidate,
     NPCChatRequest,
     NPCChatResponse,
     NPCFavorabilityResponse,
@@ -176,11 +177,14 @@ async def list_sessions(
         for item in sessions_raw
     ]
 
-    npc_names = sorted(npc_manager.state.keys())
+    npc_candidates: list[NPCCandidate] = [
+        NPCCandidate(npc_name=name, faction=npc_manager.state[name].faction)
+        for name in sorted(npc_manager.state.keys())
+    ]
 
     return SessionListResponse(
         sessions=sessions,
-        npc_candidates=npc_names,
+        npc_candidates=npc_candidates,
     )
 
 

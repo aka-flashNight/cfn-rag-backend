@@ -118,6 +118,15 @@ class SessionHistoryResponse(BaseModel):
     )
 
 
+class NPCCandidate(BaseModel):
+    """
+    NPC 候选项，用于会话列表接口中的可选 NPC。
+    """
+
+    npc_name: str = Field(..., description="NPC 名称")
+    faction: Optional[str] = Field(None, description="阵营，来自 npc_state_db.json，无则为空")
+
+
 class SessionListResponse(BaseModel):
     """
     会话列表 + NPC 候选列表。
@@ -127,9 +136,9 @@ class SessionListResponse(BaseModel):
         default_factory=list,
         description="已有的会话列表",
     )
-    npc_candidates: List[str] = Field(
+    npc_candidates: List[NPCCandidate] = Field(
         default_factory=list,
-        description="可供选择的 NPC 名称候选，来自 npc_state_db.json",
+        description="可供选择的 NPC 候选（含名称与阵营），来自 npc_state_db.json",
     )
 
 
