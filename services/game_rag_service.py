@@ -269,12 +269,25 @@ class GameRAGService:
             if msg.get("role") != "user":
                 last_npc_message = (msg.get("content") or "").strip()
                 break
+        # 为「其他 NPC 相关对话参考」准备需要排除的阵营角色（如「彩蛋」「成员」）：
+        # 若当前 NPC 自身不属于这些阵营，则从其他 NPC 中筛出这些阵营角色，在后续检索中一律跳过。
+        all_npc_states = npc_manager.state
+        forbidden_other_chars: Set[str] | None = None
+        skip_factions_for_other = {"彩蛋", "成员"}
+        if (faction or "").strip() not in skip_factions_for_other:
+            forbidden_other_chars = {
+                name.lower()
+                for name, st in all_npc_states.items()
+                if (st.faction or "").strip() in skip_factions_for_other
+            }
+
         retrieved_context = await asyncio.to_thread(
             self._retrieve_context,
             npc_name,
             payload.query,
             retrieve_query,
             npc_last_message=last_npc_message,
+            forbidden_other_chars=forbidden_other_chars,
         )
         player_identity = (
             payload.player_identity.strip()
@@ -284,7 +297,6 @@ class GameRAGService:
         sex_desc = f"（性别：{sex}）" if sex else ""
         faction_desc = f"（阵营：{faction}）" if faction else ""
         titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
-        all_npc_states = npc_manager.state
         mentioned_npcs, mentioned_names = self._find_mentioned_npcs(
             payload.query, npc_name, all_npc_states, faction
         )
@@ -784,6 +796,7 @@ class GameRAGService:
         user_query: str,
         retrieve_query: str,
         npc_last_message: str | None = None,
+        forbidden_other_chars: Set[str] | None = None,
     ) -> str:
         """
         在同步线程中使用 LlamaIndex 检索：
@@ -801,7 +814,7 @@ class GameRAGService:
         # 与入库时一致：character 存为小写；过往台词仅指日常对话 dialogues，与任务对话严格区分
         npc_char = (npc_name or "").strip().lower()
         npc_retriever = index.as_retriever(
-            similarity_top_k=5,
+            similarity_top_k=8,
             filters=MetadataFilters(
                 filters=[
                     MetadataFilter(key="type", value="dialogue"),
@@ -843,6 +856,19 @@ class GameRAGService:
                 filters=[MetadataFilter(key="type", value="intelligence")]
             ),
         )
+        # 其他 NPC 对话（不区分日常/任务），用于补充设定信息参考
+        other_dialogue_retriever = index.as_retriever(
+            similarity_top_k=15,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="dialogue")]
+            ),
+        )
+        other_task_retriever = index.as_retriever(
+            similarity_top_k=15,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="task")]
+            ),
+        )
 
         # --- 执行检索 ---
         npc_nodes = npc_retriever.retrieve(user_query)
@@ -853,6 +879,24 @@ class GameRAGService:
             raw_task_by_npc = task_retriever.retrieve(npc_last_message.strip())
         else:
             raw_task_by_npc = []
+        # 其他 NPC 对话参考：使用更精确的 query（玩家输入 + 当前 NPC 名称），
+        # 不再拼接阵营与全部称号，避免过宽的语义泛化。
+        other_query_user = user_query.strip()
+        if npc_name and npc_name.strip():
+            if other_query_user:
+                other_query_user = f"{other_query_user} {npc_name.strip()}"
+            else:
+                other_query_user = npc_name.strip()
+
+        # 其他 NPC 对话参考：玩家输入 + NPC 上一条（若有），从所有非当前 NPC 的对话/任务中挑选极高相关的少量片段
+        raw_other_dialogue_by_user = other_dialogue_retriever.retrieve(other_query_user)
+        raw_other_task_by_user = other_task_retriever.retrieve(other_query_user)
+        if (npc_last_message or "").strip():
+            raw_other_dialogue_by_npc = other_dialogue_retriever.retrieve(npc_last_message.strip())
+            raw_other_task_by_npc = other_task_retriever.retrieve(npc_last_message.strip())
+        else:
+            raw_other_dialogue_by_npc = []
+            raw_other_task_by_npc = []
         supp_nodes = supp_retriever.retrieve(retrieve_query)
         intel_nodes = intel_retriever.retrieve(retrieve_query)
 
@@ -929,6 +973,170 @@ class GameRAGService:
         task_nodes = task_from_user + task_from_npc
         task_nodes = sorted(task_nodes, key=lambda n: getattr(n, "score", 0), reverse=True)
 
+        # 其他 NPC 相关对话参考（不是当前 NPC 的台词，只参考设定，忽略语气）：
+        # - 用户检索：玩家输入 + NPC 姓名，从所有非当前 NPC 的日常/任务对话中选最高相关的少量片段
+        # - NPC 检索：NPC 上一条发言（若有），从同一池子中追加极高相关片段
+        # - 引导类任务（task_source=guide）与「彩蛋/成员」等特殊角色，使用更高分数阈值，仅在强相关时才出现
+        # 阈值设计：
+        # - 普通片段：略高于补充设定与情报（0.30/0.36），确保只有明显相关的片段才参与「其他 NPC 对话参考」
+        # - 引导任务 / 彩蛋 / 成员等特殊片段：使用更高阈值，仅在强相关时才出现
+        OTHER_SCORE_THRESHOLD = 0.36
+        OTHER_GUIDE_SCORE_THRESHOLD = 0.44
+        OTHER_NPC_SCORE_THRESHOLD = 0.40
+        OTHER_NPC_GUIDE_SCORE_THRESHOLD = 0.48
+
+        def _get_metadata(n: Any) -> Dict[str, Any]:
+            return (
+                getattr(n, "metadata", None)
+                or getattr(getattr(n, "node", n), "metadata", None)
+                or {}
+            )
+
+        forbidden_other_chars = forbidden_other_chars or set()
+
+        def _other_node_ok(n: Any, *, from_npc_query: bool) -> bool:
+            score = getattr(n, "score", None) or 0
+            meta = _get_metadata(n)
+            char_meta = (meta.get("character") or "").strip().lower()
+            # 排除当前 NPC 自己的台词
+            if char_meta == npc_char:
+                return False
+            # 额外保险：排除玩家占位符
+            if char_meta == PC_CHAR_PLACEHOLDER.lower():
+                return False
+            # 排除玩家自身在日常对话中的台词（如 $pc / $pc_title 等），这些不属于「其他 NPC 对话」
+            if "$pc" in char_meta:
+                return False
+            # 若当前 NPC 自身不属于「彩蛋」「成员」等特殊阵营，则对这些阵营角色的台词采用更高分数阈值，
+            # 并在输出时额外标注为「非正式流程，仅作参考」，而不是完全排除，避免因「完全不知情」而胡乱脑补。
+            is_egg_or_member = forbidden_other_chars and char_meta in forbidden_other_chars
+            is_guide = meta.get("task_source") == "guide"
+            is_special = is_guide or is_egg_or_member
+            if from_npc_query:
+                th = OTHER_NPC_GUIDE_SCORE_THRESHOLD if is_special else OTHER_NPC_SCORE_THRESHOLD
+            else:
+                th = OTHER_GUIDE_SCORE_THRESHOLD if is_special else OTHER_SCORE_THRESHOLD
+            return score >= th
+
+        def _other_candidate_key(n: Any) -> tuple:
+            """用于对其他 NPC 参考片段排序的 key：
+            1) 优先任务对话 (type=task) 再到日常对话 (type=dialogue)
+            2) 文本中是否提到当前 NPC 名称（有则优先）
+            3) 相似度分数
+            """
+            meta = _get_metadata(n)
+            doc_type = meta.get("type") or ""
+            is_task = 1 if doc_type == "task" else 0  # 任务优先
+
+            text = getattr(n, "text", None)
+            if text is None and hasattr(n, "get_content"):
+                text = n.get_content()
+            text = str(text or "")
+            mentions_current = 1 if (npc_name and npc_name in text) else 0
+
+            score = getattr(n, "score", None) or 0.0
+            return (is_task, mentions_current, score)
+
+        def _other_candidate_key_all(n: Any) -> tuple:
+            """自由竞争排序 key：不再区分任务 / 日常，仅按
+            1) 是否提到当前 NPC 名称
+            2) 相似度分数
+
+            用于「自由竞争」名额，避免任务对话占满所有名额，给高相关日常台词更多空间。
+            """
+            text = getattr(n, "text", None)
+            if text is None and hasattr(n, "get_content"):
+                text = n.get_content()
+            text = str(text or "")
+            mentions_current = 1 if (npc_name and npc_name in text) else 0
+            score = getattr(n, "score", None) or 0.0
+            return (mentions_current, score)
+
+        # 用户检索：从所有非当前 NPC 的「日常 + 任务」中选极少量高相关片段（总共最多 5 条）
+        # 任务优先策略：
+        #   - 先保证最多 2 条来自「非引导类任务对话」(type=task, task_source != guide)
+        #   - 再额外补充 3 条自由竞争（任务/日常 + 引导都可），总数不超过 5 条
+        other_from_user_task_strict: List[Any] = []
+        other_from_user_all: List[Any] = []
+        for n in list(raw_other_dialogue_by_user) + list(raw_other_task_by_user):
+            if not _other_node_ok(n, from_npc_query=False):
+                continue
+            meta = _get_metadata(n)
+            doc_type = meta.get("type") or ""
+            task_source = meta.get("task_source")
+            if doc_type == "task" and task_source != "guide":
+                other_from_user_task_strict.append(n)
+            other_from_user_all.append(n)
+
+        other_from_user_task_strict.sort(key=_other_candidate_key, reverse=True)
+        other_from_user_all.sort(key=_other_candidate_key_all, reverse=True)
+
+        other_from_user: List[Any] = []
+        seen_other_ids: Set[str] = set()
+
+        # 先填充最多 2 条「非引导任务」
+        for n in other_from_user_task_strict:
+            nid = _node_id(n)
+            if nid in seen_other_ids:
+                continue
+            other_from_user.append(n)
+            seen_other_ids.add(nid)
+            if len(other_from_user) >= 2:
+                break
+
+        # 再补充 3 条自由竞争（总数不超过 5）
+        for n in other_from_user_all:
+            if len(other_from_user) >= 5:
+                break
+            nid = _node_id(n)
+            if nid in seen_other_ids:
+                continue
+            other_from_user.append(n)
+            seen_other_ids.add(nid)
+
+        # NPC 上一条检索：在同一池子中追加最多 2 条极高相关片段
+        # 同样采用任务优先策略：
+        #   - 先保证最多 1 条来自「非引导类任务对话」
+        #   - 再额外补充 1 条自由竞争，总数不超过 2 条（且与用户侧不重复）
+        other_from_npc: List[Any] = []
+        if (npc_last_message or "").strip():
+            npc_task_strict: List[Any] = []
+            npc_all: List[Any] = []
+            for n in list(raw_other_dialogue_by_npc) + list(raw_other_task_by_npc):
+                if not _other_node_ok(n, from_npc_query=True):
+                    continue
+                meta = _get_metadata(n)
+                doc_type = meta.get("type") or ""
+                task_source = meta.get("task_source")
+                if doc_type == "task" and task_source != "guide":
+                    npc_task_strict.append(n)
+                npc_all.append(n)
+
+            npc_task_strict.sort(key=_other_candidate_key, reverse=True)
+            npc_all.sort(key=_other_candidate_key_all, reverse=True)
+
+            # 先保证最多 1 条非引导任务
+            for n in npc_task_strict:
+                if len(other_from_npc) >= 1:
+                    break
+                nid = _node_id(n)
+                if nid in seen_other_ids:
+                    continue
+                seen_other_ids.add(nid)
+                other_from_npc.append(n)
+
+            # 再补充 1 条自由竞争（总数不超过 2）
+            for n in npc_all:
+                if len(other_from_npc) >= 2:
+                    break
+                nid = _node_id(n)
+                if nid in seen_other_ids:
+                    continue
+                seen_other_ids.add(nid)
+                other_from_npc.append(n)
+
+        other_npc_nodes = other_from_user + other_from_npc
+
         # 补充设定 + 情报合并到同一池子，按相似度排序取最佳 3 条；若有 NPC 上一条则用其再各查一条，分数要求更严，去重后并入
         SUPP_SCORE_THRESHOLD = 0.30
         SUPP_NPC_SCORE_THRESHOLD = 0.36  # 用 NPC 上一条检索时要求更严
@@ -995,6 +1203,57 @@ class GameRAGService:
 
             return "\n".join(output_lines)
 
+        def _nodes_to_other_npc_text(nodes, max_chars: int | None = None) -> str:
+            """
+            将「其他 NPC 相关对话参考」的节点拼成文本：
+            - 每条台词前标注说话人：<角色名>: 台词
+            - 只用于非当前 NPC 的对话片段，避免与自己的台词混淆
+            """
+            seen_lines: set[str] = set()
+            output_lines: List[str] = []
+            last_blank = False
+
+            for node in nodes:
+                text = getattr(node, "text", None)
+                if text is None and hasattr(node, "get_content"):
+                    text = node.get_content()
+                if not text:
+                    continue
+
+                meta = _get_metadata(node)
+                speaker = (meta.get("character") or "").strip() or "未知角色"
+                speaker_lower = speaker.lower()
+                is_egg_or_member = bool(forbidden_other_chars and speaker_lower in forbidden_other_chars)
+
+                text = str(text).strip()
+                if max_chars and len(text) > max_chars:
+                    text = text[:max_chars] + "…"
+
+                for raw_line in text.splitlines():
+                    line = raw_line.strip()
+
+                    if not line:
+                        if output_lines and not last_blank:
+                            output_lines.append("")
+                            last_blank = True
+                        continue
+
+                    last_blank = False
+
+                    # 按内容去重，避免同一句台词重复出现
+                    if line in seen_lines:
+                        continue
+                    seen_lines.add(line)
+
+                    if is_egg_or_member:
+                        output_lines.append(
+                            f"{speaker}: {line}（该角色为非正式角色，相关信息可能不属于世界观正式内容，你的角色可能并不知情，仅作参考）"
+                        )
+                    else:
+                        output_lines.append(f"{speaker}: {line}")
+
+            return "\n".join(output_lines)
+
         parts: List[str] = []
         if npc_nodes:
             parts.append("【你的过往台词示例】\n" + _nodes_to_text(npc_nodes))
@@ -1002,10 +1261,12 @@ class GameRAGService:
             # 暂不截断，观察长度；需恢复时可传 max_chars=375 等
             parts.append("【世界观设定摘取片段（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(world_lore_nodes))
         if loading_lore_nodes:
-            # 与世界观设定使用相同检索条件的 loading 文本短句，数量较少（最多 5 条），仅作补充参考
+            # 与世界观设定使用相同检索条件的 loading 文本短句，数量较少，仅作补充参考
             parts.append("tips节选：\n" + _nodes_to_text(loading_lore_nodes, max_chars=300))
         if task_nodes:
             parts.append("【你的参考任务对话(任务可能超过玩家当前进度，仅参考语气和设定，忽略具体剧情，避免剧透)】\n" + _nodes_to_text(task_nodes, max_chars=350))
+        if other_npc_nodes:
+            parts.append("【其他NPC相关对话参考（不是你的台词，只参考设定，忽略语气，并忽略剧情以避免剧透）】\n" + _nodes_to_other_npc_text(other_npc_nodes, max_chars=350))
         if pooled:
             parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 

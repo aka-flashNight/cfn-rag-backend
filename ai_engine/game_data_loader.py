@@ -236,7 +236,7 @@ def _is_vector_index_valid(persist_dir: Path) -> bool:
 def load_dialogue_documents() -> List[Document]:
     """
     读取 ../resources/data/dialogues 下的 NPC 日常对话 XML，
-    将每个角色的台词合并为一个 Document。
+    将每个 <Dialogues>/<Dialogue> 作为一个 Document。
 
     XML 格式示例：
     <root>
@@ -269,9 +269,7 @@ def load_dialogue_documents() -> List[Document]:
         for elem in root.findall(".//items")
         if (elem.text or "").strip()
     ]
-
-    # 角色 -> 台词列表
-    character_lines: Dict[str, List[str]] = defaultdict(list)
+    documents: List[Document] = []
 
     for name in filenames:
         file_path: Path = dialogues_dir / name
@@ -287,38 +285,50 @@ def load_dialogue_documents() -> List[Document]:
             file_level_name_elem.text.strip() if file_level_name_elem is not None else None
         )
 
-        for sub in xml_root.findall(".//SubDialogue"):
-            sub_name_elem = sub.find("Name")
-            sub_char_elem = sub.find("Char")
-            text_elem = sub.find("Text")
+        # 按每个 <Dialogue> 生成一个 Document，以保持局部上下文又避免整角色文本过长稀释相似度
+        for dlg in xml_root.findall(".//Dialogues/Dialogue"):
+            lines: List[str] = []
+            character_key: str | None = None
 
-            text: str = (text_elem.text or "").strip() if text_elem is not None else ""
-            if not text:
+            for sub in dlg.findall("./SubDialogue"):
+                sub_name_elem = sub.find("Name")
+                sub_char_elem = sub.find("Char")
+                text_elem = sub.find("Text")
+
+                text: str = (text_elem.text or "").strip() if text_elem is not None else ""
+                if not text:
+                    continue
+
+                # 跳过玩家视角的台词（$PC / $PC_TITLE / $PC_CHAR 等）
+                sub_name = (sub_name_elem.text or "").strip() if sub_name_elem is not None else ""
+                sub_char = (sub_char_elem.text or "").strip() if sub_char_elem is not None else ""
+                if sub_name == "$PC" or sub_char.startswith("$PC"):
+                    continue
+
+                # 角色标注使用 Name（角色名），不用 Char（资源/表情标识）；缺省时再回退到文件级 Name 或 Char
+                if character_key is None:
+                    if sub_name:
+                        character_key = sub_name
+                    elif file_level_name:
+                        character_key = file_level_name
+                    elif sub_char:
+                        character_key = sub_char.split("#")[0].strip() if "#" in sub_char else sub_char
+                    else:
+                        character_key = "Unknown"
+
+                lines.append(text)
+
+            if not lines or not character_key:
                 continue
 
-            # 角色标注使用 Name（角色名），不用 Char（资源/表情标识）；缺省时再回退到文件级 Name 或 Char
-            character_key: str | None = None
-            if sub_name_elem is not None and (sub_name := (sub_name_elem.text or "").strip()):
-                character_key = sub_name
-            elif file_level_name:
-                character_key = file_level_name
-            elif sub_char_elem is not None and (sub_char := (sub_char_elem.text or "").strip()):
-                character_key = sub_char.split("#")[0].strip() if "#" in sub_char else sub_char
-            else:
-                character_key = "Unknown"
-
-            character_lines[character_key].append(text)
-
-    documents: List[Document] = []
-    for character, lines in character_lines.items():
-        merged_text: str = "\n".join(lines)
-        # 使用小写规范化，与检索端 npc_name 过滤一致，避免 "King" vs "king" 导致命中为空
-        character_normalized = (character or "").strip().lower()
-        metadata = {
-            "character": character_normalized,
-            "type": "dialogue",
-        }
-        documents.append(Document(text=merged_text, metadata=metadata))
+            merged_text: str = "\n".join(lines)
+            # 使用小写规范化，与检索端 npc_name 过滤一致，避免 "King" vs "king" 导致命中为空
+            character_normalized = (character_key or "").strip().lower()
+            metadata = {
+                "character": character_normalized,
+                "type": "dialogue",
+            }
+            documents.append(Document(text=merged_text, metadata=metadata))
 
     return documents
 
@@ -368,8 +378,11 @@ def load_task_documents() -> List[Document]:
         return []
 
     # 合并所有 text/*.json 的 key，使 $SIDE_GET_50001 等可从 logistics_text 等任意文件解析
+    # 注意：preview_text.json 仅用于任务预览，对正式对话与设定检索无意义，这里显式跳过。
     text_data: Dict[str, Any] = {}
     for jpath in sorted(text_dir.glob("*.json")):
+        if jpath.stem == "preview_text":
+            continue
         try:
             with jpath.open("r", encoding="utf-8") as f:
                 data = json.load(f)
