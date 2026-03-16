@@ -541,6 +541,58 @@ def load_lore_documents() -> List[Document]:
     return documents
 
 
+def load_loading_documents() -> List[Document]:
+    """
+    读取 resources/data/stages/loading_data.xml 中的 loading 文本提示。
+
+    仅向量化未被注释掉的 <Text> 内容；
+    每条 <Text> 作为一个独立 Document，以便检索时直接返回短句。
+    """
+
+    _ensure_resources_dir()
+
+    resources_dir = _get_resources_dir()
+    stages_dir: Path = resources_dir / "data" / "stages"
+    xml_path: Path = stages_dir / "loading_data.xml"
+
+    if not xml_path.exists():
+        print(f"[知识库] 未找到 loading 文本文件，跳过: {xml_path}")
+        return []
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as exc:
+        print(f"[知识库] 解析 loading_data.xml 出错，跳过: {exc}")
+        return []
+
+    documents: List[Document] = []
+
+    # 只读取未被注释掉的 <Text> 节点；xml 解析本身会自动忽略注释中的内容
+    for group in root.findall(".//LoadingText/Group"):
+        region_elem = group.find("Region")
+        unlock_elem = group.find("Unlock")
+        region = (region_elem.text or "").strip() if region_elem is not None else ""
+        unlock_raw = (unlock_elem.text or "").strip() if unlock_elem is not None else ""
+
+        for text_elem in group.findall("Text"):
+            text = (text_elem.text or "").strip() if text_elem is not None else ""
+            if not text:
+                continue
+            metadata: Dict[str, Any] = {
+                "type": "loading_lore",
+                "source_file": "loading_data.xml",
+            }
+            if region:
+                metadata["region"] = region
+            if unlock_raw:
+                metadata["unlock"] = unlock_raw
+            documents.append(Document(text=text, metadata=metadata))
+
+    print(f"[知识库] loading 文本: {len(documents)} 条（来自 loading_data.xml）")
+    return documents
+
+
 def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     """
     统一构建向量索引（对话、任务、世界观设定等）。
@@ -585,6 +637,12 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
         lore_docs = []
 
     try:
+        loading_docs = load_loading_documents()
+    except Exception as exc:
+        print(f"[知识库] 加载 loading 文本时出错，跳过: {exc}")
+        loading_docs = []
+
+    try:
         intel_docs = load_intelligence_documents()
     except Exception as exc:
         print(f"[知识库] 加载情报文件时出错，跳过: {exc}")
@@ -594,12 +652,13 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     all_docs.extend(dialogue_docs)
     all_docs.extend(task_docs)
     all_docs.extend(lore_docs)
+    all_docs.extend(loading_docs)
     all_docs.extend(intel_docs)
 
     print(
         f"[知识库] 共加载 {len(all_docs)} 个文档 "
         f"(对话={len(dialogue_docs)}, 任务={len(task_docs)}, "
-        f"设定={len(lore_docs)}, 情报={len(intel_docs)})"
+        f"设定={len(lore_docs)}, loading={len(loading_docs)}, 情报={len(intel_docs)})"
     )
 
     if not all_docs:

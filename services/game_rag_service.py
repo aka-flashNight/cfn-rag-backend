@@ -101,6 +101,8 @@ FACTION_ALIASES: Dict[str, List[str]] = {
     "摇滚公园": ["摇滚"],
     # A兵团元老 -> 别名包含"A兵团"
     "A兵团元老": ["A兵团"],
+    # A兵团 -> 别名包含"A兵团元老"
+    "A兵团": ["A兵团元老"],
 }
 
 
@@ -689,16 +691,15 @@ class GameRAGService:
         if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
             return []
 
+        current_faction_stripped = current_faction.strip()
+
+        # 1) 先收集「阵营名完全一致」的同阵营角色
         result: List[str] = []
-        for name, state in all_npc_states.items():
-            if name == current_npc:
-                continue
-            if name == PC_CHAR_PLACEHOLDER:
-                continue
-            if name in exclude_names:
-                continue
-            if (state.faction or "").strip() != current_faction.strip():
-                continue
+        seen_names: Set[str] = set(exclude_names)
+
+        def _append_npc(name: str, state: NPCState) -> None:
+            if name in seen_names:
+                return
             parts = [f"「{name}」"]
             if state.sex:
                 parts.append(f"（性别：{state.sex}）")
@@ -707,6 +708,50 @@ class GameRAGService:
             if state.titles:
                 parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
             result.append("".join(parts))
+            seen_names.add(name)
+
+        for name, state in all_npc_states.items():
+            if name == current_npc:
+                continue
+            if name == PC_CHAR_PLACEHOLDER:
+                continue
+            if name in exclude_names:
+                continue
+            if (state.faction or "").strip() != current_faction_stripped:
+                continue
+            _append_npc(name, state)
+
+        # 2) 再追加「当前阵营的别名阵营」的角色：
+        #    例如当前阵营是 A兵团元老，若 FACTION_ALIASES["A兵团元老"] = ["A兵团"]，
+        #    则再补 A兵团 阵营下的 NPC（排在完全同阵营角色之后）。
+        normalized_current = _normalize_text(current_faction_stripped)
+
+        # 根据当前阵营（经标准化）查找它在 FACTION_ALIASES 中配置的所有别名阵营
+        alias_factions: Set[str] = set()
+        for faction_name, aliases in FACTION_ALIASES.items():
+            if _normalize_text(faction_name) == normalized_current:
+                for a in aliases:
+                    alias_factions.add(a.strip())
+
+        if not alias_factions:
+            return result
+
+        # 再把这些别名阵营下的 NPC 追加进去（去重 + 排序在追加顺序上自然保证：完全一致在前，别名阵营在后）
+        for name, state in all_npc_states.items():
+            if name == current_npc:
+                continue
+            if name == PC_CHAR_PLACEHOLDER:
+                continue
+            if name in seen_names:
+                continue
+            faction = (state.faction or "").strip()
+            if not faction or faction == SKIP_FACTION_SAME_CAMP:
+                continue
+            if faction not in alias_factions:
+                continue
+            # 已在第一轮完全阵营匹配里加入过的会被 seen_names 拦截，这里只会新增真正「别名阵营」的 NPC
+            _append_npc(name, state)
+
         return result
 
     # ------------------------------------------------------------------
@@ -770,6 +815,12 @@ class GameRAGService:
                 filters=[MetadataFilter(key="type", value="world_lore")]
             ),
         )
+        loading_lore_retriever = index.as_retriever(
+            similarity_top_k=7,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="type", value="loading_lore")]
+            ),
+        )
         # 任务对话：玩家输入主导(8条)+NPC上一条辅助(2条)，避免 NPC 长句稀释玩家意图
         task_retriever = index.as_retriever(
             similarity_top_k=10,
@@ -826,8 +877,38 @@ class GameRAGService:
                     seen_wl.add(_node_id(n))
                     break
 
+        # loading 文本：与世界观设定使用相同的检索 query，但采用「玩家 5 条 + NPC 2 条」的组合，
+        # 且 NPC 检索的分数阈值更高，用于补充世界观氛围与背景信息。
+        LOADING_SCORE_THRESHOLD = 0.28
+        LOADING_NPC_SCORE_THRESHOLD = 0.32
+
+        raw_loading_by_user = loading_lore_retriever.retrieve(retrieve_query)
+        loading_from_user = [
+            n for n in raw_loading_by_user[:7]
+            if (getattr(n, "score", None) or 0) >= LOADING_SCORE_THRESHOLD
+        ][:5]
+
+        loading_from_npc = []
+        if (npc_last_message or "").strip():
+            raw_loading_by_npc = loading_lore_retriever.retrieve(npc_last_message.strip())
+            seen_loading_ids = {_node_id(n) for n in loading_from_user}
+            for n in raw_loading_by_npc:
+                if len(loading_from_npc) >= 2:
+                    break
+                if (
+                    (getattr(n, "score", None) or 0) >= LOADING_NPC_SCORE_THRESHOLD
+                    and _node_id(n) not in seen_loading_ids
+                ):
+                    seen_loading_ids.add(_node_id(n))
+                    loading_from_npc.append(n)
+
+        loading_lore_nodes = loading_from_user + loading_from_npc
+        loading_lore_nodes = sorted(
+            loading_lore_nodes, key=lambda n: getattr(n, "score", 0), reverse=True
+        )
+
         TASK_SCORE_THRESHOLD = 0.28
-        TASK_GUIDE_SCORE_THRESHOLD = 0.36  # 教学引导类与 NPC 形象弱关联，需更高分数才采用
+        TASK_GUIDE_SCORE_THRESHOLD = 0.38  # 教学引导类与 NPC 形象弱关联，需更高分数才采用
         def _task_node_ok(n: Any) -> bool:
             score = getattr(n, "score", None) or 0
             meta = getattr(n, "metadata", None) or getattr(getattr(n, "node", n), "metadata", None) or {}
@@ -920,6 +1001,9 @@ class GameRAGService:
         if world_lore_nodes:
             # 暂不截断，观察长度；需恢复时可传 max_chars=375 等
             parts.append("【世界观设定摘取片段（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(world_lore_nodes))
+        if loading_lore_nodes:
+            # 与世界观设定使用相同检索条件的 loading 文本短句，数量较少（最多 5 条），仅作补充参考
+            parts.append("tips节选：\n" + _nodes_to_text(loading_lore_nodes, max_chars=300))
         if task_nodes:
             parts.append("【你的参考任务对话(任务可能超过玩家当前进度，仅参考语气和设定，忽略具体剧情，避免剧透)】\n" + _nodes_to_text(task_nodes, max_chars=350))
         if pooled:

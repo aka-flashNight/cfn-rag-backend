@@ -191,9 +191,9 @@ python launcher.py
 
 本项目需要配置 LLM API Key 才能使用。以下是几种获取免费 API Key 的方式：
 
-#### ModelScope 魔搭社区（首推，国内访问稳定，免费额度充足）
+#### ModelScope 魔搭社区（国内访问稳定）
 
-ModelScope 提供每日刷新的免费额度，单模型20~500 次，总共 2000 次，足以支持日常聊天使用。单个模型达到额度后可切换其他模型名称。
+ModelScope 提供每日刷新的免费额度，单模型20~500 次，总共 2000 次，足以支持聊天体验。单个模型达到额度后可切换其他模型名称。
 
 **获取步骤**：
 
@@ -256,11 +256,11 @@ LLM_MODEL_NAME=moonshotai/Kimi-K2.5
 # LLM 配置（默认使用 Gemini）
 LLM_API_KEY=your_api_key_here
 LLM_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai
-LLM_MODEL_NAME=gemini-2.5-flash
+LLM_MODEL_NAME=gemini-3.1-flash-lite-preview
 
 # 或使用其他 OpenAI 兼容的 API
-# LLM_API_BASE=https://api.siliconflow.cn/v1
-# LLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+# LLM_API_BASE=https://api-inference.modelscope.cn/v1
+# LLM_MODEL_NAME=Qwen/Qwen3.5-397B-A17B
 ```
 
 ### 代理配置
