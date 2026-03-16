@@ -40,16 +40,43 @@ UPDATE_NPC_MOOD_TOOL = {
 }
 
 
+def _exc_message(exc: BaseException) -> str:
+    """从异常中提取可读错误信息（含 OpenAI/DeepSeek 的 error.message）。"""
+    raw = getattr(exc, "message", None) or getattr(exc, "body", None) or str(exc)
+    if isinstance(raw, dict):
+        err = raw.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message", err)).lower()
+        return str(err).lower()
+    return str(raw).lower()
+
+
+def is_image_unsupported_error(exc: BaseException) -> bool:
+    """
+    判断是否为「API 不支持 image_url / 多模态图片」类错误。
+    用于降级：带图片请求失败时重试不传图片，仅用 image_description 文本。
+    覆盖常见表述：DeepSeek 的 image_url/expected text、以及 vision/multimodal/image not support 等。
+    """
+    msg = _exc_message(exc)
+    if "image_url" in msg or ("expected" in msg and "text" in msg and "image" in msg):
+        return True
+    if getattr(exc, "status_code", None) == 400 and "invalid_request_error" in msg:
+        if "image" in msg or "variant" in msg:
+            return True
+    for kw in ("vision", "multimodal", "image"):
+        if kw in msg and ("not support" in msg or "unsupported" in msg or "does not support" in msg):
+            return True
+    return False
+
+
 def is_tools_unsupported_error(exc: BaseException) -> bool:
     """
     判断是否为「API 不支持 tools/function calling」类错误。
     用于降级：带 tools 请求失败时重试不带 tools，保证远古模型也能正常返回对话。
     """
-    raw = getattr(exc, "message", None) or getattr(exc, "body", None) or str(exc)
-    if isinstance(raw, dict):
-        msg = str(raw.get("error", raw)).lower()
-    else:
-        msg = str(raw).lower()
+    if is_image_unsupported_error(exc):
+        return False
+    msg = _exc_message(exc)
     if getattr(exc, "status_code", None) in (400, 422):
         return True
     for kw in ("tool", "function_call", "function call", "not support"):

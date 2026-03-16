@@ -21,6 +21,7 @@ from services.memory_manager import MemoryManager
 from services.llm_client import call_llm, call_llm_stream
 from services.npc_mood_agent import (
     UPDATE_NPC_MOOD_TOOL,
+    is_image_unsupported_error,
     is_tools_unsupported_error,
     has_update_npc_mood_tool_call,
     parse_mood_from_text,
@@ -399,6 +400,7 @@ class GameRAGService:
         """
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
 
+        reply_text, tool_calls = None, []
         try:
             reply_text, tool_calls = await call_llm(
                 api_key=ctx.effective_api_key,
@@ -412,23 +414,67 @@ class GameRAGService:
                 tools=[UPDATE_NPC_MOOD_TOOL],
             )
         except Exception as e:
-            if is_tools_unsupported_error(e):
-                reply_text, tool_calls = await call_llm(
-                    api_key=ctx.effective_api_key,
-                    api_base=ctx.effective_api_base,
-                    model_name=ctx.effective_model,
-                    system_prompt=ctx.system_prompt,
-                    user_prompt=ctx.user_prompt,
-                    image_path=ctx.image_path,
-                    image_description=ctx.image_description,
-                    emotion_hint=ctx.emotion_hint or None,
-                    tools=None,
-                )
+            if is_image_unsupported_error(e) and ctx.image_path:
+                try:
+                    reply_text, tool_calls = await call_llm(
+                        api_key=ctx.effective_api_key,
+                        api_base=ctx.effective_api_base,
+                        model_name=ctx.effective_model,
+                        system_prompt=ctx.system_prompt,
+                        user_prompt=ctx.user_prompt,
+                        image_path=None,
+                        image_description=ctx.image_description,
+                        emotion_hint=ctx.emotion_hint or None,
+                        tools=[UPDATE_NPC_MOOD_TOOL],
+                    )
+                except Exception as e2:
+                    if is_tools_unsupported_error(e2):
+                        reply_text, tool_calls = await call_llm(
+                            api_key=ctx.effective_api_key,
+                            api_base=ctx.effective_api_base,
+                            model_name=ctx.effective_model,
+                            system_prompt=ctx.system_prompt,
+                            user_prompt=ctx.user_prompt,
+                            image_path=None,
+                            image_description=ctx.image_description,
+                            emotion_hint=ctx.emotion_hint or None,
+                            tools=None,
+                        )
+                    else:
+                        raise
+            elif is_tools_unsupported_error(e):
+                try:
+                    reply_text, tool_calls = await call_llm(
+                        api_key=ctx.effective_api_key,
+                        api_base=ctx.effective_api_base,
+                        model_name=ctx.effective_model,
+                        system_prompt=ctx.system_prompt,
+                        user_prompt=ctx.user_prompt,
+                        image_path=ctx.image_path,
+                        image_description=ctx.image_description,
+                        emotion_hint=ctx.emotion_hint or None,
+                        tools=None,
+                    )
+                except Exception as e2:
+                    if is_image_unsupported_error(e2) and ctx.image_path:
+                        reply_text, tool_calls = await call_llm(
+                            api_key=ctx.effective_api_key,
+                            api_base=ctx.effective_api_base,
+                            model_name=ctx.effective_model,
+                            system_prompt=ctx.system_prompt,
+                            user_prompt=ctx.user_prompt,
+                            image_path=None,
+                            image_description=ctx.image_description,
+                            emotion_hint=ctx.emotion_hint or None,
+                            tools=None,
+                        )
+                    else:
+                        raise
             else:
                 raise
 
 
-        reply = (reply_text or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+        reply = (reply_text or "").strip() or "【对方无回应，请稍后再试。】"
         delta, emotion = parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=ctx.emotions
         )
@@ -437,7 +483,7 @@ class GameRAGService:
             reply, allowed_emotions=ctx.emotions
         )
         if fallback_delta is not None and fallback_emotion is not None:
-            reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+            reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
             if not has_update_npc_mood_tool_call(tool_calls):
                 delta, emotion = fallback_delta, fallback_emotion
         if not has_update_npc_mood_tool_call(tool_calls):
@@ -502,17 +548,22 @@ class GameRAGService:
                     out = idx
             return out
 
-        try:
+        async def _run_stream(img_path: Path | None, img_desc: str | None, use_tools: list | None) -> AsyncIterator[Tuple[str, Any]]:
+            nonlocal full_content, streamed_len, truncating, tool_calls_list
+            full_content = ""
+            streamed_len = 0
+            truncating = False
+            tool_calls_list = []
             async for event_type, data in call_llm_stream(
                 api_key=ctx.effective_api_key,
                 api_base=ctx.effective_api_base,
                 model_name=ctx.effective_model,
                 system_prompt=ctx.system_prompt,
                 user_prompt=ctx.user_prompt,
-                image_path=ctx.image_path,
-                image_description=ctx.image_description,
+                image_path=img_path,
+                image_description=img_desc,
                 emotion_hint=ctx.emotion_hint or None,
-                tools=[UPDATE_NPC_MOOD_TOOL],
+                tools=use_tools,
             ):
                 if event_type == "content":
                     full_content += data
@@ -530,45 +581,36 @@ class GameRAGService:
                         streamed_len = len(full_content)
                 elif event_type == "finished":
                     full_content, tool_calls_list = data
-                    break
+                    return
+
+        try:
+            async for ev, dat in _run_stream(ctx.image_path, ctx.image_description, [UPDATE_NPC_MOOD_TOOL]):
+                yield (ev, dat)
         except Exception as e:
-            if is_tools_unsupported_error(e):
-                full_content = ""
-                streamed_len = 0
-                truncating = False
-                tool_calls_list = []
-                async for event_type, data in call_llm_stream(
-                    api_key=ctx.effective_api_key,
-                    api_base=ctx.effective_api_base,
-                    model_name=ctx.effective_model,
-                    system_prompt=ctx.system_prompt,
-                    user_prompt=ctx.user_prompt,
-                    image_path=ctx.image_path,
-                    image_description=ctx.image_description,
-                    emotion_hint=ctx.emotion_hint or None,
-                    tools=None,
-                ):
-                    if event_type == "content":
-                        full_content += data
-                        if truncating:
-                            continue
-                        cut = _earliest_truncate_at(full_content)
-                        if cut != -1:
-                            if cut > streamed_len:
-                                yield ("content", full_content[streamed_len:cut])
-                            streamed_len = len(full_content)
-                            truncating = True
-                        else:
-                            if streamed_len < len(full_content):
-                                yield ("content", full_content[streamed_len:])
-                            streamed_len = len(full_content)
-                    elif event_type == "finished":
-                        full_content, tool_calls_list = data
-                        break
+            if is_image_unsupported_error(e) and ctx.image_path:
+                try:
+                    async for ev, dat in _run_stream(None, ctx.image_description, [UPDATE_NPC_MOOD_TOOL]):
+                        yield (ev, dat)
+                except Exception as e2:
+                    if is_tools_unsupported_error(e2):
+                        async for ev, dat in _run_stream(None, ctx.image_description, None):
+                            yield (ev, dat)
+                    else:
+                        raise
+            elif is_tools_unsupported_error(e):
+                try:
+                    async for ev, dat in _run_stream(ctx.image_path, ctx.image_description, None):
+                        yield (ev, dat)
+                except Exception as e2:
+                    if is_image_unsupported_error(e2) and ctx.image_path:
+                        async for ev, dat in _run_stream(None, ctx.image_description, None):
+                            yield (ev, dat)
+                    else:
+                        raise
             else:
                 raise
 
-        reply = (full_content or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+        reply = (full_content or "").strip() or "【对方无回应，请稍后再试。】"
         delta, emotion = parse_update_npc_mood_tool_calls(
             tool_calls_list, allowed_emotions=ctx.emotions
         )
@@ -577,7 +619,7 @@ class GameRAGService:
             reply, allowed_emotions=ctx.emotions
         )
         if fallback_delta is not None and fallback_emotion is not None:
-            reply = (cleaned or "").strip() or "（当前未能生成有效回复，请稍后再试。）"
+            reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
             if not has_update_npc_mood_tool_call(tool_calls_list):
                 delta, emotion = fallback_delta, fallback_emotion
         if not has_update_npc_mood_tool_call(tool_calls_list):
