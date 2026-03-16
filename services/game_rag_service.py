@@ -992,6 +992,19 @@ class GameRAGService:
                 or {}
             )
 
+        def _get_node_text(n: Any) -> str:
+            """从检索结果节点取文本，兼容 NodeWithScore 与 Document/TextNode，避免 Document 上调用 get_content() 报错。"""
+            node = getattr(n, "node", n)
+            text = getattr(node, "text", None)
+            if text is not None:
+                return str(text)
+            if hasattr(node, "get_content"):
+                try:
+                    return str(node.get_content())
+                except Exception:
+                    pass
+            return ""
+
         forbidden_other_chars = forbidden_other_chars or set()
 
         def _other_node_ok(n: Any, *, from_npc_query: bool) -> bool:
@@ -1028,10 +1041,7 @@ class GameRAGService:
             doc_type = meta.get("type") or ""
             is_task = 1 if doc_type == "task" else 0  # 任务优先
 
-            text = getattr(n, "text", None)
-            if text is None and hasattr(n, "get_content"):
-                text = n.get_content()
-            text = str(text or "")
+            text = _get_node_text(n)
             mentions_current = 1 if (npc_name and npc_name in text) else 0
 
             score = getattr(n, "score", None) or 0.0
@@ -1044,10 +1054,7 @@ class GameRAGService:
 
             用于「自由竞争」名额，避免任务对话占满所有名额，给高相关日常台词更多空间。
             """
-            text = getattr(n, "text", None)
-            if text is None and hasattr(n, "get_content"):
-                text = n.get_content()
-            text = str(text or "")
+            text = _get_node_text(n)
             mentions_current = 1 if (npc_name and npc_name in text) else 0
             score = getattr(n, "score", None) or 0.0
             return (mentions_current, score)
@@ -1172,9 +1179,7 @@ class GameRAGService:
             last_blank = False
 
             for node in nodes:
-                text = getattr(node, "text", None)
-                if text is None and hasattr(node, "get_content"):
-                    text = node.get_content()
+                text = _get_node_text(node)
                 if not text:
                     continue
 
@@ -1214,9 +1219,7 @@ class GameRAGService:
             last_blank = False
 
             for node in nodes:
-                text = getattr(node, "text", None)
-                if text is None and hasattr(node, "get_content"):
-                    text = node.get_content()
+                text = _get_node_text(node)
                 if not text:
                     continue
 

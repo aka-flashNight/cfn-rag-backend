@@ -246,7 +246,6 @@ LLM_MODEL_NAME=moonshotai/Kimi-K2.5
 
 - **[Moonshot AI](https://platform.moonshot.cn/)**：月之暗面 Kimi API，注册有15元免费额度
 - **[QWEN](https://bailian.console.aliyun.com/cn-beijing/?tab=model#/api-key)**：阿里云百炼 QWEN API，每个模型百万token免费额度
-- **[DeepSeek](https://platform.deepseek.com/)**：国产大模型，价格便宜且有免费额度
 
 ### 配置文件说明
 

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Callable, Dict, Iterable, List, Set
 
 from llama_index.core import Document, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core import Settings, StorageContext, load_index_from_storage
+from llama_index.core.schema import TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from services.memory_manager import get_db_path
@@ -554,6 +556,205 @@ def load_lore_documents() -> List[Document]:
     return documents
 
 
+# 设定文档按章节/段落切分：识别标题行（用于按章节切分）
+_LORE_HEADING_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"#+\s+.+|"  # Markdown: # ## ###
+    r"[一二三四五六七八九十百千]+[、．.]\s*.+|"  # 一、 二、
+    r"\d+[.、]\s*.+|"  # 1. 2. 1、
+    r"[（(][一二三四五六七八九十\d]+[)）]\s*.+"  # （一） (1)
+    r")\s*$",
+    re.MULTILINE,
+)
+
+
+def _split_by_headings(text: str) -> List[str]:
+    """
+    按标题行将文本拆成多个章节。
+    识别：Markdown #、一、二、、1. 2.、（一）等。
+    """
+    if not (text or "").strip():
+        return []
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    if not blocks:
+        return [text.strip()] if text.strip() else []
+
+    sections: List[str] = []
+    current: List[str] = []
+
+    for i, block in enumerate(blocks):
+        first_line = block.split("\n")[0] if "\n" in block else block
+        is_heading = bool(_LORE_HEADING_PATTERN.match(first_line.strip()))
+        if is_heading and current:
+            sections.append("\n\n".join(current))
+            current = [block]
+        else:
+            current.append(block)
+    if current:
+        sections.append("\n\n".join(current))
+    return sections
+
+
+def _split_sentences(text: str) -> List[str]:
+    """按句号、问号、叹号、分号分句，保留边界完整（不 mid-sentence 截断）。"""
+    if not text or not text.strip():
+        return []
+    # 在。！？； 后切分，保留分隔符在上一句末尾
+    parts = re.split(r"([。！？；])", text)
+    sentences: List[str] = []
+    buf = ""
+    for i, p in enumerate(parts):
+        buf += p
+        if p.strip() in "。！？；" and buf.strip():
+            sentences.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        sentences.append(buf.strip())
+    return sentences
+
+
+# 用于判断「以标点结尾」的中英文标点（行尾为这些则不视为软换行，不拼接下一行）
+_LINE_END_PUNCTUATION = set("。！？；，、．·.?!;:：,，！？；")
+
+
+def _ends_with_punctuation(s: str) -> bool:
+    """当前行是否以标点结尾（用于区分应保留的换行与 PDF 软换行）。"""
+    t = (s or "").rstrip()
+    if not t:
+        return False
+    return t[-1] in _LINE_END_PUNCTUATION
+
+
+def _normalize_pdf_soft_line_breaks(text: str) -> str:
+    """
+    只把「不以标点结尾的换行」拼接到下一行，保留真正的段落大换行（\\n\\n）。
+    用于 PDF 解析结果中因行宽产生的 mid-sentence 换行，避免误伤 Word 等已有正确段落的结构。
+    """
+    if not text or not text.strip():
+        return text
+    lines = text.split("\n")
+    result: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 空行视为段落边界，原样保留
+        if not line.strip():
+            result.append("")
+            i += 1
+            continue
+        buf = line
+        j = i + 1
+        # 若当前行不以标点结尾，则与后续非空行拼接，直到遇到以标点结尾的行或空行
+        while j < len(lines) and lines[j].strip() and not _ends_with_punctuation(buf):
+            buf = buf + lines[j]
+            j += 1
+        result.append(buf)
+        i = j
+    return "\n".join(result)
+
+
+def chunk_lore_documents(
+    lore_docs: List[Document],
+    tokenizer: Callable[[str], List[str]],
+) -> List[Document]:
+    """
+    对设定文档按章节/段落切分，并应用 256/512 token 规则，避免断句。
+
+    规则概要：
+    - 先按标题拆成章节；章节内若多段合计 <= 512 且 > 256 可保留整章，<= 256 则与后续短章合并到约 256。
+    - 单段/单章 > 512 时按段落再拆；单段 256 < len <= 512 保留整段；单段 > 512 再按句号分句后按 256/512 成块。
+    - 多段合并时以约 256 token 为目标；单块允许最大 512（单段或单章时）。
+    """
+    CHUNK_TARGET = 256
+    CHUNK_MAX_SINGLE = 512
+
+    def token_count(t: str) -> int:
+        return len(tokenizer(t)) if t and t.strip() else 0
+
+    result: List[Document] = []
+
+    for doc in lore_docs:
+        text = (doc.text or "").strip()
+        if not text:
+            continue
+        meta = dict(doc.metadata or {})
+        # 仅对 PDF 做软换行整合（不以标点结尾的换行拼成一行），Word 等保持原样
+        file_path = meta.get("file_path") or meta.get("file_name") or ""
+        if str(file_path).lower().endswith(".pdf"):
+            text = _normalize_pdf_soft_line_breaks(text)
+
+        sections = _split_by_headings(text)
+        if not sections:
+            sections = [text]
+
+        # 第一轮：每个章节得到若干「候选块」（可能 <256，或 256~512，或 >512 再拆后的多块）
+        candidates: List[str] = []
+
+        for sec in sections:
+            sec = sec.strip()
+            if not sec:
+                continue
+            n = token_count(sec)
+            if n <= CHUNK_MAX_SINGLE:
+                candidates.append(sec)
+                continue
+            # 章节 > 512：按段落拆
+            paras = [p.strip() for p in sec.split("\n\n") if p.strip()]
+            for para in paras:
+                if not para:
+                    continue
+                pn = token_count(para)
+                if pn <= CHUNK_MAX_SINGLE:
+                    candidates.append(para)
+                    continue
+                # 段落 > 512：按句号分句后成块
+                sentences = _split_sentences(para)
+                buf = ""
+                for s in sentences:
+                    sn = token_count(s)
+                    if sn > CHUNK_MAX_SINGLE:
+                        if buf.strip():
+                            candidates.append(buf.strip())
+                            buf = ""
+                        candidates.append(s)
+                        continue
+                    if token_count(buf + "\n" + s if buf else s) <= CHUNK_TARGET:
+                        buf = (buf + "\n" + s).strip() if buf else s
+                        continue
+                    if buf.strip():
+                        candidates.append(buf.strip())
+                    buf = s
+                if buf.strip():
+                    candidates.append(buf.strip())
+
+        # 第二轮：合并过短的候选块到约 CHUNK_TARGET
+        i = 0
+        while i < len(candidates):
+            chunk = candidates[i]
+            n = token_count(chunk)
+            if n >= CHUNK_TARGET:
+                result.append(Document(text=chunk, metadata=meta))
+                i += 1
+                continue
+            # 合并后续块直到 >= CHUNK_TARGET 或单块已 > CHUNK_MAX_SINGLE
+            merged = chunk
+            j = i + 1
+            while j < len(candidates):
+                next_block = candidates[j]
+                merged_next = (merged + "\n\n" + next_block).strip()
+                tn = token_count(merged_next)
+                if tn > CHUNK_MAX_SINGLE:
+                    break
+                merged = merged_next
+                j += 1
+                if token_count(merged) >= CHUNK_TARGET:
+                    break
+            result.append(Document(text=merged, metadata=meta))
+            i = j
+
+    return result
+
+
 def load_loading_documents() -> List[Document]:
     """
     读取 resources/data/stages/loading_data.xml 中的 loading 文本提示。
@@ -661,31 +862,46 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
         print(f"[知识库] 加载情报文件时出错，跳过: {exc}")
         intel_docs = []
 
+    # 设定文档单独按章节/段落切分（256/512 token 规则），插入时用 TextNode 避免检索时报 "Node must be a TextNode to get text"
+    lore_chunk_nodes: List[TextNode] = []
+    if lore_docs:
+        lore_chunk_docs = chunk_lore_documents(lore_docs, cjk_tokenizer)
+        lore_chunk_nodes = [
+            TextNode(text=(d.text or ""), metadata=dict(d.metadata or {}))
+            for d in lore_chunk_docs
+        ]
+        print(f"[知识库] 设定文档切分: {len(lore_docs)} 个原文档 -> {len(lore_chunk_nodes)} 个块")
+
     all_docs: List[Document] = []
     all_docs.extend(dialogue_docs)
     all_docs.extend(task_docs)
-    all_docs.extend(lore_docs)
     all_docs.extend(loading_docs)
     all_docs.extend(intel_docs)
 
     print(
         f"[知识库] 共加载 {len(all_docs)} 个文档 "
         f"(对话={len(dialogue_docs)}, 任务={len(task_docs)}, "
-        f"设定={len(lore_docs)}, loading={len(loading_docs)}, 情报={len(intel_docs)})"
+        f"设定块={len(lore_chunk_nodes)}, loading={len(loading_docs)}, 情报={len(intel_docs)})"
     )
 
-    if not all_docs:
+    if not all_docs and not lore_chunk_nodes:
         raise ValueError("没有加载到任何 Document，无法构建索引。")
 
+    # 设定文档已单独切块并以 TextNode 插入，不经过全局 256 token 切分；from_documents 仅接受 Document
+    docs_for_index = all_docs if all_docs else [Document(text=" ", metadata={"type": "placeholder"})]
     if persist_dir is not None:
         persist_dir = Path(persist_dir)
         persist_dir.mkdir(parents=True, exist_ok=True)
         storage_context = StorageContext.from_defaults()
-        index = VectorStoreIndex.from_documents(all_docs, storage_context=storage_context)
+        index = VectorStoreIndex.from_documents(docs_for_index, storage_context=storage_context)
+        if lore_chunk_nodes:
+            index.insert_nodes(lore_chunk_nodes)
         storage_context.persist(persist_dir=str(persist_dir))
         print(f"[知识库] 索引已持久化到: {persist_dir}")
     else:
-        index = VectorStoreIndex.from_documents(all_docs)
+        index = VectorStoreIndex.from_documents(docs_for_index)
+        if all_docs and lore_chunk_nodes:
+            index.insert_nodes(lore_chunk_nodes)
 
     return index
 
