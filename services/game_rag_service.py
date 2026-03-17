@@ -29,6 +29,7 @@ from services.npc_mood_agent import (
     strip_trailing_mood_json,
     strip_trailing_tool_call_text,
 )
+from services.game_progress import get_progress_stage_name
 
 
 # 前端档位对应的总结间隔（短/中/长/几乎无限），未传或非法值时用默认 30
@@ -295,6 +296,12 @@ class GameRAGService:
             if payload.player_identity and payload.player_identity.strip()
             else "一个末日后加入A兵团成为佣兵的幸存者"
         )
+        progress_stage_desc = ""
+        stage_name = get_progress_stage_name(getattr(payload, "progress_stage", None))
+        if stage_name:
+            progress_stage_desc = (
+                f"当前玩家的主要作战区域为{stage_name}。\n"
+            )
         sex_desc = f"（性别：{sex}）" if sex else ""
         faction_desc = f"（阵营：{faction}）" if faction else ""
         titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
@@ -338,7 +345,8 @@ class GameRAGService:
         emotions_str = "、".join(emotions)
         system_prompt = (
             f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
-            f"玩家的身份是：{player_identity}\n\n"
+            f"玩家的身份是：{player_identity}"
+            f"{progress_stage_desc}\n"
             "【世界观背景概要】\n"
             f"{WORLD_BACKGROUND}\n\n"
             f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
