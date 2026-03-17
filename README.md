@@ -4,6 +4,10 @@
 
 CFN-RAG 是一个基于 RAG（检索增强生成）技术的智能问答系统，专为 [Crazy Flash Night (CFN)](https://github.com/FlashNightModReborn/CrazyFlashNight) 游戏项目设计。通过读取游戏资源文件，系统能够理解游戏世界设定、角色背景、任务信息等内容，并以对话形式回答玩家的问题。终端前端界面为独立仓库：[cfn-terminal-web](https://github.com/aka-flashNight/cfn-terminal-web)。
 
+## 预览
+
+![alt text](image.png)
+
 ## 功能特点
 
 - **智能问答**：基于游戏数据回答关于角色、任务、物品等各类问题
