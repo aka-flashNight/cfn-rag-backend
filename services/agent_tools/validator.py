@@ -234,6 +234,12 @@ def _validate_v2_item_quantity_reasonableness(
                 stats = reward_stats
 
             _, max_qty = stats.get(item_name, (None, 0))  # type: ignore[assignment]
+            # 若 submit/hold 的统计不存在（max_qty=0），但该物品在奖励历史中存在，
+            # 则回退到 rewards 的统计，避免出现 allowed_range=[1,0] 这种“天然不可能”区间。
+            if int(max_qty or 0) == 0:
+                _, reward_max_qty = reward_stats.get(item_name, (None, 0))  # type: ignore[assignment]
+                if int(reward_max_qty or 0) > 0:
+                    max_qty = reward_max_qty
             allowed_max = int(max_qty) * 2
             allowed_min = 1
 

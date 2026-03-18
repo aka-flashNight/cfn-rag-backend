@@ -423,6 +423,12 @@ async def decision_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
+            # Debug:
+            print('——————【工具执行结果】decision_node——————')
+            print(
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     image_path_str = state.get("image_path")
     image_path = None
@@ -626,6 +632,12 @@ async def generate_response_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
+            # Debug:
+            print('——————【工具执行结果】generate_response_node——————')
+            print(
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
@@ -745,6 +757,12 @@ async def generate_response_stream(
         full_user_prompt += "\n\n【工具执行结果】\n"
         for tm in gen_messages:
             full_user_prompt += (
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
+            # Debug:
+            print('——————【工具执行结果】generate_response_stream——————')
+            print(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )

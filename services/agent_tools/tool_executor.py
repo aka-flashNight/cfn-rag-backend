@@ -215,14 +215,36 @@ def execute_confirm_agent_task(
     task_id = game_data.tasks.get_max_agent_task_id() + 1
     pending_draft["id"] = task_id
 
+    # 写入任务文件（原子写入：先写临时文件再替换）
+    try:
+        from services.agent_tools.task_tools import write_confirmed_agent_task_files
+
+        write_desc = write_confirmed_agent_task_files(
+            draft=pending_draft,
+            npc_name_fallback=npc_name or str(pending_draft.get("npc_name") or ""),
+            game_data=game_data,
+        )
+    except Exception as e:
+        detailed = _detailed_draft_summary(pending_draft, game_data)
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"任务写入失败：{str(e)}",
+                "draft_summary": detailed,
+            },
+            ensure_ascii=False,
+        ), pending_draft, None
+
     detailed = _detailed_draft_summary(pending_draft, game_data)
-    write_desc = f"任务 {task_id}「{pending_draft.get('title', '')}」已写入。"
-    return json.dumps({
-        "status": "confirmed",
-        "task_id": task_id,
-        "message": write_desc,
-        "draft_summary": detailed,
-    }, ensure_ascii=False), None, write_desc
+    return json.dumps(
+        {
+            "status": "confirmed",
+            "task_id": task_id,
+            "message": write_desc,
+            "draft_summary": detailed,
+        },
+        ensure_ascii=False,
+    ), None, write_desc
 
 
 def execute_cancel_agent_task(
@@ -422,6 +444,7 @@ def dispatch_tool_call(
             pretty_args = json.dumps(tool_args, ensure_ascii=False)
         except Exception:
             pretty_args = str(tool_args)
+        print('——————【工具调用】——————')
         print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
 
     updated_draft = pending_draft
@@ -489,5 +512,17 @@ def dispatch_tool_call(
             "status": "error",
             "message": f"未知工具: {tool_name}",
         }, ensure_ascii=False)
+
+    if tool_name in _task_tool_names:
+        try:
+            # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
+            preview = (result or "")
+            if isinstance(preview, str) and len(preview) > 500:
+                preview = preview[:500] + "…"
+        except Exception:
+            preview = "<preview-unavailable>"
+        # Debug
+        print('——————【结果】——————')
+        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result
