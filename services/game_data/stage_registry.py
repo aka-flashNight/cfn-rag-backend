@@ -129,6 +129,12 @@ class StageRegistry:
             if params is None:
                 continue
 
+            # 若箱子带有主线进度限制，则整个箱子不参与 Agent 任务候选
+            has_min_prog = params.findtext("最小主线进度") is not None
+            has_max_prog = params.findtext("最大主线进度") is not None
+            if has_min_prog or has_max_prog:
+                continue
+
             drops: list[LootDrop] = []
             for drop_el in params.findall(".//掉落物"):
                 name = (drop_el.findtext("名字") or "").strip()

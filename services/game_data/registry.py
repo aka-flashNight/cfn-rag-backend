@@ -7,11 +7,13 @@ from typing import Optional
 from .crafting_registry import CraftingRegistry
 from .item_registry import ItemRegistry
 from .kshop_registry import KShopRegistry
+from .mercenary_registry import MercenaryTaskRegistry
 from .paths import get_game_data_root
 from .shop_registry import ShopRegistry
 from .stage_registry import StageRegistry
 from .task_registry import TaskRegistry
 from .task_text_registry import TaskTextRegistry
+from .equipment_mods_registry import EquipmentModsRegistry
 
 
 @dataclass
@@ -29,6 +31,8 @@ class GameDataRegistry:
     shops: ShopRegistry
     kshop: KShopRegistry
     crafting: CraftingRegistry
+    equipment_mods: EquipmentModsRegistry
+    mercenary_tasks: MercenaryTaskRegistry
 
     @classmethod
     def create(cls, *, data_root: Optional[Path] = None) -> "GameDataRegistry":
@@ -42,6 +46,8 @@ class GameDataRegistry:
             shops=ShopRegistry(data_root=root),
             kshop=KShopRegistry(data_root=root),
             crafting=CraftingRegistry(data_root=root),
+            equipment_mods=EquipmentModsRegistry(data_root=root),
+            mercenary_tasks=MercenaryTaskRegistry(data_root=root),
         )
 
     def load_all(self) -> None:
@@ -53,6 +59,8 @@ class GameDataRegistry:
         self.shops.load()
         self.kshop.load()
         self.crafting.load()
+        self.equipment_mods.load()
+        self.mercenary_tasks.load()
 
 
 # 全局单例（启动时初始化）

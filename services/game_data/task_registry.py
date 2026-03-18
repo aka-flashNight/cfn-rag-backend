@@ -5,6 +5,7 @@ from typing import Optional
 
 from .models import Task
 from .parsers import discover_list_entries, parse_json
+from .reward_utils import parse_name_count
 
 
 class TaskRegistry:
@@ -18,6 +19,9 @@ class TaskRegistry:
         self._by_id: dict[int, Task] = {}
         self._by_npc: dict[str, list[Task]] = {}
         self._reward_types: set[str] = set()
+        self._submit_items: set[str] = set()
+        # 奖励物品名 -> (min_qty, max_qty)
+        self._reward_stats: dict[str, tuple[int, int]] = {}
 
     def load(self) -> None:
         list_xml = self.task_root / "list.xml"
@@ -28,6 +32,9 @@ class TaskRegistry:
         tasks: list[Task] = []
         for filename in entries:
             if not filename.lower().endswith(".json"):
+                continue
+            # 排除 preview_tasks.json（仅作展示/预览用）
+            if filename.lower() == "preview_tasks.json":
                 continue
             fp = (self.task_root / filename).resolve()
             if not fp.exists():
@@ -67,6 +74,8 @@ class TaskRegistry:
         self._by_id = {}
         self._by_npc = {}
         self._reward_types = set()
+        self._submit_items = set()
+        self._reward_stats = {}
 
         for t in tasks:
             self._by_id[t.id] = t
@@ -74,11 +83,26 @@ class TaskRegistry:
             if t.get_npc:
                 self._by_npc.setdefault(t.get_npc, []).append(t)
 
-            for reward in t.rewards or []:
-                # rewards: "物品名#数量"
-                name = str(reward).split("#", 1)[0].strip()
+            # 提交物品池：仅记录物品名集合
+            for expr in t.finish_submit_items or []:
+                name, _ = parse_name_count(expr)
                 if name:
-                    self._reward_types.add(name)
+                    self._submit_items.add(name)
+
+            # 奖励池：记录物品名集合 + 数量区间
+            for reward in t.rewards or []:
+                name, count = parse_name_count(reward)
+                if not name:
+                    continue
+                self._reward_types.add(name)
+                if count <= 0:
+                    continue
+                mn, mx = self._reward_stats.get(name, (None, None))  # type: ignore
+                if mn is None or count < mn:
+                    mn = count
+                if mx is None or count > mx:
+                    mx = count
+                self._reward_stats[name] = (int(mn), int(mx))  # type: ignore
 
     def get_by_id(self, id: int) -> Optional[Task]:
         return self._by_id.get(int(id))
@@ -101,4 +125,20 @@ class TaskRegistry:
 
     def list_reward_types(self) -> set[str]:
         return set(self._reward_types)
+
+    def list_submit_items(self) -> set[str]:
+        """
+        所有任务出现过的提交物品名集合（来自 finish_submit_items）。
+        """
+
+        return set(self._submit_items)
+
+    def get_reward_stats(self) -> dict[str, tuple[int, int]]:
+        """
+        奖励物品统计：
+        - key: 物品名
+        - value: (min_qty, max_qty) —— 在所有任务 rewards 中出现的数量区间
+        """
+
+        return dict(self._reward_stats)
 
