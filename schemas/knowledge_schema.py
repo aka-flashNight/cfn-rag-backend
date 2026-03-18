@@ -137,6 +137,10 @@ class NPCCandidate(BaseModel):
 
     npc_name: str = Field(..., description="NPC 名称")
     faction: Optional[str] = Field(None, description="阵营，来自 npc_state_db.json，无则为空")
+    challenge: Optional[str] = Field(
+        None,
+        description="可选：当前 NPC 的切磋关卡名（npc_state_db.json 的 challenge 字段）",
+    )
 
 
 class SessionListResponse(BaseModel):

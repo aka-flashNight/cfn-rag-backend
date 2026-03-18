@@ -178,7 +178,11 @@ async def list_sessions(
     ]
 
     npc_candidates: list[NPCCandidate] = [
-        NPCCandidate(npc_name=name, faction=npc_manager.state[name].faction)
+        NPCCandidate(
+            npc_name=name,
+            faction=npc_manager.state[name].faction,
+            challenge=getattr(npc_manager.state[name], "challenge", None),
+        )
         for name in sorted(npc_manager.state.keys())
     ]
 

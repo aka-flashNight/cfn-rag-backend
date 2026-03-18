@@ -84,6 +84,8 @@ class NPCState:
     favorability: int
     relationship_level: str
     sex: Optional[str] = None
+    # 可选：当前 NPC 的切磋关卡名（npc_state_db.json 的 challenge 字段）
+    challenge: Optional[str] = None
     emotions: list[str] = field(default_factory=list)
     faction: Optional[str] = None
     titles: list[str] = field(default_factory=list)
@@ -137,6 +139,8 @@ class NPCManager:
                 level = cls._compute_relationship_level(favorability)
             sex_raw = str(item.get("sex") or "").strip()
             sex: Optional[str] = sex_raw or None
+            challenge_raw = str(item.get("challenge") or "").strip()
+            challenge: Optional[str] = challenge_raw or None
             emotions_raw = item.get("emotions")
             emotions: list[str] = []
             if isinstance(emotions_raw, list):
@@ -157,6 +161,7 @@ class NPCManager:
                 favorability=favorability,
                 relationship_level=level,
                 sex=sex,
+                challenge=challenge,
                 emotions=emotions,
                 faction=faction,
                 titles=titles,
@@ -321,6 +326,8 @@ class NPCManager:
             }
             if state.sex:
                 item["sex"] = state.sex
+            if state.challenge:
+                item["challenge"] = state.challenge
             if state.emotions:
                 item["emotions"] = list(state.emotions)
             serializable[name] = item
