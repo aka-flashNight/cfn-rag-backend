@@ -447,6 +447,18 @@ async def run_startup_tasks() -> None:
 
     loop.create_task(_chained_preload())
 
+    # 4. 后台加载静态游戏数据（Items/Tasks/Stages/Shops/Crafting）
+    def _load_game_data():
+        try:
+            from services.game_data.registry import init_game_data_registry
+
+            init_game_data_registry()
+            print("[初始化] GameDataRegistry 加载完成 ✓")
+        except Exception as e:
+            print(f"[初始化] GameDataRegistry 加载失败（将在首次使用时重试）: {e}")
+
+    loop.run_in_executor(None, _load_game_data)
+
     print("=" * 50)
     print("[初始化] 所有启动任务已提交到后台，服务器即将就绪...")
     print("=" * 50 + "\n")
