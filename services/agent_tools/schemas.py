@@ -62,12 +62,16 @@ class StageRequirement(TypedDict):
 
 
 class TaskDraft(TypedDict, total=False):
-    # V1-V6 用到的字段（其余字段由后续 Phase 实现补齐/计算）
+    task_type: str
+    title: str
+    description: str
     get_requirements: List[int]
     finish_requirements: List[StageRequirement]
     finish_submit_items: List[RewardItem]
     finish_contain_items: List[RewardItem]
     rewards: List[RewardItem]
+    get_conversation_text: str
+    finish_conversation_text: str
 
 
 # ---------------------------------------------------------------------------

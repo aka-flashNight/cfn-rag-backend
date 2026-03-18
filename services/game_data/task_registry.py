@@ -20,6 +20,9 @@ class TaskRegistry:
         self._by_npc: dict[str, list[Task]] = {}
         self._reward_types: set[str] = set()
         self._submit_items: set[str] = set()
+        # 提交/持有物品数量统计：用于 agent 草案校验的“数量合理性”
+        self._submit_stats: dict[str, tuple[int, int]] = {}
+        self._contain_stats: dict[str, tuple[int, int]] = {}
         # 奖励物品名 -> (min_qty, max_qty)
         self._reward_stats: dict[str, tuple[int, int]] = {}
 
@@ -75,6 +78,8 @@ class TaskRegistry:
         self._by_npc = {}
         self._reward_types = set()
         self._submit_items = set()
+        self._submit_stats = {}
+        self._contain_stats = {}
         self._reward_stats = {}
 
         for t in tasks:
@@ -88,6 +93,30 @@ class TaskRegistry:
                 name, _ = parse_name_count(expr)
                 if name:
                     self._submit_items.add(name)
+
+            # 提交物品数量统计（finish_submit_items）
+            for expr in t.finish_submit_items or []:
+                name, count = parse_name_count(expr)
+                if not name or count <= 0:
+                    continue
+                mn, mx = self._submit_stats.get(name, (None, None))  # type: ignore
+                if mn is None or count < mn:
+                    mn = count
+                if mx is None or count > mx:
+                    mx = count
+                self._submit_stats[name] = (int(mn), int(mx))  # type: ignore
+
+            # 持有物品数量统计（finish_contain_items）
+            for expr in t.finish_contain_items or []:
+                name, count = parse_name_count(expr)
+                if not name or count <= 0:
+                    continue
+                mn, mx = self._contain_stats.get(name, (None, None))  # type: ignore
+                if mn is None or count < mn:
+                    mn = count
+                if mx is None or count > mx:
+                    mx = count
+                self._contain_stats[name] = (int(mn), int(mx))  # type: ignore
 
             # 奖励池：记录物品名集合 + 数量区间
             for reward in t.rewards or []:
@@ -124,7 +153,17 @@ class TaskRegistry:
         return max_id
 
     def list_reward_types(self) -> set[str]:
+        """
+        注意：此方法历史命名沿用，但实际返回的是“已有任务 rewards 中出现过的物品名集合”，
+        不是“奖励类型集合”（例如 '药剂' / '武器' 这种 item.type）。
+        """
         return set(self._reward_types)
+
+    def list_reward_item_names(self) -> set[str]:
+        """
+        兼容别名：返回“已有任务 rewards 中出现过的物品名集合”。
+        """
+        return self.list_reward_types()
 
     def list_submit_items(self) -> set[str]:
         """
@@ -141,4 +180,27 @@ class TaskRegistry:
         """
 
         return dict(self._reward_stats)
+
+    def get_submit_stats(self) -> dict[str, tuple[int, int]]:
+        """
+        提交物品数量统计：
+        - key: 物品名
+        - value: (min_qty, max_qty) —— 在所有任务 finish_submit_items 中出现的数量区间
+        """
+
+        return dict(self._submit_stats)
+
+    def get_contain_stats(self) -> dict[str, tuple[int, int]]:
+        """
+        持有物品数量统计：
+        - key: 物品名
+        - value: (min_qty, max_qty) —— 在所有任务 finish_contain_items 中出现的数量区间
+        """
+
+        return dict(self._contain_stats)
+
+    def list_agent_tasks(self) -> list[Task]:
+        """Agent 生成的任务（ID 区间 200001–300000）。"""
+
+        return [t for tid, t in self._by_id.items() if 200001 <= tid <= 300000]
 
