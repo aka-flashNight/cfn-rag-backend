@@ -18,6 +18,8 @@ class MercenaryTaskInfo:
     challenge_recommended_min_level: Optional[int]
     challenge_recommended_max_level: Optional[int]
     challenge_description: Optional[str]
+    """challenge 的 LLM 提醒：选择该难度时需在任务介绍中说明难度并在对话中提醒具有挑战性。仅在该难度可选时随 challenge_modes 返回，按需占用 token。"""
+    challenge_llm_hint: Optional[str]
     stage_name: Optional[str]
     raw: dict
 
@@ -64,6 +66,7 @@ class MercenaryTaskRegistry:
             # challenge 解析：仅当 challenge.difficulty 存在且非 "简单" 时才作为“额外难度”使用
             challenge_difficulty: Optional[str] = None
             challenge_description: Optional[str] = None
+            challenge_llm_hint: Optional[str] = None
             cmin: Optional[int]
             cmax: Optional[int]
             cmin, cmax = None, None
@@ -76,6 +79,9 @@ class MercenaryTaskRegistry:
                 desc = challenge_obj.get("description")
                 if isinstance(desc, str) and desc.strip():
                     challenge_description = desc.strip()
+                llm_hint = challenge_obj.get("llm_hint")
+                if isinstance(llm_hint, str) and llm_hint.strip():
+                    challenge_llm_hint = llm_hint.strip()
 
                 # challenge.recommended_level 解析；若缺失，按你的“同逻辑”回退到根 recommended_level
                 cmin, cmax = self._parse_recommended_level(challenge_obj.get("recommended_level"))
@@ -86,6 +92,7 @@ class MercenaryTaskRegistry:
                     # challenge == "简单" 或缺失：视为没有额外难度
                     challenge_difficulty = None
                     cmin, cmax = None, None
+                    challenge_llm_hint = None
 
             info = MercenaryTaskInfo(
                 id=tid,
@@ -96,6 +103,7 @@ class MercenaryTaskRegistry:
                 challenge_recommended_min_level=cmin,
                 challenge_recommended_max_level=cmax,
                 challenge_description=challenge_description,
+                challenge_llm_hint=challenge_llm_hint,
                 stage_name=stage_name,
                 raw=t,
             )

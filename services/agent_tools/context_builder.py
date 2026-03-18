@@ -19,6 +19,9 @@ from services.game_progress import (
     PROGRESS_STAGE_CONFIG,
 )
 
+# 当 challenge 无 llm_hint 时使用的默认提醒（仅在选择该难度时随 challenge_modes 返回，按需占用 token）
+DEFAULT_CHALLENGE_LLM_HINT = "若选择此难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
+
 
 # ---------------------------------------------------------------------------
 # 任务类型规则说明模板
@@ -336,6 +339,7 @@ def _get_all_stages_for_progress(
 
             allowed_difficulties: set[str] = {"简单"}
             challenge_modes_map: dict[str, str] = {}
+            challenge_hint_map: dict[str, str] = {}
 
             # 额外难度：需要满足 challenge.recommended_level 的下限
             for mt in merc_tasks:
@@ -348,6 +352,10 @@ def _get_all_stages_for_progress(
                     allowed_difficulties.add(mt.challenge_difficulty)
                     if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
                         challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+                    if mt.challenge_difficulty not in challenge_hint_map:
+                        challenge_hint_map[mt.challenge_difficulty] = (
+                            mt.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
+                        )
 
             # 保持稳定顺序：按照 difficulty 枚举顺序输出
             difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
@@ -355,7 +363,11 @@ def _get_all_stages_for_progress(
             # 返回给 LLM 的挑战模式说明（仅当包含非简单时）
             if len(difficulties) > 1 and challenge_modes_map:
                 entry_challenges = [
-                    {"difficulty": diff, "description": desc}
+                    {
+                        "difficulty": diff,
+                        "description": desc,
+                        "hint": challenge_hint_map.get(diff, DEFAULT_CHALLENGE_LLM_HINT),
+                    }
                     for diff, desc in challenge_modes_map.items()
                     if diff in difficulties and diff != "简单"
                 ]
@@ -489,6 +501,7 @@ def _build_challenge_targets(
     # 基础：至少包含“简单”
     allowed_difficulties: set[str] = {"简单"}
     challenge_modes_map: dict[str, str] = {}
+    challenge_hint_map: dict[str, str] = {}
     for m in matched_merc_tasks:
         if not m.challenge_difficulty or m.challenge_difficulty == "简单":
             continue
@@ -499,6 +512,8 @@ def _build_challenge_targets(
             allowed_difficulties.add(m.challenge_difficulty)
             if m.challenge_description and m.challenge_difficulty not in challenge_modes_map:
                 challenge_modes_map[m.challenge_difficulty] = m.challenge_description
+            if m.challenge_difficulty not in challenge_hint_map:
+                challenge_hint_map[m.challenge_difficulty] = m.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
 
     difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
 
@@ -510,7 +525,11 @@ def _build_challenge_targets(
 
     if len(difficulties) > 1:
         extra_modes = [
-            {"difficulty": d, "description": desc}
+            {
+                "difficulty": d,
+                "description": desc,
+                "hint": challenge_hint_map.get(d, DEFAULT_CHALLENGE_LLM_HINT),
+            }
             for d, desc in challenge_modes_map.items()
             if d in difficulties and d != "简单"
         ]
@@ -836,6 +855,7 @@ def _build_stage_loot_list(
 
             allowed_difficulties: set[str] = {"简单"}
             challenge_modes_map: dict[str, str] = {}
+            challenge_hint_map: dict[str, str] = {}
             for mt in merc_tasks:
                 if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
                     continue
@@ -846,10 +866,18 @@ def _build_stage_loot_list(
                     allowed_difficulties.add(mt.challenge_difficulty)
                     if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
                         challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+                    if mt.challenge_difficulty not in challenge_hint_map:
+                        challenge_hint_map[mt.challenge_difficulty] = (
+                            mt.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
+                        )
 
             difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
             entry_challenges = [
-                {"difficulty": diff, "description": desc}
+                {
+                    "difficulty": diff,
+                    "description": desc,
+                    "hint": challenge_hint_map.get(diff, DEFAULT_CHALLENGE_LLM_HINT),
+                }
                 for diff, desc in challenge_modes_map.items()
                 if diff in difficulties and diff != "简单"
             ]

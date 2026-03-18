@@ -113,13 +113,15 @@ def execute_draft_agent_task(
             "errors": result.validation_errors,
             "draft_summary": detailed,
         }, ensure_ascii=False), draft
-    else:
-        return json.dumps({
-            "status": "draft_created",
-            "draft_id": draft_id,
-            "message": "任务草案已创建，等待玩家确认。",
-            "draft_summary": detailed,
-        }, ensure_ascii=False), draft
+    payload: dict[str, Any] = {
+        "status": "draft_created",
+        "draft_id": draft_id,
+        "message": "任务草案已创建，等待玩家确认。",
+        "draft_summary": detailed,
+    }
+    if result.validation_warnings:
+        payload["warnings"] = result.validation_warnings
+    return json.dumps(payload, ensure_ascii=False), draft
 
 
 def execute_update_task_draft(
@@ -166,13 +168,15 @@ def execute_update_task_draft(
             "errors": result.validation_errors,
             "draft_summary": detailed,
         }, ensure_ascii=False), pending_draft
-    else:
-        return json.dumps({
-            "status": "draft_updated",
-            "draft_id": pending_draft.get("draft_id", ""),
-            "message": "草案已更新，等待玩家确认。",
-            "draft_summary": detailed,
-        }, ensure_ascii=False), pending_draft
+    payload = {
+        "status": "draft_updated",
+        "draft_id": pending_draft.get("draft_id", ""),
+        "message": "草案已更新，等待玩家确认。",
+        "draft_summary": detailed,
+    }
+    if result.validation_warnings:
+        payload["warnings"] = result.validation_warnings
+    return json.dumps(payload, ensure_ascii=False), pending_draft
 
 
 def execute_confirm_agent_task(
@@ -236,15 +240,15 @@ def execute_confirm_agent_task(
         ), pending_draft, None
 
     detailed = _detailed_draft_summary(pending_draft, game_data)
-    return json.dumps(
-        {
-            "status": "confirmed",
-            "task_id": task_id,
-            "message": write_desc,
-            "draft_summary": detailed,
-        },
-        ensure_ascii=False,
-    ), None, write_desc
+    confirm_payload: dict[str, Any] = {
+        "status": "confirmed",
+        "task_id": task_id,
+        "message": write_desc,
+        "draft_summary": detailed,
+    }
+    if result.validation_warnings:
+        confirm_payload["warnings"] = result.validation_warnings
+    return json.dumps(confirm_payload, ensure_ascii=False), None, write_desc
 
 
 def execute_cancel_agent_task(

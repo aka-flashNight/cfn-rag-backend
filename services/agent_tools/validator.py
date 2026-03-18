@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from services.game_progress import VALID_STAGE_ROOTS
@@ -672,9 +672,11 @@ def _validate_v9_task_uniqueness(
             similar_ids.append(t.id)
 
     if similar_ids:
+        n = len(similar_ids)
         return {
             "step": "V9",
-            "error": "任务与已有agent任务高度雷同，发布失败，请重新生成任务或拒绝发布！",
+            "warning": f"已发布{n}个高度雷同的任务，请谨慎发布，可视情况取消任务/变更任务或继续委派任务。",
+            "similar_task_count": n,
             "similar_task_ids": similar_ids,
         }
     return None
@@ -728,6 +730,8 @@ def _validate_v10_equipment_level_match(
 class DraftValidationResult:
     success: bool
     validation_errors: list[dict[str, Any]]
+    """仅提示，不阻止工具调用；如 V9 高度雷同时的谨慎发布提醒。"""
+    validation_warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 # =========================================================================
@@ -785,7 +789,7 @@ def validate_task_draft(
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V2: 物品数量合理性 ----
     if run_rewards:
@@ -795,7 +799,7 @@ def validate_task_draft(
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V3: 关卡存在性与解锁 ----
     if run_stages:
@@ -803,7 +807,7 @@ def validate_task_draft(
             draft=draft, stage_registry=stage_registry,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V3R: 副本/切磋关卡推荐等级强校验 ----
     if run_stages:
@@ -813,7 +817,7 @@ def validate_task_draft(
             game_data=game_data,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V4: 关卡解锁条件匹配 ----
     if run_stages:
@@ -823,7 +827,7 @@ def validate_task_draft(
             main_task_max_id=context.main_task_max_id,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V5: 副本关卡难度 ----
     if run_stages:
@@ -833,7 +837,7 @@ def validate_task_draft(
             game_data=game_data,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V6: 前置任务合法性 ----
     if run_preconditions:
@@ -841,7 +845,7 @@ def validate_task_draft(
             draft=draft, task_registry=task_registry,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V7: 奖励总价值 ----
     if run_v7:
@@ -856,7 +860,7 @@ def validate_task_draft(
                 bargain_rate=context.bargain_rate,
             )
             if e:
-                return DraftValidationResult(success=False, validation_errors=[e])
+                return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
     # ---- V8: 奖励类型合规 ----
     if run_v8:
@@ -868,17 +872,18 @@ def validate_task_draft(
             npc_name=context.npc_name,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
-    # ---- V9: 任务不完全重复 ----
+    # ---- V9: 任务高度雷同（仅警告，不阻止发布） ----
+    validation_warnings: list[dict[str, Any]] = []
     if run_v9:
-        e = _validate_v9_task_uniqueness(
+        w = _validate_v9_task_uniqueness(
             draft=draft,
             task_registry=task_registry,
             npc_name=context.npc_name,
         )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+        if w:
+            validation_warnings.append(w)
 
     # ---- V10: 装备等级匹配 ----
     if run_v10:
@@ -890,9 +895,9 @@ def validate_task_draft(
             keys=keys_for_v10,
         )
         if e:
-            return DraftValidationResult(success=False, validation_errors=[e])
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
 
-    return DraftValidationResult(success=True, validation_errors=[])
+    return DraftValidationResult(success=True, validation_errors=[], validation_warnings=validation_warnings)
 
 
 # =========================================================================
@@ -936,7 +941,7 @@ def validate_task_draft_v1_v6(
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e1:
-            return DraftValidationResult(success=False, validation_errors=[e1])
+            return DraftValidationResult(success=False, validation_errors=[e1], validation_warnings=[])
 
         e2 = _validate_v2_item_quantity_reasonableness(
             draft=draft,
@@ -944,12 +949,12 @@ def validate_task_draft_v1_v6(
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e2:
-            return DraftValidationResult(success=False, validation_errors=[e2])
+            return DraftValidationResult(success=False, validation_errors=[e2], validation_warnings=[])
 
     if run_stage_steps:
         e3 = _validate_v3_stage_existence_and_area(draft=draft, stage_registry=stage_registry)
         if e3:
-            return DraftValidationResult(success=False, validation_errors=[e3])
+            return DraftValidationResult(success=False, validation_errors=[e3], validation_warnings=[])
 
         e4 = _validate_v4_stage_unlock_condition(
             draft=draft,
@@ -957,7 +962,7 @@ def validate_task_draft_v1_v6(
             main_task_max_id=context.main_task_max_id,
         )
         if e4:
-            return DraftValidationResult(success=False, validation_errors=[e4])
+            return DraftValidationResult(success=False, validation_errors=[e4], validation_warnings=[])
 
         e5 = _validate_v5_replica_stage_difficulty(
             draft=draft,
@@ -965,11 +970,11 @@ def validate_task_draft_v1_v6(
             game_data=game_data,
         )
         if e5:
-            return DraftValidationResult(success=False, validation_errors=[e5])
+            return DraftValidationResult(success=False, validation_errors=[e5], validation_warnings=[])
 
     if run_precondition_steps:
         e6 = _validate_v6_precondition_tasks(draft=draft, task_registry=task_registry)
         if e6:
-            return DraftValidationResult(success=False, validation_errors=[e6])
+            return DraftValidationResult(success=False, validation_errors=[e6], validation_warnings=[])
 
-    return DraftValidationResult(success=True, validation_errors=[])
+    return DraftValidationResult(success=True, validation_errors=[], validation_warnings=[])
