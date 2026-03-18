@@ -19,7 +19,10 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def parse_json(path: Path, encoding: str = "utf-8") -> Any:
+def parse_json(path: Path, encoding: str = "utf-8-sig") -> Any:
+    # 兼容部分数据文件带 UTF-8 BOM 的情况：
+    # - 正常 UTF-8 也能被 utf-8-sig 正确读取
+    # - 带 BOM 的文件则不会触发 “Unexpected UTF-8 BOM” 异常
     with path.open("r", encoding=encoding) as f:
         return json.load(f)
 

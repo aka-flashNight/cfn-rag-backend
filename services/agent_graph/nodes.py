@@ -1,0 +1,864 @@
+"""
+LangGraph 图节点实现（对应文档 6.2.3 – 6.2.7）。
+
+节点列表：
+  - prepare_context   — 构建 prompt、检索 RAG、注入 NPC 状态
+  - decision          — 非流式 LLM 调用（带全部工具）判断是否使用工具
+  - tool_executor     — 执行工具调用
+  - generate_response — LLM 调用，生成 NPC 对话回复
+  - parse_mood        — 从回复 / tool_calls 中解析情绪与好感度
+  - post_process      — 保存记忆、更新好感度
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, Optional
+
+from langchain_core.runnables import RunnableConfig
+
+from services.llm_client import call_llm, call_llm_stream
+from services.npc_mood_agent import (
+    has_update_npc_mood_tool_call,
+    is_image_unsupported_error,
+    is_tools_unsupported_error,
+    parse_mood_from_text,
+    parse_update_npc_mood_tool_calls,
+    strip_trailing_mood_json,
+    strip_trailing_tool_call_text,
+)
+from services.agent_tools.tool_executor import dispatch_tool_call
+from services.agent_tools import (
+    PREPARE_TASK_CONTEXT_TOOL,
+    SEARCH_KNOWLEDGE_TOOL,
+    DRAFT_AGENT_TASK_TOOL,
+    UPDATE_TASK_DRAFT_TOOL,
+    UPDATE_NPC_MOOD_TOOL,
+)
+
+from .prompts import (
+    DECISION_ROUND_SUFFIX,
+    GENERATION_ROUND_SUFFIX,
+    build_system_prompt,
+    build_user_prompt,
+)
+
+logger = logging.getLogger(__name__)
+
+ALL_TOOLS = [
+    PREPARE_TASK_CONTEXT_TOOL,
+    SEARCH_KNOWLEDGE_TOOL,
+    DRAFT_AGENT_TASK_TOOL,
+    UPDATE_TASK_DRAFT_TOOL,
+    UPDATE_NPC_MOOD_TOOL,
+]
+
+CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "confirm_agent_task",
+        "description": "确认当前草案并写入任务系统。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "draft_id": {"type": "string"},
+            },
+            "required": ["draft_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+CANCEL_AGENT_TASK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "cancel_agent_task",
+        "description": "取消当前待确认的任务草案。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "draft_id": {"type": "string"},
+            },
+            "required": ["draft_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _get_full_tools() -> list[dict[str, Any]]:
+    return ALL_TOOLS + [CONFIRM_AGENT_TASK_TOOL, CANCEL_AGENT_TASK_TOOL]
+
+
+# ---------------------------------------------------------------------------
+# Node: prepare_context
+# ---------------------------------------------------------------------------
+
+async def prepare_context_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    构建 system prompt 和 user prompt，设置初始状态。
+    该节点需要外部注入的配置（通过 config["configurable"]）：
+    - rag_service: GameRAGService 实例（检索用）
+    - npc_manager: NPCManager 实例
+    - memory: MemoryManager 实例
+    - payload: NPCChatRequest 对象
+    """
+    cfgable = config.get("configurable", {})
+    rag_service = cfgable["rag_service"]
+    npc_manager = cfgable["npc_manager"]
+    memory = cfgable["memory"]
+    payload = cfgable["payload"]
+    game_data = cfgable.get("game_data")
+
+    from services.npc_manager import NPCState
+    from services.game_rag_service import (
+        ALLOWED_SUMMARIZE_INTERVALS,
+        DEFAULT_SUMMARIZE_INTERVAL,
+    )
+    from services.game_progress import get_progress_stage_name
+
+    npc_name = payload.npc_name.strip()
+    current_state = npc_manager.state.get(npc_name)
+    if current_state is None:
+        current_state = NPCState(
+            favorability=0,
+            relationship_level="陌生",
+            emotions=["普通"],
+        )
+
+    favorability = current_state.favorability
+    relationship_level = current_state.relationship_level
+    sex = current_state.sex
+    emotions = current_state.emotions or ["普通"]
+    faction = current_state.faction
+    titles = current_state.titles or []
+    npc_challenge = getattr(current_state, "challenge", None)
+    has_shop = False
+    if game_data:
+        has_shop = game_data.shops.has_shop(npc_name)
+
+    effective_interval = (
+        payload.summarize_interval
+        if payload.summarize_interval is not None
+        and payload.summarize_interval in ALLOWED_SUMMARIZE_INTERVALS
+        else DEFAULT_SUMMARIZE_INTERVAL
+    )
+
+    history_records = await memory.get_history(
+        payload.session_id, limit=effective_interval
+    )
+
+    last_npc_message: str | None = None
+    for msg in reversed(history_records):
+        if msg.get("role") != "user":
+            last_npc_message = (msg.get("content") or "").strip()
+            break
+
+    all_npc_states = npc_manager.state
+
+    retrieve_query = rag_service._build_retrieve_query(
+        payload.query, npc_name, titles, faction
+    )
+
+    forbidden_other_chars = None
+    skip_factions_for_other = {"彩蛋", "成员"}
+    if (faction or "").strip() not in skip_factions_for_other:
+        forbidden_other_chars = {
+            name.lower()
+            for name, st in all_npc_states.items()
+            if (st.faction or "").strip() in skip_factions_for_other
+        }
+
+    retrieved_context = await asyncio.to_thread(
+        rag_service._retrieve_context,
+        npc_name,
+        payload.query,
+        retrieve_query,
+        npc_last_message=last_npc_message,
+        forbidden_other_chars=forbidden_other_chars,
+    )
+
+    player_identity = (
+        payload.player_identity.strip()
+        if payload.player_identity and payload.player_identity.strip()
+        else "一个末日后加入A兵团成为佣兵的幸存者"
+    )
+
+    progress_stage = getattr(payload, "progress_stage", None)
+    progress_stage_desc = ""
+    stage_name = get_progress_stage_name(progress_stage)
+    if stage_name:
+        progress_stage_desc = f"当前玩家的主要作战区域为{stage_name}。"
+
+    mentioned_npcs, mentioned_names = rag_service._find_mentioned_npcs(
+        payload.query, npc_name, all_npc_states, faction
+    )
+    same_faction_npc_strs = rag_service._get_same_faction_npcs(
+        npc_name, faction, all_npc_states, exclude_names=mentioned_names
+    )
+
+    mentioned_npcs_str = ""
+    if mentioned_npcs:
+        mentioned_npcs_str += (
+            "可能涉及到的其他角色的设定（注意，如果和你不是一个阵营的角色你可能了解的不多）：\n"
+            + "\n".join(mentioned_npcs)
+            + "\n\n"
+        )
+
+    same_faction_str = ""
+    if same_faction_npc_strs:
+        same_faction_str = (
+            ("其他同阵营角色：\n" if mentioned_npcs else "同阵营角色：\n")
+            + "\n".join(same_faction_npc_strs)
+            + "\n\n"
+        )
+
+    pending_draft = state.get("pending_task_draft")
+    pending_draft_summary = ""
+    if pending_draft:
+        from services.agent_tools.tool_executor import _summarize_draft
+        pending_draft_summary = _summarize_draft(pending_draft)
+
+    summary_text = await memory.get_summary(payload.session_id)
+    history_lines = []
+    for msg in history_records:
+        role, content = msg["role"], msg["content"]
+        prefix = "玩家" if role == "user" else npc_name
+        history_lines.append(f"{prefix}: {content}")
+    history_str = ""
+    if summary_text:
+        history_str += "当前对话历史较长，早期对话已整理为以下摘要：\n" + summary_text + "\n\n"
+    if history_lines:
+        joined = "\n".join(history_lines)
+        history_str += (
+            "以下是最近的对话记录（按时间从早到晚排列），"
+            "请结合上述摘要与近期记录，在保持人物性格与情节连贯的前提下继续对话：\n"
+            if summary_text
+            else "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
+            "请在保持人物性格与情节连贯的前提下继续对话：\n"
+        ) + joined + "\n\n"
+
+    raw_emotion = getattr(payload, "current_emotion", None)
+    current_emotion_for_use = None
+    if raw_emotion is not None and isinstance(raw_emotion, str):
+        s = raw_emotion.strip()
+        if s and s.lower() not in ("null", "undefined"):
+            current_emotion_for_use = s
+    emotion_for_portrait = current_emotion_for_use or "普通"
+    image_path, image_description = rag_service._get_npc_image_path(
+        npc_name, emotion_for_portrait
+    )
+    emotion_hint = ""
+    if current_emotion_for_use and current_emotion_for_use != "普通":
+        emotion_hint = f"你之前的情绪是「{current_emotion_for_use}」。"
+
+    system_prompt = build_system_prompt(
+        npc_name=npc_name,
+        sex=sex or "",
+        faction=faction or "",
+        titles=titles,
+        emotions=emotions,
+        has_shop=has_shop,
+        has_challenge=bool(npc_challenge),
+        same_faction_npcs=same_faction_str,
+        player_identity=player_identity,
+        progress_stage_desc=progress_stage_desc,
+        favorability=favorability,
+        relationship_level=relationship_level,
+        mentioned_npcs_str=mentioned_npcs_str,
+        pending_draft_summary=pending_draft_summary,
+    )
+
+    user_prompt = build_user_prompt(
+        retrieved_context=retrieved_context or "",
+        history_str=history_str,
+        user_query=payload.query,
+        emotion_hint=emotion_hint,
+        image_description=image_description or "",
+    )
+
+    from core.config import get_settings
+    settings = get_settings()
+    effective_api_key = (
+        (payload.api_key.strip() if payload.api_key and payload.api_key.strip() else None)
+        or settings.llm_api_key
+    )
+    effective_api_base = (
+        (payload.api_base.strip() if payload.api_base and payload.api_base.strip() else None)
+        or settings.llm_api_base
+    )
+    effective_model = (
+        (payload.model_name.strip() if payload.model_name and payload.model_name.strip() else None)
+        or settings.llm_model_name
+    )
+
+    return {
+        "npc_name": npc_name,
+        "player_progress": progress_stage or 0,
+        "npc_affinity": favorability,
+        "npc_relationship_level": relationship_level,
+        "npc_faction": faction or "",
+        "npc_titles": titles,
+        "npc_sex": sex or "",
+        "npc_challenge": npc_challenge,
+        "npc_emotions": emotions,
+        "session_id": payload.session_id,
+        "retrieved_context": retrieved_context or "",
+        "api_key": effective_api_key or "",
+        "api_base": effective_api_base or "",
+        "model_name": effective_model or "",
+        "image_path": str(image_path) if image_path else None,
+        "image_description": image_description,
+        "emotion_hint": emotion_hint,
+        "tool_call_round": 0,
+        "has_tool_calls": False,
+        "pending_task_draft": pending_draft,
+        "task_confirmed": False,
+        "task_write_result": None,
+        "payload_dict": {
+            "query": payload.query,
+            "npc_name": npc_name,
+            "session_id": payload.session_id,
+        },
+        "effective_summarize_interval": effective_interval,
+        # 存储构建好的 prompt（供 decision / generate 节点复用）
+        "_system_prompt": system_prompt,
+        "_user_prompt": user_prompt,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: decision
+# ---------------------------------------------------------------------------
+
+async def decision_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    非流式 LLM 调用（带全部工具），判断是否需要使用工具。
+    """
+    system_prompt = state.get("_system_prompt", "")
+    user_prompt = state.get("_user_prompt", "")
+    round_num = state.get("tool_call_round", 0)
+
+    decision_suffix = f"\n\n{DECISION_ROUND_SUFFIX}"
+    full_user_prompt = user_prompt + decision_suffix
+
+    tool_messages = state.get("_tool_messages", [])
+    if tool_messages:
+        full_user_prompt += "\n\n【工具执行结果】\n"
+        for tm in tool_messages:
+            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+
+    image_path_str = state.get("image_path")
+    image_path = None
+    if image_path_str:
+        from pathlib import Path
+        image_path = Path(image_path_str)
+
+    reply_text = ""
+    tool_calls: list[dict] = []
+
+    try:
+        reply_text, tool_calls = await call_llm(
+            api_key=state.get("api_key"),
+            api_base=state.get("api_base"),
+            model_name=state.get("model_name"),
+            system_prompt=system_prompt,
+            user_prompt=full_user_prompt,
+            image_path=image_path if round_num == 0 else None,
+            image_description=state.get("image_description") if round_num == 0 else None,
+            emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+            tools=_get_full_tools(),
+        )
+    except Exception as e:
+        if is_image_unsupported_error(e) and image_path:
+            try:
+                reply_text, tool_calls = await call_llm(
+                    api_key=state.get("api_key"),
+                    api_base=state.get("api_base"),
+                    model_name=state.get("model_name"),
+                    system_prompt=system_prompt,
+                    user_prompt=full_user_prompt,
+                    image_path=None,
+                    image_description=state.get("image_description"),
+                    emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+                    tools=_get_full_tools(),
+                )
+            except Exception as e2:
+                if is_tools_unsupported_error(e2):
+                    reply_text, tool_calls = await call_llm(
+                        api_key=state.get("api_key"),
+                        api_base=state.get("api_base"),
+                        model_name=state.get("model_name"),
+                        system_prompt=system_prompt,
+                        user_prompt=full_user_prompt,
+                        image_path=None,
+                        image_description=state.get("image_description"),
+                        emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+                        tools=None,
+                    )
+                else:
+                    raise
+        elif is_tools_unsupported_error(e):
+            reply_text, tool_calls = await call_llm(
+                api_key=state.get("api_key"),
+                api_base=state.get("api_base"),
+                model_name=state.get("model_name"),
+                system_prompt=system_prompt,
+                user_prompt=full_user_prompt,
+                image_path=image_path if round_num == 0 else None,
+                image_description=state.get("image_description") if round_num == 0 else None,
+                emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+                tools=None,
+            )
+        else:
+            raise
+
+    mood_tool_calls = [
+        tc for tc in tool_calls
+        if (tc.get("function", {}).get("name") or tc.get("name", "")) == "update_npc_mood"
+    ]
+    other_tool_calls = [
+        tc for tc in tool_calls
+        if (tc.get("function", {}).get("name") or tc.get("name", "")) != "update_npc_mood"
+    ]
+
+    has_tools = bool(other_tool_calls)
+
+    return {
+        "tool_call_round": round_num + 1,
+        "has_tool_calls": has_tools,
+        "_pending_tool_calls": other_tool_calls,
+        "_mood_tool_calls": state.get("_mood_tool_calls", []) + mood_tool_calls,
+        "_decision_reply": reply_text or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: tool_executor
+# ---------------------------------------------------------------------------
+
+async def tool_executor_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    执行 decision 节点产出的 tool_calls。
+    """
+    cfgable = config.get("configurable", {})
+    game_data = cfgable.get("game_data")
+    npc_manager = cfgable.get("npc_manager")
+    rag_service = cfgable.get("rag_service")
+
+    pending_calls = state.get("_pending_tool_calls", [])
+    pending_draft = state.get("pending_task_draft")
+    npc_name = state.get("npc_name", "")
+    npc_faction = state.get("npc_faction", "")
+    npc_challenge = state.get("npc_challenge")
+    player_progress = state.get("player_progress", 1)
+    npc_affinity = state.get("npc_affinity", 0)
+
+    npc_states = npc_manager.state if npc_manager else None
+
+    def _make_retrieve_fn():
+        if rag_service is None:
+            return None
+
+        def _fn(keyword: str) -> str:
+            titles = state.get("npc_titles", [])
+            faction = state.get("npc_faction", "")
+            retrieve_query = rag_service._build_retrieve_query(
+                keyword, npc_name, titles, faction
+            )
+            return rag_service._retrieve_context(
+                npc_name, keyword, retrieve_query
+            )
+        return _fn
+
+    tool_messages: list[dict[str, str]] = list(state.get("_tool_messages", []))
+    task_write_result = state.get("task_write_result")
+
+    for tc in pending_calls:
+        func_info = tc.get("function", tc)
+        tool_name = func_info.get("name", "")
+        raw_args = func_info.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                tool_args = json.loads(raw_args)
+            except Exception:
+                tool_args = {}
+        else:
+            tool_args = raw_args or {}
+
+        result_str, updated_draft, write_result = dispatch_tool_call(
+            tool_name,
+            tool_args,
+            npc_name=npc_name,
+            npc_faction=npc_faction,
+            npc_challenge=npc_challenge,
+            player_progress=player_progress,
+            npc_affinity=npc_affinity,
+            npc_states=npc_states,
+            game_data=game_data,
+            pending_draft=pending_draft,
+            retrieve_fn=_make_retrieve_fn(),
+        )
+
+        if updated_draft is not None:
+            pending_draft = updated_draft
+        elif tool_name in ("confirm_agent_task", "cancel_agent_task"):
+            pending_draft = None
+
+        if write_result:
+            task_write_result = write_result
+
+        tool_messages.append({
+            "tool_name": tool_name,
+            "result": result_str,
+        })
+
+    return {
+        "_tool_messages": tool_messages,
+        "_pending_tool_calls": [],
+        "pending_task_draft": pending_draft,
+        "task_write_result": task_write_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: generate_response (non-streaming for `ask`)
+# ---------------------------------------------------------------------------
+
+async def generate_response_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    生成最终 NPC 对话回复（非流式，用于 ask 接口）。
+    """
+    system_prompt = state.get("_system_prompt", "")
+    user_prompt = state.get("_user_prompt", "")
+
+    gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
+    full_user_prompt = user_prompt + gen_suffix
+
+    tool_messages = state.get("_tool_messages", [])
+    if tool_messages:
+        full_user_prompt += "\n\n【工具执行结果】\n"
+        for tm in tool_messages:
+            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+
+    decision_reply = state.get("_decision_reply", "")
+    if decision_reply.strip():
+        full_user_prompt += f"\n\n你在决策轮的初步想法：{decision_reply[:500]}"
+
+    image_path_str = state.get("image_path")
+    image_path = None
+    if image_path_str:
+        from pathlib import Path
+        image_path = Path(image_path_str)
+
+    try:
+        reply_text, tool_calls = await call_llm(
+            api_key=state.get("api_key"),
+            api_base=state.get("api_base"),
+            model_name=state.get("model_name"),
+            system_prompt=system_prompt,
+            user_prompt=full_user_prompt,
+            image_path=image_path,
+            image_description=state.get("image_description"),
+            emotion_hint=state.get("emotion_hint") or None,
+            tools=[UPDATE_NPC_MOOD_TOOL],
+        )
+    except Exception as e:
+        if is_image_unsupported_error(e) and image_path:
+            try:
+                reply_text, tool_calls = await call_llm(
+                    api_key=state.get("api_key"),
+                    api_base=state.get("api_base"),
+                    model_name=state.get("model_name"),
+                    system_prompt=system_prompt,
+                    user_prompt=full_user_prompt,
+                    image_path=None,
+                    image_description=state.get("image_description"),
+                    emotion_hint=state.get("emotion_hint") or None,
+                    tools=[UPDATE_NPC_MOOD_TOOL],
+                )
+            except Exception as e2:
+                if is_tools_unsupported_error(e2):
+                    reply_text, tool_calls = await call_llm(
+                        api_key=state.get("api_key"),
+                        api_base=state.get("api_base"),
+                        model_name=state.get("model_name"),
+                        system_prompt=system_prompt,
+                        user_prompt=full_user_prompt,
+                        image_path=None,
+                        image_description=state.get("image_description"),
+                        emotion_hint=state.get("emotion_hint") or None,
+                        tools=None,
+                    )
+                else:
+                    raise
+        elif is_tools_unsupported_error(e):
+            try:
+                reply_text, tool_calls = await call_llm(
+                    api_key=state.get("api_key"),
+                    api_base=state.get("api_base"),
+                    model_name=state.get("model_name"),
+                    system_prompt=system_prompt,
+                    user_prompt=full_user_prompt,
+                    image_path=image_path,
+                    image_description=state.get("image_description"),
+                    emotion_hint=state.get("emotion_hint") or None,
+                    tools=None,
+                )
+            except Exception as e2:
+                if is_image_unsupported_error(e2) and image_path:
+                    reply_text, tool_calls = await call_llm(
+                        api_key=state.get("api_key"),
+                        api_base=state.get("api_base"),
+                        model_name=state.get("model_name"),
+                        system_prompt=system_prompt,
+                        user_prompt=full_user_prompt,
+                        image_path=None,
+                        image_description=state.get("image_description"),
+                        emotion_hint=state.get("emotion_hint") or None,
+                        tools=None,
+                    )
+                else:
+                    raise
+        else:
+            raise
+
+    mood_calls = state.get("_mood_tool_calls", [])
+    mood_calls.extend(tool_calls)
+
+    return {
+        "final_reply": reply_text or "",
+        "_mood_tool_calls": mood_calls,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streaming generate (standalone coroutine, not a graph node)
+# ---------------------------------------------------------------------------
+
+async def generate_response_stream(
+    state: dict[str, Any],
+    config: RunnableConfig,
+):
+    """
+    流式生成 NPC 对话回复（用于 ask_stream 接口）。
+    这是一个独立协程，不是 LangGraph 节点——因为它需要 yield 流式 chunk。
+
+    Yields: ("content", delta_text)
+    Returns: (full_reply, mood_tool_calls) 更新到 state
+    """
+    system_prompt = state.get("_system_prompt", "")
+    user_prompt = state.get("_user_prompt", "")
+
+    gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
+    full_user_prompt = user_prompt + gen_suffix
+
+    tool_messages = state.get("_tool_messages", [])
+    if tool_messages:
+        full_user_prompt += "\n\n【工具执行结果】\n"
+        for tm in tool_messages:
+            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+
+    decision_reply = state.get("_decision_reply", "")
+    if decision_reply.strip():
+        full_user_prompt += f"\n\n你在决策轮的初步想法：{decision_reply[:500]}"
+
+    image_path_str = state.get("image_path")
+    image_path = None
+    if image_path_str:
+        from pathlib import Path
+        image_path = Path(image_path_str)
+
+    _TRUNCATE_PREFIXES = ["工具调用", "{", "<!---", "<!--", "update_npc_mood(", "tool_calls_list"]
+    full_content = ""
+    streamed_len = 0
+    truncating = False
+    tool_calls_list: list[dict] = []
+
+    def _earliest_truncate_at(text: str) -> int:
+        out = -1
+        for p in _TRUNCATE_PREFIXES:
+            if "update_npc_mood" in p.lower() or "tool_calls_list" in p.lower():
+                idx = text.lower().find(p.lower())
+            else:
+                idx = text.find(p)
+            if idx != -1 and (out == -1 or idx < out):
+                out = idx
+        return out
+
+    async def _run_stream(img_path, img_desc, use_tools):
+        nonlocal full_content, streamed_len, truncating, tool_calls_list
+        full_content = ""
+        streamed_len = 0
+        truncating = False
+        tool_calls_list = []
+        async for event_type, data in call_llm_stream(
+            api_key=state.get("api_key"),
+            api_base=state.get("api_base"),
+            model_name=state.get("model_name"),
+            system_prompt=system_prompt,
+            user_prompt=full_user_prompt,
+            image_path=img_path,
+            image_description=img_desc,
+            emotion_hint=state.get("emotion_hint") or None,
+            tools=use_tools,
+        ):
+            if event_type == "content":
+                full_content += data
+                if truncating:
+                    continue
+                cut = _earliest_truncate_at(full_content)
+                if cut != -1:
+                    if cut > streamed_len:
+                        yield ("content", full_content[streamed_len:cut])
+                    streamed_len = len(full_content)
+                    truncating = True
+                else:
+                    if streamed_len < len(full_content):
+                        yield ("content", full_content[streamed_len:])
+                    streamed_len = len(full_content)
+            elif event_type == "finished":
+                full_content, tool_calls_list = data
+                return
+
+    try:
+        async for ev, dat in _run_stream(image_path, state.get("image_description"), [UPDATE_NPC_MOOD_TOOL]):
+            yield ev, dat
+    except Exception as e:
+        if is_image_unsupported_error(e) and image_path:
+            try:
+                async for ev, dat in _run_stream(None, state.get("image_description"), [UPDATE_NPC_MOOD_TOOL]):
+                    yield ev, dat
+            except Exception as e2:
+                if is_tools_unsupported_error(e2):
+                    async for ev, dat in _run_stream(None, state.get("image_description"), None):
+                        yield ev, dat
+                else:
+                    raise
+        elif is_tools_unsupported_error(e):
+            try:
+                async for ev, dat in _run_stream(image_path, state.get("image_description"), None):
+                    yield ev, dat
+            except Exception as e2:
+                if is_image_unsupported_error(e2) and image_path:
+                    async for ev, dat in _run_stream(None, state.get("image_description"), None):
+                        yield ev, dat
+                else:
+                    raise
+        else:
+            raise
+
+    mood_calls = list(state.get("_mood_tool_calls", []))
+    mood_calls.extend(tool_calls_list)
+
+    state["final_reply"] = full_content or ""
+    state["_mood_tool_calls"] = mood_calls
+
+
+# ---------------------------------------------------------------------------
+# Node: parse_mood
+# ---------------------------------------------------------------------------
+
+def parse_mood_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    从回复文本 / tool_calls 中解析情绪与好感度变化。
+    """
+    reply = state.get("final_reply", "")
+    emotions = state.get("npc_emotions", ["普通"])
+    mood_tool_calls = state.get("_mood_tool_calls", [])
+
+    delta, emotion = parse_update_npc_mood_tool_calls(
+        mood_tool_calls, allowed_emotions=emotions
+    )
+    parsed_delta, parsed_emotion = parse_mood_from_text(reply)
+    cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
+        reply, allowed_emotions=emotions
+    )
+
+    if fallback_delta is not None and fallback_emotion is not None:
+        reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
+        if not has_update_npc_mood_tool_call(mood_tool_calls):
+            delta, emotion = fallback_delta, fallback_emotion
+
+    if not has_update_npc_mood_tool_call(mood_tool_calls):
+        default_emo = "普通" if "普通" in emotions else (emotions[0] if emotions else "普通")
+        if (delta == 0 and emotion == default_emo) and (
+            parsed_delta is not None or parsed_emotion
+        ):
+            if parsed_delta is not None:
+                delta = parsed_delta
+            if parsed_emotion is not None:
+                emotion = (
+                    parsed_emotion
+                    if parsed_emotion in emotions
+                    else default_emo
+                )
+
+    reply = strip_trailing_tool_call_text(reply)
+
+    return {
+        "final_reply": reply.strip() or "【对方无回应，请稍后再试。】",
+        "emotion": emotion,
+        "favorability_change": delta,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: post_process
+# ---------------------------------------------------------------------------
+
+async def post_process_node(
+    state: dict[str, Any],
+    config: RunnableConfig,
+) -> dict[str, Any]:
+    """
+    保存对话记录、更新好感度。
+    """
+    cfgable = config.get("configurable", {})
+    memory = cfgable["memory"]
+    npc_manager = cfgable["npc_manager"]
+    payload = cfgable["payload"]
+
+    npc_name = state.get("npc_name", "")
+    reply = state.get("final_reply", "")
+    delta = state.get("favorability_change", 0)
+    effective_interval = state.get("effective_summarize_interval", 30)
+
+    await memory.add_message(payload.session_id, "user", payload.query)
+    await memory.add_message(
+        payload.session_id,
+        "assistant",
+        reply,
+        llm_config={
+            "api_key": state.get("api_key"),
+            "api_base": state.get("api_base"),
+            "model_name": state.get("model_name"),
+        },
+        npc_name=npc_name,
+        summarize_interval=effective_interval,
+    )
+
+    updated_state = npc_manager.update_favorability(npc_name, delta)
+    await npc_manager.save()
+
+    return {
+        "npc_affinity": updated_state.favorability,
+        "npc_relationship_level": updated_state.relationship_level,
+    }

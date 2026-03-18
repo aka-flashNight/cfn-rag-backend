@@ -13,3 +13,6 @@ openai
 docx2txt>=0.8
 modelscope
 Pillow
+langgraph
+langchain-openai
+langchain-core

@@ -397,6 +397,45 @@ class GameRAGService:
             payload=payload,
         )
 
+    # ==================================================================
+    # ask / ask_stream — LangGraph 三阶段管线 + 旧逻辑向后兼容
+    # ==================================================================
+
+    def _use_agent_graph(self, payload: NPCChatRequest) -> bool:
+        """
+        判断是否启用 LangGraph 管线。
+        条件：progress_stage 已传且值 1-6。
+        否则降级到旧的简单对话流程。
+        """
+        stage = getattr(payload, "progress_stage", None)
+        return stage is not None and isinstance(stage, int) and 1 <= stage <= 6
+
+    def _build_graph_config(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> dict:
+        from services.game_data.registry import get_game_data_registry
+        try:
+            game_data = get_game_data_registry()
+        except Exception:
+            game_data = None
+
+        return {
+            "configurable": {
+                "rag_service": self,
+                "npc_manager": npc_manager,
+                "memory": memory,
+                "payload": payload,
+                "game_data": game_data,
+            }
+        }
+
+    # ------------------------------------------------------------------
+    # ask（非流式）
+    # ------------------------------------------------------------------
+
     async def ask(
         self,
         payload: NPCChatRequest,
@@ -405,7 +444,56 @@ class GameRAGService:
     ) -> NPCChatResponse:
         """
         基于游戏知识库进行 RAG + Agent 对话，并更新 NPC 好感度。
+        当 progress_stage 已传时使用 LangGraph 三阶段管线；否则降级到旧逻辑。
         """
+        if self._use_agent_graph(payload):
+            try:
+                return await self._ask_with_graph(payload, npc_manager, memory)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[ask] LangGraph 管线失败，降级到旧逻辑: {e}")
+
+        return await self._ask_legacy(payload, npc_manager, memory)
+
+    async def _ask_with_graph(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> NPCChatResponse:
+        """使用 LangGraph 完整图执行 ask。"""
+        from services.agent_graph.graph import get_full_graph
+
+        graph = get_full_graph()
+        config = self._build_graph_config(payload, npc_manager, memory)
+        initial_state = {}
+
+        result = await graph.ainvoke(initial_state, config)
+
+        npc_name = result.get("npc_name", payload.npc_name)
+        reply = result.get("final_reply", "【对方无回应，请稍后再试。】")
+        emotion = result.get("emotion", "普通")
+        delta = result.get("favorability_change", 0)
+        favorability = result.get("npc_affinity", 0)
+        relationship_level = result.get("npc_relationship_level", "陌生")
+
+        return NPCChatResponse(
+            reply=reply,
+            npc_name=npc_name,
+            favorability=favorability,
+            relationship_level=relationship_level,
+            favorability_change=delta,
+            emotion=emotion,
+        )
+
+    async def _ask_legacy(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> NPCChatResponse:
+        """旧版非流式 ask 逻辑（向后兼容，无 LangGraph）。"""
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
 
         reply_text, tool_calls = None, []
@@ -481,7 +569,6 @@ class GameRAGService:
             else:
                 raise
 
-
         reply = (reply_text or "").strip() or "【对方无回应，请稍后再试。】"
         delta, emotion = parse_update_npc_mood_tool_calls(
             tool_calls, allowed_emotions=ctx.emotions
@@ -526,6 +613,10 @@ class GameRAGService:
             emotion=emotion,
         )
 
+    # ------------------------------------------------------------------
+    # ask_stream（流式）
+    # ------------------------------------------------------------------
+
     async def ask_stream(
         self,
         payload: NPCChatRequest,
@@ -533,15 +624,86 @@ class GameRAGService:
         memory: "MemoryManager",
     ) -> AsyncIterator[Tuple[str, Any]]:
         """
-        流式版 ask：前面内容正常流式 yield；一旦检测到截断前缀（工具调用、{、tool_calls_list、update_npc_mood( 等）
-        则停止向客户端输出、只缓冲，避免首字延迟。结束后再做完整截断得到 reply，done 时带上 reply。
+        流式版 ask：当 progress_stage 已传时使用 LangGraph 三阶段管线；否则降级到旧逻辑。
         """
+        if self._use_agent_graph(payload):
+            try:
+                async for ev, dat in self._ask_stream_with_graph(payload, npc_manager, memory):
+                    yield (ev, dat)
+                return
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[ask_stream] LangGraph 管线失败，降级到旧逻辑: {e}")
+
+        async for ev, dat in self._ask_stream_legacy(payload, npc_manager, memory):
+            yield (ev, dat)
+
+    async def _ask_stream_with_graph(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """
+        使用 LangGraph 决策循环 + 流式生成的 ask_stream。
+
+        流程：
+        1. 运行决策循环子图（prepare_context -> decision <-> tool_executor）
+        2. 子图结束后，用流式 LLM 调用生成最终回复
+        3. 解析情绪 + 好感度
+        4. 保存记忆 + 更新 NPC 状态
+        """
+        from services.agent_graph.graph import get_decision_loop
+        from services.agent_graph.nodes import (
+            generate_response_stream,
+            parse_mood_node,
+            post_process_node,
+        )
+
+        loop_graph = get_decision_loop()
+        config = self._build_graph_config(payload, npc_manager, memory)
+        initial_state = {}
+
+        state = await loop_graph.ainvoke(initial_state, config)
+
+        async for ev, dat in generate_response_stream(state, config):
+            yield (ev, dat)
+
+        mood_result = parse_mood_node(state, config)
+        state.update(mood_result)
+
+        pp_result = await post_process_node(state, config)
+        state.update(pp_result)
+
+        npc_name = state.get("npc_name", payload.npc_name)
+        reply = state.get("final_reply", "【对方无回应，请稍后再试。】")
+        emotion = state.get("emotion", "普通")
+        delta = state.get("favorability_change", 0)
+        favorability = state.get("npc_affinity", 0)
+        relationship_level = state.get("npc_relationship_level", "陌生")
+
+        yield ("done", {
+            "reply": reply,
+            "npc_name": npc_name,
+            "favorability": favorability,
+            "relationship_level": relationship_level,
+            "favorability_change": delta,
+            "emotion": emotion,
+        })
+
+    async def _ask_stream_legacy(
+        self,
+        payload: NPCChatRequest,
+        npc_manager: NPCManager,
+        memory: "MemoryManager",
+    ) -> AsyncIterator[Tuple[str, Any]]:
+        """旧版流式 ask_stream 逻辑（向后兼容，无 LangGraph）。"""
         ctx = await self._prepare_ask_context(payload, npc_manager, memory)
 
         full_content = ""
         streamed_len = 0
         truncating = False
-        # 截断前缀：任一出现即停发（含 工具调用、{、HTML 注释头、工具名、tool_calls_list，不考虑误伤）
         _TRUNCATE_PREFIXES: List[str] = ["工具调用", "{", "<!---", "<!--", "update_npc_mood(", "tool_calls_list"]
         tool_calls_list: List[dict] = []
 
@@ -638,15 +800,6 @@ class GameRAGService:
                 if parsed_emotion is not None:
                     emotion = parsed_emotion if parsed_emotion in ctx.emotions else default_emo
         reply = strip_trailing_tool_call_text(reply)
-
-        # print("\n" + "=" * 60 + " [ask_stream] 大模型原始输出与工具调用 " + "=" * 60)
-        # print("[ask_stream] content 原始 (前 500 字):", (full_content or "")[:500])
-        # print("[ask_stream] tool_calls_list:", tool_calls_list)
-        # if not tool_calls_list:
-        #     print("[ask_stream] 提示: 流式下 tool_calls 为空...")
-        # print("[ask_stream] 解析结果: delta=%s emotion=%s" % (delta, emotion))
-        # print("[ask_stream] 截断后 reply (前 300 字):", (reply or "")[:300])
-        # print("=" * 60 + "\n")
 
         await memory.add_message(ctx.payload.session_id, "user", ctx.payload.query)
         await memory.add_message(
