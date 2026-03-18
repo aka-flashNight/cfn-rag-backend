@@ -104,12 +104,12 @@ def execute_draft_agent_task(
         npc_affinity=npc_affinity,
     )
 
-    errors = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
-    if errors:
+    result = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
+    if not result.success:
         return json.dumps({
             "status": "validation_failed",
             "draft_id": draft_id,
-            "errors": errors,
+            "errors": result.validation_errors,
             "draft_summary": _summarize_draft(draft),
         }, ensure_ascii=False), draft
     else:
@@ -153,15 +153,15 @@ def execute_update_task_draft(
         npc_affinity=npc_affinity,
     )
     changed = set(modify_fields.keys())
-    errors = validate_task_draft(
+    result = validate_task_draft(
         pending_draft, context=validation_ctx,
         changed_fields=changed, game_data=game_data,
     )
-    if errors:
+    if not result.success:
         return json.dumps({
             "status": "validation_failed",
             "draft_id": pending_draft.get("draft_id", ""),
-            "errors": errors,
+            "errors": result.validation_errors,
             "draft_summary": _summarize_draft(pending_draft),
         }, ensure_ascii=False), pending_draft
     else:
@@ -201,11 +201,11 @@ def execute_confirm_agent_task(
         player_progress=player_progress,
         npc_affinity=npc_affinity,
     )
-    errors = validate_task_draft(pending_draft, context=validation_ctx, game_data=game_data)
-    if errors:
+    result = validate_task_draft(pending_draft, context=validation_ctx, game_data=game_data)
+    if not result.success:
         return json.dumps({
             "status": "validation_failed",
-            "errors": errors,
+            "errors": result.validation_errors,
             "message": "草案校验未通过，无法确认。",
         }, ensure_ascii=False), pending_draft, None
 
