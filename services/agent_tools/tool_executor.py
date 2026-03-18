@@ -105,19 +105,20 @@ def execute_draft_agent_task(
     )
 
     result = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
+    detailed = _detailed_draft_summary(draft, game_data)
     if not result.success:
         return json.dumps({
             "status": "validation_failed",
             "draft_id": draft_id,
             "errors": result.validation_errors,
-            "draft_summary": _summarize_draft(draft),
+            "draft_summary": detailed,
         }, ensure_ascii=False), draft
     else:
         return json.dumps({
             "status": "draft_created",
             "draft_id": draft_id,
             "message": "任务草案已创建，等待玩家确认。",
-            "draft_summary": _summarize_draft(draft),
+            "draft_summary": detailed,
         }, ensure_ascii=False), draft
 
 
@@ -157,19 +158,20 @@ def execute_update_task_draft(
         pending_draft, context=validation_ctx,
         changed_fields=changed, game_data=game_data,
     )
+    detailed = _detailed_draft_summary(pending_draft, game_data)
     if not result.success:
         return json.dumps({
             "status": "validation_failed",
             "draft_id": pending_draft.get("draft_id", ""),
             "errors": result.validation_errors,
-            "draft_summary": _summarize_draft(pending_draft),
+            "draft_summary": detailed,
         }, ensure_ascii=False), pending_draft
     else:
         return json.dumps({
             "status": "draft_updated",
             "draft_id": pending_draft.get("draft_id", ""),
             "message": "草案已更新，等待玩家确认。",
-            "draft_summary": _summarize_draft(pending_draft),
+            "draft_summary": detailed,
         }, ensure_ascii=False), pending_draft
 
 
@@ -213,12 +215,13 @@ def execute_confirm_agent_task(
     task_id = game_data.tasks.get_max_agent_task_id() + 1
     pending_draft["id"] = task_id
 
+    detailed = _detailed_draft_summary(pending_draft, game_data)
     write_desc = f"任务 {task_id}「{pending_draft.get('title', '')}」已写入。"
     return json.dumps({
         "status": "confirmed",
         "task_id": task_id,
         "message": write_desc,
-        "draft_summary": _summarize_draft(pending_draft),
+        "draft_summary": detailed,
     }, ensure_ascii=False), None, write_desc
 
 
@@ -308,6 +311,80 @@ def _summarize_draft(draft: dict[str, Any]) -> str:
     return " | ".join(parts) if parts else "(空草案)"
 
 
+def _detailed_draft_summary(
+    draft: dict[str, Any],
+    game_data: Optional[GameDataRegistry] = None,
+) -> str:
+    """
+    生成包含完整字段和物品单价的草案摘要，
+    用于注入 prompt 让 LLM 了解当前任务的全部关键信息。
+    """
+    lines: list[str] = []
+    did = draft.get("draft_id", "?")
+    lines.append(f"草案ID: {did}")
+    lines.append(f"发布NPC: {draft.get('npc_name', '?')}")
+    lines.append(f"类型: {draft.get('task_type', '?')}")
+    lines.append(f"标题: {draft.get('title', '?')}")
+    lines.append(f"描述: {draft.get('description', '?')}")
+
+    get_reqs = draft.get("get_requirements") or []
+    if get_reqs:
+        lines.append(f"前置主线任务ID: {get_reqs}")
+
+    finish_reqs = draft.get("finish_requirements") or []
+    if finish_reqs:
+        fr_strs = [
+            f"{fr.get('stage_area', '?')}/{fr.get('stage_name', '?')}({fr.get('difficulty', '?')})"
+            for fr in finish_reqs
+        ]
+        lines.append(f"通关要求: {', '.join(fr_strs)}")
+
+    finish_submit = draft.get("finish_submit_items") or []
+    if finish_submit:
+        fs_strs = _format_items_with_price(finish_submit, game_data)
+        lines.append(f"提交物品: {', '.join(fs_strs)}")
+
+    finish_contain = draft.get("finish_contain_items") or []
+    if finish_contain:
+        fc_strs = _format_items_with_price(finish_contain, game_data)
+        lines.append(f"持有物品: {', '.join(fc_strs)}")
+
+    rewards = draft.get("rewards") or []
+    if rewards:
+        rw_strs = _format_items_with_price(rewards, game_data)
+        lines.append(f"奖励: {', '.join(rw_strs)}")
+
+    get_text = draft.get("get_conversation_text", "")
+    if get_text:
+        lines.append(f"接取对话: {get_text[:120]}{'…' if len(get_text) > 120 else ''}")
+    finish_text = draft.get("finish_conversation_text", "")
+    if finish_text:
+        lines.append(f"完成对话: {finish_text[:120]}{'…' if len(finish_text) > 120 else ''}")
+
+    return "\n".join(lines)
+
+
+def _format_items_with_price(
+    items: list[dict[str, Any]],
+    game_data: Optional[GameDataRegistry] = None,
+) -> list[str]:
+    parts: list[str] = []
+    for it in items[:10]:
+        name = it.get("item_name", "?")
+        count = it.get("count", "?")
+        price = 0
+        if game_data:
+            try:
+                price = game_data.items.get_price(name)
+            except Exception:
+                pass
+        if price and name != "金币":
+            parts.append(f"{name}x{count}(单价{price})")
+        else:
+            parts.append(f"{name}x{count}")
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # 统一分发入口
 # ---------------------------------------------------------------------------
@@ -331,6 +408,22 @@ def dispatch_tool_call(
 
     返回: (tool_result_str, updated_pending_draft, task_write_result)
     """
+    # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
+    # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
+    _task_tool_names = {
+        "prepare_task_context",
+        "draft_agent_task",
+        "update_task_draft",
+        "confirm_agent_task",
+        "cancel_agent_task",
+    }
+    if tool_name in _task_tool_names:
+        try:
+            pretty_args = json.dumps(tool_args, ensure_ascii=False)
+        except Exception:
+            pretty_args = str(tool_args)
+        print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+
     updated_draft = pending_draft
     task_write_result = None
 

@@ -381,9 +381,23 @@ def _build_npc_list(
     current_npc: str,
 ) -> list[dict[str, Any]]:
     """问候/传话类：所有NPC列表。"""
+    # 文档约束：如果当前NPC不是“成员/彩蛋”阵营，则候选列表里排除这些类型NPC，
+    # 避免 LLM 在对话中把非正式角色当作可选完成NPC。
+    current_state = npc_states.get(current_npc)
+    current_faction = getattr(current_state, "faction", None) or ""
+    allow_special_npcs = current_faction in {"成员", "彩蛋"}
+
+    banned_special_factions = {"成员", "彩蛋"}
     result: list[dict[str, Any]] = []
     for name, state in npc_states.items():
         if name == "$PC_CHAR":
+            continue
+        faction = getattr(state, "faction", None) or ""
+        if (
+            not allow_special_npcs
+            and faction in banned_special_factions
+            and name != current_npc
+        ):
             continue
         entry: dict[str, Any] = {
             "name": name,

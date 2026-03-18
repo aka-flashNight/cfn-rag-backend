@@ -31,7 +31,7 @@ TOOL_USAGE_GUIDE = """\
 
 3. 任务发布工具（两步式流程，详见下文【任务发布流程】）：
    - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，获取筛选后的可选数据与规则。
-   - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。
+   - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。注意，必须在prepare_task_context的数据返回后，才能调用此工具。
    - update_task_draft：局部修改已有的待确认草案（如调整奖励、更换关卡），无需重新生成完整草案。
    - confirm_agent_task：玩家明确接受任务后，调用此工具确认并写入。
    - cancel_agent_task：取消当前待确认的任务草案（玩家拒绝或你决定撤回时使用）。
@@ -66,7 +66,7 @@ TOOL_USAGE_GUIDE = """\
   - 通关并收集/通关并持有：通关关卡+从中获取物品，基础奖励×2并叠加收集/持有加成。
 
 ■ 协商流程（跨多轮对话）：
-  - 草案创建后，以自然语言向玩家描述任务内容。
+  - 草案创建后，以自然语言向玩家描述任务内容，并可以选择是否简述任务奖励。
   - 玩家可以接受、拒绝、讨价还价或要求修改：
     · 接受 → 调用 confirm_agent_task 写入。
     · 拒绝 → 调用 cancel_agent_task 清除草案，以角色身份自然回应。
@@ -103,8 +103,8 @@ DIALOGUE_FORMAT_RULES = """\
 """
 
 DECISION_ROUND_SUFFIX = (
-    "本轮请仅判断是否需要调用工具并生成 tool_calls。"
-    "若不需要任何工具，返回空内容即可，不要输出对话文本。"
+    "本轮请仅判断是否需要调用工具并生成 tool_calls，可以调用工具，不要输出对话文本。"
+    "若不需要任何工具，返回空内容即可。"
 )
 
 GENERATION_ROUND_SUFFIX = "请根据以上信息，以 NPC 身份生成对话回复。"

@@ -92,6 +92,43 @@ def _get_full_tools() -> list[dict[str, Any]]:
     return ALL_TOOLS + [CONFIRM_AGENT_TASK_TOOL, CANCEL_AGENT_TASK_TOOL]
 
 
+_DRAFT_SUCCESS_STATUSES = {"draft_created", "draft_updated", "confirmed"}
+
+
+def _build_gen_tool_messages(
+    tool_messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """
+    为 generate_response 阶段精简工具结果：
+    如果 draft_agent_task / update_task_draft / confirm_agent_task 已成功，
+    其返回的 draft_summary 已包含完整信息，就不再保留冗长的 prepare_task_context 输出。
+    """
+    has_draft_success = False
+    for tm in tool_messages:
+        if tm["tool_name"] in ("draft_agent_task", "update_task_draft", "confirm_agent_task"):
+            try:
+                parsed = json.loads(tm["result"])
+                if parsed.get("status") in _DRAFT_SUCCESS_STATUSES:
+                    has_draft_success = True
+                    break
+            except Exception:
+                pass
+
+    if not has_draft_success:
+        return tool_messages
+
+    condensed: list[dict[str, str]] = []
+    for tm in tool_messages:
+        if tm["tool_name"] == "prepare_task_context":
+            condensed.append({
+                "tool_name": tm["tool_name"],
+                "result": '{"status":"ok","message":"上下文已被后续草案工具使用，详见 draft_summary。"}',
+            })
+        else:
+            condensed.append(tm)
+    return condensed
+
+
 def _format_tool_result_for_prompt(tool_name: str, result: str, *, limit: int = 1000) -> str:
     """
     拼 prompt 时的 tool 输出展示策略。
@@ -236,10 +273,21 @@ async def prepare_context_node(
         )
 
     pending_draft = state.get("pending_task_draft")
+    if pending_draft is None:
+        from services.task_draft_store import get_session_task_draft_store
+        try:
+            db_draft = await get_session_task_draft_store().get_draft_json_by_session_id(
+                payload.session_id
+            )
+            if db_draft and isinstance(db_draft, dict):
+                pending_draft = db_draft
+        except Exception:
+            logger.warning("加载 DB 草案失败", exc_info=True)
+
     pending_draft_summary = ""
     if pending_draft:
-        from services.agent_tools.tool_executor import _summarize_draft
-        pending_draft_summary = _summarize_draft(pending_draft)
+        from services.agent_tools.tool_executor import _detailed_draft_summary
+        pending_draft_summary = _detailed_draft_summary(pending_draft, game_data)
 
     summary_text = await memory.get_summary(payload.session_id)
     history_lines = []
@@ -569,10 +617,11 @@ async def generate_response_node(
     gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
     full_user_prompt = user_prompt + gen_suffix
 
-    tool_messages = state.get("_tool_messages", [])
-    if tool_messages:
+    raw_tool_messages = state.get("_tool_messages", [])
+    gen_messages = _build_gen_tool_messages(raw_tool_messages)
+    if gen_messages:
         full_user_prompt += "\n\n【工具执行结果】\n"
-        for tm in tool_messages:
+        for tm in gen_messages:
             full_user_prompt += (
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
@@ -690,10 +739,11 @@ async def generate_response_stream(
     gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
     full_user_prompt = user_prompt + gen_suffix
 
-    tool_messages = state.get("_tool_messages", [])
-    if tool_messages:
+    raw_tool_messages = state.get("_tool_messages", [])
+    gen_messages = _build_gen_tool_messages(raw_tool_messages)
+    if gen_messages:
         full_user_prompt += "\n\n【工具执行结果】\n"
-        for tm in tool_messages:
+        for tm in gen_messages:
             full_user_prompt += (
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
@@ -855,7 +905,7 @@ async def post_process_node(
     config: RunnableConfig,
 ) -> dict[str, Any]:
     """
-    保存对话记录、更新好感度。
+    保存对话记录、更新好感度、持久化任务草案状态。
     """
     cfgable = config.get("configurable", {})
     memory = cfgable["memory"]
@@ -883,6 +933,21 @@ async def post_process_node(
 
     updated_state = npc_manager.update_favorability(npc_name, delta)
     await npc_manager.save()
+
+    # 持久化任务草案状态
+    pending_draft = state.get("pending_task_draft")
+    try:
+        from services.task_draft_store import get_session_task_draft_store
+        store = get_session_task_draft_store()
+        if pending_draft and isinstance(pending_draft, dict):
+            await store.upsert_draft(
+                session_id=payload.session_id,
+                draft=pending_draft,
+            )
+        else:
+            await store.delete_by_session_id(payload.session_id)
+    except Exception:
+        logger.warning("持久化任务草案失败", exc_info=True)
 
     return {
         "npc_affinity": updated_state.favorability,
