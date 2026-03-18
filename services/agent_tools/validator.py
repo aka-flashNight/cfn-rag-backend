@@ -318,6 +318,61 @@ def _validate_v3_stage_existence_and_area(
     return None
 
 
+def _validate_v3_dungeon_recommended_level(
+    *,
+    draft: Mapping[str, Any],
+    context: DraftValidationContext,
+    game_data: "GameDataRegistry",
+) -> Optional[dict[str, Any]]:
+    """
+    对副本/切磋类的关卡按 mercenary_tasks.json 的 recommended_level 做强校验：
+    - 如果某关卡在 mercenary_tasks 中存在推荐下限且推荐下限 > 玩家当前阶段上限，则拒绝。
+    - 如果该关卡没有推荐等级（或 recommended_min_level 为 None），则不做推荐筛选。
+    """
+    # 可用的 mercency 数据：需要 game_data
+    mercenary_registry = getattr(game_data, "mercenary_tasks", None)
+    if mercenary_registry is None:
+        return None
+
+    max_level = int(getattr(context, "max_level", 50) or 50)
+
+    invalid: list[dict[str, Any]] = []
+    for sr in _stage_requirement_iter(draft):
+        stage_name = sr.get("stage_name")
+        difficulty = sr.get("difficulty")
+        if not isinstance(stage_name, str) or not stage_name.strip():
+            continue
+
+        matched = [m for m in mercenary_registry.list_all() if m.stage_name == stage_name]
+        if not matched:
+            continue
+
+        # 只要有一个匹配项满足推荐条件，则认为该关卡可用
+        ok = False
+        for m in matched:
+            if m.recommended_min_level is None:
+                ok = True
+                break
+            if int(m.recommended_min_level or 0) <= max_level:
+                ok = True
+                break
+        if not ok:
+            invalid.append({
+                "stage_name": stage_name,
+                "difficulty": difficulty,
+                "recommended_min_level": max(m.recommended_min_level for m in matched if m.recommended_min_level is not None),
+                "player_max_level": max_level,
+            })
+
+    if invalid:
+        return {
+            "step": "V3R",
+            "error": "关卡推荐等级不满足",
+            "invalid_stages": invalid,
+        }
+    return None
+
+
 # =========================================================================
 # V4: 关卡解锁条件匹配
 # =========================================================================
@@ -735,6 +790,16 @@ def validate_task_draft(
     if run_stages:
         e = _validate_v3_stage_existence_and_area(
             draft=draft, stage_registry=stage_registry,
+        )
+        if e:
+            return DraftValidationResult(success=False, validation_errors=[e])
+
+    # ---- V3R: 副本/切磋关卡推荐等级强校验 ----
+    if run_stages:
+        e = _validate_v3_dungeon_recommended_level(
+            draft=draft,
+            context=context,
+            game_data=game_data,
         )
         if e:
             return DraftValidationResult(success=False, validation_errors=[e])

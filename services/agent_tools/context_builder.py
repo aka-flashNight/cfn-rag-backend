@@ -431,8 +431,27 @@ def _build_challenge_targets(
         return {"error": "当前NPC无可用的切磋目标，请选择其他任务类型"}
 
     stage_registry = game_data.stages
+    mercenary_registry = game_data.mercenary_tasks
     cfg = get_progress_stage_config(stage)
     max_level = cfg.max_level if cfg else 50
+
+    # 根据 mercenary_tasks.json 的 recommended_level 过滤：不展示推荐等级高于当前阶段上限的关卡
+    matched_merc_tasks = [
+        m for m in mercenary_registry.list_all()
+        if m.stage_name == npc_challenge
+    ]
+    if matched_merc_tasks:
+        # 规则：只要存在一个条目满足 rec_min <= player_max_level（或该条目无推荐等级），则认为可用
+        ok = False
+        for m in matched_merc_tasks:
+            if m.recommended_min_level is None:
+                ok = True
+                break
+            if m.recommended_min_level <= max_level:
+                ok = True
+                break
+        if not ok:
+            return {"error": "当前阶段等级不满足该NPC切磋关卡的推荐等级，请选择其他任务类型"}
 
     # 切磋关卡通常在副本任务下
     is_dungeon = True

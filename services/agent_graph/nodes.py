@@ -174,7 +174,10 @@ async def prepare_context_node(
         ALLOWED_SUMMARIZE_INTERVALS,
         DEFAULT_SUMMARIZE_INTERVAL,
     )
-    from services.game_progress import get_progress_stage_name
+    from services.game_progress import (
+        get_progress_stage_name,
+        get_progress_stage_level_range,
+    )
 
     npc_name = payload.npc_name.strip()
     current_state = npc_manager.state.get(npc_name)
@@ -248,6 +251,33 @@ async def prepare_context_node(
     stage_name = get_progress_stage_name(progress_stage)
     if stage_name:
         progress_stage_desc = f"当前玩家的主要作战区域为{stage_name}。"
+
+    # 切磋关卡的 recommended_level 过滤：不满足阶段时不要在 prompt 中提示 NPC 有切磋可选
+    if game_data and npc_challenge:
+        try:
+            stage_num = int(progress_stage or 1)
+        except Exception:
+            stage_num = 1
+        stage_num = max(1, min(6, stage_num))
+        level_range = get_progress_stage_level_range(stage_num) or (1, 50)
+        player_max_level = int(level_range[1]) if level_range and len(level_range) > 1 else 50
+
+        matched_merc_tasks = [
+            m
+            for m in game_data.mercenary_tasks.list_all()
+            if m.stage_name == npc_challenge
+        ]
+        if matched_merc_tasks:
+            ok = False
+            for m in matched_merc_tasks:
+                if m.recommended_min_level is None:
+                    ok = True
+                    break
+                if m.recommended_min_level <= player_max_level:
+                    ok = True
+                    break
+            if not ok:
+                npc_challenge = None
 
     mentioned_npcs, mentioned_names = rag_service._find_mentioned_npcs(
         payload.query, npc_name, all_npc_states, faction
