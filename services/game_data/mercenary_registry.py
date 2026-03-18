@@ -13,6 +13,11 @@ class MercenaryTaskInfo:
     title: str
     recommended_min_level: Optional[int]
     recommended_max_level: Optional[int]
+    # challenge 模式（challenge.difficulty != "简单"）
+    challenge_difficulty: Optional[str]
+    challenge_recommended_min_level: Optional[int]
+    challenge_recommended_max_level: Optional[int]
+    challenge_description: Optional[str]
     stage_name: Optional[str]
     raw: dict
 
@@ -56,11 +61,41 @@ class MercenaryTaskRegistry:
                     stage_name = req.split("#", 1)[0].strip()
                     break
 
+            # challenge 解析：仅当 challenge.difficulty 存在且非 "简单" 时才作为“额外难度”使用
+            challenge_difficulty: Optional[str] = None
+            challenge_description: Optional[str] = None
+            cmin: Optional[int]
+            cmax: Optional[int]
+            cmin, cmax = None, None
+
+            challenge_obj = t.get("challenge")
+            if isinstance(challenge_obj, dict):
+                cd = challenge_obj.get("difficulty")
+                if isinstance(cd, str) and cd.strip():
+                    challenge_difficulty = cd.strip()
+                desc = challenge_obj.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    challenge_description = desc.strip()
+
+                # challenge.recommended_level 解析；若缺失，按你的“同逻辑”回退到根 recommended_level
+                cmin, cmax = self._parse_recommended_level(challenge_obj.get("recommended_level"))
+                if challenge_difficulty and challenge_difficulty != "简单":
+                    if cmin is None and cmax is None:
+                        cmin, cmax = rec_min, rec_max
+                else:
+                    # challenge == "简单" 或缺失：视为没有额外难度
+                    challenge_difficulty = None
+                    cmin, cmax = None, None
+
             info = MercenaryTaskInfo(
                 id=tid,
                 title=str(t.get("title", "")),
                 recommended_min_level=rec_min,
                 recommended_max_level=rec_max,
+                challenge_difficulty=challenge_difficulty,
+                challenge_recommended_min_level=cmin,
+                challenge_recommended_max_level=cmax,
+                challenge_description=challenge_description,
                 stage_name=stage_name,
                 raw=t,
             )

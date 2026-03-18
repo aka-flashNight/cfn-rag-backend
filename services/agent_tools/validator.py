@@ -427,9 +427,17 @@ def _validate_v4_stage_unlock_condition(
 def _validate_v5_replica_stage_difficulty(
     *,
     draft: Mapping[str, Any],
-    stage_registry: Any,
+    context: DraftValidationContext,
+    game_data: "GameDataRegistry",
 ) -> Optional[dict[str, Any]]:
+    """
+    mercenary_tasks.json 绑定的关卡难度校验：
+    - 永远允许 "简单"
+    - 非简单难度仅当该 stage_name 在 mercenary_tasks.json 的对应任务配置了 challenge 额外难度，且玩家满足其推荐等级下限时才允许
+    """
     invalid: list[dict[str, Any]] = []
+    mercenary_registry = getattr(game_data, "mercenary_tasks", None)
+    max_level = int(getattr(context, "max_level", 50) or 50)
     for sr in _stage_requirement_iter(draft):
         stage_name = sr.get("stage_name")
         difficulty = sr.get("difficulty")
@@ -437,25 +445,28 @@ def _validate_v5_replica_stage_difficulty(
             continue
         if not isinstance(difficulty, str) or not difficulty.strip():
             continue
-
-        replica_infos = [
-            (area, si)
-            for (area, si) in _get_stage_infos_by_name(
-                stage_registry=stage_registry,
-                stage_name=stage_name,
-            )
-            if area == "副本任务"
-        ]
-        if not replica_infos:
+        if mercenary_registry is None:
             continue
 
-        if difficulty != "简单":
+        # 判定“副本类/委托类”：以 mercenary_tasks.json 绑定的 stage_name 为准
+        matched = [m for m in mercenary_registry.list_all() if m.stage_name == stage_name]
+        if not matched:
+            continue
+
+        allowed_difficulties: set[str] = {"简单"}
+        for m in matched:
+            if not m.challenge_difficulty or m.challenge_difficulty == "简单":
+                continue
+            cmin = m.challenge_recommended_min_level
+            if cmin is not None and int(cmin) <= max_level:
+                allowed_difficulties.add(m.challenge_difficulty)
+
+        if difficulty not in allowed_difficulties:
             invalid.append(
                 {
                     "stage_name": stage_name,
                     "difficulty": difficulty,
-                    "expected": "简单",
-                    "replica_areas": [area for (area, _si) in replica_infos],
+                    "expected": sorted(allowed_difficulties),
                 }
             )
 
@@ -663,7 +674,7 @@ def _validate_v9_task_uniqueness(
     if similar_ids:
         return {
             "step": "V9",
-            "error": "任务与已有agent任务高度雷同",
+            "error": "任务与已有agent任务高度雷同，发布失败，请重新生成任务或拒绝发布！",
             "similar_task_ids": similar_ids,
         }
     return None
@@ -816,7 +827,11 @@ def validate_task_draft(
 
     # ---- V5: 副本关卡难度 ----
     if run_stages:
-        e = _validate_v5_replica_stage_difficulty(draft=draft, stage_registry=stage_registry)
+        e = _validate_v5_replica_stage_difficulty(
+            draft=draft,
+            context=context,
+            game_data=game_data,
+        )
         if e:
             return DraftValidationResult(success=False, validation_errors=[e])
 
@@ -944,7 +959,11 @@ def validate_task_draft_v1_v6(
         if e4:
             return DraftValidationResult(success=False, validation_errors=[e4])
 
-        e5 = _validate_v5_replica_stage_difficulty(draft=draft)
+        e5 = _validate_v5_replica_stage_difficulty(
+            draft=draft,
+            context=context,
+            game_data=game_data,
+        )
         if e5:
             return DraftValidationResult(success=False, validation_errors=[e5])
 

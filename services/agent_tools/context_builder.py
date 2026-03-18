@@ -38,8 +38,9 @@ _TASK_RULES: dict[str, str] = {
     "通关": (
         "通关类任务：要求玩家通关指定关卡。"
         "关卡必须在玩家当前进度范围内（解锁ID ≤ 当前主线ID）。"
-        "副本关卡只允许普通难度。地图关卡可选任意难度。"
-        "基础奖励 ×2。建议优先选择普通/冒险难度。"
+        "副本关卡通常仅可选择“简单”。只有当副本配置了 challenge 额外难度（且满足玩家等级校验）时，才允许选择该额外难度（特征是仅有两个难度候选项），选择时需明确提醒难度要求；否则只能选择“简单”。"
+        "地图关卡可选任意难度。"
+        "基础奖励 ×2。"
     ),
     "清理": (
         "清理类任务：与通关类似，但叙事上侧重'清除威胁/清理区域'。"
@@ -53,7 +54,7 @@ _TASK_RULES: dict[str, str] = {
     "切磋": (
         "切磋类任务：要求玩家通关当前NPC配置的专属切磋关卡。"
         "必须使用当前NPC的challenge属性对应的关卡。"
-        "副本类仅普通难度。基础奖励 ×2。"
+        "基础奖励 ×2。"
     ),
     "资源收集": (
         "资源收集类任务：要求玩家收集并提交指定数量的食材/药剂/材料/弹夹。"
@@ -83,11 +84,13 @@ _TASK_RULES: dict[str, str] = {
         "收集物品必须是该关卡箱子的产出物品。"
         "收集数量建议使用箱子的最小产出数量。"
         "基础奖励 ×2，再叠加收集品加成。"
+        "如果你在 finish_requirements 里选择了非“简单”的副本难度（例如“地狱”），请务必在任务说明（title/description）中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
     "通关并持有": (
         "通关并持有类任务：组合通关+持有要求。"
         "持有物品必须是该关卡箱子的产出物品。"
         "基础奖励 ×2，再叠加持有品加成。"
+        "如果你在 finish_requirements 里选择了非“简单”的副本难度（例如“地狱”），请务必在任务说明（title/description）中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
 }
 
@@ -305,11 +308,12 @@ def _get_all_stages_for_progress(
     main_task_min_id = cfg.main_task_min_id or 0
     max_level = cfg.max_level or 50
 
-    # 副本推荐等级索引
-    merc_by_stage: dict[str, Any] = {}
+    # 副本任务（副本关卡）按 stage_name 聚合
+    mercs_by_stage: dict[str, list[Any]] = {}
     for mt in mercenary_registry.list_all():
-        if mt.stage_name:
-            merc_by_stage[mt.stage_name] = mt
+        if not mt.stage_name:
+            continue
+        mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
     area_map: dict[str, list[dict[str, Any]]] = {}
 
@@ -320,12 +324,43 @@ def _get_all_stages_for_progress(
         is_dungeon = area == "副本任务"
 
         if is_dungeon:
-            merc = merc_by_stage.get(name)
-            if merc is None or merc.recommended_min_level is None:
+            merc_tasks = mercs_by_stage.get(name) or []
+            # 文档：没有标注推荐等级的副本一律剔除（沿用旧逻辑）
+            # 只有当至少存在一个 merc task 的 recommended_min_level <= max_level 时才放行
+            allowed_by_root = [
+                mt for mt in merc_tasks
+                if mt.recommended_min_level is not None and mt.recommended_min_level <= max_level
+            ]
+            if not allowed_by_root:
                 continue
-            if merc.recommended_min_level > max_level:
-                continue
-            difficulties = ["简单"]
+
+            allowed_difficulties: set[str] = {"简单"}
+            challenge_modes_map: dict[str, str] = {}
+
+            # 额外难度：需要满足 challenge.recommended_level 的下限
+            for mt in merc_tasks:
+                if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
+                    continue
+                cmin = mt.challenge_recommended_min_level
+                if cmin is None:
+                    continue
+                if cmin <= max_level:
+                    allowed_difficulties.add(mt.challenge_difficulty)
+                    if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
+                        challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+
+            # 保持稳定顺序：按照 difficulty 枚举顺序输出
+            difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
+
+            # 返回给 LLM 的挑战模式说明（仅当包含非简单时）
+            if len(difficulties) > 1 and challenge_modes_map:
+                entry_challenges = [
+                    {"difficulty": diff, "description": desc}
+                    for diff, desc in challenge_modes_map.items()
+                    if diff in difficulties and diff != "简单"
+                ]
+            else:
+                entry_challenges = []
         else:
             if si.unlock_condition > main_task_max_id:
                 continue
@@ -342,12 +377,18 @@ def _get_all_stages_for_progress(
             "difficulties": difficulties,
             "is_dungeon": is_dungeon,
         }
+        if is_dungeon:
+            # 根 recommended_level 用于“副本可选性”提示（这里取放行集合的最小下限）
+            entry["recommended_level"] = min(
+                mt.recommended_min_level
+                for mt in merc_tasks
+                if mt.recommended_min_level is not None
+            )
+            if entry_challenges:
+                entry["challenge_modes"] = entry_challenges
         if below_progress:
             entry["below_progress"] = True
-        if is_dungeon and merc_by_stage.get(name):
-            m = merc_by_stage[name]
-            if m.recommended_min_level is not None:
-                entry["recommended_level"] = m.recommended_min_level
+        # difficulties/challenge_modes/recommended_level 已在 is_dungeon 分支里处理
 
         area_map.setdefault(area, []).append(entry)
 
@@ -430,38 +471,53 @@ def _build_challenge_targets(
     if not npc_challenge:
         return {"error": "当前NPC无可用的切磋目标，请选择其他任务类型"}
 
-    stage_registry = game_data.stages
     mercenary_registry = game_data.mercenary_tasks
     cfg = get_progress_stage_config(stage)
     max_level = cfg.max_level if cfg else 50
 
     # 根据 mercenary_tasks.json 的 recommended_level 过滤：不展示推荐等级高于当前阶段上限的关卡
-    matched_merc_tasks = [
-        m for m in mercenary_registry.list_all()
-        if m.stage_name == npc_challenge
-    ]
+    matched_merc_tasks = [m for m in mercenary_registry.list_all() if m.stage_name == npc_challenge]
     if matched_merc_tasks:
         # 规则：只要存在一个条目满足 rec_min <= player_max_level（或该条目无推荐等级），则认为可用
-        ok = False
-        for m in matched_merc_tasks:
-            if m.recommended_min_level is None:
-                ok = True
-                break
-            if m.recommended_min_level <= max_level:
-                ok = True
-                break
+        ok = any(
+            (m.recommended_min_level is None) or (m.recommended_min_level <= max_level)
+            for m in matched_merc_tasks
+        )
         if not ok:
             return {"error": "当前阶段等级不满足该NPC切磋关卡的推荐等级，请选择其他任务类型"}
 
-    # 切磋关卡通常在副本任务下
-    is_dungeon = True
-    difficulties = ["简单"] if is_dungeon else ["简单", "冒险", "修罗", "地狱"]
+    # 基础：至少包含“简单”
+    allowed_difficulties: set[str] = {"简单"}
+    challenge_modes_map: dict[str, str] = {}
+    for m in matched_merc_tasks:
+        if not m.challenge_difficulty or m.challenge_difficulty == "简单":
+            continue
+        cmin = m.challenge_recommended_min_level
+        if cmin is None:
+            continue
+        if int(cmin) <= int(max_level):
+            allowed_difficulties.add(m.challenge_difficulty)
+            if m.challenge_description and m.challenge_difficulty not in challenge_modes_map:
+                challenge_modes_map[m.challenge_difficulty] = m.challenge_description
 
-    return [{
+    difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
+
+    entry: dict[str, Any] = {
         "dungeon_name": npc_challenge,
         "target_npc": npc_name,
         "difficulties": difficulties,
-    }]
+    }
+
+    if len(difficulties) > 1:
+        extra_modes = [
+            {"difficulty": d, "description": desc}
+            for d, desc in challenge_modes_map.items()
+            if d in difficulties and d != "简单"
+        ]
+        if extra_modes:
+            entry["challenge_modes"] = extra_modes
+
+    return [entry]
 
 
 def _build_collectable_items(
@@ -756,10 +812,11 @@ def _build_stage_loot_list(
     main_task_min_id = cfg.main_task_min_id or 0
     max_level = cfg.max_level or 50
 
-    merc_by_stage: dict[str, Any] = {}
+    mercs_by_stage: dict[str, list[Any]] = {}
     for mt in mercenary_registry.list_all():
-        if mt.stage_name:
-            merc_by_stage[mt.stage_name] = mt
+        if not mt.stage_name:
+            continue
+        mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
     result: list[dict[str, Any]] = []
 
@@ -769,12 +826,33 @@ def _build_stage_loot_list(
 
         is_dungeon = area == "副本任务"
         if is_dungeon:
-            merc = merc_by_stage.get(name)
-            if merc is None or merc.recommended_min_level is None:
+            merc_tasks = mercs_by_stage.get(name) or []
+            allowed_by_root = [
+                mt for mt in merc_tasks
+                if mt.recommended_min_level is not None and mt.recommended_min_level <= max_level
+            ]
+            if not allowed_by_root:
                 continue
-            if merc.recommended_min_level > max_level:
-                continue
-            difficulties = ["简单"]
+
+            allowed_difficulties: set[str] = {"简单"}
+            challenge_modes_map: dict[str, str] = {}
+            for mt in merc_tasks:
+                if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
+                    continue
+                cmin = mt.challenge_recommended_min_level
+                if cmin is None:
+                    continue
+                if cmin <= max_level:
+                    allowed_difficulties.add(mt.challenge_difficulty)
+                    if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
+                        challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+
+            difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
+            entry_challenges = [
+                {"difficulty": diff, "description": desc}
+                for diff, desc in challenge_modes_map.items()
+                if diff in difficulties and diff != "简单"
+            ]
         else:
             if si.unlock_condition > main_task_max_id:
                 continue
@@ -818,10 +896,14 @@ def _build_stage_loot_list(
         }
         if below_progress:
             entry["below_progress"] = True
-        if is_dungeon and name in merc_by_stage:
-            m = merc_by_stage[name]
-            if m.recommended_min_level is not None:
-                entry["recommended_level"] = m.recommended_min_level
+        if is_dungeon:
+            entry["recommended_level"] = min(
+                mt.recommended_min_level
+                for mt in merc_tasks
+                if mt.recommended_min_level is not None
+            )
+            if entry_challenges:
+                entry["challenge_modes"] = entry_challenges
 
         result.append(entry)
 

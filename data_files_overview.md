@@ -252,9 +252,10 @@
 - **通关要求（finish_requirements）**
   - 结构：字符串数组，每项形如 `"关卡名#难度"`；
   - 四个标准难度名：`简单`、`冒险`、`修罗`、`地狱`；
-  - 仅**地图关卡（非副本任务）**拥有四难度；`data/stages/副本任务` 中的关卡通常只有普通难度；
-    - 若某副本在 `mercenary_tasks` 中配置了挑战内容，则可能增加 `修罗` / `地狱` 难度；
-    - **Agent 生成任务中，如果引用副本关卡，只允许要求普通难度**，以避免意外。
+  - 仅**地图关卡（非副本任务）**拥有四难度；
+  - `data/stages/副本任务` 中的关卡通常只允许 `简单` 难度；
+  - 若某副本在 `mercenary_tasks` 中配置了 `challenge` 额外难度（且该额外难度推荐等级满足玩家等级），则允许在任务要求中选择该额外难度；
+  - 当你在任务要求中选择了副本的非 `简单` 难度时，LLM 必须在任务说明（title/description）与对话台词中明显提到玩家正在选择/挑战该高难度模式。
 
 - **提交/持有物品要求**
   - `finish_submit_items`：表示完成时**消耗**指定物品；数组元素示例：`"抗生素#1"`；
@@ -314,7 +315,7 @@
     - 正常与 NPC 对话时不可见/不可直接接取；
   - `chain` 统一为 `"委托"`，**不需要区分编号**（如 `委托#1` 等）；
   - 绑定 `data/stages/副本任务` 中的关卡；
-  - 部分委托会扩展副本难度（如增加 `修罗` / `地狱`），但这是 mercenary 自己的逻辑，Agent 任务只允许要求普通。
+  - 部分委托会扩展副本难度（如增加 `修罗` / `地狱`）：当玩家满足 mercenary 的推荐等级（含 challenge 的推荐）时，Agent 任务可在副本难度里选择额外模式；选择非 `简单` 时必须在任务说明与对话台词中明显提示玩家正在挑战高难度模式。
 
 #### 3.2 我们计划新增的 agent 任务（agent_tasks）
 
@@ -795,8 +796,9 @@
     - 地图关卡（如上示例）在游戏中有 `简单/冒险/修罗/地狱` 四种难度：
       - 通关类基础任务优先选择 `简单` / `冒险` 难度；
       - 挑战类任务可选择 `修罗` / `地狱`，并给予主要偏向经验的奖励；
-    - 副本任务目录 `data/stages/副本任务` 中的关卡通常只有普通难度，只有与 mercenary 委托强绑定时才会扩展；
-      - Agent 任务引用副本任务关卡时**只允许普通难度**。
+    - 副本任务目录 `data/stages/副本任务` 中的关卡通常只允许 `简单` 难度；
+    - 若 `mercenary_tasks.json` 中该副本配置了 `challenge` 额外难度，并且玩家等级满足其推荐等级，则可在 `difficulties` 中看到该额外难度；
+    - 当 LLM 在副本中选择非 `简单` 难度时，必须在任务说明与对话台词中明确提醒玩家选择挑战模式/高难度。
       - Agent 任务引用地图关卡时允许任意难度。
 
 #### 5.2 关卡详细结构与箱子掉落
@@ -1407,11 +1409,14 @@ Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `stage_list` | `list` | 二级结构的可选关卡列表，结构为 `[{area, area_level_range, stages: [{name, unlock_id, difficulties, is_dungeon, recommended_level?, below_progress?}]}]` |
+| `stage_list` | `list` | 二级结构的可选关卡列表，结构为 `[{area, area_level_range, stages: [{name, unlock_id, difficulties, is_dungeon, recommended_level?, below_progress?, challenge_modes?}]}]` |
 
 > **后端筛选逻辑：**
 > - **关卡类**（非副本）：根据解锁 ID ≤ 当前主线 ID 筛选，可选四个难度（简单/冒险/修罗/地狱）；
-> - **副本类**：根据推荐等级筛选（推荐等级下限 ≤ 玩家等级上限），**未标注推荐等级的副本一律剔除**，且副本仅可选**简单难度**（返回数据中 `difficulties` 仅包含 `["简单"]`）；
+> - **副本类**：根据推荐等级筛选（推荐等级下限 ≤ 玩家等级上限），**未标注推荐等级的副本一律剔除**；
+>   - 默认仅可选 `简单`；
+>   - 若该副本在 `mercenary_tasks.json` 中配置了 `challenge` 额外难度（且额外难度的推荐等级满足玩家等级），则 `difficulties` 可能包含该额外难度，并返回 `challenge_modes` 说明；
+>   - 若选择了非 `简单` 难度，LLM 必须在任务说明与对话台词中明显提醒玩家选择挑战模式/高难度；
 > - 优先返回解锁 ID 在玩家当前主线 ID 区间内的关卡，低于玩家区间的关卡保留但标注 `"below_progress": true`，超出玩家进度的一律剔除。
 
 **③ 切磋类：**
@@ -1420,7 +1425,7 @@ Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `challenge_targets` | `list` | 当前 NPC 的可用切磋关卡列表 `[{dungeon_name, target_npc, difficulties}]`，`difficulties` 和之前一样，根据当前关卡是否是副本任务做区分，副本仅可选**普通难度**（返回数据中 `difficulties` 仅包含 `["简单"]`） |
+| `challenge_targets` | `list` | 当前 NPC 的可用切磋关卡列表 `[{dungeon_name, target_npc, difficulties, challenge_modes?}]`；`difficulties` 至少包含 `["简单"]`，若 `mercenary_tasks.json` 为该关卡配置了 `challenge` 额外难度且推荐满足玩家等级，则 `difficulties` 会额外包含该额外难度，并返回 `challenge_modes`（可选）用于描述该挑战模式 |
 
 **④ 资源收集类：**
 
@@ -1450,14 +1455,17 @@ Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `stage_loot_list` | `list` | **仅包含有箱子掉落的关卡**（无箱子的关卡不返回），结构为 `[{area, area_level_range, stage_name, unlock_id, is_dungeon, recommended_level?, difficulties, below_progress?, loot_items: [{item_name, min_qty, max_qty, unit_price}], total_loot_value}]` |
+| `stage_loot_list` | `list` | **仅包含有箱子掉落的关卡**（无箱子的关卡不返回），结构为 `[{area, area_level_range, stage_name, unlock_id, is_dungeon, recommended_level?, difficulties, challenge_modes?, below_progress?, loot_items: [{item_name, min_qty, max_qty, unit_price}], total_loot_value}]` |
 
 > **关键约束：**
 > - 收集/持有要求的物品**必须是该关卡箱子的产出物品**，不可选择关卡外的物品；
 > - 收集数量**建议使用箱子产出的最小数量**（`min_qty`），避免要求玩家反复刷关；
 > - `total_loot_value` 为该关卡箱子产出的总价值估算（`Σ(unit_price × min_qty)`），供 LLM 参考奖励定价；
 > - 后端筛选逻辑同通关类：优先返回进度区间内关卡，保留低于进度的关卡（标注 `"below_progress": true`），剔除超出进度的关卡；
-> - 副本类关卡同样根据推荐等级筛选，未标注推荐等级的剔除，且仅可选普通难度。
+> - 副本类关卡同样根据推荐等级筛选，未标注推荐等级的剔除；
+>   - 默认仅可选 `简单`；
+>   - 若该副本在 `mercenary_tasks.json` 配置了 `challenge` 额外难度且推荐满足玩家等级，则 `difficulties` 可能包含该额外难度，并返回 `challenge_modes` 说明；
+>   - 选择非 `简单` 难度时，LLM 必须在任务说明与对话台词中明确提醒玩家选择挑战模式/高难度。
 
 ---
 
@@ -1609,7 +1617,7 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 | V2       | **物品数量合理性**：每种物品的数量 ≥ 1，且不超过该物品在已有任务奖励中出现过的最大数量的 2 倍（防止异常值） | 返回超限的物品及建议区间        |
 | V3       | **关卡存在性与解锁**：`finish_requirements` 中的每个关卡只需要提供 `stage_name + difficulty`，关卡需存在于 `StageRegistry` 且存在解锁条件；`stage_area` 不由 LLM 提供且不参与本校验 | 返回无效关卡名                 |
 | V4       | **关卡解锁条件匹配**：关卡的 `UnlockCondition` ≤ 当前阶段的 `main_task_max_id`（不得超进度） | 返回超进度关卡及其解锁 ID      |
-| V5       | **副本关卡难度**：`stages/副本任务` 中的关卡只允许 `简单` 难度   | 返回违规的副本关卡              |
+| V5       | **副本关卡难度**：只要某个 `finish_requirements.stage_name` 在 `mercenary_tasks.json` 中存在，则始终允许 `简单`；若该 stage_name 在 `mercenary_tasks.json` 对应任务配置了 `challenge` 额外难度，则仅当玩家等级满足 `challenge.recommended_level`（或缺失则回退到根 `recommended_level`）时，才允许选择对应非 `简单` 难度 | 返回违规的副本关卡              |
 | V6       | **前置任务合法性**：`get_requirements` 为空或其中的每个 ID 必须在 `TaskRegistry` 中存在且 ≠ -1 | 返回无效的前置 ID              |
 | V7       | **奖励总价值**：计算 `sum(price(item) * count)` 是否在允许区间内（见下文） | 返回每种物品单价、所有物品总价值、允许区间          |
 | V8       | **奖励类型合规**：奖励物品必须属于已有任务奖励中出现过的物品类型集合，或属于当前 NPC 商店的物品 | 返回不合规的物品及原因          |
