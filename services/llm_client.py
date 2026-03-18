@@ -66,6 +66,9 @@ async def call_llm(
                 ],
             },
         ]
+        print(prompt_with_desc);
+        print("————————");
+        print(user_prompt);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [

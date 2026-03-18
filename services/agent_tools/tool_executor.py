@@ -12,6 +12,7 @@ import uuid
 from typing import Any, Optional
 
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
+from services.game_progress import get_progress_stage_config
 from services.agent_tools.context_builder import prepare_task_context
 from services.agent_tools.validator import validate_task_draft, DraftValidationContext
 
@@ -23,6 +24,25 @@ def _safe_json_loads(s: str) -> dict[str, Any]:
         return json.loads(s)
     except Exception:
         return {}
+
+
+def _build_validation_ctx(
+    *,
+    npc_name: str = "",
+    player_progress: int = 1,
+    npc_affinity: int = 0,
+) -> DraftValidationContext:
+    """根据玩家进度构建校验上下文，字段映射到 DraftValidationContext。"""
+    cfg = get_progress_stage_config(player_progress)
+    main_task_max_id = cfg.main_task_max_id if cfg else 0
+    max_level = cfg.max_level if cfg else 50
+    return DraftValidationContext(
+        main_task_max_id=main_task_max_id or 0,
+        max_level=max_level or 50,
+        stage=player_progress,
+        affinity=npc_affinity,
+        npc_name=npc_name or None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +98,13 @@ def execute_draft_agent_task(
         **args,
     }
 
-    validation_ctx = DraftValidationContext(
-        draft=draft,
+    validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
-        game_data=game_data,
     )
 
-    errors = validate_task_draft(validation_ctx)
+    errors = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
     if errors:
         return json.dumps({
             "status": "validation_failed",
@@ -129,14 +147,16 @@ def execute_update_task_draft(
     for k, v in modify_fields.items():
         pending_draft[k] = v
 
-    validation_ctx = DraftValidationContext(
-        draft=pending_draft,
+    validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
-        game_data=game_data,
     )
-    errors = validate_task_draft(validation_ctx)
+    changed = set(modify_fields.keys())
+    errors = validate_task_draft(
+        pending_draft, context=validation_ctx,
+        changed_fields=changed, game_data=game_data,
+    )
     if errors:
         return json.dumps({
             "status": "validation_failed",
@@ -176,14 +196,12 @@ def execute_confirm_agent_task(
         game_data = get_game_data_registry()
 
     # 最终校验
-    validation_ctx = DraftValidationContext(
-        draft=pending_draft,
+    validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
-        game_data=game_data,
     )
-    errors = validate_task_draft(validation_ctx)
+    errors = validate_task_draft(pending_draft, context=validation_ctx, game_data=game_data)
     if errors:
         return json.dumps({
             "status": "validation_failed",

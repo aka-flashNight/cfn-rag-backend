@@ -27,12 +27,12 @@ from services.game_progress import (
 _TASK_RULES: dict[str, str] = {
     "问候": (
         "问候/闲聊类任务：最简单的任务类型，玩家只需与指定NPC对话即可完成。"
-        "可选当前NPC自己为完成NPC。奖励较少，以金币为主。"
+        "可选当前NPC自己或其他NPC为完成NPC。奖励较少，以金币为主。"
         "适合低好感度或初次对话时使用。"
     ),
     "传话": (
         "传话类任务：要求玩家去找另一个NPC对话。"
-        "通常选择其他阵营或有关系的NPC作为完成NPC。"
+        "在有理由的情况下，可选择任意NPC作为完成NPC，包括同阵营传话、不同阵营的外交等。"
         "奖励较少，以金币为主。适合推动NPC间剧情互动。"
     ),
     "通关": (
@@ -814,12 +814,13 @@ def prepare_task_context(
     )
 
     existing_tasks: list[dict[str, Any]] = []
-    for t in game_data.tasks.list_by_npc(npc_name):
-        existing_tasks.append({
-            "id": t.id,
-            "title": t.title,
-            "type": t.chain or "",
-        })
+    # 注释掉已存在任务
+    # for t in game_data.tasks.list_by_npc(npc_name):
+    #     existing_tasks.append({
+    #         "id": t.id,
+    #         "title": t.title,
+    #         "type": t.chain or "",
+    #     })
 
     reward_item_candidates = _build_reward_item_candidates(
         reward_types=reward_types,
