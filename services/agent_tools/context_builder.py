@@ -325,11 +325,11 @@ def _get_all_stages_for_progress(
                 continue
             if merc.recommended_min_level > max_level:
                 continue
-            difficulties = ["普通"]
+            difficulties = ["简单"]
         else:
             if si.unlock_condition > main_task_max_id:
                 continue
-            difficulties = ["普通", "冒险", "修罗", "地狱"]
+            difficulties = ["简单", "冒险", "修罗", "地狱"]
 
         below_progress = (
             not is_dungeon
@@ -406,6 +406,14 @@ def _build_npc_list(
         titles = getattr(state, "titles", None)
         if titles:
             entry["title"] = titles[0] if titles else ""
+            entry["titles"] = list(titles) if isinstance(titles, list) else titles
+        else:
+            entry["titles"] = []
+        emotions = getattr(state, "emotions", None)
+        if isinstance(emotions, list) and emotions:
+            entry["emotions"] = list(emotions)
+        else:
+            entry["emotions"] = ["普通"]
         if name == current_npc:
             entry["is_current"] = True
         result.append(entry)
@@ -428,7 +436,7 @@ def _build_challenge_targets(
 
     # 切磋关卡通常在副本任务下
     is_dungeon = True
-    difficulties = ["普通"] if is_dungeon else ["普通", "冒险", "修罗", "地狱"]
+    difficulties = ["简单"] if is_dungeon else ["简单", "冒险", "修罗", "地狱"]
 
     return [{
         "dungeon_name": npc_challenge,
@@ -747,11 +755,11 @@ def _build_stage_loot_list(
                 continue
             if merc.recommended_min_level > max_level:
                 continue
-            difficulties = ["普通"]
+            difficulties = ["简单"]
         else:
             if si.unlock_condition > main_task_max_id:
                 continue
-            difficulties = ["普通", "冒险", "修罗", "地狱"]
+            difficulties = ["简单", "冒险", "修罗", "地狱"]
 
         crates = stage_registry.get_stage_loot(area, name)
         if not crates:

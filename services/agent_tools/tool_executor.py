@@ -348,6 +348,10 @@ def _detailed_draft_summary(
     lines.append(f"类型: {draft.get('task_type', '?')}")
     lines.append(f"标题: {draft.get('title', '?')}")
     lines.append(f"描述: {draft.get('description', '?')}")
+    # get/finish NPC：缺省时用 npc_name 兜底（后端写入逻辑一致）
+    npc_name_fallback = draft.get("npc_name") or "?"
+    lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
+    lines.append(f"完成NPC: {draft.get('finish_npc') or npc_name_fallback}")
 
     get_reqs = draft.get("get_requirements") or []
     if get_reqs:
@@ -356,7 +360,7 @@ def _detailed_draft_summary(
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:
         fr_strs = [
-            f"{fr.get('stage_area', '?')}/{fr.get('stage_name', '?')}({fr.get('difficulty', '?')})"
+            f"{fr.get('stage_name', '?')}({fr.get('difficulty', '?')})"
             for fr in finish_reqs
         ]
         lines.append(f"通关要求: {', '.join(fr_strs)}")
@@ -376,12 +380,50 @@ def _detailed_draft_summary(
         rw_strs = _format_items_with_price(rewards, game_data)
         lines.append(f"奖励: {', '.join(rw_strs)}")
 
-    get_text = draft.get("get_conversation_text", "")
-    if get_text:
-        lines.append(f"接取对话: {get_text[:120]}{'…' if len(get_text) > 120 else ''}")
-    finish_text = draft.get("finish_conversation_text", "")
-    if finish_text:
-        lines.append(f"完成对话: {finish_text[:120]}{'…' if len(finish_text) > 120 else ''}")
+    def _summarize_dialogue(dialogue: Any) -> str:
+        # 新结构：数组[{name,title,emotion?,text}, ...]
+        if isinstance(dialogue, list):
+            parts: list[str] = []
+            for it in dialogue[:8]:
+                if not isinstance(it, dict):
+                    continue
+                n = str(it.get("name") or "").strip()
+                emo = str(it.get("emotion") or "").strip()
+                t = str(it.get("text") or "").strip()
+                if not n and not t:
+                    continue
+                label = n or "?"
+                if emo:
+                    label = f"{label}#{emo}"
+                t_short = t[:60] + ("…" if len(t) > 60 else "")
+                parts.append(f"{label}:{t_short}")
+            return "；".join(parts)
+
+        # 旧结构：字符串
+        if isinstance(dialogue, str):
+            s = dialogue.strip()
+            if not s:
+                return ""
+            return s[:120] + ("…" if len(s) > 120 else "")
+        return ""
+
+    get_dialogue = draft.get("get_dialogue")
+    get_summary = _summarize_dialogue(get_dialogue)
+    if get_summary:
+        lines.append(f"接取对话: {get_summary}")
+    else:
+        get_text = draft.get("get_conversation_text", "")
+        if isinstance(get_text, str) and get_text.strip():
+            lines.append(f"接取对话(旧字段): {get_text.strip()[:120]}{'…' if len(get_text.strip()) > 120 else ''}")
+
+    finish_dialogue = draft.get("finish_dialogue")
+    finish_summary = _summarize_dialogue(finish_dialogue)
+    if finish_summary:
+        lines.append(f"完成对话: {finish_summary}")
+    else:
+        finish_text = draft.get("finish_conversation_text", "")
+        if isinstance(finish_text, str) and finish_text.strip():
+            lines.append(f"完成对话(旧字段): {finish_text.strip()[:120]}{'…' if len(finish_text.strip()) > 120 else ''}")
 
     return "\n".join(lines)
 

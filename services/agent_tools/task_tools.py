@@ -70,7 +70,7 @@ def _reward_items_to_expr(items: Any) -> List[str]:
 
 def _stage_reqs_to_strings(stage_reqs: Any) -> List[str]:
     """
-    [{stage_area, stage_name, difficulty}] -> ["关卡名#难度", ...]
+    [{stage_name, difficulty}] -> ["关卡名#难度", ...]
     """
     out: List[str] = []
     if not isinstance(stage_reqs, list):
@@ -98,6 +98,63 @@ def _ensure_int_list(v: Any) -> List[int]:
         except Exception:
             continue
     return out
+
+
+def _strip_bracket_expressions(text: str) -> str:
+    """
+    去掉形如 `【...】` / `（...）` 的动作/神态/旁白标记，确保 text 是纯对话。
+    """
+    import re
+
+    s = (text or "").strip()
+    # 常见格式：把开头的【...】/（...）当作动作/旁白前缀直接剥离
+    s = re.sub(r"^(?:【[^】]*】|（[^）]*）|\s)+", "", s)
+    # 其余位置的【...】也直接删掉
+    cleaned = re.sub(r"【[^】]*】", "", s)
+    # 若文本仍然是纯旁白段落，也把（...）删掉（尽量严格）
+    cleaned = re.sub(r"（[^）]*）", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_leading_emotion_from_brackets(text: str) -> tuple[str, str]:
+    """
+    从字符串开头的 `【情绪】` 前缀提取 emotion，并返回去前缀后的纯文本。
+    """
+    import re
+
+    s = (text or "").strip()
+    m = re.match(r"^【([^】]+)】(.*)$", s)
+    if not m:
+        return "", _strip_bracket_expressions(s)
+    emotion = (m.group(1) or "").strip()
+    rest = (m.group(2) or "").strip()
+    return emotion, _strip_bracket_expressions(rest)
+
+
+def _dialogue_entry_to_agent_text_item(
+    entry: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    将草案 dialogue entry 映射到 agent_text.json 的单条：
+    { name, title, char, text }
+    """
+    name = str(entry.get("name") or "").strip()
+    title = str(entry.get("title") or "").strip()
+    emotion = str(entry.get("emotion") or "").strip()
+    text = str(entry.get("text") or "").strip()
+    text = _strip_bracket_expressions(text)
+
+    if name == "$PC":
+        title = "$PC_TITLE" if not title else title
+        char_base = "$PC_CHAR"
+        char = f"{char_base}#{emotion}" if emotion else char_base
+        return {"name": "$PC", "title": title, "char": char, "text": text}
+
+    # NPC：char 用 NPC名#emotion（可选）
+    if not title:
+        title = name
+    char = f"{name}#{emotion}" if emotion else name
+    return {"name": name, "title": title, "char": char, "text": text}
 
 
 def write_confirmed_agent_task_files(
@@ -146,12 +203,62 @@ def write_confirmed_agent_task_files(
         description = (
             draft.get("description") if isinstance(draft.get("description"), str) else ""
         )
-        get_text = draft.get("get_conversation_text")
-        finish_text = draft.get("finish_conversation_text")
-        if not isinstance(get_text, str):
-            get_text = ""
-        if not isinstance(finish_text, str):
-            finish_text = ""
+
+        # 新结构：对话数组（优先）
+        get_dialogue = draft.get("get_dialogue")
+        finish_dialogue = draft.get("finish_dialogue")
+
+        # 旧结构兼容：字符串对话
+        get_text_old = draft.get("get_conversation_text")
+        finish_text_old = draft.get("finish_conversation_text")
+        if not isinstance(get_text_old, str):
+            get_text_old = ""
+        if not isinstance(finish_text_old, str):
+            finish_text_old = ""
+
+        # 生成 agent_text.json 的数组（纯对话）
+        get_items: List[Dict[str, str]] = []
+        finish_items: List[Dict[str, str]] = []
+
+        if isinstance(get_dialogue, list) and get_dialogue:
+            for it in get_dialogue:
+                if isinstance(it, dict):
+                    get_items.append(_dialogue_entry_to_agent_text_item(it))
+        elif get_text_old:
+            # 只有旧字段：为当前 get_npc 生成一条
+            emo, text_clean = _extract_leading_emotion_from_brackets(get_text_old)
+            get_items = [
+                {
+                    "name": get_npc,
+                    "title": get_npc,
+                    "char": f"{get_npc}#{emo}" if emo else get_npc,
+                    "text": text_clean,
+                }
+            ]
+
+        if isinstance(finish_dialogue, list) and finish_dialogue:
+            for it in finish_dialogue:
+                if isinstance(it, dict):
+                    finish_items.append(
+                        _dialogue_entry_to_agent_text_item(it)
+                    )
+        elif finish_text_old:
+            emo, text_clean = _extract_leading_emotion_from_brackets(finish_text_old)
+            finish_items = [
+                {
+                    "name": finish_npc,
+                    "title": finish_npc,
+                    "char": f"{finish_npc}#{emo}" if emo else finish_npc,
+                    "text": text_clean,
+                }
+            ]
+
+        # 如果 LLM 没给对话数组，但有字符串字段为空，至少要给一个空对话占位
+        # 避免游戏端/前端解析空数组出错
+        if not get_items:
+            get_items = [{"name": get_npc, "title": get_npc, "char": get_npc, "text": ""}]
+        if not finish_items:
+            finish_items = [{"name": finish_npc, "title": finish_npc, "char": finish_npc, "text": ""}]
 
         get_req_list = _ensure_int_list(draft.get("get_requirements"))
         finish_reqs = _stage_reqs_to_strings(draft.get("finish_requirements"))
@@ -197,22 +304,9 @@ def write_confirmed_agent_task_files(
 
         text_doc[f"$AGENT_TITLE_{task_id_int}"] = title
         text_doc[f"$AGENT_DESCRIPTION_{task_id_int}"] = description
-        text_doc[f"$AGENT_GET_{task_id_int}"] = [
-            {
-                "name": get_npc,
-                "title": get_npc,
-                "char": get_npc,
-                "text": get_text,
-            }
-        ]
-        text_doc[f"$AGENT_FINISH_{task_id_int}"] = [
-            {
-                "name": finish_npc,
-                "title": finish_npc,
-                "char": finish_npc,
-                "text": finish_text,
-            }
-        ]
+        # 接取/完成：写入 dialogue array 映射后的多条对话
+        text_doc[f"$AGENT_GET_{task_id_int}"] = get_items
+        text_doc[f"$AGENT_FINISH_{task_id_int}"] = finish_items
 
         _atomic_write_text(agent_tasks_path, _dump_json(new_tasks_doc))
         _atomic_write_text(agent_text_path, _dump_json(text_doc))

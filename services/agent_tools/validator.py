@@ -63,6 +63,24 @@ def _stage_requirement_iter(draft: Mapping[str, Any]) -> Iterable[Mapping[str, A
             yield sr
 
 
+def _get_stage_infos_by_name(*, stage_registry: Any, stage_name: str) -> list[tuple[str, Any]]:
+    """
+    通过 stage_name 在所有大区中查找 stage 信息。
+    注意：stage_area 不参与 LLM 输入；由后端在筛选候选关卡时使用，本校验只做 stage_name 级校验。
+    """
+    if not isinstance(stage_name, str) or not stage_name.strip():
+        return []
+    stage_infos_raw = getattr(stage_registry, "_stage_infos", None)
+    if not isinstance(stage_infos_raw, dict):
+        return []
+
+    out: list[tuple[str, Any]] = []
+    for (area, name), si in stage_infos_raw.items():
+        if name == stage_name:
+            out.append((str(area), si))
+    return out
+
+
 def _compute_items_value(
     items: Iterable[Mapping[str, Any]], item_registry: Any,
 ) -> int:
@@ -272,20 +290,24 @@ def _validate_v3_stage_existence_and_area(
 ) -> Optional[dict[str, Any]]:
     invalid: list[dict[str, Any]] = []
     for sr in _stage_requirement_iter(draft):
-        stage_area = sr.get("stage_area")
         stage_name = sr.get("stage_name")
-        if not isinstance(stage_area, str) or not stage_area.strip():
-            continue
         if not isinstance(stage_name, str) or not stage_name.strip():
             continue
-
-        if stage_area not in VALID_STAGE_ROOTS:
-            invalid.append({"stage_area": stage_area, "stage_name": stage_name, "reason": "无效大区"})
+        stage_infos = _get_stage_infos_by_name(stage_registry=stage_registry, stage_name=stage_name)
+        if not stage_infos:
+            invalid.append({"stage_name": stage_name, "reason": "无效关卡"})
             continue
 
-        unlock = stage_registry.get_unlock_condition(stage_area, stage_name)
-        if not isinstance(unlock, int) or unlock <= 0:
-            invalid.append({"stage_area": stage_area, "stage_name": stage_name, "reason": "关卡无效或缺少解锁条件"})
+        # stage_area 由筛选阶段负责；这里只确认：至少存在一个匹配关卡，且有 unlock_condition
+        has_valid_unlock = False
+        for _area, si in stage_infos:
+            unlock = getattr(si, "unlock_condition", None)
+            if isinstance(unlock, int) and unlock > 0:
+                has_valid_unlock = True
+                break
+
+        if not has_valid_unlock:
+            invalid.append({"stage_name": stage_name, "reason": "关卡无效或缺少解锁条件"})
 
     if invalid:
         return {
@@ -308,23 +330,31 @@ def _validate_v4_stage_unlock_condition(
 ) -> Optional[dict[str, Any]]:
     over: list[dict[str, Any]] = []
     for sr in _stage_requirement_iter(draft):
-        stage_area = sr.get("stage_area")
         stage_name = sr.get("stage_name")
-        if not isinstance(stage_area, str) or not stage_area.strip():
-            continue
         if not isinstance(stage_name, str) or not stage_name.strip():
             continue
+        stage_infos = _get_stage_infos_by_name(stage_registry=stage_registry, stage_name=stage_name)
+        if not stage_infos:
+            continue  # V3 会处理
 
-        unlock_id = stage_registry.get_unlock_condition(stage_area, stage_name)
-        if int(unlock_id) > int(main_task_max_id):
-            over.append(
-                {
-                    "stage_area": stage_area,
-                    "stage_name": stage_name,
-                    "unlock_id": int(unlock_id),
-                    "main_task_max_id": int(main_task_max_id),
-                }
-            )
+        unlock_ids: list[int] = []
+        for _area, si in stage_infos:
+            unlock = getattr(si, "unlock_condition", None)
+            if isinstance(unlock, int) and unlock > 0:
+                unlock_ids.append(int(unlock))
+
+        if not unlock_ids:
+            continue  # V3 会处理
+
+        # 只要存在一种“该 stage_name”对应关卡在当前进度可解锁即可
+        # 否则表示所有匹配关卡都超进度。
+        min_unlock = min(unlock_ids)
+        if min_unlock > int(main_task_max_id):
+            over.append({
+                "stage_name": stage_name,
+                "min_unlock_id": int(min_unlock),
+                "main_task_max_id": int(main_task_max_id),
+            })
 
     if over:
         return {
@@ -342,27 +372,35 @@ def _validate_v4_stage_unlock_condition(
 def _validate_v5_replica_stage_difficulty(
     *,
     draft: Mapping[str, Any],
+    stage_registry: Any,
 ) -> Optional[dict[str, Any]]:
     invalid: list[dict[str, Any]] = []
     for sr in _stage_requirement_iter(draft):
-        stage_area = sr.get("stage_area")
         stage_name = sr.get("stage_name")
         difficulty = sr.get("difficulty")
-        if not isinstance(stage_area, str) or not stage_area.strip():
-            continue
-        if stage_area != "副本任务":
-            continue
         if not isinstance(stage_name, str) or not stage_name.strip():
             continue
         if not isinstance(difficulty, str) or not difficulty.strip():
             continue
-        if difficulty != "普通":
+
+        replica_infos = [
+            (area, si)
+            for (area, si) in _get_stage_infos_by_name(
+                stage_registry=stage_registry,
+                stage_name=stage_name,
+            )
+            if area == "副本任务"
+        ]
+        if not replica_infos:
+            continue
+
+        if difficulty != "简单":
             invalid.append(
                 {
-                    "stage_area": stage_area,
                     "stage_name": stage_name,
                     "difficulty": difficulty,
-                    "expected": "普通",
+                    "expected": "简单",
+                    "replica_areas": [area for (area, _si) in replica_infos],
                 }
             )
 
@@ -660,7 +698,7 @@ def validate_task_draft(
     rewards_keys = {"rewards", "finish_submit_items", "finish_contain_items"}
     stage_keys = {"finish_requirements"}
     precondition_keys = {"get_requirements"}
-    text_keys = {"title", "description", "get_conversation_text", "finish_conversation_text"}
+    text_keys = {"title", "description", "get_dialogue", "finish_dialogue", "get_npc", "finish_npc"}
 
     reward_keys_to_validate = rewards_keys if full_mode else (changed & rewards_keys)
 
@@ -669,7 +707,8 @@ def validate_task_draft(
     run_preconditions = full_mode or bool(changed & precondition_keys)
     run_v7 = full_mode or bool(changed & rewards_keys)
     run_v8 = full_mode or bool(changed & {"rewards"})
-    run_v9 = full_mode or bool(changed & (rewards_keys | stage_keys | text_keys))
+    # V9 的指纹只依赖：关卡要求 + 提交/持有物品，不应因为“对话/标题描述”变更而触发
+    run_v9 = full_mode or bool(changed & (rewards_keys | stage_keys))
     run_v10 = full_mode or bool(changed & rewards_keys)
 
     # ---- V1: 物品存在性 ----
@@ -712,7 +751,7 @@ def validate_task_draft(
 
     # ---- V5: 副本关卡难度 ----
     if run_stages:
-        e = _validate_v5_replica_stage_difficulty(draft=draft)
+        e = _validate_v5_replica_stage_difficulty(draft=draft, stage_registry=stage_registry)
         if e:
             return DraftValidationResult(success=False, validation_errors=[e])
 

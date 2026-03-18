@@ -23,7 +23,7 @@ TASK_TYPES: List[str] = [
     "通关并持有",
 ]
 
-DIFFICULTIES: List[str] = ["普通", "冒险", "修罗", "地狱"]
+DIFFICULTIES: List[str] = ["简单", "冒险", "修罗", "地狱"]
 
 REWARD_REGULAR: List[str] = ["金币", "经验"]
 REWARD_OPTIONAL: List[str] = [
@@ -55,8 +55,7 @@ class RewardItem(TypedDict):
     count: int
 
 
-class StageRequirement(TypedDict):
-    stage_area: str
+class StageRequirement(TypedDict, total=False):
     stage_name: str
     difficulty: str
 
@@ -70,8 +69,12 @@ class TaskDraft(TypedDict, total=False):
     finish_submit_items: List[RewardItem]
     finish_contain_items: List[RewardItem]
     rewards: List[RewardItem]
-    get_conversation_text: str
-    finish_conversation_text: str
+    # 发布/完成 NPC：可选；为空时由后端默认当前 NPC
+    get_npc: str
+    finish_npc: str
+    # 接取/完成对话：数组，每项为纯对话文本（不要包含【动作/神态/旁白】）
+    get_dialogue: List[dict[str, Any]]
+    finish_dialogue: List[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +147,30 @@ REWARD_ITEM_SCHEMA: dict[str, Any] = {
 STAGE_REQUIREMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "stage_area": {"type": "string"},
         "stage_name": {"type": "string"},
         "difficulty": {"type": "string", "enum": DIFFICULTIES},
     },
-    "required": ["stage_area", "stage_name", "difficulty"],
+    "required": ["stage_name", "difficulty"],
+    "additionalProperties": False,
+}
+
+TOP_NPC_EMOTION_HINT: str = "emotion：可选；用于拼接 char（NPC名#情绪 或 $PC_CHAR#情绪）。"
+
+DIALOGUE_ENTRY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "NPC 名称或固定值 '$PC'（玩家）"},
+        "title": {"type": "string", "description": "称号（NPC 称号或 '$PC_TITLE'）"},
+        "emotion": {
+            "type": "string",
+            "description": TOP_NPC_EMOTION_HINT + "；允许空字符串表示默认情绪。",
+        },
+        "text": {
+            "type": "string",
+            "description": "纯对话内容（不要包含动作/神态/旁白/【...】）。"
+        },
+    },
+    "required": ["name", "title", "text"],
     "additionalProperties": False,
 }
 
@@ -180,8 +202,18 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": REWARD_ITEM_SCHEMA,
         },
-        "get_conversation_text": {"type": "string", "description": "接取时 NPC 的对话文本"},
-        "finish_conversation_text": {"type": "string", "description": "完成时 NPC 的对话文本"},
+        "get_npc": {"type": "string", "description": "接取时由谁发布（可为空，后端默认当前 NPC）"},
+        "finish_npc": {"type": "string", "description": "完成时由谁发言（可为空，后端默认当前 NPC）"},
+        "get_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": "接取对话数组；可以包含 NPC 与玩家($PC)多条。",
+        },
+        "finish_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": "完成对话数组；可以包含 NPC 与玩家($PC)多条。",
+        },
     },
     "required": [
         "task_type",
@@ -189,8 +221,8 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
         "description",
         "get_requirements",
         "rewards",
-        "get_conversation_text",
-        "finish_conversation_text",
+        "get_dialogue",
+        "finish_dialogue",
     ],
     "additionalProperties": False,
 }
@@ -222,8 +254,10 @@ UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA: dict[str, Any] = {
                 "finish_submit_items": {"type": "array", "items": REWARD_ITEM_SCHEMA},
                 "finish_contain_items": {"type": "array", "items": REWARD_ITEM_SCHEMA},
                 "rewards": {"type": "array", "items": REWARD_ITEM_SCHEMA},
-                "get_conversation_text": {"type": "string"},
-                "finish_conversation_text": {"type": "string"},
+                "get_npc": {"type": "string"},
+                "finish_npc": {"type": "string"},
+                "get_dialogue": {"type": "array", "items": DIALOGUE_ENTRY_SCHEMA},
+                "finish_dialogue": {"type": "array", "items": DIALOGUE_ENTRY_SCHEMA},
             },
             "additionalProperties": False,
         },
