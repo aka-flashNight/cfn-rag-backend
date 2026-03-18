@@ -165,6 +165,7 @@ def _build_reward_item_candidates(
     game_data: GameDataRegistry,
     npc_name: str,
     stage: int,
+    min_level: int,
     max_level: int,
 ) -> list[dict[str, Any]]:
     """
@@ -220,6 +221,9 @@ def _build_reward_item_candidates(
             continue
         if item.level > max_level:
             continue
+        # 4.2：任务奖励常见不返回装备类（仅 shop 允许提供武器/防具）
+        if item.type in ("武器", "防具"):
+            continue
         for rt in all_types:
             if _matches_reward_type(item, rt, equipment_mods):
                 entry: dict[str, Any] = {
@@ -249,8 +253,14 @@ def _build_reward_item_candidates(
         item = item_registry.get_by_name(shop_item_name)
         if item is None:
             continue
-        if item.level > max_level:
-            continue
+        # 对商店物品：仅对 武器/防具/手雷 做“落入区间”筛选
+        is_weapon_or_armor = item.type in ("武器", "防具")
+        is_grenade = bool(item.use) and item.use == "手雷"
+        if is_weapon_or_armor or is_grenade:
+            # 文档：要求在当前区间内，且要“大于下限”
+            # 这里实现为：level_min < level <= max_level
+            if item.level <= min_level or item.level > max_level:
+                continue
         for rt in all_types:
             if _matches_reward_type(item, rt, equipment_mods):
                 entry = {
@@ -827,6 +837,7 @@ def prepare_task_context(
         game_data=game_data,
         npc_name=npc_name,
         stage=stage,
+        min_level=level_range[0],
         max_level=max_level,
     )
 

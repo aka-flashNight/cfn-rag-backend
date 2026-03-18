@@ -92,6 +92,23 @@ def _get_full_tools() -> list[dict[str, Any]]:
     return ALL_TOOLS + [CONFIRM_AGENT_TASK_TOOL, CANCEL_AGENT_TASK_TOOL]
 
 
+def _format_tool_result_for_prompt(tool_name: str, result: str, *, limit: int = 1000) -> str:
+    """
+    拼 prompt 时的 tool 输出展示策略。
+
+    - `prepare_task_context` 结果包含结构化候选列表，不能被完整 JSON 截断
+      （否则会导致 LLM 看不到 `reward_item_candidates` 的后半段）。
+    - 其他工具结果保持字符上限，避免 prompt 过长。
+    """
+    if tool_name == "prepare_task_context":
+        return result
+    if not result:
+        return ""
+    if len(result) <= limit:
+        return result
+    return result[:limit] + "…"
+
+
 # ---------------------------------------------------------------------------
 # Node: prepare_context
 # ---------------------------------------------------------------------------
@@ -354,7 +371,10 @@ async def decision_node(
     if tool_messages:
         full_user_prompt += "\n\n【工具执行结果】\n"
         for tm in tool_messages:
-            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+            full_user_prompt += (
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     image_path_str = state.get("image_path")
     image_path = None
@@ -553,7 +573,10 @@ async def generate_response_node(
     if tool_messages:
         full_user_prompt += "\n\n【工具执行结果】\n"
         for tm in tool_messages:
-            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+            full_user_prompt += (
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
@@ -671,7 +694,10 @@ async def generate_response_stream(
     if tool_messages:
         full_user_prompt += "\n\n【工具执行结果】\n"
         for tm in tool_messages:
-            full_user_prompt += f"[{tm['tool_name']}]: {tm['result'][:1000]}\n"
+            full_user_prompt += (
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():

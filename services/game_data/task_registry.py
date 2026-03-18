@@ -36,8 +36,10 @@ class TaskRegistry:
         for filename in entries:
             if not filename.lower().endswith(".json"):
                 continue
-            # 排除 preview_tasks.json（仅作展示/预览用）
+            # 排除 preview_tasks.json （仅作展示/预览用） bonus_tasks.json（彩蛋任务）
             if filename.lower() == "preview_tasks.json":
+                continue
+            if filename.lower() == "bonus_tasks.json":
                 continue
             fp = (self.task_root / filename).resolve()
             if not fp.exists():
