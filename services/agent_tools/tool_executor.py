@@ -26,6 +26,17 @@ def _safe_json_loads(s: str) -> dict[str, Any]:
         return {}
 
 
+def _reward_field_value_changed(cur: Any, new: Any) -> bool:
+    """奖励类字段是否发生实际变化，用于讨价还价计数去重（同一轮内重复调用不重复计数）。"""
+    if cur is None and (new is None or new == []):
+        return False
+    if (cur is None or cur == []) and new is None:
+        return False
+    if cur == new:
+        return False
+    return True
+
+
 def _build_validation_ctx(
     *,
     npc_name: str = "",
@@ -95,6 +106,7 @@ def execute_draft_agent_task(
     draft: dict[str, Any] = {
         "draft_id": draft_id,
         "npc_name": npc_name,
+        "bargain_count": 0,  # 讨价还价次数，上限 2 次（仅调整奖励时计数）
         **args,
     }
 
@@ -118,6 +130,7 @@ def execute_draft_agent_task(
         "draft_id": draft_id,
         "message": "任务草案已创建，等待玩家确认。",
         "draft_summary": detailed,
+        "bargain_remaining": 2,  # 讨价还价最多 2 次，提醒 LLM
     }
     if result.validation_warnings:
         payload["warnings"] = result.validation_warnings
@@ -147,6 +160,30 @@ def execute_update_task_draft(
         game_data = get_game_data_registry()
 
     modify_fields = args.get("modify_fields", {})
+    if not isinstance(modify_fields, dict):
+        modify_fields = {}
+
+    # 讨价还价上限 2 次：仅当本次修改涉及奖励字段且内容实际发生变化时计数（同一轮中 decision_node 与 generate_response_stream 可能各执行一次，避免重复计数）
+    BARGAIN_KEYS = {"rewards", "finish_submit_items", "finish_contain_items"}
+    bargain_keys_touched = BARGAIN_KEYS & set(modify_fields)
+    is_bargain = bool(bargain_keys_touched)
+    reward_actually_changed = False
+    if is_bargain:
+        for k in bargain_keys_touched:
+            new_val = modify_fields[k]
+            cur_val = pending_draft.get(k)
+            if _reward_field_value_changed(cur_val, new_val):
+                reward_actually_changed = True
+                break
+        if reward_actually_changed:
+            bargain_count = int(pending_draft.get("bargain_count", 0))
+            if bargain_count >= 2:
+                return json.dumps({
+                    "status": "error",
+                    "message": "最多允许讨价还价2次，已达上限。请让玩家接受或拒绝任务，或取消/拒绝发布。",
+                    "draft_id": pending_draft.get("draft_id", ""),
+                }, ensure_ascii=False), pending_draft
+
     for k, v in modify_fields.items():
         pending_draft[k] = v
 
@@ -168,11 +205,17 @@ def execute_update_task_draft(
             "errors": result.validation_errors,
             "draft_summary": detailed,
         }, ensure_ascii=False), pending_draft
+
+    # 仅在校验通过后增加讨价还价次数，避免失败或重放时误计数
+    if is_bargain and reward_actually_changed:
+        pending_draft["bargain_count"] = int(pending_draft.get("bargain_count", 0)) + 1
+
     payload = {
         "status": "draft_updated",
         "draft_id": pending_draft.get("draft_id", ""),
         "message": "草案已更新，等待玩家确认。",
         "draft_summary": detailed,
+        "bargain_remaining": max(0, 2 - int(pending_draft.get("bargain_count", 0))),
     }
     if result.validation_warnings:
         payload["warnings"] = result.validation_warnings
