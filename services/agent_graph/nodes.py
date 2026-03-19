@@ -395,7 +395,9 @@ async def prepare_context_node(
         retrieved_context=retrieved_context or "",
         history_str=history_str,
         user_query=payload.query,
-        emotion_hint=emotion_hint,
+        # emotion_hint 不要写入共享 user_prompt，避免与 llm_client 末尾拼接重复。
+        # 由 llm_client 统一决定：是否与 image_description 同行、或单独一行。
+        emotion_hint="",
         image_description="",
     )
 

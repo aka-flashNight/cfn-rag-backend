@@ -47,12 +47,12 @@ async def call_llm(
 
     # emotion_hint 可放在 system 前；image_description 与高频变动内容一起放在 user 末尾，避免 prompt 前部变动影响缓存
     prefix_parts: List[str] = []
-    if emotion_hint and emotion_hint.strip():
-        prefix_parts.append(emotion_hint.strip())
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
-    user_suffix = ""
+    user_suffix = "\n\n"
     if image_description and image_description.strip():
         user_suffix = "\n\n" + image_description.strip() + "。"
+    if emotion_hint and emotion_hint.strip():
+        user_suffix = user_suffix + emotion_hint.strip()
     effective_user = user_prompt + user_suffix
 
     if image_path and image_path.is_file():
@@ -135,12 +135,12 @@ async def call_llm_stream(
     client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
     prefix_parts: List[str] = []
-    if emotion_hint and emotion_hint.strip():
-        prefix_parts.append(emotion_hint.strip())
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
-    user_suffix = ""
+    user_suffix = "\n\n"
     if image_description and image_description.strip():
         user_suffix = "\n\n" + image_description.strip() + "。"
+    if emotion_hint and emotion_hint.strip():
+        user_suffix = user_suffix + emotion_hint.strip()
     effective_user = user_prompt + user_suffix
 
     if image_path and image_path.is_file():
