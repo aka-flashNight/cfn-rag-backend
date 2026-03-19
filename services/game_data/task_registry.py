@@ -138,6 +138,10 @@ class TaskRegistry:
     def get_by_id(self, id: int) -> Optional[Task]:
         return self._by_id.get(int(id))
 
+    def list_all_tasks(self) -> list[Task]:
+        """返回所有已加载任务（用于按区间优先级排序奖励池）。"""
+        return list(self._by_id.values())
+
     def list_by_npc(self, npc_name: str) -> list[Task]:
         return list(self._by_npc.get(npc_name, []))
 

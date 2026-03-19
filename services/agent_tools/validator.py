@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from services.game_progress import VALID_STAGE_ROOTS
+from services.game_data.reward_utils import parse_name_count
 
 if TYPE_CHECKING:
     from services.game_data.registry import GameDataRegistry
@@ -52,9 +53,14 @@ def _as_list(v: Any) -> list[Any]:
 
 
 def _reward_item_iter(draft: Mapping[str, Any], key: str) -> Iterable[Mapping[str, Any]]:
+    """遍历奖励/提交/持有列表，支持 dict {item_name, count} 与字符串 \"物品名#数量\" 两种格式。"""
     for it in _as_list(draft.get(key)):
         if isinstance(it, dict):
             yield it
+        elif isinstance(it, str) and it.strip():
+            name, count = parse_name_count(it.strip())
+            if name:
+                yield {"item_name": name, "count": count}
 
 
 def _stage_requirement_iter(draft: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
@@ -557,9 +563,14 @@ def _validate_v7_reward_total_value(
             "subtotal": price * max(n, 0),
         })
 
+    if rewards_value < range_min:
+        error_msg = "奖励总价值低于允许区间下限，请增加奖励（如增加金币或物品）使总价值不低于 {}。".format(range_min)
+    else:
+        error_msg = "奖励总价值高于允许区间上限，请减少奖励或调整物品数量使总价值不超过 {}。".format(range_max)
+
     return {
         "step": "V7",
-        "error": "奖励总价值超出允许区间",
+        "error": error_msg,
         "item_prices": item_prices,
         "total_value": rewards_value,
         "allowed_range": [range_min, range_max],

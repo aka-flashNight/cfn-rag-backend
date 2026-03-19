@@ -169,6 +169,59 @@ def _matches_reward_type(
     return False
 
 
+def _ordered_reward_item_names_from_tasks(
+    *,
+    task_registry: Any,
+    mercenary_registry: Any,
+    main_task_min_id: int,
+    main_task_max_id: int,
+    level_min: int,
+    level_max: int,
+) -> list[str]:
+    """
+    按“当前区间优先”顺序产出任务奖励池中的物品名，用于 reward_item_candidates 排序。
+    顺序：主线 id 在区间内 → 前置含区间内主线 id 的非主线 → mercenary 推荐等级与当前等级区间有交集 → 其他。
+    """
+    all_tasks = task_registry.list_all_tasks()
+    main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
+    # 前置任务包含当前区间内任一主线 id 的任务（且自身不在区间内，避免重复）
+    precondition_in_range_ids = {
+        t.id for t in all_tasks
+        if t.id not in main_range_ids
+        and (t.get_requirements or [])
+        and any(rid in main_range_ids for rid in (t.get_requirements or []))
+    }
+    # mercenary_tasks.json 中存在且推荐等级与当前等级区间有交集的任务 id（无推荐等级的副本视为最低优先级，不放入 tier3）
+    merc_level_overlap_ids: set[int] = set()
+    for m in (mercenary_registry.list_all() if hasattr(mercenary_registry, "list_all") else []):
+        rmin = getattr(m, "recommended_min_level", None)
+        rmax = getattr(m, "recommended_max_level", None)
+        if rmin is None and rmax is None:
+            continue  # 无推荐等级 -> 不视为“符合”，归入 tier4
+        rmin = rmin if rmin is not None else 0
+        rmax = rmax if rmax is not None else 999
+        if rmax < level_min or rmin > level_max:
+            continue
+        merc_level_overlap_ids.add(m.id)
+    # 分档：tier1 主线区间内, tier2 前置在区间内, tier3 mercenary 等级有交集, tier4 其余
+    tier1: list[int] = [t.id for t in all_tasks if t.id in main_range_ids]
+    tier2: list[int] = [t.id for t in all_tasks if t.id in precondition_in_range_ids]
+    tier3: list[int] = [t.id for t in all_tasks if t.id in merc_level_overlap_ids and t.id not in main_range_ids and t.id not in precondition_in_range_ids]
+    tier4: list[int] = [t.id for t in all_tasks if t.id not in main_range_ids and t.id not in precondition_in_range_ids and t.id not in merc_level_overlap_ids]
+    ordered_ids = tier1 + tier2 + tier3 + tier4
+    # 按任务顺序收集奖励物品名（保持顺序、可重复，后续用 seen 去重）
+    out: list[str] = []
+    for tid in ordered_ids:
+        t = task_registry.get_by_id(tid)
+        if not t or not t.rewards:
+            continue
+        for r in t.rewards:
+            name, _ = parse_name_count(r)
+            if name:
+                out.append(name)
+    return out
+
+
 def _build_reward_item_candidates(
     *,
     reward_types: dict[str, list[str]],
@@ -177,33 +230,24 @@ def _build_reward_item_candidates(
     stage: int,
     min_level: int,
     max_level: int,
+    main_task_range: tuple[int, int],
 ) -> list[dict[str, Any]]:
     """
     组装奖励物品候选列表（文档 6.3.2 通用字段 reward_item_candidates）。
 
-    数据来源：
-    - 任务奖励池（物品名 + 数量上下限 + 单价）
-    - 当前NPC商店物品（物品名 + 单价）
-
-    筛选规则：
-    - 根据 reward_types 中的 regular + optional 类型做过滤
-    - 过滤方式：item.name == type 或 item.type == type 或 item.use == type
-    - 特殊：\"插件\" 通过 equipment_mods_registry 判断
-    - 按玩家等级筛选（level ≤ max_level）
-    - K点仅阶段4及以上可选；武器/防具/插件仅NPC商店有售时可选
+    数据来源与顺序：NPC 商店优先 → 当前区间任务（主线/前置/mercenary 等级重合）→ 其他任务。
     """
     item_registry = game_data.items
     task_registry = game_data.tasks
     shop_registry = game_data.shops
     equipment_mods = game_data.equipment_mods
+    mercenary_registry = game_data.mercenary_tasks
 
     all_types = list(reward_types.get("regular", [])) + list(reward_types.get("optional", []))
 
-    # K点仅阶段4+
     if stage < 4 and "K点" in all_types:
         all_types.remove("K点")
 
-    # 武器/防具/插件仅NPC商店有售时可选
     npc_shop_items = set(shop_registry.get_npc_shop(npc_name))
     has_shop = shop_registry.has_shop(npc_name)
     if not has_shop:
@@ -214,15 +258,21 @@ def _build_reward_item_candidates(
     if not all_types:
         return []
 
-    # 收集任务奖励池物品（含数量统计）
     reward_stats = task_registry.get_reward_stats()
-    reward_item_names = task_registry.list_reward_item_names()
+    main_min, main_max = main_task_range
+    ordered_task_item_names = _ordered_reward_item_names_from_tasks(
+        task_registry=task_registry,
+        mercenary_registry=mercenary_registry,
+        main_task_min_id=main_min,
+        main_task_max_id=main_max,
+        level_min=min_level,
+        level_max=max_level,
+    )
 
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
 
-    # 来源 2 优先：当前NPC商店物品（先加入，避免被任务池占满前 20 导致商店材料不出现）
-    # 商店一律按 reward_types 过滤；装备/手雷再做等级筛选，非装备不做等级筛选
+    # 来源 2 优先：当前NPC商店物品
     for shop_item_name in npc_shop_items:
         if shop_item_name in seen:
             continue
@@ -257,8 +307,8 @@ def _build_reward_item_candidates(
         candidates.append(entry)
         seen.add(shop_item_name)
 
-    # 来源 1：任务奖励池
-    for item_name in reward_item_names:
+    # 来源 1：任务奖励池（按当前区间优先顺序：主线区间 → 前置在区间 → mercenary 等级重合 → 其他）
+    for item_name in ordered_task_item_names:
         if item_name in seen:
             continue
         item = item_registry.get_by_name(item_name)
@@ -995,6 +1045,7 @@ def prepare_task_context(
         stage=stage,
         min_level=level_range[0],
         max_level=max_level,
+        main_task_range=(main_task_range[0], main_task_range[1]),
     )
 
     task_rules = _TASK_RULES.get(task_type, "")
