@@ -140,8 +140,29 @@ class StageRegistry:
                 name = (drop_el.findtext("名字") or "").strip()
                 if not name:
                     continue
-                mn = _safe_int(drop_el.findtext("最小数量"), default=0)
-                mx = _safe_int(drop_el.findtext("最大数量"), default=0)
+
+                # 兼容 XML 中“缺失最小/最大数量”的默认规则：
+                # - 两者都缺失或空：min=1, max=1
+                # - 仅最大存在：min=1, max=最大值
+                # - 仅最小存在：min=最小值, max=最小值
+                min_raw = drop_el.findtext("最小数量")
+                max_raw = drop_el.findtext("最大数量")
+                min_present = min_raw is not None and str(min_raw).strip() != ""
+                max_present = max_raw is not None and str(max_raw).strip() != ""
+
+                if not min_present and not max_present:
+                    mn = 1
+                    mx = 1
+                elif not min_present and max_present:
+                    mn = 1
+                    mx = _safe_int(max_raw, default=1)
+                elif min_present and not max_present:
+                    mn = _safe_int(min_raw, default=1)
+                    mx = mn
+                else:
+                    mn = _safe_int(min_raw, default=0)
+                    mx = _safe_int(max_raw, default=0)
+
                 drops.append(LootDrop(name=name, min_count=mn, max_count=mx))
 
             if drops:

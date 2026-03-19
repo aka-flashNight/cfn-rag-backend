@@ -1112,17 +1112,28 @@ def _build_stage_loot_list(
         if not crates:
             continue
 
+        # 汇总同一关卡下的重复掉落物，减少 prompt 长度：
+        # 相同 item_name：min/max 分别求和，仅保留一条记录。
         loot_items: list[dict[str, Any]] = []
+        loot_map: dict[str, dict[str, Any]] = {}
         total_loot_value = 0
         for crate in crates:
             for drop in crate.drops:
                 unit_price = item_registry.get_price(drop.name)
-                loot_items.append({
-                    "item_name": drop.name,
-                    "min_qty": drop.min_count,
-                    "max_qty": drop.max_count,
-                    "unit_price": unit_price,
-                })
+                prev = loot_map.get(drop.name)
+                if prev is None:
+                    entry = {
+                        "item_name": drop.name,
+                        "min_qty": drop.min_count,
+                        "max_qty": drop.max_count,
+                        "unit_price": unit_price,
+                    }
+                    loot_map[drop.name] = entry
+                    loot_items.append(entry)  # 保持首次出现顺序
+                else:
+                    # unit_price 按 item_name 取值应当恒定；这里只累加数量
+                    prev["min_qty"] += drop.min_count
+                    prev["max_qty"] += drop.max_count
                 total_loot_value += unit_price * drop.min_count
 
         if not loot_items:

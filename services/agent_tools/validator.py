@@ -719,7 +719,7 @@ def _validate_v9_task_uniqueness(
         n = len(similar_ids)
         return {
             "step": "V9",
-            "warning": f"已发布{n}个高度雷同的任务，请谨慎发布，可视情况取消任务/变更任务或继续委派任务。",
+            "warning": f"此前已发布{n}个高度雷同的任务，请谨慎发布，可视情况取消任务/变更任务或继续委派任务。",
             "similar_task_count": n,
             "similar_task_ids": similar_ids,
         }
