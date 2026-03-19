@@ -115,7 +115,7 @@ async def ask_game_knowledge(
                 elif event_type == "done":
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: done\ndata: {line}\n\n".encode("utf-8")
-                elif event_type in ("tool_status", "system"):
+                elif event_type == "tool_status":
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: {event_type}\ndata: {line}\n\n".encode("utf-8")
         except Exception as e:

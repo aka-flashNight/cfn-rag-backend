@@ -688,12 +688,16 @@ class GameRAGService:
                 if not isinstance(ev, dict):
                     continue
                 event_type = ev.get("event_type") or ""
-                if event_type in ("tool_status", "system"):
+                # 仅输出 tool_status；system 通知只拼到最终 reply 前缀，不作为 SSE 独立事件
+                if event_type == "tool_status":
                     payload2 = {k: v for k, v in ev.items() if k != "event_type"}
                     yield (event_type, payload2)
 
             # 防止同一轮 ui_events 在 state 中被二次消费
             state["_ui_events"] = []
+
+        # 工具阶段结束 -> 正式生成正文前：再给前端一个短提示，避免空窗
+        yield ("tool_status", {"text": "正在思考……", "tool_name": "generate_response"})
 
         async for ev, dat in generate_response_stream(state, config):
             yield (ev, dat)
