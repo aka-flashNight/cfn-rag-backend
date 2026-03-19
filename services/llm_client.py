@@ -45,7 +45,8 @@ async def call_llm(
     """
     client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
-    # emotion_hint 可放在 system 前；image_description 与高频变动内容一起放在 user 末尾，避免 prompt 前部变动影响缓存
+    # emotion_hint / image_description 拼在 user 文本末尾；多模态时 **文本 part 在前、图像 part 在后**，
+    # 便于与纯文本轮次对齐更长公共前缀，并减少「图在前导致整段 user 与决策轮无法共享缓存」的情况。
     prefix_parts: List[str] = []
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
     user_suffix = "\n\n"
@@ -64,8 +65,8 @@ async def call_llm(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
                     {"type": "text", "text": effective_user},
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
                 ],
             },
         ]
@@ -76,8 +77,9 @@ async def call_llm(
             {"role": "user", "content": effective_user},
         ]
         # Debug: 
+        # print("————————非流式————————");
         # print(system_content);
-        print("————————非流式无立绘————————");
+        # print("————————非流式无立绘————————");
         # print(effective_user);
 
     kwargs: dict = {"model": model_name, "messages": messages}
@@ -134,6 +136,7 @@ async def call_llm_stream(
     """
     client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
+    # 与非流式一致：多模态时文本 part 在前、图像 part 在后。
     prefix_parts: List[str] = []
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
     user_suffix = "\n\n"
@@ -152,15 +155,16 @@ async def call_llm_stream(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
                     {"type": "text", "text": effective_user},
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
                 ],
             },
         ]
         # Debug: 
+        # print("————————流式————————");
         # print(system_content);        
-        print("————————流式————————");
-        print(effective_user);
+        # print("————————流式有立绘————————");
+        # print(effective_user);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [

@@ -525,8 +525,6 @@ def dispatch_tool_call(
 
     返回: (tool_result_str, updated_pending_draft, task_write_result)
     """
-    # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
-    # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
     _task_tool_names = {
         "prepare_task_context",
         "draft_agent_task",
@@ -534,13 +532,15 @@ def dispatch_tool_call(
         "confirm_agent_task",
         "cancel_agent_task",
     }
-    if tool_name in _task_tool_names:
-        try:
-            pretty_args = json.dumps(tool_args, ensure_ascii=False)
-        except Exception:
-            pretty_args = str(tool_args)
-        print('——————【工具调用】——————')
-        print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+    # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
+    # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         pretty_args = json.dumps(tool_args, ensure_ascii=False)
+    #     except Exception:
+    #         pretty_args = str(tool_args)
+    #     print('——————【工具调用】——————')
+    #     print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
 
     updated_draft = pending_draft
     task_write_result = None
@@ -616,8 +616,8 @@ def dispatch_tool_call(
                 preview = preview[:500] + "…"
         except Exception:
             preview = "<preview-unavailable>"
-        # Debug
-        print('——————【结果】——————')
-        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+        # Debug: 
+        # print('——————【结果】——————')
+        # print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result

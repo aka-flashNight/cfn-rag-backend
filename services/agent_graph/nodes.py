@@ -516,12 +516,12 @@ async def decision_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug:
-            print('——————【工具执行结果】decision_node——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # Debug: 
+            # print('——————【工具执行结果】decision_node——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
 
     # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
@@ -729,12 +729,20 @@ async def generate_response_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug:
-            print('——————【工具执行结果】generate_response_node——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # Debug: 
+            # print('——————【工具执行结果】generate_response_node——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
+
+    # 为了与决策轮在缓存结构上保持一致，本轮依然传入完整工具 definitions，
+    # 但通过额外说明严格约束：本轮只允许（可选）调用 update_npc_mood，不得再次调用任务/检索相关工具。
+    full_user_prompt += (
+        "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
+        "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
+        "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
+    )
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -755,7 +763,7 @@ async def generate_response_node(
             image_path=image_path,
             image_description=state.get("image_description"),
             emotion_hint=state.get("emotion_hint") or None,
-            tools=[UPDATE_NPC_MOOD_TOOL],
+            tools=_get_full_tools(),
         )
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
@@ -769,7 +777,7 @@ async def generate_response_node(
                     image_path=None,
                     image_description=state.get("image_description"),
                     emotion_hint=state.get("emotion_hint") or None,
-                    tools=[UPDATE_NPC_MOOD_TOOL],
+                    tools=_get_full_tools(),
                 )
             except Exception as e2:
                 if is_tools_unsupported_error(e2):
@@ -788,7 +796,7 @@ async def generate_response_node(
                     raise
         elif is_tools_unsupported_error(e):
             try:
-                reply_text, tool_calls = await call_llm(
+                    reply_text, tool_calls = await call_llm(
                     api_key=state.get("api_key"),
                     api_base=state.get("api_base"),
                     model_name=state.get("model_name"),
@@ -817,8 +825,13 @@ async def generate_response_node(
         else:
             raise
 
+    # 仅在本轮解析情绪工具；其他工具调用（若有）全部忽略，不执行任何副作用。
     mood_calls = state.get("_mood_tool_calls", [])
-    mood_calls.extend(tool_calls)
+    for tc in tool_calls:
+        func = tc.get("function", tc)
+        name = func.get("name") or ""
+        if name == "update_npc_mood":
+            mood_calls.append(tc)
 
     system_prefix = state.get("_system_prefix_text") or ""
     if system_prefix:
@@ -860,12 +873,19 @@ async def generate_response_stream(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug:
-            print('——————【工具执行结果】generate_response_stream——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # Debug: 
+            # print('——————【工具执行结果】generate_response_stream——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
+
+    # 与非流式生成保持一致：传入完整工具 definitions，但通过 prompt 约束本轮仅允许（可选）调用 update_npc_mood。
+    full_user_prompt += (
+        "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
+        "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
+        "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
+    )
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -937,12 +957,12 @@ async def generate_response_stream(
                 return
 
     try:
-        async for ev, dat in _run_stream(image_path, state.get("image_description"), [UPDATE_NPC_MOOD_TOOL]):
+        async for ev, dat in _run_stream(image_path, state.get("image_description"), _get_full_tools()):
             yield ev, dat
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
             try:
-                async for ev, dat in _run_stream(None, state.get("image_description"), [UPDATE_NPC_MOOD_TOOL]):
+                async for ev, dat in _run_stream(None, state.get("image_description"), _get_full_tools()):
                     yield ev, dat
             except Exception as e2:
                 if is_tools_unsupported_error(e2):
@@ -963,8 +983,13 @@ async def generate_response_stream(
         else:
             raise
 
+    # 仅在本轮解析情绪工具；其他工具调用（若有）全部忽略，不执行任何副作用。
     mood_calls = list(state.get("_mood_tool_calls", []))
-    mood_calls.extend(tool_calls_list)
+    for tc in tool_calls_list:
+        func = tc.get("function", tc)
+        name = func.get("name") or ""
+        if name == "update_npc_mood":
+            mood_calls.append(tc)
 
     state["final_reply"] = full_content or ""
     state["_mood_tool_calls"] = mood_calls
