@@ -48,7 +48,7 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 
 - **Decision（非流式）**：LLM 仅负责判断是否需要工具，并产生 `tool_calls`
 - **Execute（后端执行）**：后端分发工具调用，执行并把 `tool results` 注入消息
-- **Generate（流式）**：LLM 在无 tools 的模式下生成最终回复（SSE 流式输出）
+- **Generate（流式）**：LLM 生成最终 NPC 对话回复（SSE 流式输出）
 
 该流程由 `services/agent_graph/` 下的 LangGraph 状态图实现，并设置工具回合上限（默认 5 轮）避免无限循环。
 
@@ -103,6 +103,19 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 ### 校验管线（后端拦截范围摘要）
 
 `services/agent_tools/validator.py` 对草案/更新/确认执行多项校验，主要包括：**物品是否存在**、**数量是否合理**、**关卡是否存在且解锁条件不超玩家进度**、**副本难度与 mercenary/challenge 规则**、**前置任务 ID 合法且禁止 `-1`**、**奖励总价值是否在预算区间**、**奖励类型与 NPC 商店/既有任务池等合规性**、**装备等级与当前阶段上限匹配**等。未通过时返回结构化错误，由模型修正后重试。
+### Prompt 缓存命中优化
+
+主流LLM API 服务会对「与历史请求相同前缀」的输入 token 计为 **缓存命中（Cached tokens）**，在控制台与账单中与未命中部分区分计价。
+
+在本项目的一次典型「多轮工具 + 最终流式回复」链路中（以 Kimi K2.5 实测为例）实测：
+
+| 阶段 | 缓存命中表现（示例） |
+|------|----------------------|
+| **工具决策轮** | 输入 token **命中率多在 95%+** |
+| **最终生成轮** | 输入 token **命中率约 85%～95%** |
+
+
+
 
 > 完整规则与字段说明见仓库根目录 `data_files_overview.md`。
 
