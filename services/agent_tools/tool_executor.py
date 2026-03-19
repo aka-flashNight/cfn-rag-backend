@@ -617,7 +617,7 @@ def dispatch_tool_call(
         except Exception:
             preview = "<preview-unavailable>"
         # Debug
-        # print('——————【结果】——————')
-        # print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+        print('——————【结果】——————')
+        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result

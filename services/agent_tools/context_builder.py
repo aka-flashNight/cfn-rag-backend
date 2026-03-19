@@ -222,6 +222,77 @@ def _ordered_reward_item_names_from_tasks(
     return out
 
 
+def _ordered_collectable_item_names_from_tasks(
+    *,
+    task_registry: Any,
+    mercenary_registry: Any,
+    main_task_min_id: int,
+    main_task_max_id: int,
+    level_min: int,
+    level_max: int,
+) -> list[str]:
+    """
+    按“当前区间优先”顺序产出资源收集相关物品池中的物品名（可能重复），
+    顺序：主线 id 在区间内 → 前置含区间主线 → mercenary 等级重合 → 其他。
+
+    同一任务内：先其 `finish_submit_items`，再其 `rewards`。
+    """
+    all_tasks = task_registry.list_all_tasks()
+    main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
+    precondition_in_range_ids = {
+        t.id
+        for t in all_tasks
+        if t.id not in main_range_ids
+        and (t.get_requirements or [])
+        and any(rid in main_range_ids for rid in (t.get_requirements or []))
+    }
+
+    merc_level_overlap_ids: set[int] = set()
+    for m in (mercenary_registry.list_all() if hasattr(mercenary_registry, "list_all") else []):
+        rmin = getattr(m, "recommended_min_level", None)
+        rmax = getattr(m, "recommended_max_level", None)
+        if rmin is None and rmax is None:
+            continue
+        rmin = rmin if rmin is not None else 0
+        rmax = rmax if rmax is not None else 999
+        if rmax < level_min or rmin > level_max:
+            continue
+        merc_level_overlap_ids.add(m.id)
+
+    tier1: list[int] = [t.id for t in all_tasks if t.id in main_range_ids]
+    tier2: list[int] = [t.id for t in all_tasks if t.id in precondition_in_range_ids]
+    tier3: list[int] = [
+        t.id
+        for t in all_tasks
+        if t.id in merc_level_overlap_ids
+        and t.id not in main_range_ids
+        and t.id not in precondition_in_range_ids
+    ]
+    tier4: list[int] = [
+        t.id
+        for t in all_tasks
+        if t.id not in main_range_ids
+        and t.id not in precondition_in_range_ids
+        and t.id not in merc_level_overlap_ids
+    ]
+    ordered_ids = tier1 + tier2 + tier3 + tier4
+
+    out: list[str] = []
+    for tid in ordered_ids:
+        t = task_registry.get_by_id(tid)
+        if not t:
+            continue
+        for expr in (t.finish_submit_items or []):
+            name, _ = parse_name_count(expr)
+            if name:
+                out.append(name)
+        for r in (t.rewards or []):
+            name, _ = parse_name_count(r)
+            if name:
+                out.append(name)
+    return out
+
+
 def _build_reward_item_candidates(
     *,
     reward_types: dict[str, list[str]],
@@ -603,36 +674,107 @@ def _build_collectable_items(
     """资源收集类：食材/药剂/材料/弹夹，且在现有任务物品池中。"""
     item_registry = game_data.items
     task_registry = game_data.tasks
+    mercenary_registry = game_data.mercenary_tasks
 
     allowed_uses = {"食材", "药剂", "材料", "弹夹"}
     pool = task_registry.list_submit_items() | task_registry.list_reward_item_names()
     price_cap = base_max * 2
 
+    # 资源池按“当前区间任务优先级”排序（提交物品 + 奖励物品都参与）
+    main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)
+    level_range = get_progress_stage_level_range(stage) or (1, 50)
+    ordered_item_names = _ordered_collectable_item_names_from_tasks(
+        task_registry=task_registry,
+        mercenary_registry=mercenary_registry,
+        main_task_min_id=main_task_range[0],
+        main_task_max_id=main_task_range[1],
+        level_min=level_range[0],
+        level_max=max_level,
+    )
+    seen: set[str] = set()
+    submit_stats = task_registry.get_submit_stats()
+    reward_stats = task_registry.get_reward_stats()
+
     result: list[dict[str, Any]] = []
     total = 0
-    for item_name in sorted(pool):
+
+    def _can_use_item(it: Any) -> bool:
+        return (it.use in allowed_uses) or (it.type in allowed_uses) or (it.name in allowed_uses)
+
+    for item_name in ordered_item_names:
+        if item_name in seen or item_name not in pool:
+            continue
         item = item_registry.get_by_name(item_name)
         if item is None:
             continue
         if item.level > max_level:
             continue
-        if not (item.use in allowed_uses or item.type in allowed_uses
-                or item.name in allowed_uses):
+        if not _can_use_item(item):
             continue
+
         price = item.price or 0
         if total + price > price_cap:
             continue
         total += price
+
         entry: dict[str, Any] = {
             "name": item.name,
             "type": item.type,
             "price": price,
+            "min_qty": 1,
         }
+
+        stats = submit_stats.get(item_name)
+        submit_max = int(stats[1] or 0) if stats and int(stats[1] or 0) > 0 else 0
+        reward_max = int(reward_stats.get(item_name, (None, 0))[1] or 0)
+        # 并集原则：提交历史 max_qty 与奖励历史 max_qty 取并集上限
+        effective_max = max(submit_max, reward_max)
+        if effective_max > 0:
+            # 统一沿用 V2 的 allowed_max = effective_max * 2
+            entry["max_qty"] = effective_max * 2
+        else:
+            # 历史统计缺失：用当前阶段奖励上限/单价估算一个“不会轻易超限”的数量上限
+            unit_price = price or 1
+            entry["max_qty"] = max(1, int(base_max / unit_price))
+
         if item.level > 0:
             entry["level"] = item.level
+
         result.append(entry)
+        seen.add(item_name)
         if len(result) >= 20:
             break
+
+    # 若区间优先池不足，再补齐剩余物品（按名称稳定排序）
+    if len(result) < 20:
+        remaining = sorted(pool - seen)
+        for item_name in remaining:
+            if len(result) >= 20:
+                break
+            item = item_registry.get_by_name(item_name)
+            if item is None or item.level > max_level:
+                continue
+            if not _can_use_item(item):
+                continue
+            price = item.price or 0
+            if total + price > price_cap:
+                continue
+
+            stats = submit_stats.get(item_name)
+            submit_max = int(stats[1] or 0) if stats and int(stats[1] or 0) > 0 else 0
+            reward_max = int(reward_stats.get(item_name, (None, 0))[1] or 0)
+            effective_max = max(submit_max, reward_max)
+            max_qty = effective_max * 2 if effective_max > 0 else max(1, int(base_max / (price or 1)))
+
+            result.append({
+                "name": item.name,
+                "type": item.type,
+                "price": price,
+                "min_qty": 1,
+                "max_qty": max_qty,
+                **({"level": item.level} if item.level > 0 else {}),
+            })
+            total += price
     return result
 
 

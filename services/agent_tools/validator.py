@@ -211,6 +211,8 @@ def _validate_v2_item_quantity_reasonableness(
     *,
     draft: Mapping[str, Any],
     task_registry: Any,
+    item_registry: Any,
+    context: DraftValidationContext,
     keys: tuple[str, ...] = ("rewards", "finish_submit_items", "finish_contain_items"),
 ) -> Optional[dict[str, Any]]:
     reward_stats: dict[str, tuple[int, int]] = {}
@@ -232,6 +234,10 @@ def _validate_v2_item_quantity_reasonableness(
         contain_stats = {}
 
     over: list[dict[str, Any]] = []
+    stage = int(getattr(context, "stage", 1) or 1)
+    base_max = stage * 20000
+    task_type = draft.get("task_type", "") if isinstance(draft, dict) else ""
+    type_mult = 2 if isinstance(task_type, str) and task_type in COMBAT_TASK_TYPES else 1
 
     for k in keys:
         for it in _reward_item_iter(draft, k):
@@ -258,17 +264,39 @@ def _validate_v2_item_quantity_reasonableness(
                 stats = reward_stats
 
             _, max_qty = stats.get(item_name, (None, 0))  # type: ignore[assignment]
-            # 若 submit/hold 的统计不存在（max_qty=0），但该物品在奖励历史中存在，
-            # 则回退到 rewards 的统计，避免出现 allowed_range=[1,0] 这种“天然不可能”区间。
-            if int(max_qty or 0) == 0:
-                _, reward_max_qty = reward_stats.get(item_name, (None, 0))  # type: ignore[assignment]
-                if int(reward_max_qty or 0) > 0:
-                    max_qty = reward_max_qty
+            reward_min_qty, reward_max_qty = reward_stats.get(item_name, (None, 0))  # type: ignore[assignment]
+
+            # 并集原则：提交/持有的数量上限同时参考奖励历史（同一物品在 rewards 里出现很多次时，
+            # 仅看 finish_submit_items/finish_contain_items 的统计会过小，导致 V2 误拒绝）。
+            if k in ("finish_submit_items", "finish_contain_items") and int(reward_max_qty or 0) > 0:
+                max_qty = max(int(max_qty or 0), int(reward_max_qty or 0))
+
+            # 若 submit/hold 的统计仍然不存在（max_qty=0），且为装备类：
+            # 回退到 rewards 统计，避免出现 allowed_range=[1,0] 的“天然不可能”区间。
+            if int(max_qty or 0) == 0 and k in ("finish_submit_items", "finish_contain_items"):
+                item = item_registry.get_by_name(item_name) if item_registry else None
+                item_type = getattr(item, "type", None) if item else None
+                if item_type in EQUIPMENT_TYPES:
+                    if int(reward_max_qty or 0) > 0:
+                        max_qty = reward_max_qty
             allowed_min = 1
             effective_max = int(max_qty or 0)
-            # 无历史统计时（如仅出现在 equipment_items 的装备），允许 1～2，避免 [1,0] 报错
             if effective_max <= 0:
-                allowed_max = 2
+                # 无历史统计：用“阶段奖励上限/单价”估算一个数量上限，
+                # 比固定 [1,2] 更贴近实际预算，避免生成直接触发 V2。
+                if k == "rewards":
+                    allowed_max = 2
+                else:
+                    item = item_registry.get_by_name(item_name) if item_registry else None
+                    unit_price = int(getattr(item, "price", 0) or 0) if item else 0
+                    if unit_price <= 0:
+                        allowed_max = 2
+                    else:
+                        # 武器/防具单价高，允许更宽松的“数量”上限
+                        item_type = getattr(item, "type", None) if item else None
+                        qty_multiplier = 3 if item_type in ("武器", "防具") else 1
+                        allowed_max = int((base_max * type_mult * qty_multiplier) / unit_price)
+                        allowed_max = max(1, allowed_max)
             else:
                 allowed_max = effective_max * 2
 
@@ -812,6 +840,8 @@ def validate_task_draft(
         e = _validate_v2_item_quantity_reasonableness(
             draft=draft,
             task_registry=task_registry,
+            item_registry=item_registry,
+            context=context,
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e:
@@ -962,6 +992,8 @@ def validate_task_draft_v1_v6(
         e2 = _validate_v2_item_quantity_reasonableness(
             draft=draft,
             task_registry=task_registry,
+            item_registry=item_registry,
+            context=context,
             keys=tuple(sorted(reward_keys_to_validate)),
         )
         if e2:

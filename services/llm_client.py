@@ -78,7 +78,7 @@ async def call_llm(
         # Debug: 
         # print(system_content);
         print("————————非流式无立绘————————");
-        print(effective_user);
+        # print(effective_user);
 
     kwargs: dict = {"model": model_name, "messages": messages}
     if tools:

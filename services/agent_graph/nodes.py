@@ -103,25 +103,46 @@ def _build_gen_tool_messages(
     如果 draft_agent_task / update_task_draft / confirm_agent_task 已成功，
     其返回的 draft_summary 已包含完整信息，就不再保留冗长的 prepare_task_context 输出。
     """
-    has_draft_success = False
-    for tm in tool_messages:
-        if tm["tool_name"] in ("draft_agent_task", "update_task_draft", "confirm_agent_task"):
-            try:
-                parsed = json.loads(tm["result"])
-                if parsed.get("status") in _DRAFT_SUCCESS_STATUSES:
-                    has_draft_success = True
-                    break
-            except Exception:
-                pass
+    def _get_status(tm: dict[str, str]) -> Optional[str]:
+        try:
+            parsed = json.loads(tm.get("result") or "{}")
+            st = parsed.get("status")
+            return st if isinstance(st, str) else None
+        except Exception:
+            return None
 
+    has_draft_success = any(
+        (tm.get("tool_name") in ("draft_agent_task", "update_task_draft", "confirm_agent_task")
+         and (_get_status(tm) in _DRAFT_SUCCESS_STATUSES))
+        for tm in tool_messages
+    )
     if not has_draft_success:
         return tool_messages
 
+    has_update_success = any(
+        (tm.get("tool_name") == "update_task_draft" and _get_status(tm) in _DRAFT_SUCCESS_STATUSES)
+        for tm in tool_messages
+    )
+    has_confirm_success = any(
+        (tm.get("tool_name") == "confirm_agent_task" and _get_status(tm) in _DRAFT_SUCCESS_STATUSES)
+        for tm in tool_messages
+    )
+
+    # 若后续已经拿到了 update/confirm 成功结果，则 draft_agent_task 的失败明细对 LLM 没有必要。
+    drop_draft_agent_task = has_update_success or has_confirm_success
+    drop_update_task_draft = has_confirm_success
+
     condensed: list[dict[str, str]] = []
     for tm in tool_messages:
-        if tm["tool_name"] == "prepare_task_context":
+        tool_name = tm.get("tool_name") or ""
+        if drop_draft_agent_task and tool_name == "draft_agent_task":
+            continue
+        if drop_update_task_draft and tool_name == "update_task_draft":
+            continue
+
+        if tool_name == "prepare_task_context":
             condensed.append({
-                "tool_name": tm["tool_name"],
+                "tool_name": tool_name,
                 "result": '{"status":"ok","message":"上下文已被后续草案工具使用，详见 draft_summary。"}',
             })
         else:
@@ -455,11 +476,11 @@ async def decision_node(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            # print('——————【工具执行结果】decision_node——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+            print('——————【工具执行结果】decision_node——————')
+            print(
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
@@ -631,11 +652,11 @@ async def generate_response_node(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            # print('——————【工具执行结果】generate_response_node——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+            print('——————【工具执行结果】generate_response_node——————')
+            print(
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
@@ -759,11 +780,11 @@ async def generate_response_stream(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            # print('——————【工具执行结果】generate_response_stream——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+            print('——————【工具执行结果】generate_response_stream——————')
+            print(
+                f"[{tm['tool_name']}]: "
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
