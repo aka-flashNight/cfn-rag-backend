@@ -20,6 +20,10 @@ class NPCChatRequest(BaseModel):
         le=6,
         description="玩家当前主线进度阶段，1-6 的整数；不传时表示未知或未开始，用于后续 LLM 与后端工具根据进度做差异化响应",
     )
+    agent_enabled: Optional[bool] = Field(
+        default=None,
+        description="是否启用 LangGraph 工具轮（任务发布等）；不传或 null 视为 true；为 false 时降级为单次 LLM 对话（与旧版一致，无工具轮）",
+    )
     session_id: str = Field(
         ...,
         description="会话 ID，由后端创建并返回，后续对话必须携带",
@@ -47,12 +51,6 @@ class NPCChatRequest(BaseModel):
     summarize_interval: Optional[int] = Field(
         default=None,
         description="精确短期记忆的总结间隔/历史长度档位。取值 10/30/100/500，对应前端短/中/长/几乎无限。不传时后端使用默认值 30。",
-    )
-    progress_stage: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=6,
-        description="玩家当前所在的游戏进度阶段。取值为 1-6 的整数；不传时后端视为未知阶段，按旧逻辑兼容处理。",
     )
 
 

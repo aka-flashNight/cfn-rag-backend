@@ -401,12 +401,22 @@ class GameRAGService:
     # ask / ask_stream — LangGraph 三阶段管线 + 旧逻辑向后兼容
     # ==================================================================
 
+    @staticmethod
+    def _is_agent_enabled(payload: NPCChatRequest) -> bool:
+        """前端 agent_enabled：可空，默认视为开启。"""
+        v = getattr(payload, "agent_enabled", None)
+        if v is None:
+            return True
+        return bool(v)
+
     def _use_agent_graph(self, payload: NPCChatRequest) -> bool:
         """
         判断是否启用 LangGraph 管线。
-        条件：progress_stage 已传且值 1-6。
-        否则降级到旧的简单对话流程。
+        条件：agent_enabled 不为 false，且 progress_stage 已传且值 1-6。
+        否则降级到旧的简单对话流程（单次 LLM，无工具轮）。
         """
+        if not self._is_agent_enabled(payload):
+            return False
         stage = getattr(payload, "progress_stage", None)
         return stage is not None and isinstance(stage, int) and 1 <= stage <= 6
 
@@ -444,7 +454,7 @@ class GameRAGService:
     ) -> NPCChatResponse:
         """
         基于游戏知识库进行 RAG + Agent 对话，并更新 NPC 好感度。
-        当 progress_stage 已传时使用 LangGraph 三阶段管线；否则降级到旧逻辑。
+        当 progress_stage 已传且 agent_enabled 不为 false 时使用 LangGraph；否则降级到旧逻辑。
         """
         if self._use_agent_graph(payload):
             try:
@@ -624,7 +634,7 @@ class GameRAGService:
         memory: "MemoryManager",
     ) -> AsyncIterator[Tuple[str, Any]]:
         """
-        流式版 ask：当 progress_stage 已传时使用 LangGraph 三阶段管线；否则降级到旧逻辑。
+        流式版 ask：当 progress_stage 已传且 agent_enabled 不为 false 时使用 LangGraph；否则降级到旧逻辑（单次流式 LLM）。
         """
         if self._use_agent_graph(payload):
             try:
@@ -1569,27 +1579,30 @@ class GameRAGService:
             if name not in q:
                 continue
 
-            tags: list[str] = []
             it_use = (getattr(it, "use", None) or "").strip()
             it_type = (getattr(it, "type", None) or "").strip()
 
-            if it_use in allowed_use:
-                tags.append(it_use)
+            type_tags: list[str] = []
+            use_tags: list[str] = []
             if it_type in allowed_type:
-                tags.append(it_type)
-            try:
-                if equipment_mods and equipment_mods.is_plugin(name):
-                    tags.append("插件")
-            except Exception:
-                pass
+                type_tags.append(it_type)
+            if it_use in allowed_use:
+                use_tags.append(it_use)
 
-            if not tags:
+            plugin = False
+            try:
+                plugin = bool(equipment_mods and equipment_mods.is_plugin(name))
+            except Exception:
+                plugin = False
+
+            if not type_tags and not use_tags and not plugin:
                 # 命中 name 但不属于可标注的类型则忽略
                 continue
 
-            # 去重保持稳定顺序：use/type 在前，插件在后
+            # 顺序：type → use → 插件（去重保序）
+            ordered = type_tags + use_tags + (["插件"] if plugin else [])
             dedup: list[str] = []
-            for t in tags:
+            for t in ordered:
                 if t not in dedup:
                     dedup.append(t)
 
