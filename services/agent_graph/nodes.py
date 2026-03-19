@@ -111,11 +111,11 @@ DEFAULT_UI_HINTS: dict[str, str] = {
 }
 
 SYSTEM_MESSAGES: dict[tuple[str, str], str] = {
-    ("draft_agent_task", "draft_created"): "[任务草案拟定完成]",
-    ("draft_agent_task", "draft_updated"): "[任务草案拟定更新]",
-    ("update_task_draft", "draft_updated"): "[任务草案已更新]",
-    ("confirm_agent_task", "confirmed"): "[任务发布成功]",
-    ("cancel_agent_task", "cancelled"): "[任务已取消]",
+    ("draft_agent_task", "draft_created"): "{任务草案拟定完成}",
+    ("draft_agent_task", "draft_updated"): "{任务草案拟定更新}",
+    ("update_task_draft", "draft_updated"): "{任务草案已更新}",
+    ("confirm_agent_task", "confirmed"): "{任务发布成功}",
+    ("cancel_agent_task", "cancelled"): "{任务已取消}",
 }
 
 
@@ -619,6 +619,7 @@ async def tool_executor_node(
     tool_messages: list[dict[str, str]] = list(state.get("_tool_messages", []))
     task_write_result = state.get("task_write_result")
     ui_events: list[dict[str, Any]] = list(state.get("_ui_events", []))
+    system_prefixes: list[str] = []
 
     for tc in pending_calls:
         func_info = tc.get("function", tc)
@@ -682,6 +683,7 @@ async def tool_executor_node(
                     if isinstance(parsed.get("task_id"), (int, str)):
                         payload["task_id"] = parsed.get("task_id")
                 ui_events.append(payload)
+                system_prefixes.append(sys_text)
 
         tool_messages.append({
             "tool_name": tool_name,
@@ -694,6 +696,10 @@ async def tool_executor_node(
         "pending_task_draft": pending_draft,
         "task_write_result": task_write_result,
         "_ui_events": ui_events,
+        "_system_prefix_text": (
+            (state.get("_system_prefix_text") or "")
+            + ("".join(system_prefixes) + "\n\n" if system_prefixes else "")
+        ),
     }
 
 
@@ -815,6 +821,10 @@ async def generate_response_node(
     mood_calls = state.get("_mood_tool_calls", [])
     mood_calls.extend(tool_calls)
 
+    system_prefix = state.get("_system_prefix_text") or ""
+    if system_prefix:
+        reply_text = f"{system_prefix}{reply_text or ''}"
+
     return {
         "final_reply": reply_text or "",
         "_mood_tool_calls": mood_calls,
@@ -869,8 +879,9 @@ async def generate_response_stream(
         image_path = Path(image_path_str)
 
     _TRUNCATE_PREFIXES = ["工具调用", "{", "<!---", "<!--", "update_npc_mood(", "tool_calls_list"]
-    full_content = ""
-    streamed_len = 0
+    system_prefix = state.get("_system_prefix_text") or ""
+    full_content = system_prefix
+    streamed_len = len(system_prefix)
     truncating = False
     tool_calls_list: list[dict] = []
 
@@ -881,14 +892,20 @@ async def generate_response_stream(
                 idx = text.lower().find(p.lower())
             else:
                 idx = text.find(p)
+            # 避免系统前缀（以 "{" 开头）触发截断逻辑
+            if system_prefix and p == "{" and idx != -1 and idx < streamed_len:
+                continue
             if idx != -1 and (out == -1 or idx < out):
                 out = idx
         return out
 
+    # 若有系统前缀，则先把它作为“正文增量”推给前端，保证与 done 一致
+    if system_prefix:
+        yield ("content", system_prefix)
+
     async def _run_stream(img_path, img_desc, use_tools):
         nonlocal full_content, streamed_len, truncating, tool_calls_list
-        full_content = ""
-        streamed_len = 0
+        # 继续向后追加模型输出（system_prefix 已在外层 yield 并写入 full_content）
         truncating = False
         tool_calls_list = []
         async for event_type, data in call_llm_stream(
@@ -917,7 +934,8 @@ async def generate_response_stream(
                         yield ("content", full_content[streamed_len:])
                     streamed_len = len(full_content)
             elif event_type == "finished":
-                full_content, tool_calls_list = data
+                model_full_content, tool_calls_list = data
+                full_content = system_prefix + (model_full_content or "")
                 return
 
     try:

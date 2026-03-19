@@ -667,15 +667,24 @@ class GameRAGService:
 
         state = await loop_graph.ainvoke(initial_state, config)
 
-        # 在开始流式正文前，先把工具执行状态/系统消息推给前端
+        # 在开始流式正文前，把工具执行状态推给前端；
+        # “系统消息”会被拼接到 NPC 正文最前面（由 generate_response_stream/节点统一处理），因此这里不单独 yield。
         ui_events = state.get("_ui_events") or []
+        system_prefixes: list[str] = []
         for ev in ui_events:
             if not isinstance(ev, dict):
                 continue
             event_type = ev.get("event_type") or ""
-            if event_type in ("tool_status", "system"):
+            if event_type == "tool_status":
                 payload = {k: v for k, v in ev.items() if k != "event_type"}
                 yield (event_type, payload)
+            elif event_type == "system":
+                text = ev.get("text")
+                if isinstance(text, str) and text.strip():
+                    system_prefixes.append(text.strip())
+
+        if system_prefixes and not state.get("_system_prefix_text"):
+            state["_system_prefix_text"] = "".join(system_prefixes) + "\n\n"
 
         async for ev, dat in generate_response_stream(state, config):
             yield (ev, dat)
