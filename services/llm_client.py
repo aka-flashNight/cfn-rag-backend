@@ -69,7 +69,7 @@ async def call_llm(
         # Debug: 
         # print(prompt_with_desc);
         print("————————非流式————————");
-        # print(user_prompt);
+        print(user_prompt);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [
@@ -155,7 +155,7 @@ async def call_llm_stream(
         # Debug: 
         # print(prompt_with_desc);
         print("————————流式————————");
-        # print(user_prompt);
+        print(user_prompt);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [

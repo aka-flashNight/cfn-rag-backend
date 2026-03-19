@@ -53,6 +53,16 @@ def _ensure_table_sync() -> None:
                 ON session_task_drafts(updated_at)
                 """
             )
+            # 4.5：连续 N 次 ask 未调用任务相关工具时清除草案，按 ask 轮次计数
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_ask_counters (
+                    session_id TEXT NOT NULL PRIMARY KEY,
+                    rounds_without_task INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             conn.commit()
             _TABLE_INITIALIZED = True
         finally:
@@ -325,6 +335,105 @@ class SessionTaskDraftStore:
     async def clear_session(self, session_id: str) -> bool:
         """别名：删除指定会话的草案。"""
         return await self.delete_by_session_id(session_id)
+
+    # ---------------------------------------------------------------------
+    # 4.5：草案自动过期（连续 3 次 ask 未提及任务则清除）
+    # ---------------------------------------------------------------------
+
+    _TASK_RELATED_TOOL_NAMES = frozenset({
+        "prepare_task_context",
+        "draft_agent_task",
+        "update_task_draft",
+        "confirm_agent_task",
+        "cancel_agent_task",
+    })
+
+    async def get_rounds_without_task(self, session_id: str) -> int:
+        """返回该 session 当前「连续未调用任务相关工具的 ask 轮数」。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return 0
+        await self._ensure_table()
+
+        def _inner() -> int:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT rounds_without_task FROM session_ask_counters
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_inner)
+
+    async def increment_rounds_without_task(self, session_id: str) -> int:
+        """本 ask 未调用任务相关工具：轮数 +1，返回新值。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return 0
+        await self._ensure_table()
+        now = time.time()
+
+        def _inner() -> int:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO session_ask_counters (session_id, rounds_without_task, updated_at)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        rounds_without_task = rounds_without_task + 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (session_id, now),
+                )
+                conn.commit()
+                cur.execute(
+                    "SELECT rounds_without_task FROM session_ask_counters WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 1
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_inner)
+
+    async def reset_rounds_without_task(self, session_id: str) -> None:
+        """本 ask 调用了任务相关工具：轮数归零。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return
+        await self._ensure_table()
+        now = time.time()
+
+        def _inner() -> None:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO session_ask_counters (session_id, rounds_without_task, updated_at)
+                    VALUES (?, 0, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        rounds_without_task = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (session_id, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(_inner)
 
 
 _GLOBAL_STORE: SessionTaskDraftStore | None = None

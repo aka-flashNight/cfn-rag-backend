@@ -454,11 +454,11 @@ async def decision_node(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            print('——————【工具执行结果】decision_node——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # print('——————【工具执行结果】decision_node——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
 
     image_path_str = state.get("image_path")
     image_path = None
@@ -663,11 +663,11 @@ async def generate_response_node(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            print('——————【工具执行结果】generate_response_node——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # print('——————【工具执行结果】generate_response_node——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
@@ -791,11 +791,11 @@ async def generate_response_stream(
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
             # Debug:
-            print('——————【工具执行结果】generate_response_stream——————')
-            print(
-                f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            )
+            # print('——————【工具执行结果】generate_response_stream——————')
+            # print(
+            #     f"[{tm['tool_name']}]: "
+            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+            # )
 
     decision_reply = state.get("_decision_reply", "")
     if decision_reply.strip():
@@ -982,17 +982,33 @@ async def post_process_node(
     updated_state = npc_manager.update_favorability(npc_name, delta)
     await npc_manager.save()
 
-    # 持久化任务草案状态
+    # 持久化任务草案状态 + 4.5 草案自动过期（连续 3 次 ask 未调用任务相关工具则清除）
     pending_draft = state.get("pending_task_draft")
     try:
         from services.task_draft_store import get_session_task_draft_store
         store = get_session_task_draft_store()
-        if pending_draft and isinstance(pending_draft, dict):
+        tool_messages = state.get("_tool_messages") or []
+        had_task_tool = any(
+            (tm.get("tool_name") or "") in store._TASK_RELATED_TOOL_NAMES
+            for tm in tool_messages
+        )
+        if had_task_tool:
+            await store.reset_rounds_without_task(payload.session_id)
+            should_persist_draft = True
+        else:
+            rounds = await store.increment_rounds_without_task(payload.session_id)
+            if rounds >= 3:
+                await store.delete_by_session_id(payload.session_id)
+                await store.reset_rounds_without_task(payload.session_id)
+                should_persist_draft = False
+            else:
+                should_persist_draft = True
+        if pending_draft and isinstance(pending_draft, dict) and should_persist_draft:
             await store.upsert_draft(
                 session_id=payload.session_id,
                 draft=pending_draft,
             )
-        else:
+        elif not pending_draft or not should_persist_draft:
             await store.delete_by_session_id(payload.session_id)
     except Exception:
         logger.warning("持久化任务草案失败", exc_info=True)
