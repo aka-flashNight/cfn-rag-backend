@@ -672,6 +672,9 @@ class GameRAGService:
         state: dict[str, Any] = {}
         state.update(await prepare_context_node(state, config))
 
+        # 进入第一轮决策前先提示一次，避免“工具状态在前，正在思考在后”的观感
+        yield ("tool_status", {"text": "正在思考……", "tool_name": "decision"})
+
         for _round in range(MAX_TOOL_ROUNDS):
             # 决策轮：模型只负责判断 tool_calls，不负责对话文本（如有 decision_reply 也会丢弃）
             state.update(await decision_node(state, config))
