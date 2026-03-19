@@ -258,8 +258,13 @@ def _validate_v2_item_quantity_reasonableness(
                 _, reward_max_qty = reward_stats.get(item_name, (None, 0))  # type: ignore[assignment]
                 if int(reward_max_qty or 0) > 0:
                     max_qty = reward_max_qty
-            allowed_max = int(max_qty) * 2
             allowed_min = 1
+            effective_max = int(max_qty or 0)
+            # 无历史统计时（如仅出现在 equipment_items 的装备），允许 1～2，避免 [1,0] 报错
+            if effective_max <= 0:
+                allowed_max = 2
+            else:
+                allowed_max = effective_max * 2
 
             if n < allowed_min or n > allowed_max:
                 over.append(

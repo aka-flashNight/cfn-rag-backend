@@ -65,15 +65,15 @@ _TASK_RULES: dict[str, str] = {
         "提交品总价值不超过基础奖励的200%。"
         "奖励额外增加提交品价值的1.5~2倍。"
     ),
-    "装备获取": (
-        "装备获取类任务：要求玩家获取并提交一件装备（武器/防具）。"
+    "装备缴纳": (
+        "装备缴纳类任务：要求玩家获取并提交一件装备（武器/防具）。"
         "来源：非本阵营NPC商店、合成配方、K点商店。"
         "提交品总价值不超过基础奖励的300%。"
         "奖励额外增加提交品价值的1.5~2倍。"
     ),
     "特殊物品获取": (
         "特殊物品获取类任务：要求玩家获取并提交一个特殊物品。"
-        "通常只需要1个物品。来源同装备获取类。"
+        "通常只需要1个物品。来源同装备缴纳类。"
         "包括插件、药剂、菜品、贵重消耗品等非装备物品。"
     ),
     "物品持有": (
@@ -152,6 +152,7 @@ def _matches_reward_type(
     判断一个物品是否匹配指定的奖励类型。
     规则：name 或 type 或 use 任意一项与 reward_type 相等即可。
     特殊：\"插件\" 通过 equipment_mods_registry 判断。
+    材料：reward_type「材料」同时匹配 item.use==材料 或 item.type==收集品（数据里材料多为 type 收集品 + use 材料）。
     """
     if reward_type == "插件":
         return equipment_mods.is_plugin(item.name)
@@ -161,6 +162,9 @@ def _matches_reward_type(
     if item.type and item.type == reward_type:
         return True
     if item.use and item.use == reward_type:
+        return True
+    # 材料：数据中常为 type=收集品、use=材料；若 use 未标或归一化，用 type 收集品 兜底
+    if reward_type == "材料" and item.type and item.type == "收集品":
         return True
     return False
 
@@ -214,9 +218,44 @@ def _build_reward_item_candidates(
     reward_stats = task_registry.get_reward_stats()
     reward_item_names = task_registry.list_reward_item_names()
 
-    # 候选结果（去重）
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
+
+    # 来源 2 优先：当前NPC商店物品（先加入，避免被任务池占满前 20 导致商店材料不出现）
+    # 商店一律按 reward_types 过滤；装备/手雷再做等级筛选，非装备不做等级筛选
+    for shop_item_name in npc_shop_items:
+        if shop_item_name in seen:
+            continue
+        item = item_registry.get_by_name(shop_item_name)
+        if item is None:
+            continue
+        is_weapon_or_armor = item.type in ("武器", "防具")
+        is_grenade = bool(item.use) and item.use == "手雷"
+        if is_weapon_or_armor or is_grenade:
+            if item.level <= min_level or item.level > max_level:
+                continue
+        # 所有商店物品都需匹配 reward_types（含「材料」匹配 item.use/type）
+        matched = False
+        for rt in all_types:
+            if _matches_reward_type(item, rt, equipment_mods):
+                matched = True
+                break
+        if not matched:
+            continue
+        entry = {
+            "name": item.name,
+            "type": item.type,
+            "price": item.price or 0,
+            "source": "NPC商店",
+        }
+        if item.level > 0:
+            entry["level"] = item.level
+        if equipment_mods.is_plugin(item.name):
+            tier = equipment_mods.get_plugin_tier(item.name)
+            if tier:
+                entry["plugin_tier"] = tier
+        candidates.append(entry)
+        seen.add(shop_item_name)
 
     # 来源 1：任务奖励池
     for item_name in reward_item_names:
@@ -227,12 +266,11 @@ def _build_reward_item_candidates(
             continue
         if item.level > max_level:
             continue
-        # 4.2：任务奖励常见不返回装备类（仅 shop 允许提供武器/防具）
         if item.type in ("武器", "防具"):
             continue
         for rt in all_types:
             if _matches_reward_type(item, rt, equipment_mods):
-                entry: dict[str, Any] = {
+                entry = {
                     "name": item.name,
                     "type": item.type,
                     "price": item.price or 0,
@@ -250,39 +288,6 @@ def _build_reward_item_candidates(
                         entry["plugin_tier"] = tier
                 candidates.append(entry)
                 seen.add(item_name)
-                break
-
-    # 来源 2：当前NPC商店物品
-    for shop_item_name in npc_shop_items:
-        if shop_item_name in seen:
-            continue
-        item = item_registry.get_by_name(shop_item_name)
-        if item is None:
-            continue
-        # 对商店物品：仅对 武器/防具/手雷 做“落入区间”筛选
-        is_weapon_or_armor = item.type in ("武器", "防具")
-        is_grenade = bool(item.use) and item.use == "手雷"
-        if is_weapon_or_armor or is_grenade:
-            # 文档：要求在当前区间内，且要“大于下限”
-            # 这里实现为：level_min < level <= max_level
-            if item.level <= min_level or item.level > max_level:
-                continue
-        for rt in all_types:
-            if _matches_reward_type(item, rt, equipment_mods):
-                entry = {
-                    "name": item.name,
-                    "type": item.type,
-                    "price": item.price or 0,
-                    "source": "NPC商店",
-                }
-                if item.level > 0:
-                    entry["level"] = item.level
-                if equipment_mods.is_plugin(item.name):
-                    tier = equipment_mods.get_plugin_tier(item.name)
-                    if tier:
-                        entry["plugin_tier"] = tier
-                candidates.append(entry)
-                seen.add(shop_item_name)
                 break
 
     return candidates[:20]
@@ -588,7 +593,7 @@ def _build_equipment_items(
     stage: int,
     max_level: int,
 ) -> list[dict[str, Any]]:
-    """装备获取类：非本阵营商店+合成+K点商店的装备。"""
+    """装备缴纳类：非本阵营商店+合成+K点商店的装备。"""
     item_registry = game_data.items
     shop_registry = game_data.shops
     crafting_registry = game_data.crafting
@@ -1026,7 +1031,7 @@ def prepare_task_context(
             game_data, stage, max_level, base_max,
         )
 
-    elif task_type == "装备获取":
+    elif task_type == "装备缴纳":
         context["equipment_items"] = _build_equipment_items(
             game_data, npc_name, npc_faction, stage, max_level,
         )

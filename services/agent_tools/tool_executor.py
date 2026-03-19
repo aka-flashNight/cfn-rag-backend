@@ -42,8 +42,11 @@ def _build_validation_ctx(
     npc_name: str = "",
     player_progress: int = 1,
     npc_affinity: int = 0,
+    bargain_rate: float = 1.0,
 ) -> DraftValidationContext:
-    """根据玩家进度构建校验上下文，字段映射到 DraftValidationContext。"""
+    """根据玩家进度构建校验上下文，字段映射到 DraftValidationContext。
+    讨价还价时传入 bargain_rate=1.5，使 V7 允许区间按上限 1.5 倍计算，避免超限报错。
+    """
     cfg = get_progress_stage_config(player_progress)
     main_task_max_id = cfg.main_task_max_id if cfg else 0
     max_level = cfg.max_level if cfg else 50
@@ -53,6 +56,7 @@ def _build_validation_ctx(
         stage=player_progress,
         affinity=npc_affinity,
         npc_name=npc_name or None,
+        bargain_rate=bargain_rate,
     )
 
 
@@ -187,10 +191,12 @@ def execute_update_task_draft(
     for k, v in modify_fields.items():
         pending_draft[k] = v
 
+    # 讨价还价时按上限 1.5 倍放宽 V7 允许区间，避免超限报错
     validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
+        bargain_rate=1.5 if (is_bargain and reward_actually_changed) else 1.0,
     )
     changed = set(modify_fields.keys())
     result = validate_task_draft(
