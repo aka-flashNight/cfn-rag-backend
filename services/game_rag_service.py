@@ -187,28 +187,39 @@ class GameRAGService:
 
         Returns:
             (image_path, description) 元组：
-            - 如果找到立绘：返回 (立绘路径，"现在传入了你所扮演的角色的立绘")
-            - 如果找到头像：返回 (头像路径，"现在传入了你所扮演的角色的头像")
+            - 如果找到立绘：返回含「你所扮演的角色{具体名称}」的说明，避免与玩家图像混淆
+            - 如果找到头像：同上
             - 如果都没找到：返回 (None, None)
         """
+        who = (npc_name or "").strip() or "当前 NPC"
+
         # 1. 先尝试找立绘（指定情绪）：优先 WebP，其次 PNG
         illustration_dir = self._resources_dir / "flashswf" / "portraits" / "illustration"
         for ext in (".webp", ".png"):
             primary_illustration = illustration_dir / f"{npc_name}#{emotion}{ext}"
             if primary_illustration.is_file():
-                return primary_illustration, "现在传入了你所扮演的角色的肖像（但不需要强行通过你的肖像内容开启话题）"
+                return (
+                    primary_illustration,
+                    f"现在传入了你所扮演的角色「{who}」的肖像（不需要强行通过肖像内容开启话题）",
+                )
 
         # 2. 回退到普通情绪立绘
         for ext in (".webp", ".png"):
             fallback_illustration = illustration_dir / f"{npc_name}#普通{ext}"
             if fallback_illustration.is_file():
-                return fallback_illustration, "现在传入了你所扮演的角色的肖像（但不需要强行通过你的肖像内容开启话题）"
+                return (
+                    fallback_illustration,
+                    f"现在传入了你所扮演的角色「{who}」的肖像（不需要强行通过肖像内容开启话题）",
+                )
 
         # 3. 最后尝试头像
         avatar_dir = self._resources_dir / "flashswf" / "portraits" / "profiles"
         avatar_path = avatar_dir / f"{npc_name}.png"
         if avatar_path.is_file():
-            return avatar_path, "现在传入了你所扮演的角色的头像"
+            return (
+                avatar_path,
+                f"现在传入了你所扮演的角色「{who}」的头像（此为该 NPC 的图像，不是玩家）",
+            )
 
         return None, None
 
@@ -359,10 +370,18 @@ class GameRAGService:
             "3. 若无法调用工具而必须用正文传参时，最后一段只输出一行 JSON，不要在最后一段的 JSON 前加任何换行以外的前缀。\n"
             "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或心理活动，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具，输出tool_calls_list。\n"
         )
+        # agent_enabled=false：走纯对话，无任务工具；在检索与物品类型提示之后、对话历史之前提醒模型
+        task_agent_disabled_note = ""
+        if not self._is_agent_enabled(payload):
+            task_agent_disabled_note = (
+                "注：现在无法发布任务；若玩家要求任务，请推辞、拒绝，或提醒其开启终端的任务接收窗口后才能接收任务。\n\n"
+            )
+
         context_prompt = (
             f"{mentioned_npcs_str}"
             "下面是可能与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
             f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
+            f"{task_agent_disabled_note}"
             f"{history_str}"
         )
         user_prompt = f"{context_prompt}\n玩家：{payload.query}"
@@ -1539,8 +1558,8 @@ class GameRAGService:
         从玩家输入中提取“按 name 精确命中的物品”，并标注其可能的奖励类型。
 
         标注规则（与任务奖励类型一致）：
-        - "药剂","弹夹","材料","食品"：来自 item.use
-        - "武器","防具"：来自 item.type
+        - "药剂","弹夹","材料","食品"：来自 item.use（非装备类）
+        - "武器","防具"：来自 item.type；若 item.use 非空则一并附上（不限于奖励白名单，供 LLM 理解用途）
         - "插件"：通过 equipment_mods.is_plugin(item.name) 判断
         - 材料与插件可能重合，重合时两个都要标注
 
@@ -1584,9 +1603,12 @@ class GameRAGService:
 
             type_tags: list[str] = []
             use_tags: list[str] = []
+            # 武器/防具：type 在前；无论 use 是否在奖励白名单内，都把原始 use 一并给 LLM 作参考（非空才写）
             if it_type in allowed_type:
                 type_tags.append(it_type)
-            if it_use in allowed_use:
+                if it_use:
+                    use_tags.append(it_use)
+            elif it_use in allowed_use:
                 use_tags.append(it_use)
 
             plugin = False
