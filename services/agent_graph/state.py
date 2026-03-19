@@ -65,3 +65,5 @@ class AgentState(TypedDict, total=False):
     _pending_tool_calls: list[dict[str, Any]]
     _mood_tool_calls: list[dict[str, Any]]
     _decision_reply: str
+    # SSE: 工具调用/关键阶段的 UI 事件（由 tool_executor_node 填充）
+    _ui_events: list[dict[str, Any]]

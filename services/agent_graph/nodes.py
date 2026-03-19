@@ -64,6 +64,8 @@ CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "draft_id": {"type": "string"},
+                # 用于 SSE/前端显示：非常短的“正在进行中”提示
+                "ui_hint": {"type": "string", "maxLength": 12},
             },
             "required": ["draft_id"],
             "additionalProperties": False,
@@ -80,6 +82,8 @@ CANCEL_AGENT_TASK_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "draft_id": {"type": "string"},
+                # 用于 SSE/前端显示：非常短的“正在进行中”提示
+                "ui_hint": {"type": "string", "maxLength": 12},
             },
             "required": ["draft_id"],
             "additionalProperties": False,
@@ -93,6 +97,41 @@ def _get_full_tools() -> list[dict[str, Any]]:
 
 
 _DRAFT_SUCCESS_STATUSES = {"draft_created", "draft_updated", "confirmed"}
+
+# ---------------------------------------------------------------------------
+# SSE: tool 调度状态提示
+# ---------------------------------------------------------------------------
+MAX_UI_HINT_LEN = 12
+DEFAULT_UI_HINTS: dict[str, str] = {
+    "prepare_task_context": "正在构思任务……",
+    "draft_agent_task": "正在拟派清单……",
+    "update_task_draft": "正在调整草案……",
+    "confirm_agent_task": "正在提交任务……",
+    "cancel_agent_task": "正在取消任务……",
+}
+
+SYSTEM_MESSAGES: dict[tuple[str, str], str] = {
+    ("draft_agent_task", "draft_created"): "[任务草案拟定完成]",
+    ("draft_agent_task", "draft_updated"): "[任务草案拟定更新]",
+    ("update_task_draft", "draft_updated"): "[任务草案已更新]",
+    ("confirm_agent_task", "confirmed"): "[任务发布成功]",
+    ("cancel_agent_task", "cancelled"): "[任务已取消]",
+}
+
+
+def _sanitize_ui_hint(value: Any, default_hint: str) -> str:
+    """
+    前端显示用：空/过长 -> 默认提示。
+    这里用字符长度做“严格控制”，保证提示足够短。
+    """
+    if not isinstance(value, str):
+        return default_hint
+    s = value.strip()
+    if not s:
+        return default_hint
+    if len(s) > MAX_UI_HINT_LEN:
+        return default_hint
+    return s
 
 
 def _build_gen_tool_messages(
@@ -579,6 +618,7 @@ async def tool_executor_node(
 
     tool_messages: list[dict[str, str]] = list(state.get("_tool_messages", []))
     task_write_result = state.get("task_write_result")
+    ui_events: list[dict[str, Any]] = list(state.get("_ui_events", []))
 
     for tc in pending_calls:
         func_info = tc.get("function", tc)
@@ -591,6 +631,17 @@ async def tool_executor_node(
                 tool_args = {}
         else:
             tool_args = raw_args or {}
+
+        # 1) 工具开始：推送一个极短提示给前端
+        start_hint = _sanitize_ui_hint(
+            tool_args.get("ui_hint"),
+            DEFAULT_UI_HINTS.get(tool_name, "正在思考……"),
+        )
+        ui_events.append({
+            "event_type": "tool_status",
+            "text": start_hint,
+            "tool_name": tool_name,
+        })
 
         result_str, updated_draft, write_result = dispatch_tool_call(
             tool_name,
@@ -614,6 +665,24 @@ async def tool_executor_node(
         if write_result:
             task_write_result = write_result
 
+        # 2) 工具完成：根据结果 status 推送关键系统消息（成功时）
+        try:
+            parsed = json.loads(result_str or "{}")
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            st = parsed.get("status")
+            sys_text = SYSTEM_MESSAGES.get((tool_name, st))
+            if sys_text:
+                payload: dict[str, Any] = {"event_type": "system", "text": sys_text}
+                if tool_name == "draft_agent_task":
+                    if isinstance(parsed.get("draft_id"), str):
+                        payload["draft_id"] = parsed.get("draft_id")
+                if tool_name == "confirm_agent_task":
+                    if isinstance(parsed.get("task_id"), (int, str)):
+                        payload["task_id"] = parsed.get("task_id")
+                ui_events.append(payload)
+
         tool_messages.append({
             "tool_name": tool_name,
             "result": result_str,
@@ -624,6 +693,7 @@ async def tool_executor_node(
         "_pending_tool_calls": [],
         "pending_task_draft": pending_draft,
         "task_write_result": task_write_result,
+        "_ui_events": ui_events,
     }
 
 

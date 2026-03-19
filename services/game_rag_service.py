@@ -667,6 +667,16 @@ class GameRAGService:
 
         state = await loop_graph.ainvoke(initial_state, config)
 
+        # 在开始流式正文前，先把工具执行状态/系统消息推给前端
+        ui_events = state.get("_ui_events") or []
+        for ev in ui_events:
+            if not isinstance(ev, dict):
+                continue
+            event_type = ev.get("event_type") or ""
+            if event_type in ("tool_status", "system"):
+                payload = {k: v for k, v in ev.items() if k != "event_type"}
+                yield (event_type, payload)
+
         async for ev, dat in generate_response_stream(state, config):
             yield (ev, dat)
 

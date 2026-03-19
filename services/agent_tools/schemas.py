@@ -100,6 +100,8 @@ PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
             "required": ["regular", "optional"],
             "additionalProperties": False,
         },
+        # 用于 SSE/前端显示：非常短的“正在进行中”提示
+        "ui_hint": {"type": "string", "maxLength": 12, "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。"},
     },
     "required": ["task_type", "reward_types"],
     "additionalProperties": False,
@@ -214,6 +216,8 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "items": DIALOGUE_ENTRY_SCHEMA,
             "description": "完成对话数组；可以包含 NPC 与玩家($PC)多条。",
         },
+        # 用于 SSE/前端显示：非常短的“正在进行中”提示
+        "ui_hint": {"type": "string", "maxLength": 12, "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。"},
     },
     "required": [
         "task_type",
@@ -244,6 +248,8 @@ UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "要修改的草案 ID（从 draft_agent_task 返回值获取）",
         },
+        # 用于 SSE/前端显示：非常短的“正在进行中”提示
+        "ui_hint": {"type": "string", "maxLength": 12, "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。"},
         "modify_fields": {
             "type": "object",
             "description": "要修改的字段集合，仅包含需要变更的字段，未包含的字段保持原值不变",
