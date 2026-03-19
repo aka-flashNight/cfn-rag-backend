@@ -154,3 +154,22 @@ def is_valid_stage_root(stage_root: str) -> bool:
     return stage_root in VALID_STAGE_ROOTS
 
 
+# 少数关卡大区目录名较抽象，需附带叙事地图说明；其余目录名对 LLM 已足够清晰，直接沿用原名。
+_STAGE_ROOT_REGION_HINT_EXTRA: Dict[str, str] = {
+    "基地门口": "基地门口，主要区域为废城",
+    "基地车库": "基地车库，主要区域为堕落城",
+    "基地房顶": "基地房顶，主要区域为荒漠",
+    "地下2层": "地下2层，主要区域为禁区与诺亚外围",
+}
+
+
+def stage_root_region_hint(stage_root: str) -> str:
+    """
+    返回 stages 子目录（关卡大区）对应的地图/叙事区域说明，供 prepare_task_context 等写入关卡对象。
+
+    - 对抽象目录名附加「主要区域」说明；
+    - 黑铁会总部、诺亚前线基地深处、雪山、副本任务、试炼场深处等返回目录名本身。
+    """
+    return _STAGE_ROOT_REGION_HINT_EXTRA.get(stage_root, stage_root)
+
+

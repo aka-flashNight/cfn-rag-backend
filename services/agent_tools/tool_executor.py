@@ -534,6 +534,7 @@ def dispatch_tool_call(
     }
     # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
     # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
+
     # if tool_name in _task_tool_names:
     #     try:
     #         pretty_args = json.dumps(tool_args, ensure_ascii=False)
@@ -608,16 +609,16 @@ def dispatch_tool_call(
             "message": f"未知工具: {tool_name}",
         }, ensure_ascii=False)
 
-    if tool_name in _task_tool_names:
-        try:
-            # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
-            preview = (result or "")
-            if isinstance(preview, str) and len(preview) > 500:
-                preview = preview[:500] + "…"
-        except Exception:
-            preview = "<preview-unavailable>"
-        # Debug: 
-        # print('——————【结果】——————')
-        # print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+    # Debug: 
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
+    #         preview = (result or "")
+    #         # if isinstance(preview, str) and len(preview) > 3000:
+    #         #     preview = preview[:3000] + "…"
+    #     except Exception:
+    #         preview = "<preview-unavailable>"
+    #     print('——————【结果】——————')
+    #     print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result

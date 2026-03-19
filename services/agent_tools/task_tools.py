@@ -100,6 +100,48 @@ def _ensure_int_list(v: Any) -> List[int]:
     return out
 
 
+def _stage_reqs_unlock_ids(
+    *,
+    finish_requirements: Any,
+    game_data: GameDataRegistry,
+) -> List[int]:
+    """
+    从 finish_requirements 反推对应关卡（stage_name）的主线解锁 id（unlock_condition）。
+
+    规则：
+    - unlock_condition 缺失/为非正数：认为是副本等无主线解锁需求，不写入 get_requirements。
+    - 若同一 stage_name 在多个大区存在多个 unlock_condition：取最小值（更符合“最早解锁前置”）。
+    """
+    stage_registry = getattr(game_data, "stages", None)
+    stage_infos_raw = getattr(stage_registry, "_stage_infos", None) if stage_registry else None
+    if not isinstance(stage_infos_raw, dict):
+        return []
+
+    out: set[int] = set()
+    if not isinstance(finish_requirements, list):
+        return []
+
+    for sr in finish_requirements:
+        if not isinstance(sr, dict):
+            continue
+        stage_name = sr.get("stage_name")
+        if not isinstance(stage_name, str) or not stage_name.strip():
+            continue
+
+        unlocks: list[int] = []
+        for (_area, name), si in stage_infos_raw.items():
+            if name != stage_name:
+                continue
+            unlock = getattr(si, "unlock_condition", None)
+            if isinstance(unlock, int) and unlock > 0:
+                unlocks.append(unlock)
+
+        if unlocks:
+            out.add(min(unlocks))
+
+    return sorted(out)
+
+
 def _strip_bracket_expressions(text: str) -> str:
     """
     去掉形如 `【...】` / `（...）` 的动作/神态/旁白标记，确保 text 是纯对话。
@@ -261,6 +303,13 @@ def write_confirmed_agent_task_files(
             finish_items = [{"name": finish_npc, "title": finish_npc, "char": finish_npc, "text": ""}]
 
         get_req_list = _ensure_int_list(draft.get("get_requirements"))
+        # 若大模型没填 get_requirements，则由后端根据 finish_requirements 的关卡解锁条件补全。
+        # 该逻辑不依赖任务类型：只要 finish_requirements 中的关卡有 unlock_condition，就应写入前置主线。
+        if not get_req_list:
+            get_req_list = _stage_reqs_unlock_ids(
+                finish_requirements=draft.get("finish_requirements"),
+                game_data=game_data,
+            )
         finish_reqs = _stage_reqs_to_strings(draft.get("finish_requirements"))
         finish_submit = _reward_items_to_expr(draft.get("finish_submit_items"))
         finish_contain = _reward_items_to_expr(draft.get("finish_contain_items"))

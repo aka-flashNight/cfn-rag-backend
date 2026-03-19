@@ -516,7 +516,7 @@ async def decision_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug: 
+            # Debug
             # print('——————【工具执行结果】decision_node——————')
             # print(
             #     f"[{tm['tool_name']}]: "
@@ -729,7 +729,7 @@ async def generate_response_node(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug: 
+            # Debug
             # print('——————【工具执行结果】generate_response_node——————')
             # print(
             #     f"[{tm['tool_name']}]: "
@@ -873,7 +873,7 @@ async def generate_response_stream(
                 f"[{tm['tool_name']}]: "
                 f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             )
-            # Debug: 
+            # Debug
             # print('——————【工具执行结果】generate_response_stream——————')
             # print(
             #     f"[{tm['tool_name']}]: "

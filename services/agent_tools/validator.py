@@ -133,8 +133,8 @@ def _compute_reward_value_range(
     submit_cap_hi = mult_max * 2.0
     capped_submit_lo = min(submit_value, submit_cap_lo)
     capped_submit_hi = min(submit_value, submit_cap_hi)
-    # 额外 += capped × 1.5（下限）~ 2.0（上限）
-    submit_bonus_lo = capped_submit_lo * 1.5
+    # 额外 += capped × 1.0（下限）~ 2.0（上限）：下限与提交品等价，上限为 2 倍，降低「略增奖励仍低于区间」的概率
+    submit_bonus_lo = capped_submit_lo * 1.0
     submit_bonus_hi = capped_submit_hi * 2.0
 
     # ---- 持有品加成 ----

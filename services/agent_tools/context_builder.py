@@ -17,6 +17,7 @@ from services.game_progress import (
     get_progress_stage_level_range,
     get_progress_stage_main_task_range,
     PROGRESS_STAGE_CONFIG,
+    stage_root_region_hint,
 )
 
 # 当 challenge 无 llm_hint 时使用的默认提醒（仅在选择该难度时随 challenge_modes 返回，按需占用 token）
@@ -41,13 +42,16 @@ _TASK_RULES: dict[str, str] = {
     "通关": (
         "通关类任务：要求玩家通关指定关卡。"
         "关卡必须在玩家当前进度范围内（解锁ID ≤ 当前主线ID）。"
-        "副本关卡通常仅可选择“简单”。只有当副本配置了 challenge 额外难度（且满足玩家等级校验）时，才允许选择该额外难度（特征是仅有两个难度候选项），选择时需明确提醒难度要求；否则只能选择“简单”。"
+        "area为“副本任务”的关卡通常仅可选择“简单”。只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求；否则只能选择“简单”。"
         "地图关卡可选任意难度。"
         "基础奖励 ×2。"
     ),
     "清理": (
-        "清理类任务：与通关类似，但叙事上侧重'清除威胁/清理区域'。"
-        "规则与通关类相同。基础奖励 ×2。"
+        "清理类任务：要求玩家通关指定关卡，但叙事上侧重'清除威胁/清理区域'。"
+        "关卡必须在玩家当前进度范围内（解锁ID ≤ 当前主线ID）。"
+        "area为“副本任务”的关卡通常仅可选择“简单”。只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求；否则只能选择“简单”。"
+        "地图关卡可选任意难度。"
+        "基础奖励 ×2。"
     ),
     "挑战": (
         "挑战类任务：高难度通关，建议选择修罗或地狱难度。"
@@ -63,37 +67,43 @@ _TASK_RULES: dict[str, str] = {
         "资源收集类任务：要求玩家收集并提交指定数量的食材/药剂/材料/弹夹。"
         "提交物品必须在现有任务的提交物品+奖励物品池中。"
         "提交品总价值不超过基础奖励的200%。"
-        "奖励额外增加提交品价值的1.5~2倍。"
+        "奖励在原有区间要求上，额外增加提交品总价值的1~2倍。"
+        "资源是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "装备缴纳": (
         "装备缴纳类任务：要求玩家获取并提交一件装备（武器/防具）。"
         "来源：非本阵营NPC商店、合成配方、K点商店。"
         "提交品总价值不超过基础奖励的300%。"
-        "奖励额外增加提交品价值的1.5~2倍。"
+        "奖励在原有区间要求上，额外增加提交品价值的1~2倍。"
+        "装备是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "特殊物品获取": (
         "特殊物品获取类任务：要求玩家获取并提交一个特殊物品。"
         "通常只需要1个物品。来源同装备缴纳类。"
         "包括插件、药剂、菜品、贵重消耗品等非装备物品。"
+        "特殊物品是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "物品持有": (
         "物品持有类任务：要求玩家持有（不提交）指定物品。"
         "来源：情报类物品或合成配方产出。"
         "奖励额外增加持有品价值的0.5倍，上限不超过基础奖励的50%。"
         "持有品本身总价值上限为基础奖励的200%。"
+        "持有类可以是让玩家获取情报，也可以是指引玩家去制作物品并检验成果，或者其他需要获取物品但无需提交的情况。"
     ),
     "通关并收集": (
         "通关并收集类任务：组合通关+收集要求。"
         "收集物品必须是该关卡箱子的产出物品。"
         "收集数量建议使用箱子的最小产出数量。"
-        "基础奖励 ×2，再叠加收集品加成。"
-        "如果你在 finish_requirements 里选择了非“简单”的副本难度（例如“地狱”），请务必在任务说明（title/description）中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
+        "基础奖励 ×2，再叠加收集品加成（提交品价值计入奖励区间：下限+1×、上限+2×，与同规则收集类一致）。"
+        "收集品是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
+        "如果当前关卡的area是“副本任务”，且只有两个难度选择，而你在 finish_requirements 里选择了非“简单”的难度（例如“地狱”），请务必在任务说明中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
     "通关并持有": (
         "通关并持有类任务：组合通关+持有要求。"
         "持有物品必须是该关卡箱子的产出物品。"
-        "基础奖励 ×2，再叠加持有品加成。"
-        "如果你在 finish_requirements 里选择了非“简单”的副本难度（例如“地狱”），请务必在任务说明（title/description）中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
+        "基础奖励 ×2，再叠加持有品加成（持有品按 0.5× 计入奖励区间，规则同「物品持有」类）。"
+        "持有品不要求玩家提交。可以是需要情报物品，也可以是检验玩家的搜索成果等情况。"
+        "如果当前关卡的area是“副本任务”，且只有两个难度选择，而你 finish_requirements 里选择了非“简单”的难度（例如“地狱”），请务必在任务说明中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
 }
 
@@ -395,7 +405,7 @@ def _build_reward_item_candidates(
                     "name": item.name,
                     "type": item.type,
                     "price": item.price or 0,
-                    "source": "任务奖励常见",
+                    "source": "任务奖励可选",
                 }
                 if item.level > 0:
                     entry["level"] = item.level
@@ -417,6 +427,16 @@ def _build_reward_item_candidates(
 # ---------------------------------------------------------------------------
 # 类型专属字段构建
 # ---------------------------------------------------------------------------
+
+def _pick_stage_root_for_stage_name(stage_registry: Any, stage_name: str) -> Optional[str]:
+    """根据关卡 XML 名解析其所在的 stages 子目录（大区）；副本优先归为「副本任务」。"""
+    areas = {a for (a, n), _ in stage_registry._stage_infos.items() if n == stage_name}
+    if not areas:
+        return None
+    if "副本任务" in areas:
+        return "副本任务"
+    return min(areas)
+
 
 def _get_all_stages_for_progress(
     game_data: GameDataRegistry,
@@ -514,6 +534,7 @@ def _get_all_stages_for_progress(
             "unlock_id": si.unlock_condition,
             "difficulties": difficulties,
             "is_dungeon": is_dungeon,
+            "area_region_hint": stage_root_region_hint(area),
         }
         if is_dungeon:
             # 根 recommended_level 用于“副本可选性”提示（这里取放行集合的最小下限）
@@ -648,6 +669,10 @@ def _build_challenge_targets(
         "target_npc": npc_name,
         "difficulties": difficulties,
     }
+    ch_area = _pick_stage_root_for_stage_name(game_data.stages, npc_challenge)
+    if ch_area:
+        entry["stage_area"] = ch_area
+        entry["area_region_hint"] = stage_root_region_hint(ch_area)
 
     if len(difficulties) > 1:
         extra_modes = [
@@ -1111,6 +1136,7 @@ def _build_stage_loot_list(
         lr = get_progress_stage_level_range(stage)
         entry: dict[str, Any] = {
             "area": area,
+            "area_region_hint": stage_root_region_hint(area),
             "area_level_range": list(lr) if lr else None,
             "stage_name": name,
             "unlock_id": si.unlock_condition,
