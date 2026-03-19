@@ -369,12 +369,13 @@ async def prepare_context_node(
         pending_draft_summary=pending_draft_summary,
     )
 
+    # 立绘描述不写入共享 user_prompt，避免缓存变动；仅在流式/生成阶段按需拼接到 user 内容末尾
     user_prompt = build_user_prompt(
         retrieved_context=retrieved_context or "",
         history_str=history_str,
         user_query=payload.query,
         emotion_hint=emotion_hint,
-        image_description=image_description or "",
+        image_description="",
     )
 
     from core.config import get_settings
@@ -460,12 +461,7 @@ async def decision_node(
             #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             # )
 
-    image_path_str = state.get("image_path")
-    image_path = None
-    if image_path_str:
-        from pathlib import Path
-        image_path = Path(image_path_str)
-
+    # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
     tool_calls: list[dict] = []
 
@@ -476,49 +472,21 @@ async def decision_node(
             model_name=state.get("model_name"),
             system_prompt=system_prompt,
             user_prompt=full_user_prompt,
-            image_path=image_path if round_num == 0 else None,
-            image_description=state.get("image_description") if round_num == 0 else None,
+            image_path=None,
+            image_description=None,
             emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
             tools=_get_full_tools(),
         )
     except Exception as e:
-        if is_image_unsupported_error(e) and image_path:
-            try:
-                reply_text, tool_calls = await call_llm(
-                    api_key=state.get("api_key"),
-                    api_base=state.get("api_base"),
-                    model_name=state.get("model_name"),
-                    system_prompt=system_prompt,
-                    user_prompt=full_user_prompt,
-                    image_path=None,
-                    image_description=state.get("image_description"),
-                    emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
-                    tools=_get_full_tools(),
-                )
-            except Exception as e2:
-                if is_tools_unsupported_error(e2):
-                    reply_text, tool_calls = await call_llm(
-                        api_key=state.get("api_key"),
-                        api_base=state.get("api_base"),
-                        model_name=state.get("model_name"),
-                        system_prompt=system_prompt,
-                        user_prompt=full_user_prompt,
-                        image_path=None,
-                        image_description=state.get("image_description"),
-                        emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
-                        tools=None,
-                    )
-                else:
-                    raise
-        elif is_tools_unsupported_error(e):
+        if is_tools_unsupported_error(e):
             reply_text, tool_calls = await call_llm(
                 api_key=state.get("api_key"),
                 api_base=state.get("api_base"),
                 model_name=state.get("model_name"),
                 system_prompt=system_prompt,
                 user_prompt=full_user_prompt,
-                image_path=image_path if round_num == 0 else None,
-                image_description=state.get("image_description") if round_num == 0 else None,
+                image_path=None,
+                image_description=None,
                 emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
                 tools=None,
             )

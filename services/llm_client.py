@@ -45,37 +45,40 @@ async def call_llm(
     """
     client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
+    # emotion_hint 可放在 system 前；image_description 与高频变动内容一起放在 user 末尾，避免 prompt 前部变动影响缓存
     prefix_parts: List[str] = []
-    if image_description and image_description.strip():
-        prefix_parts.append(image_description.strip() + "。")
     if emotion_hint and emotion_hint.strip():
         prefix_parts.append(emotion_hint.strip())
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
+    user_suffix = ""
+    if image_description and image_description.strip():
+        user_suffix = "\n\n" + image_description.strip() + "。"
+    effective_user = user_prompt + user_suffix
 
     if image_path and image_path.is_file():
         portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
         image_data = base64.b64encode(portrait_bytes).decode("utf-8")
-        prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
+        system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [
-            {"role": "system", "content": prompt_with_desc},
+            {"role": "system", "content": system_content},
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
-                    {"type": "text", "text": user_prompt},
+                    {"type": "text", "text": effective_user},
                 ],
             },
         ]
-        # Debug: 
-        # print(prompt_with_desc);
-        print("————————非流式————————");
-        print(user_prompt);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": effective_user},
         ]
+        # Debug: 
+        # print(system_content);
+        print("————————非流式无立绘————————");
+        print(effective_user);
 
     kwargs: dict = {"model": model_name, "messages": messages}
     if tools:
@@ -132,35 +135,37 @@ async def call_llm_stream(
     client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
     prefix_parts: List[str] = []
-    if image_description and image_description.strip():
-        prefix_parts.append(image_description.strip() + "。")
     if emotion_hint and emotion_hint.strip():
         prefix_parts.append(emotion_hint.strip())
     prompt_prefix = ("".join(prefix_parts) + "\n\n") if prefix_parts else ""
+    user_suffix = ""
+    if image_description and image_description.strip():
+        user_suffix = "\n\n" + image_description.strip() + "。"
+    effective_user = user_prompt + user_suffix
 
     if image_path and image_path.is_file():
         portrait_bytes, media_type = prepare_portrait_for_ai(image_path)
         image_data = base64.b64encode(portrait_bytes).decode("utf-8")
-        prompt_with_desc = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
+        system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [
-            {"role": "system", "content": prompt_with_desc},
+            {"role": "system", "content": system_content},
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
-                    {"type": "text", "text": user_prompt},
+                    {"type": "text", "text": effective_user},
                 ],
             },
         ]
         # Debug: 
-        # print(prompt_with_desc);
+        # print(system_content);        
         print("————————流式————————");
-        print(user_prompt);
+        print(effective_user);
     else:
         system_content = f"{prompt_prefix}{system_prompt}" if prompt_prefix else system_prompt
         messages = [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": effective_user},
         ]
 
     kwargs: dict = {"model": model_name, "messages": messages, "stream": True}
