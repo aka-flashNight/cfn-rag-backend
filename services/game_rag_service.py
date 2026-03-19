@@ -654,37 +654,46 @@ class GameRAGService:
         3. 解析情绪 + 好感度
         4. 保存记忆 + 更新 NPC 状态
         """
-        from services.agent_graph.graph import get_decision_loop
+        from services.agent_graph.graph import MAX_TOOL_ROUNDS
         from services.agent_graph.nodes import (
+            prepare_context_node,
+            decision_node,
+            tool_executor_node,
             generate_response_stream,
             parse_mood_node,
             post_process_node,
         )
 
-        loop_graph = get_decision_loop()
         config = self._build_graph_config(payload, npc_manager, memory)
-        initial_state = {}
 
-        state = await loop_graph.ainvoke(initial_state, config)
+        # 关键拆分：
+        # 1) 工具阶段：只 yield tool_status/system（不 yield content），不写入数据库（post_process 在最后才执行）
+        # 2) 生成阶段：仅最后一次 generate_response_stream 才 yield content/done
+        state: dict[str, Any] = {}
+        state.update(await prepare_context_node(state, config))
 
-        # 在开始流式正文前，把工具执行状态推给前端；
-        # “系统消息”会被拼接到 NPC 正文最前面（由 generate_response_stream/节点统一处理），因此这里不单独 yield。
-        ui_events = state.get("_ui_events") or []
-        system_prefixes: list[str] = []
-        for ev in ui_events:
-            if not isinstance(ev, dict):
-                continue
-            event_type = ev.get("event_type") or ""
-            if event_type == "tool_status":
-                payload = {k: v for k, v in ev.items() if k != "event_type"}
-                yield (event_type, payload)
-            elif event_type == "system":
-                text = ev.get("text")
-                if isinstance(text, str) and text.strip():
-                    system_prefixes.append(text.strip())
+        for _round in range(MAX_TOOL_ROUNDS):
+            # 决策轮：模型只负责判断 tool_calls，不负责对话文本（如有 decision_reply 也会丢弃）
+            state.update(await decision_node(state, config))
 
-        if system_prefixes and not state.get("_system_prefix_text"):
-            state["_system_prefix_text"] = "".join(system_prefixes) + "\n\n"
+            if not state.get("has_tool_calls", False):
+                break
+
+            # 工具执行轮：立即把 tool_status/system 给前端，且不输出对话 content
+            tool_update = await tool_executor_node(state, config)
+            state.update(tool_update)
+
+            ui_events = tool_update.get("_ui_events") or []
+            for ev in ui_events:
+                if not isinstance(ev, dict):
+                    continue
+                event_type = ev.get("event_type") or ""
+                if event_type in ("tool_status", "system"):
+                    payload2 = {k: v for k, v in ev.items() if k != "event_type"}
+                    yield (event_type, payload2)
+
+            # 防止同一轮 ui_events 在 state 中被二次消费
+            state["_ui_events"] = []
 
         async for ev, dat in generate_response_stream(state, config):
             yield (ev, dat)
@@ -702,14 +711,17 @@ class GameRAGService:
         favorability = state.get("npc_affinity", 0)
         relationship_level = state.get("npc_relationship_level", "陌生")
 
-        yield ("done", {
-            "reply": reply,
-            "npc_name": npc_name,
-            "favorability": favorability,
-            "relationship_level": relationship_level,
-            "favorability_change": delta,
-            "emotion": emotion,
-        })
+        yield (
+            "done",
+            {
+                "reply": reply,
+                "npc_name": npc_name,
+                "favorability": favorability,
+                "relationship_level": relationship_level,
+                "favorability_change": delta,
+                "emotion": emotion,
+            },
+        )
 
     async def _ask_stream_legacy(
         self,

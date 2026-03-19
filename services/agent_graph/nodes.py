@@ -737,8 +737,7 @@ async def generate_response_node(
             )
 
     decision_reply = state.get("_decision_reply", "")
-    if decision_reply.strip():
-        full_user_prompt += f"\n\n你在决策轮的初步想法：{decision_reply[:500]}"
+    # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
 
     image_path_str = state.get("image_path")
     image_path = None
@@ -869,8 +868,7 @@ async def generate_response_stream(
             )
 
     decision_reply = state.get("_decision_reply", "")
-    if decision_reply.strip():
-        full_user_prompt += f"\n\n你在决策轮的初步想法：{decision_reply[:500]}"
+    # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
 
     image_path_str = state.get("image_path")
     image_path = None
