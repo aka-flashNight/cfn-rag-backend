@@ -1514,7 +1514,96 @@ class GameRAGService:
         if pooled:
             parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 
+        # 额外：从玩家输入中按 name 精确匹配物品，并标注其可能的奖励类型（仅用于任务/奖励类型判断）
+        # 目标类型集合来自 reward_types 的可选项：
+        # ["药剂","弹夹","K点","技能点","强化石","战宠灵石","材料","食品","武器","防具","插件"]
+        item_type_hints = self._build_item_type_hints(user_query)
+        if item_type_hints:
+            parts.append(item_type_hints)
+
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _build_item_type_hints(user_query: str) -> str:
+        """
+        从玩家输入中提取“按 name 精确命中的物品”，并标注其可能的奖励类型。
+
+        标注规则（与任务奖励类型一致）：
+        - "药剂","弹夹","材料","食品"：来自 item.use
+        - "武器","防具"：来自 item.type
+        - "插件"：通过 equipment_mods.is_plugin(item.name) 判断
+        - 材料与插件可能重合，重合时两个都要标注
+
+        输出为单行，使用分号拼接：
+        【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】
+        物品A：材料；物品B：材料、插件
+        """
+        q = (user_query or "").strip()
+        if not q:
+            return ""
+
+        try:
+            from services.game_data.registry import get_game_data_registry
+            game_data = get_game_data_registry()
+            items = game_data.items
+            equipment_mods = game_data.equipment_mods
+        except Exception:
+            return ""
+
+        allowed_use = {"药剂", "弹夹", "材料", "食品"}
+        allowed_type = {"武器", "防具"}
+
+        # name 精确匹配：只要物品名作为子串出现即视为“被提到”
+        # 为避免 token 膨胀，最多输出前 N 个命中（按物品名长度降序优先更具体的名字）
+        matches: list[tuple[str, list[str]]] = []
+        seen_names: set[str] = set()
+
+        # items.items 返回的是 list[Item]（复制），这里仍是 O(N) 扫描；考虑到仅做字符串包含匹配，通常可接受
+        candidates = list(items.items)
+        candidates.sort(key=lambda it: len(getattr(it, "name", "") or ""), reverse=True)
+
+        for it in candidates:
+            name = (getattr(it, "name", None) or "").strip()
+            if not name or name in seen_names:
+                continue
+            if name not in q:
+                continue
+
+            tags: list[str] = []
+            it_use = (getattr(it, "use", None) or "").strip()
+            it_type = (getattr(it, "type", None) or "").strip()
+
+            if it_use in allowed_use:
+                tags.append(it_use)
+            if it_type in allowed_type:
+                tags.append(it_type)
+            try:
+                if equipment_mods and equipment_mods.is_plugin(name):
+                    tags.append("插件")
+            except Exception:
+                pass
+
+            if not tags:
+                # 命中 name 但不属于可标注的类型则忽略
+                continue
+
+            # 去重保持稳定顺序：use/type 在前，插件在后
+            dedup: list[str] = []
+            for t in tags:
+                if t not in dedup:
+                    dedup.append(t)
+
+            matches.append((name, dedup))
+            seen_names.add(name)
+            if len(matches) >= 10:
+                break
+
+        if not matches:
+            return ""
+
+        # 单行：用分号连接；同一物品多标签用 "、"
+        pairs = [f"{name}：{'、'.join(tags)}" for name, tags in matches]
+        return "【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】\n" + "；".join(pairs)
 
     async def get_npc_favorability(
         self,
