@@ -61,6 +61,12 @@ def create_spec_file(dirs_to_include, root_py_files, script_dir):
         add_data_lines.append(f"             (r'{scripts_dir}', 'scripts'),")
         print(f"  包含目录: scripts/")
 
+    # 静态备份：npc_state_db / agent_tasks / agent_text（不每次从外部复制，随 exe 分发）
+    backup_resources_dir = os.path.abspath('backup_resources')
+    if os.path.exists(backup_resources_dir):
+        add_data_lines.append(f"             (r'{backup_resources_dir}', 'backup_resources'),")
+        print(f"  包含目录: backup_resources/")
+
     # 添加后端Python目录
     for dir_name in dirs_to_include:
         abs_path = os.path.abspath(dir_name)
@@ -119,6 +125,9 @@ a = Analysis(
         'docx',
         'sqlalchemy',
         'sqlite3',
+        'tiktoken',
+        'tiktoken_ext',
+        'tiktoken_ext.openai_public',
         'scripts.extract_portraits_from_swf',
     ],
     hookspath=[],

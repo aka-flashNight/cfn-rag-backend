@@ -21,6 +21,31 @@ _EMBED_MODEL_CONFIGURED: bool = False
 # 模型配置
 MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 
+# 统一的中英文 tokenizer：
+# - 英文按词
+# - 数字单独
+# - 中文按字
+# - 其余符号按单字符
+_CJK_TOKEN_RE = re.compile(
+    r"[a-zA-Z]+"
+    r"|\d+"
+    r"|[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]"
+    r"|[^\s]"
+)
+
+
+def cjk_tokenizer(text: str) -> list[str]:
+    tokens = _CJK_TOKEN_RE.findall(text or "")
+    return tokens if tokens else [""]
+
+
+def _configure_llamaindex_tokenizer() -> None:
+    """
+    强制使用项目内 tokenizer，避免运行环境缺失 tiktoken 插件时
+    抛出 `Unknown encoding cl100k_base`。
+    """
+    Settings.tokenizer = cjk_tokenizer
+
 
 def _get_model_dir() -> Path:
     """
@@ -70,6 +95,9 @@ def ensure_embed_model(offline: bool = True) -> None:
     global _EMBED_MODEL_CONFIGURED
     if _EMBED_MODEL_CONFIGURED:
         return
+
+    # 提前设置 tokenizer，避免后续索引加载阶段触发 tiktoken 依赖
+    _configure_llamaindex_tokenizer()
 
     # 强制离线环境变量（先设置，确保任何情况下都不联网）
     if offline:
@@ -818,19 +846,6 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     from llama_index.core.text_splitter import TokenTextSplitter
     from llama_index.core import Settings
 
-    import re
-    _CJK_TOKEN_RE = re.compile(
-        r'[a-zA-Z]+'       # 英文单词
-        r'|\d+'             # 数字
-        r'|[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]'  # CJK 汉字（每字一 token）
-        r'|[^\s]'           # 其余非空白字符（标点等）
-    )
-
-    def cjk_tokenizer(text: str) -> list[str]:
-        """中英文混合 tokenizer：英文按词、中文按字、标点逐个。"""
-        tokens = _CJK_TOKEN_RE.findall(text)
-        return tokens if tokens else ['']
-
     text_splitter = TokenTextSplitter(
         separator="\n",
         chunk_size=256,
@@ -927,6 +942,7 @@ def get_cached_index(force_rebuild: bool = False) -> VectorStoreIndex:
             shutil.rmtree(persist_dir)
             print("[知识库] 已清除本地向量索引目录，准备重新构建")
         ensure_embed_model(offline=True)
+        _configure_llamaindex_tokenizer()
         _index_cache = build_index(persist_dir=persist_dir)
         return _index_cache
 
@@ -934,6 +950,7 @@ def get_cached_index(force_rebuild: bool = False) -> VectorStoreIndex:
         return _index_cache
 
     ensure_embed_model(offline=True)
+    _configure_llamaindex_tokenizer()
 
     if _is_vector_index_valid(persist_dir):
         try:

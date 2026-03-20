@@ -10,10 +10,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
+import shutil
 import sys
 import zipfile
 from pathlib import Path
+from typing import Any
 
 # 模型加载状态
 _EMBED_MODEL_LOADING = False
@@ -35,6 +39,158 @@ def get_npc_state_db_path() -> Path:
     # 获取 resources 目录
     resources_dir = _get_resources_dir()
     return resources_dir / "data" / "rag" / "npc_state_db.json"
+
+
+def _get_backup_resources_dir() -> Path:
+    """
+    获取内置备份目录 `backup_resources` 的位置（与 `backup_resources/data/...` 下三份 JSON 对应）。
+
+    - PyInstaller：datas 解压到 sys._MEIPASS，优先使用 `_MEIPASS/backup_resources`
+    - 其次：exe 同目录下的 `backup_resources`（便于你手动放置覆盖）
+    - 开发环境：项目根目录 `cfn-rag-backend/backup_resources`
+    """
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            meipass_backup = Path(sys._MEIPASS) / "backup_resources"
+            if meipass_backup.is_dir():
+                return meipass_backup
+        exe_side = Path(sys.executable).parent / "backup_resources"
+        if exe_side.is_dir():
+            return exe_side
+        # 仍返回 exe 侧路径，便于 _copy_backup_file_if_missing 统一判断 .exists()
+        return Path(sys.executable).parent / "backup_resources"
+    return Path(__file__).resolve().parent.parent / "backup_resources"
+
+
+def _copy_backup_file_if_missing(
+    *,
+    target_path: Path,
+    backup_rel_path: Path,
+) -> bool:
+    """
+    若 target_path 不存在，则尝试从 backup_rel_path 复制到 target_path。
+    """
+    if target_path.exists():
+        return False
+
+    backup_path = _get_backup_resources_dir() / backup_rel_path
+    if not backup_path.exists():
+        return False
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(backup_path), str(target_path))
+    print(f"[初始化] 已从备份复制: {backup_path} -> {target_path}")
+    return True
+
+
+def _ensure_json_file(
+    *,
+    target_path: Path,
+    default_obj: Any,
+    backup_rel_path: Path,
+) -> None:
+    """
+    确保某 JSON 文件存在：
+    1) 目标存在则跳过
+    2) 目标不存在则优先从备份复制
+    3) 备份也不存在则写入最小骨架
+    """
+    if target_path.exists():
+        return
+
+    if _copy_backup_file_if_missing(target_path=target_path, backup_rel_path=backup_rel_path):
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(
+        json.dumps(default_obj, ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+    print(f"[初始化] 已创建默认 JSON 文件: {target_path}")
+
+
+def _ensure_xml_entry(
+    *,
+    list_xml_path: Path,
+    tag: str,
+    value: str,
+) -> None:
+    """
+    若 list.xml 中缺失 `<tag>value</tag>`，只在文件末尾的 `</root>` 前插入一行，避免改动其它内容。
+    """
+    if not list_xml_path.exists():
+        print(f"[初始化] 未找到 XML 列表文件，跳过修复: {list_xml_path}")
+        return
+
+    try:
+        raw = list_xml_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        print(f"[初始化] 读取 XML 失败，跳过修复: {list_xml_path}, err={e}")
+        return
+
+    # 允许 `<tag> value </tag>` 中间有空白
+    if re.search(rf"<{re.escape(tag)}>\s*{re.escape(value)}\s*</{re.escape(tag)}>", raw):
+        return
+
+    newline = "\r\n" if "\r\n" in raw else "\n"
+
+    # 尽量复用已有条目的缩进
+    indent = "  "
+    m = re.search(rf"^(?P<indent>\s*)<{re.escape(tag)}>\s*.+?\s*</{re.escape(tag)}>\s*$", raw, flags=re.M)
+    if m:
+        indent = m.group("indent") or indent
+
+    insertion_line = f"{indent}<{tag}>{value}</{tag}>"
+    close_idx = raw.rfind("</root>")
+    if close_idx != -1:
+        before = raw[:close_idx].rstrip("\r\n")
+        after = raw[close_idx:]
+        raw_new = before + newline + insertion_line + newline + after
+    else:
+        raw_new = raw.rstrip("\r\n") + newline + insertion_line + newline
+
+    try:
+        list_xml_path.write_text(raw_new, encoding="utf-8")
+        print(f"[初始化] 已修复 XML 列表条目: {list_xml_path} -> {insertion_line}")
+    except Exception as e:
+        print(f"[初始化] 写入 XML 修复失败，跳过: {list_xml_path}, err={e}")
+
+
+def ensure_task_agent_files_and_lists() -> None:
+    """
+    启动时确保：
+    - `resources/data/task/agent_tasks.json` 与 `resources/data/task/text/agent_text.json` 存在
+    - `resources/data/task/list.xml` 中包含 `<task>agent_tasks.json</task>`
+    - `resources/data/task/text/list.xml` 中包含 `<text>agent_text.json</text>`
+
+    目的：保证后续 NPC 状态生成与任务/文本注册逻辑的输入齐全。
+    """
+    resources_dir = _get_resources_dir()
+    task_root = resources_dir / "data" / "task"
+    task_list_xml = task_root / "list.xml"
+    task_text_root = task_root / "text"
+    task_text_list_xml = task_text_root / "list.xml"
+
+    agent_tasks_path = task_root / "agent_tasks.json"
+    agent_text_path = task_text_root / "agent_text.json"
+
+    _ensure_json_file(
+        target_path=agent_tasks_path,
+        default_obj={"tasks": []},
+        backup_rel_path=Path("data") / "task" / "agent_tasks.json",
+    )
+    _ensure_json_file(
+        target_path=agent_text_path,
+        default_obj={},
+        backup_rel_path=Path("data") / "task" / "text" / "agent_text.json",
+    )
+
+    _ensure_xml_entry(list_xml_path=task_list_xml, tag="task", value="agent_tasks.json")
+    _ensure_xml_entry(
+        list_xml_path=task_text_list_xml,
+        tag="text",
+        value="agent_text.json",
+    )
 
 
 def _get_resources_dir() -> Path:
@@ -269,6 +425,13 @@ def ensure_npc_state_db() -> bool:
         print(f"[初始化] NPC 状态数据库已存在: {npc_state_path}")
         return True
 
+    # 优先从打包内置备份恢复，避免直接跑较慢的扫描生成逻辑
+    if _copy_backup_file_if_missing(
+        target_path=npc_state_path,
+        backup_rel_path=Path("data") / "rag" / "npc_state_db.json",
+    ):
+        return True
+
     print(f"[初始化] NPC 状态数据库不存在，正在生成: {npc_state_path}")
 
     # 执行更新脚本
@@ -428,6 +591,15 @@ async def run_startup_tasks() -> None:
     print("\n" + "=" * 50)
     print("[初始化] 开始执行后端启动任务...")
     print("=" * 50)
+
+    # 0. 修复/补齐 Agent 生成类任务所需文件（避免 list.xml 缺项导致下游生成/注册失败）
+    ensure_task_agent_files_and_lists()
+
+    # 0-b. 尽量在主线程快速恢复 NPC 状态库（避免首个请求前被其它逻辑创建空文件）
+    _copy_backup_file_if_missing(
+        target_path=get_npc_state_db_path(),
+        backup_rel_path=Path("data") / "rag" / "npc_state_db.json",
+    )
 
     # 1. 在后台线程中检查/生成 NPC 状态数据库（不阻塞服务器启动）
     loop = asyncio.get_running_loop()

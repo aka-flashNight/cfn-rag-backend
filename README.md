@@ -121,7 +121,7 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 
 ## 快速开始
 
-### 方式一：使用预编译的可执行文件（推荐普通用户）
+### 方式一：使用预编译的可执行文件（推荐有游戏项目或下载过一次独立版的用户）
 
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG.exe`
 2. 确保 `resources` 文件夹与 `CFN-RAG.exe` 在同一目录
@@ -131,7 +131,7 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 **注意**：必须配合`resources`游戏项目文件夹，且是github上的最新版本
 
 
-### 方式二：使用完整独立版（推荐无游戏项目的用户）
+### 方式二：使用完整独立版（推荐无游戏项目且首次下载的用户）
 
 适合没有下载游戏项目，但想体验功能的用户。
 
@@ -223,7 +223,7 @@ python launcher.py
 
 ### 1. CFN-RAG-Full.zip（完整独立版）
 
-**面向人群**：想独立体验功能，不想下载完整游戏项目的用户
+**面向人群**：首次下载，想独立体验功能，不想下载完整游戏项目的用户
 
 | 特点 | 说明 |
 |------|------|
@@ -244,13 +244,13 @@ python launcher.py
 
 ### 2. CFN-RAG.exe（单文件版）
 
-**面向人群**：有完整游戏项目的用户
+**面向人群**：有完整游戏项目，或已下载过完整版的用户
 
 | 特点 | 说明 |
 |------|------|
 | 文件大小 | 约 300MB |
 | 使用方式 | 将 `CFN-RAG.exe` 放到与 `resources` 文件夹同一目录，双击运行 |
-| 依赖 | 需要完整的游戏项目 `resources` 文件夹，无需 Python 环境 |
+| 依赖 | 需要游戏项目 `resources` 文件夹，无需 Python 环境 |
 | 优点 | 单个文件，下载即用，移动方便 |
 | 缺点 | 必须配合 `resources` 文件夹，且是github上的最新版本 |
 
@@ -267,8 +267,8 @@ python launcher.py
 
 | 你的情况 | 推荐版本 |
 |---------|---------|
-| 没有游戏项目，想独立体验功能 | **CFN-RAG-Full.zip** |
-| 有游戏项目，想体验完整功能 | **CFN-RAG.exe** |
+| 首次体验，没有游戏项目，想独立体验功能 | **CFN-RAG-Full.zip** |
+| 有游戏项目，想体验完整功能/已下载过Full压缩包 | **CFN-RAG.exe** |
 | 开发者，需要修改代码 | **源码克隆** |
 
 ## 配置说明
@@ -518,12 +518,12 @@ A: 推荐方式：
 
 - **Web**：FastAPI + Uvicorn
 - **流式**：SSE（前端对接见 `docs/STREAMING_API_FRONTEND.md`）
-- **RAG**：LlamaIndex（向量索引、检索；依赖中含 `llama-index-embeddings-huggingface`、`llama-index-llms-google-genai` 等，可按配置选用）
+- **RAG**：LlamaIndex（向量索引、检索；）
 - **Agent**：**LangGraph**（`langgraph`）编排状态图；**LangChain** 生态（`langchain-openai`、`langchain-core`）承载消息与工具调用结构
 - **LLM HTTP**：**OpenAI 兼容** REST（`openai` SDK，`base_url` + `model` 可指向 Gemini / ModelScope / 自建网关等）
 - **工具**：OpenAI **Function Calling** 风格 schema（`services/agent_tools/schemas.py`），运行时由 `tool_executor` 分发  
   `prepare_task_context` · `draft_agent_task` · `update_task_draft` · `confirm_agent_task` · `cancel_agent_task` · `search_knowledge` · `update_npc_mood`
-- **嵌入**：默认 **BAAI/bge-small-zh-v1.5**（HuggingFace，本地；仓库 `models/` 可能为空，可用 `scripts/download_model.py` 或首次运行拉取）
+- **嵌入**：默认 **BAAI/bge-small-zh-v1.5**（HuggingFace/本地 `models/` 。可用 `scripts/download_model.py` 或首次运行拉取至本地）
 - **持久化**：SQLite（`memory_manager` 会话记忆 + `task_draft_store` 任务草案）；游戏静态数据来自 `resources/data`，启动时载入 `GameDataRegistry`
 - **打包**：PyInstaller
 
