@@ -80,11 +80,14 @@ def create_spec_file(dirs_to_include, root_py_files, script_dir):
     add_data_str = '\n'.join(add_data_lines)
 
     launcher_path = os.path.abspath('launcher.py')
+    splash_image = os.path.join(script_dir, 'icon.ico').replace('\\', '/')
 
     spec_content = f'''# -*- mode: python ; coding: utf-8 -*-
 
 import sys
 sys.setrecursionlimit(5000)
+
+from PyInstaller.building.splash import Splash
 
 a = Analysis(
     [r'{launcher_path}'],
@@ -129,6 +132,8 @@ a = Analysis(
         'tiktoken_ext',
         'tiktoken_ext.openai_public',
         'scripts.extract_portraits_from_swf',
+        'tkinter',
+        '_tkinter',
     ],
     hookspath=[],
     hooksconfig={{}},
@@ -141,12 +146,21 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data)
 
+splash = Splash(
+    r'{splash_image}',
+    binaries=a.binaries,
+    datas=a.datas,
+    minify_script=True,
+    always_on_top=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.zipfiles,
     a.datas,
+    splash,
     [],
     name='CFN-RAG',
     debug=False,
@@ -155,7 +169,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -297,7 +311,8 @@ def main():
                 print(f"  已删除 {folder}/")
 
         print("\n使用方法:")
-        print("  双击 CFN-RAG.exe 即可启动服务")
+        print("  双击 CFN-RAG.exe：解压阶段会先显示闪屏（icon）；随后为状态窗。")
+        print("  浏览器就绪后请保持状态窗开启；退出请关闭状态窗（会停止本地服务）。")
         print("  - 后端API: http://127.0.0.1:7077")
         print("  - 前端页面: http://127.0.0.1:7080")
         print("\n注意事项:")

@@ -19,6 +19,12 @@ import http.server
 import urllib.request
 import urllib.error
 
+# 打包模式下由 tk 状态窗使用；关闭窗口时 shutdown 前端 HTTP 服务
+_httpd_instance = None
+_splash_root = None
+_splash_main_label = None
+_splash_sub_label = None
+
 
 
 
@@ -58,6 +64,121 @@ def check_python_environment():
 def is_packaged_environment():
     """检查是否在PyInstaller打包环境中运行"""
     return hasattr(sys, '_MEIPASS') or getattr(sys, 'frozen', False)
+
+
+def _configure_stdio_line_buffering():
+    """尽量行缓冲；无控制台（windowed exe）时忽略失败"""
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(line_buffering=True)
+            except Exception:
+                pass
+
+
+def _stream_is_usable(stream):
+    if stream is None:
+        return False
+    try:
+        stream.write("")
+        stream.flush()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_stdio_for_windowed():
+    """
+    PyInstaller windowed 模式下 stdout/stderr 常为 None，print 与 uvicorn 日志会立即抛错，
+    后端线程静默失败，表现为一直「等待后端就绪」。重定向到 NUL，不写入磁盘日志。
+    """
+    if not is_packaged_environment():
+        return
+    if _stream_is_usable(sys.stdout) and _stream_is_usable(sys.stderr):
+        return
+    try:
+        dn = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        sys.stdout = dn
+        sys.stderr = dn
+    except Exception:
+        pass
+
+
+def _find_launcher_icon_path():
+    """scripts/icon.ico：开发目录或打包 _MEIPASS / exe 旁"""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(os.path.join(sys._MEIPASS, "scripts", "icon.ico"))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "scripts", "icon.ico"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "scripts", "icon.ico"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _apply_launcher_window_chrome(tk_root, width, height):
+    """固定窗口大小、居中、任务栏图标"""
+    tk_root.resizable(False, False)
+    tk_root.geometry(f"{width}x{height}")
+    tk_root.minsize(width, height)
+    tk_root.maxsize(width, height)
+    tk_root.update_idletasks()
+    sw = tk_root.winfo_screenwidth()
+    sh = tk_root.winfo_screenheight()
+    x = max(0, (sw - width) // 2)
+    y = max(0, (sh - height) // 2)
+    tk_root.geometry(f"{width}x{height}+{x}+{y}")
+    icon_path = _find_launcher_icon_path()
+    if icon_path and os.name == "nt":
+        try:
+            tk_root.iconbitmap(default=icon_path)
+        except Exception:
+            pass
+
+
+def _close_pyi_splash_if_any():
+    """关闭 PyInstaller onefile 解压阶段闪屏（若存在）"""
+    try:
+        import pyi_splash  # type: ignore
+
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
+def splash_update(main_text, sub_text=""):
+    """从任意线程更新打包模式下的状态窗（通过 tk after 切回主线程）"""
+    global _splash_root, _splash_main_label, _splash_sub_label
+    root = _splash_root
+    main_lbl = _splash_main_label
+    sub_lbl = _splash_sub_label
+    if not root or not main_lbl:
+        return
+
+    def apply():
+        main_lbl.config(text=main_text)
+        if sub_lbl is not None:
+            sub_lbl.config(text=sub_text)
+
+    try:
+        root.after(0, apply)
+    except Exception:
+        pass
+
+
+def shutdown_launcher():
+    """停止前端静态服务并退出进程（后端线程为 daemon，随进程结束）"""
+    global _httpd_instance
+    h = _httpd_instance
+    if h is not None:
+        try:
+            h.shutdown()
+        except Exception:
+            pass
+    os._exit(0)
 
 
 def find_resources_directory():
@@ -377,7 +498,10 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             resp = e  # 4xx/5xx 也有 read() 和 headers
         except (urllib.error.URLError, OSError) as e:
-            self.send_error(502, f"后端不可达: {e.reason if hasattr(e, 'reason') else e}")
+            # HTTP status phrase 必须为 latin-1，中文会导致 UnicodeEncodeError
+            detail = e.reason if hasattr(e, "reason") and e.reason else e
+            print(f"[前端] 代理失败 /api -> 7077: {detail}", flush=True)
+            self.send_error(502, "Bad Gateway")
             return
 
         # 判断是否为流式响应（如 SSE），需边收边转不能整段缓冲
@@ -444,29 +568,66 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def open_browser_when_ready(frontend_port):
-    """在独立线程中等待后端就绪后打开浏览器，超时也会直接打开"""
+    """在独立线程中等待后端就绪后再打开浏览器（打包后 import 较慢，需足够等待）"""
     import socket
 
     url = f"http://127.0.0.1:{frontend_port}"
-    # 端口就绪后多等一会再开浏览器，避免首请求时应用尚未完成初始化
+    # 端口可连上后再稍等，降低首请求撞上 lifespan 尚未完成的概率
     BROWSER_OPEN_DELAY = 1.0
+    poll_interval = 0.5
+    # 约 30 秒上限（与界面文案一致）；后端正常时通常数秒内就绪
+    max_attempts = 60
 
-    for _ in range(10):
+    splash_update(
+        "正在等待后端就绪…",
+        "请勿关闭启动器窗口。若超过约 30 秒仍无响应，可关闭后重新运行或改用源码启动查看控制台输出。",
+    )
+
+    ready = False
+    for attempt in range(max_attempts):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(0.5)
-            result = sock.connect_ex(('127.0.0.1', 7077))
+            result = sock.connect_ex(("127.0.0.1", 7077))
             sock.close()
             if result == 0:
                 print("[系统] 后端服务已就绪 ✓")
+                splash_update("后端已就绪，即将打开浏览器…", "")
                 time.sleep(BROWSER_OPEN_DELAY)
+                ready = True
                 break
         except Exception:
             pass
-        time.sleep(0.5)
+        time.sleep(poll_interval)
+        if attempt > 0 and attempt % 10 == 0:
+            elapsed = attempt * poll_interval
+            splash_update(
+                "正在等待后端就绪…",
+                f"已等待约 {elapsed:.0f} 秒（最多约 30 秒）…",
+            )
+            print(
+                f"[系统] 仍在等待后端监听 7077... ({elapsed:.0f}s)",
+                flush=True,
+            )
+
+    if not ready:
+        print(
+            "[系统] 警告: 在超时内未检测到后端 7077 端口，仍将打开浏览器；"
+            "若页面 API 失败请刷新或稍后重试。",
+            flush=True,
+        )
+        splash_update(
+            "后端在预期时间内未就绪",
+            "仍将尝试打开浏览器。若页面异常请刷新浏览器页面或重新运行本程序。",
+        )
 
     print(f"[系统] 正在打开浏览器: {url}")
     webbrowser.open(url)
+
+    splash_update(
+        "服务运行中……",
+        "浏览器已打开页面，也可手动输入网址127.0.0.1:7080访问。\n如需停止服务，可关闭本窗口。",
+    )
 
     print("\n" + "=" * 50)
     print("服务启动完成！")
@@ -492,7 +653,10 @@ def start_builtin_server(dist_path):
                 print(f"[前端] 端口 {port} 被占用，尝试下一个...")
                 continue
 
-            with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
+            global _httpd_instance
+            httpd = socketserver.ThreadingTCPServer(("", port), handler)
+            _httpd_instance = httpd
+            try:
                 print(f"[前端] 服务地址: http://127.0.0.1:{port}")
                 print("-" * 50)
 
@@ -504,7 +668,9 @@ def start_builtin_server(dist_path):
                 browser_thread.start()
 
                 httpd.serve_forever()
-                break
+            finally:
+                _httpd_instance = None
+            break
         except OSError as e:
             if "Address already in use" in str(e):
                 print(f"[前端] 端口 {port} 被占用，尝试下一个...")
@@ -519,26 +685,20 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-def main():
-    """主函数"""
-    # 注册信号处理
+def main_console():
+    """开发/源码运行：保留控制台日志"""
     signal.signal(signal.SIGINT, signal_handler)
-
-    # 禁用输出缓冲，确保print立即显示（解决Windows下黑屏问题）
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    _configure_stdio_line_buffering()
 
     print("=" * 50, flush=True)
     print("CFN-RAG 启动器", flush=True)
     print("=" * 50, flush=True)
 
-    # 检查Python环境
     if not check_python_environment():
         print("\nPython环境检查未通过，请修复后重试", flush=True)
         input("按回车键退出...")
         sys.exit(1)
 
-    # 在主线程中完成环境设置（避免多线程竞争修改 sys.path / 环境变量）
     print("\n[环境] 正在设置运行环境...", flush=True)
     setup_environment()
 
@@ -546,19 +706,115 @@ def main():
     print("正在启动服务...", flush=True)
     print("=" * 50, flush=True)
 
-    # 同时启动前后端线程，互不阻塞
     backend_thread = threading.Thread(target=start_backend, daemon=True)
     frontend_thread = threading.Thread(target=start_frontend, daemon=True)
-
     backend_thread.start()
     frontend_thread.start()
 
     try:
-        # 保持主线程运行
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         signal_handler(None, None)
+
+
+def main_packaged_gui():
+    """打包 exe（无控制台）：轻量状态窗 + 关闭即退出"""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    global _splash_root, _splash_main_label, _splash_sub_label
+
+    signal.signal(signal.SIGINT, lambda s, f: shutdown_launcher())
+    _configure_stdio_line_buffering()
+
+    win_w, win_h = 440, 200
+    text_wrap = win_w - 48
+
+    root = tk.Tk()
+    root.title("CFN-RAG")
+    _apply_launcher_window_chrome(root, win_w, win_h)
+
+    frame = tk.Frame(root, padx=24, pady=18)
+    frame.pack(fill=tk.BOTH, expand=True)
+    tk.Label(frame, text="CFN-RAG", font=("Segoe UI", 13, "bold")).pack()
+    main_lbl = tk.Label(
+        frame,
+        text="正在启动本地服务…",
+        justify=tk.CENTER,
+        fg="#222",
+        wraplength=text_wrap,
+    )
+    main_lbl.pack(pady=(12, 0))
+    sub_lbl = tk.Label(
+        frame,
+        text="请勿关闭本窗口。",
+        justify=tk.CENTER,
+        fg="#555",
+        font=("Segoe UI", 9),
+        wraplength=text_wrap,
+    )
+    sub_lbl.pack(pady=(8, 0))
+
+    _splash_root = root
+    _splash_main_label = main_lbl
+    _splash_sub_label = sub_lbl
+
+    root.update_idletasks()
+    root.update()
+    _close_pyi_splash_if_any()
+
+    if not check_python_environment():
+        _splash_root = None
+        _splash_main_label = None
+        _splash_sub_label = None
+        messagebox.showerror(
+            "CFN-RAG",
+            "运行环境检查未通过。\n若使用源码，请安装 requirements.txt 后重试。",
+        )
+        sys.exit(1)
+
+    splash_update("正在配置运行环境…", "请稍候")
+    root.update()
+
+    try:
+        setup_environment()
+    except SystemExit:
+        raise
+    except Exception as e:
+        _splash_root = None
+        _splash_main_label = None
+        _splash_sub_label = None
+        messagebox.showerror("CFN-RAG", f"环境配置失败：\n{e}")
+        sys.exit(1)
+
+    def on_quit():
+        if messagebox.askokcancel(
+            "退出 CFN-RAG",
+            "关闭本窗口将停止本地服务，已打开的网页将无法继续访问。\n\n确定退出吗？",
+        ):
+            shutdown_launcher()
+
+    root.protocol("WM_DELETE_WINDOW", on_quit)
+
+    splash_update("正在启动后端与网页服务…", "首次启动可能较慢，请耐心等待")
+    root.update()
+
+    backend_thread = threading.Thread(target=start_backend, daemon=True)
+    frontend_thread = threading.Thread(target=start_frontend, daemon=True)
+    backend_thread.start()
+    frontend_thread.start()
+
+    root.mainloop()
+    shutdown_launcher()
+
+
+def main():
+    if is_packaged_environment():
+        _ensure_stdio_for_windowed()
+        main_packaged_gui()
+    else:
+        main_console()
 
 
 if __name__ == "__main__":
