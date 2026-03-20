@@ -79,15 +79,15 @@ TOOL_USAGE_GUIDE = """\
     · 拒绝 → 调用 cancel_agent_task 清除草案，以角色身份自然回应。
     · 讨价还价 → 你可以视情况接受或拒绝，接受时调用 update_task_draft 在允许范围内调整奖励（最多2次），拒绝则不调用并在后续对话中拒绝
       调整幅度受好感度影响：好感≥50可+10%~50%，好感20~49可+1%~20%，好感<20几乎不让步。
-    · 修改要求 → 调用 update_task_draft 局部修改（换关卡、调物品等）；
-      仅当需要更改任务类型时才重新走 prepare_task_context + draft_agent_task 全流程。
+    · 修改要求 → 调用 update_task_draft 做局部修改（调整数量、难度等）。
+    · 整体重拟 → 当玩家想要的任务类型/奖励类型与当前草案差别较大时，应主动重新调用 prepare_task_context + draft_agent_task，生成全新草案。
   - 如果玩家连续多轮对话未提及任务，草案会自动过期清除。
 
 【任务发布原则】
 - 只在对话氛围合适时考虑发布任务，不是每次对话都需要发布任务。
 - 任务必须符合你的角色定位和能力范围（详见下方NPC层约束）。
 - 发布动机应自然融入对话（如基于当前话题、你的需求或烦恼），不要生硬地突然提出。
-- 同一时间只处理一个任务草案，有待确认草案时不要创建新草案。
+- 同一时间只保留一个待确认草案：需更换任务时，调用 prepare_task_context + draft_agent_task ，会替换当前草案。
 - 完成NPC可以是当前NPC，也可以是其他NPC，但任务奖励是由完成NPC提供的，提交物品也是提供给完成NPC。
   draft_agent_task 里请填入 `finish_npc`（可为空，后端默认当前 NPC）。
 - 合理的触发场景：
@@ -241,7 +241,8 @@ def build_layer3(
         parts.append(
             "【待确认的任务草案】\n"
             f"{pending_draft_summary}\n"
-            "玩家可能会接受、拒绝或讨价还价。"
+            "玩家可能会接受、拒绝、讨价还价、要求变更任务类型或大幅调整。\n"
+            "讨价还价时调用 update_task_draft；变更任务类型或大幅调整用 prepare_task_context + draft_agent_task 重新拟定。"
         )
 
     return "\n".join(parts)
