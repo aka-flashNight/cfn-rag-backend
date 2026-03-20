@@ -1562,10 +1562,11 @@ class GameRAGService:
         - "武器","防具"：来自 item.type；若 item.use 非空则一并附上（不限于奖励白名单，供 LLM 理解用途）
         - "插件"：通过 equipment_mods.is_plugin(item.name) 判断
         - 材料与插件可能重合，重合时两个都要标注
+        - 单价：来自 item.price；缺失（None）则不写
 
-        输出为单行，使用分号拼接：
+        输出为两行：首行标题，次行用分号拼接各物品：
         【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】
-        物品A：材料；物品B：材料、插件
+        物品A：材料，单价100；物品B：材料、插件，单价50
         """
         q = (user_query or "").strip()
         if not q:
@@ -1584,7 +1585,7 @@ class GameRAGService:
 
         # name 精确匹配：只要物品名作为子串出现即视为“被提到”
         # 为避免 token 膨胀，最多输出前 N 个命中（按物品名长度降序优先更具体的名字）
-        matches: list[tuple[str, list[str]]] = []
+        matches: list[tuple[str, list[str], int | None]] = []
         seen_names: set[str] = set()
 
         # items.items 返回的是 list[Item]（复制），这里仍是 O(N) 扫描；考虑到仅做字符串包含匹配，通常可接受
@@ -1600,6 +1601,7 @@ class GameRAGService:
 
             it_use = (getattr(it, "use", None) or "").strip()
             it_type = (getattr(it, "type", None) or "").strip()
+            it_price: int | None = getattr(it, "price", None)
 
             type_tags: list[str] = []
             use_tags: list[str] = []
@@ -1628,7 +1630,7 @@ class GameRAGService:
                 if t not in dedup:
                     dedup.append(t)
 
-            matches.append((name, dedup))
+            matches.append((name, dedup, it_price))
             seen_names.add(name)
             if len(matches) >= 10:
                 break
@@ -1636,8 +1638,13 @@ class GameRAGService:
         if not matches:
             return ""
 
-        # 单行：用分号连接；同一物品多标签用 "、"
-        pairs = [f"{name}：{'、'.join(tags)}" for name, tags in matches]
+        # 次行：分号分隔物品；同一物品多标签用 "、"；有 price 则追加「，单价n」
+        pairs: list[str] = []
+        for name, tags, price in matches:
+            seg = f"{name}：{'、'.join(tags)}"
+            if price is not None:
+                seg += f"，单价{price}"
+            pairs.append(seg)
         return "【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】\n" + "；".join(pairs)
 
     async def get_npc_favorability(
