@@ -767,6 +767,44 @@ def _validate_v10_equipment_level_match(
 
 
 # =========================================================================
+# V11: 提交品与奖励物品不得重名
+# =========================================================================
+
+def _collect_reward_item_names(draft: Mapping[str, Any], key: str) -> set[str]:
+    """物品名字符串集合（strip 后），用于跨字段重复检测。"""
+    names: set[str] = set()
+    for it in _reward_item_iter(draft, key):
+        name = it.get("item_name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _validate_v11_submit_reward_no_overlap(
+    *,
+    draft: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """
+    finish_submit_items 与 rewards 不得出现相同物品名（易把「玩家想要的报酬」误填进提交要求）。
+    """
+    submit_names = _collect_reward_item_names(draft, "finish_submit_items")
+    reward_names = _collect_reward_item_names(draft, "rewards")
+    overlap = submit_names & reward_names
+    if not overlap:
+        return None
+    return {
+        "step": "V11",
+        "error": (
+            "`finish_submit_items` 与 `rewards` 不能包含相同物品："
+            f"{sorted(overlap)}。"
+            "请检查任务是否合理：玩家需要的物品只能写在 `rewards`；"
+            "需要玩家提交给你的物品只能写在 `finish_submit_items`。"
+        ),
+        "duplicate_item_names": sorted(overlap),
+    }
+
+
+# =========================================================================
 # 校验结果
 # =========================================================================
 
@@ -779,7 +817,7 @@ class DraftValidationResult:
 
 
 # =========================================================================
-# 完整校验管线 V1-V10
+# 完整校验管线 V1-V11
 # =========================================================================
 
 def validate_task_draft(
@@ -790,7 +828,7 @@ def validate_task_draft(
     game_data: Optional["GameDataRegistry"] = None,
 ) -> DraftValidationResult:
     """
-    完整校验管线（V1-V10）。
+    完整校验管线（V1-V11）。
 
     - draft_agent_task：全量校验（changed_fields=None）
     - update_task_draft：增量校验（changed_fields 为仅变更字段的名称集合）
@@ -824,6 +862,7 @@ def validate_task_draft(
     # V9 的指纹只依赖：关卡要求 + 提交/持有物品，不应因为“对话/标题描述”变更而触发
     run_v9 = full_mode or bool(changed & (rewards_keys | stage_keys))
     run_v10 = full_mode or bool(changed & rewards_keys)
+    run_v11 = full_mode or bool(changed & {"rewards", "finish_submit_items"})
 
     # ---- V1: 物品存在性 ----
     if run_rewards:
@@ -942,6 +981,12 @@ def validate_task_draft(
         )
         if e:
             return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+
+    # ---- V11: 提交品与奖励物品不得重名 ----
+    if run_v11:
+        e = _validate_v11_submit_reward_no_overlap(draft=draft)
+        if e:
+            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=validation_warnings)
 
     return DraftValidationResult(success=True, validation_errors=[], validation_warnings=validation_warnings)
 

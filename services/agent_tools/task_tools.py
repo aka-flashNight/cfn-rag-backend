@@ -204,27 +204,41 @@ def write_confirmed_agent_task_files(
     draft: Dict[str, Any],
     npc_name_fallback: str,
     game_data: GameDataRegistry,
-) -> str:
+) -> tuple[str, int]:
     """
     将已确认的任务草案写入：
     - resources/data/task/agent_tasks.json
     - resources/data/task/text/agent_text.json
 
-    返回写入描述字符串。
+    在锁内根据磁盘上已有 agent 任务的最大 ID 分配新 ID（避免内存 TaskRegistry 未重载时重复 ID 覆盖旧任务）。
+
+    返回 (写入描述字符串, 分配的任务 ID)。
     """
     with _WRITE_LOCK:
         data_root = game_data.data_root
         agent_tasks_path = (data_root / "task" / "agent_tasks.json").resolve()
         agent_text_path = (data_root / "task" / "text" / "agent_text.json").resolve()
 
-        task_id = draft.get("id")
-        if task_id is None:
-            raise ValueError("draft.id 缺失，无法写入 agent_tasks.json")
+        tasks_doc = _read_json(agent_tasks_path, default={"tasks": []})
+        if not isinstance(tasks_doc, dict):
+            tasks_doc = {"tasks": []}
+        tasks = tasks_doc.get("tasks", [])
+        if not isinstance(tasks, list):
+            tasks = []
 
-        try:
-            task_id_int = int(task_id)
-        except Exception as e:
-            raise ValueError(f"draft.id 非法: {task_id}") from e
+        max_agent = 200000
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            try:
+                tid = int(t.get("id"))
+            except Exception:
+                continue
+            if 200001 <= tid <= 300000 and tid > max_agent:
+                max_agent = tid
+
+        task_id_int = max_agent + 1
+        draft["id"] = task_id_int
 
         get_npc = (
             draft.get("get_npc")
@@ -315,14 +329,7 @@ def write_confirmed_agent_task_files(
         finish_contain = _reward_items_to_expr(draft.get("finish_contain_items"))
         rewards = _reward_items_to_expr(draft.get("rewards"))
 
-        # -------- agent_tasks.json --------
-        tasks_doc = _read_json(agent_tasks_path, default={"tasks": []})
-        if not isinstance(tasks_doc, dict):
-            tasks_doc = {"tasks": []}
-        tasks = tasks_doc.get("tasks", [])
-        if not isinstance(tasks, list):
-            tasks = []
-
+        # -------- agent_tasks.json（tasks_doc 已在上方读取）--------
         # 防止重复写入同 id
         tasks = [t for t in tasks if not (isinstance(t, dict) and str(t.get("id")) == str(task_id_int))]
 
@@ -360,5 +367,6 @@ def write_confirmed_agent_task_files(
         _atomic_write_text(agent_tasks_path, _dump_json(new_tasks_doc))
         _atomic_write_text(agent_text_path, _dump_json(text_doc))
 
-        return f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
+        msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
+        return msg, task_id_int
 

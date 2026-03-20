@@ -1283,4 +1283,9 @@ def prepare_task_context(
     elif task_type in ("通关并收集", "通关并持有"):
         context["stage_loot_list"] = _build_stage_loot_list(game_data, stage)
 
+    if task_type in ("资源收集", "装备缴纳", "特殊物品获取", "通关并收集"):
+        context["submit_vs_reward_hint"] = (
+            "拟定草案时 `finish_submit_items` 与 `rewards` 不得出现相同物品。"
+        )
+
     return json.dumps(context, ensure_ascii=False)

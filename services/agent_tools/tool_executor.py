@@ -113,6 +113,7 @@ def execute_draft_agent_task(
         "bargain_count": 0,  # 讨价还价次数，上限 2 次（仅调整奖励时计数）
         **args,
     }
+    draft.pop("_draft_commit_valid", None)
 
     validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
@@ -123,12 +124,14 @@ def execute_draft_agent_task(
     result = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
     detailed = _detailed_draft_summary(draft, game_data)
     if not result.success:
+        draft["_draft_commit_valid"] = False
         return json.dumps({
             "status": "validation_failed",
             "draft_id": draft_id,
             "errors": result.validation_errors,
             "draft_summary": detailed,
         }, ensure_ascii=False), draft
+    draft["_draft_commit_valid"] = True
     payload: dict[str, Any] = {
         "status": "draft_created",
         "draft_id": draft_id,
@@ -167,7 +170,10 @@ def execute_update_task_draft(
     if not isinstance(modify_fields, dict):
         modify_fields = {}
 
-    # 讨价还价上限 2 次：仅当本次修改涉及奖励字段且内容实际发生变化时计数（同一轮中 decision_node 与 generate_response_stream 可能各执行一次，避免重复计数）
+    prev_commit_ok = bool(pending_draft.get("_draft_commit_valid"))
+
+    # 讨价还价上限 2 次：仅在上一次已成功校验通过（commit）的前提下，对奖励类字段的实际修改才计入次数；
+    # 拟定失败后为通过校验而做的修改不计入讨价还价。
     BARGAIN_KEYS = {"rewards", "finish_submit_items", "finish_contain_items"}
     bargain_keys_touched = BARGAIN_KEYS & set(modify_fields)
     is_bargain = bool(bargain_keys_touched)
@@ -179,7 +185,7 @@ def execute_update_task_draft(
             if _reward_field_value_changed(cur_val, new_val):
                 reward_actually_changed = True
                 break
-        if reward_actually_changed:
+        if reward_actually_changed and prev_commit_ok:
             bargain_count = int(pending_draft.get("bargain_count", 0))
             if bargain_count >= 2:
                 return json.dumps({
@@ -191,12 +197,12 @@ def execute_update_task_draft(
     for k, v in modify_fields.items():
         pending_draft[k] = v
 
-    # 讨价还价时按上限 1.5 倍放宽 V7 允许区间，避免超限报错
+    # 讨价还价时按上限 1.5 倍放宽 V7 允许区间；修正校验错误时不放宽
     validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
-        bargain_rate=1.5 if (is_bargain and reward_actually_changed) else 1.0,
+        bargain_rate=1.5 if (is_bargain and reward_actually_changed and prev_commit_ok) else 1.0,
     )
     changed = set(modify_fields.keys())
     result = validate_task_draft(
@@ -212,8 +218,9 @@ def execute_update_task_draft(
             "draft_summary": detailed,
         }, ensure_ascii=False), pending_draft
 
-    # 仅在校验通过后增加讨价还价次数，避免失败或重放时误计数
-    if is_bargain and reward_actually_changed:
+    pending_draft["_draft_commit_valid"] = True
+    # 仅「原草案已合规 + 本次仍合规」且实际改了奖励类字段时计为一次讨价还价
+    if is_bargain and reward_actually_changed and prev_commit_ok:
         pending_draft["bargain_count"] = int(pending_draft.get("bargain_count", 0)) + 1
 
     payload = {
@@ -264,15 +271,11 @@ def execute_confirm_agent_task(
             "message": "草案校验未通过，无法确认。",
         }, ensure_ascii=False), pending_draft, None
 
-    # 分配正式任务 ID
-    task_id = game_data.tasks.get_max_agent_task_id() + 1
-    pending_draft["id"] = task_id
-
-    # 写入任务文件（原子写入：先写临时文件再替换）
+    # 写入任务文件：在锁内按磁盘 agent_tasks.json 分配 ID（内存 TaskRegistry 写入后不会自动重载）
     try:
         from services.agent_tools.task_tools import write_confirmed_agent_task_files
 
-        write_desc = write_confirmed_agent_task_files(
+        write_desc, task_id = write_confirmed_agent_task_files(
             draft=pending_draft,
             npc_name_fallback=npc_name or str(pending_draft.get("npc_name") or ""),
             game_data=game_data,
