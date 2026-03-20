@@ -4,6 +4,11 @@ from typing import Iterable
 
 from .item_registry import ItemRegistry
 
+# Agent 任务奖励的「阶段」现金等价基准（阶段为玩家进度 1～6）。
+# 与 prepare_task_context 的 reward_budget、校验 V7/V2 使用同一尺度。
+REWARD_STAGE_BASE_MIN = 10_000
+REWARD_STAGE_BASE_MAX = 30_000
+
 
 def parse_name_count(expr: str) -> tuple[str, int]:
     """

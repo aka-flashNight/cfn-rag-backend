@@ -11,7 +11,11 @@ import json
 from typing import Any, Optional
 
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
-from services.game_data.reward_utils import parse_name_count
+from services.game_data.reward_utils import (
+    REWARD_STAGE_BASE_MAX,
+    REWARD_STAGE_BASE_MIN,
+    parse_name_count,
+)
 from services.game_progress import (
     get_progress_stage_config,
     get_progress_stage_level_range,
@@ -46,45 +50,45 @@ _TASK_RULES: dict[str, str] = {
         "优先选择在玩家当前进度范围内的关卡，其次可选小于玩家进度的。（解锁ID ≤ 当前主线ID）"
         "area为“副本任务”的关卡通常仅可选择“简单”。只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求；否则只能选择“简单”。"
         "area为其他区域的地图关卡可选任意难度。"
-        "基础奖励上下限 ×2。"
+        "基础奖励上下限更高。"
     ),
     "清理": (
         "清理类任务：要求玩家通关指定关卡，但叙事上侧重'清除威胁/清理区域'。"
         "优先选择在玩家当前进度范围内的关卡，其次可选小于玩家进度的。（解锁ID ≤ 当前主线ID）"
         "area为“副本任务”的关卡通常仅可选择“简单”。只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求；否则只能选择“简单”。"
         "area为其他区域的地图关卡可选任意难度。"
-        "基础奖励上下限 ×2。"
+        "基础奖励上下限更高。"
     ),
     "挑战": (
         "挑战类任务：高难度通关，建议选择修罗或地狱难度。"
         "area为“副本任务”的关卡，只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求。"
         "奖励中经验占比应 ≥ 50%，金币占比可降低。"
-        "基础奖励上下限 ×2。"
+        "基础奖励上下限更高。"
     ),
     "切磋": (
         "切磋类任务：要求玩家通关当前NPC配置的专属切磋关卡。"
         "只能使用当前NPC的challenge属性对应的关卡。"
-        "基础奖励上下限 ×2。"
+        "基础奖励上下限更高。"
     ),
     "资源收集": (
         "资源收集类任务：要求玩家收集并提交指定数量的食材/药剂/材料/弹夹。"
         "提交物品必须在现有任务的提交物品+奖励物品池中。"
         "提交品总价值不超过基础奖励的200%。"
         "奖励在原有区间要求上，额外增加提交品总价值的1~2倍（下限+1×、上限+2×）。"
-        "资源是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
+        "收集的资源是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "装备缴纳": (
         "装备缴纳类任务：要求玩家获取并提交一件装备（武器/防具）。"
         "来源：合成配方、K点商店、其他阵营的NPC商店。"
         "提交品总价值不超过基础奖励的300%。"
         "奖励在原有区间要求上，额外增加提交品价值的1~2倍（下限+1×、上限+2×）。"
-        "装备是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
+        "缴纳的装备是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "特殊物品获取": (
         "特殊物品获取类任务：要求玩家获取并提交一个特殊物品。"
         "通常只需要1个物品。来源：合成配方、K点商店、其他阵营的NPC商店。"
         "包括插件、药剂、菜品、贵重消耗品等非装备物品。"
-        "特殊物品是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
+        "获取的特殊物品是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
     ),
     "物品持有": (
         "物品持有类任务：要求玩家持有（不提交）指定物品。"
@@ -97,14 +101,15 @@ _TASK_RULES: dict[str, str] = {
         "通关并收集类任务：组合通关+收集要求。"
         "收集物品必须是该关卡箱子的产出物品。"
         "收集数量建议使用箱子的最小产出数量。"
-        "基础奖励 ×2，再叠加收集品加成（提交品价值计入奖励区间：下限+1×、上限+2×）。"
+        "基础奖励上下限更高，并需要再叠加收集品加成（提交品价值计入奖励区间：下限+1×、上限+2×）。"
         "收集品是玩家提交给完成NPC的。完成NPC可以选自己，也可以选他人，但需要任务文本的配合。"
         "如果当前关卡的area是“副本任务”，且只有两个难度选择，而你在 finish_requirements 里选择了非“简单”的难度（例如“地狱”），请务必在任务说明中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
     "通关并持有": (
         "通关并持有类任务：组合通关+持有要求。"
         "持有物品必须是该关卡箱子的产出物品。"
-        "基础奖励 ×2，再叠加持有品加成（持有品按 0.5× 计入奖励区间，规则同「物品持有」类）。"
+        "基础奖励上下限更高，并需要再叠加持有品加成（持有品按 0.5× 计入奖励区间，上限不超过基础奖励的50%。）。"
+        "持有品本身总价值上限为基础奖励的200%。"
         "持有品不要求玩家提交。可以是需要情报物品，也可以是检验玩家的搜索成果等情况。"
         "如果当前关卡的area是“副本任务”，且只有两个难度选择，而你 finish_requirements 里选择了非“简单”的难度（例如“地狱”），请务必在任务说明中明显提醒玩家正在选择挑战模式，并在接取/完成台词里明确提到要挑战该高难度模式。"
     ),
@@ -126,8 +131,8 @@ def _compute_reward_budget(
     task_type: str,
     affinity: int,
 ) -> dict[str, Any]:
-    base_min = stage * 10000
-    base_max = stage * 20000
+    base_min = stage * REWARD_STAGE_BASE_MIN
+    base_max = stage * REWARD_STAGE_BASE_MAX
     multiplier = 2 if task_type in _COMBAT_TYPES else 1
 
     if affinity >= 80:
@@ -142,11 +147,8 @@ def _compute_reward_budget(
     final_min = int(base_min * multiplier * aff_mod)
     final_max = int(base_max * multiplier * aff_mod)
 
+    # 只返回模型定价用的上下限；基础值/倍率由后端内部使用，校验 V7 亦不从本字段读取。
     return {
-        "base_min": base_min,
-        "base_max": base_max,
-        "multiplier": multiplier,
-        "affinity_modifier": aff_mod,
         "final_min": final_min,
         "final_max": final_max,
     }
@@ -1259,7 +1261,7 @@ def prepare_task_context(
         )
 
     elif task_type == "资源收集":
-        base_max = stage * 20000
+        base_max = stage * REWARD_STAGE_BASE_MAX
         context["collectable_items"] = _build_collectable_items(
             game_data, stage, max_level, base_max,
         )
@@ -1275,7 +1277,7 @@ def prepare_task_context(
         )
 
     elif task_type == "物品持有":
-        base_max = stage * 20000
+        base_max = stage * REWARD_STAGE_BASE_MAX
         context["holdable_items"] = _build_holdable_items(
             game_data, stage, max_level, base_max,
         )

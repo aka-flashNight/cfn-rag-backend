@@ -1388,7 +1388,7 @@ Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
 |------|------|------|
 | `level_range` | `[int, int]` | 玩家当前阶段的等级区间，如 `[1, 20]` |
 | `main_task_range` | `[int, int]` | 玩家当前阶段的主线任务 ID 区间，如 `[1, 50]` |
-| `reward_budget` | `object` | 奖励总额区间 `{base_min, base_max, multiplier, final_min, final_max}`，已根据 `task_type` 和好感度计算好倍率 |
+| `reward_budget` | `object` | 仅含 `final_min`、`final_max`（金币等价总价值参考上下限，已含任务类型倍率与好感修正）；校验 V7 不读取本对象，按草案实算；含提交/持有时实际上限常高于 `final_max` |
 | `existing_tasks` | `list` | 当前 NPC 已发布的任务列表 `[{id, title, type}]`，供 LLM 避免重复 |
 | `reward_item_candidates` | `list` | 根据 `reward_types` 筛选的可选奖励物品 `[{name, type, price, level?, source}]`，`source` 标注来源（`"任务奖励可选"` / `"NPC商店"`），已根据玩家等级筛选 |
 | `task_rules` | `str` | 该任务类型的思路说明、限制条件、注意事项（纯文本，供 LLM 理解规则） |

@@ -4,7 +4,11 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from services.game_progress import VALID_STAGE_ROOTS
-from services.game_data.reward_utils import parse_name_count
+from services.game_data.reward_utils import (
+    REWARD_STAGE_BASE_MAX,
+    REWARD_STAGE_BASE_MIN,
+    parse_name_count,
+)
 
 if TYPE_CHECKING:
     from services.game_data.registry import GameDataRegistry
@@ -119,8 +123,8 @@ def _compute_reward_value_range(
 
     bargain_rate：讨价还价上限放大倍数（只影响 final_max）。
     """
-    base_min = stage * 10000
-    base_max = stage * 20000
+    base_min = stage * REWARD_STAGE_BASE_MIN
+    base_max = stage * REWARD_STAGE_BASE_MAX
 
     type_mult = 2 if task_type in COMBAT_TASK_TYPES else 1
 
@@ -235,7 +239,7 @@ def _validate_v2_item_quantity_reasonableness(
 
     over: list[dict[str, Any]] = []
     stage = int(getattr(context, "stage", 1) or 1)
-    base_max = stage * 20000
+    base_max = stage * REWARD_STAGE_BASE_MAX
     task_type = draft.get("task_type", "") if isinstance(draft, dict) else ""
     type_mult = 2 if isinstance(task_type, str) and task_type in COMBAT_TASK_TYPES else 1
 
