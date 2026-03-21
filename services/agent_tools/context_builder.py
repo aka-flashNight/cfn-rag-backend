@@ -256,7 +256,7 @@ _TASK_RULES: dict[str, str] = {
     "挑战": (
         "挑战类任务：高难度通关，建议选择修罗或地狱难度。"
         "area为“副本任务”的关卡，只有当关卡配置了额外的难度候选项时（副本类只有最多两个选项），才允许选择该额外难度，选择时需明确提醒难度要求。"
-        "奖励中经验占比应 ≥ 50%，金币占比可降低。"
+        "奖励中经验占比应 ≥ 50%，金币占比可降低。可适当给一些技能点。"
         "基础奖励上下限更高。"
     ),
     "切磋": (
@@ -703,6 +703,7 @@ def _build_reward_item_candidates(
         reward_keywords=reward_keywords,
         reward_task_tier_by_name=reward_task_tier_by_name,
         max_n=20,
+        selected_reward_types=all_types,
     )
 
 
@@ -1768,6 +1769,183 @@ def _build_stage_loot_list(
     return result[:20]
 
 
+# 每种在数据侧通常唯一对应条目；若玩家勾选了该奖励类型，截断列表中优先保证出现。
+SINGLETON_REWARD_LABELS: frozenset[str] = frozenset({
+    "金币", "经验", "K点", "技能点", "强化石",
+})
+
+
+def _sort_candidates_by_task_tier_shuffle(
+    items: list[dict[str, Any]],
+    *,
+    reward_task_tier_by_name: dict[str, int],
+) -> list[dict[str, Any]]:
+    """任务奖励池侧：tier 1→4→其余；同 tier 内随机（商店物品多为 tier 5，落在最后一桶）。"""
+    t1: list[dict[str, Any]] = []
+    t2: list[dict[str, Any]] = []
+    t3: list[dict[str, Any]] = []
+    t4: list[dict[str, Any]] = []
+    rest: list[dict[str, Any]] = []
+    for c in items:
+        tr = reward_task_tier_by_name.get(c.get("name") or "", 5)
+        if tr <= 1:
+            t1.append(c)
+        elif tr == 2:
+            t2.append(c)
+        elif tr == 3:
+            t3.append(c)
+        elif tr == 4:
+            t4.append(c)
+        else:
+            rest.append(c)
+    return _shuffle_each_bucket_concat([t1, t2, t3, t4, rest])
+
+
+def _pin_requested_singleton_candidates(
+    candidates: list[dict[str, Any]],
+    selected_reward_types: list[str],
+    item_registry: Any,
+    equipment_mods: Any,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """按勾选顺序为每种「单例」奖励类型至多保留 1 条；优先 NPC 商店来源。"""
+    pinned: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for t in selected_reward_types:
+        if t not in SINGLETON_REWARD_LABELS:
+            continue
+        matches: list[dict[str, Any]] = []
+        for c in candidates:
+            name = c.get("name") or ""
+            if not name or name in seen_names:
+                continue
+            it = item_registry.get_by_name(name)
+            if it is None:
+                continue
+            if _matches_reward_type(it, t, equipment_mods):
+                matches.append(c)
+        if not matches:
+            continue
+        matches.sort(key=lambda x: 0 if x.get("source") == "NPC商店" else 1)
+        best = matches[0]
+        nm = best.get("name") or ""
+        if nm:
+            seen_names.add(nm)
+        pinned.append(best)
+    return pinned, seen_names
+
+
+def _proportional_pick_one_source(
+    pool: list[dict[str, Any]],
+    non_sing_types: list[str],
+    n: int,
+    item_registry: Any,
+    equipment_mods: Any,
+    reward_task_tier_by_name: dict[str, int],
+) -> list[dict[str, Any]]:
+    """
+    单侧来源（仅商店或仅任务池）：在非单例类型间轮询均分名额；
+    每类型内部按任务 tier 分桶后桶内随机；无法归入类型的条目最后补齐。
+    """
+    if n <= 0 or not pool:
+        return []
+    if not non_sing_types:
+        ordered = _sort_candidates_by_task_tier_shuffle(
+            pool, reward_task_tier_by_name=reward_task_tier_by_name,
+        )
+        return ordered[:n]
+
+    groups: dict[str, list[dict[str, Any]]] = {t: [] for t in non_sing_types}
+    orphans: list[dict[str, Any]] = []
+    for c in pool:
+        it = item_registry.get_by_name(c.get("name") or "")
+        placed = False
+        if it is not None:
+            for t in non_sing_types:
+                if _matches_reward_type(it, t, equipment_mods):
+                    groups[t].append(c)
+                    placed = True
+                    break
+        if not placed:
+            orphans.append(c)
+
+    for t in non_sing_types:
+        groups[t] = _sort_candidates_by_task_tier_shuffle(
+            groups[t], reward_task_tier_by_name=reward_task_tier_by_name,
+        )
+    orphans = _sort_candidates_by_task_tier_shuffle(
+        orphans, reward_task_tier_by_name=reward_task_tier_by_name,
+    )
+    non_empty = [t for t in non_sing_types if groups[t]]
+    picked: list[dict[str, Any]] = []
+    if non_empty:
+        idxs = {t: 0 for t in non_empty}
+        while len(picked) < n:
+            progressed = False
+            for t in non_empty:
+                if len(picked) >= n:
+                    break
+                arr = groups[t]
+                i = idxs[t]
+                if i < len(arr):
+                    picked.append(arr[i])
+                    idxs[t] = i + 1
+                    progressed = True
+            if not progressed:
+                break
+    if len(picked) < n and orphans:
+        picked.extend(orphans[: n - len(picked)])
+    return picked[:n]
+
+
+def _pick_layer_shop_task_82_proportional(
+    items: list[dict[str, Any]],
+    n: int,
+    non_sing_types: list[str],
+    item_registry: Any,
+    equipment_mods: Any,
+    reward_task_tier_by_name: dict[str, int],
+) -> list[dict[str, Any]]:
+    """
+    某一档内（全量池 / 关键词命中池 / 关键词未命中池）：商店 : 任务池 = 8 : 2
+   （与 _allocate_remainder_quota_pools mode「82」同一口径：低档 round(n×20%)，余数给商店侧）；
+    各侧再按类型轮询 + tier 内随机；名额不足时从另一侧与剩余项按 tier 顺序补齐。
+    """
+    if n <= 0 or not items:
+        return []
+    shop = [c for c in items if c.get("source") == "NPC商店"]
+    task = [c for c in items if c.get("source") != "NPC商店"]
+    q_task = int(round(n * 2 / 10))
+    q_shop = n - q_task
+    ps = _proportional_pick_one_source(
+        shop, non_sing_types, q_shop,
+        item_registry, equipment_mods, reward_task_tier_by_name,
+    )
+    pt = _proportional_pick_one_source(
+        task, non_sing_types, q_task,
+        item_registry, equipment_mods, reward_task_tier_by_name,
+    )
+    picked = ps + pt
+    seen: set[str] = {x.get("name") or "" for x in picked if x.get("name")}
+    if len(picked) < n:
+        rest = [
+            c for c in items
+            if (c.get("name") or "") not in seen
+        ]
+        rest = _sort_candidates_by_task_tier_shuffle(
+            rest, reward_task_tier_by_name=reward_task_tier_by_name,
+        )
+        for c in rest:
+            if len(picked) >= n:
+                break
+            nm = c.get("name") or ""
+            if nm and nm in seen:
+                continue
+            picked.append(c)
+            if nm:
+                seen.add(nm)
+    return picked[:n]
+
+
 def _finalize_reward_item_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -1776,64 +1954,58 @@ def _finalize_reward_item_candidates(
     reward_keywords: Optional[list[str]],
     reward_task_tier_by_name: dict[str, int],
     max_n: int = 20,
+    selected_reward_types: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
+    """
+    截断优先级（从高到低）：
+    1) 勾选的单例类型（金币/经验/K点/技能点/强化石）各至多 1 条且优先商店——排在一切关键词之前，
+       因勾选即表示玩家/NPC 明确需要；
+    2) 剩余名额：有关键词时先填「关键词命中」再填「未命中」；
+    3) 上述每一层内部：商店 : 任务池 = 8 : 2，再按非单例奖励类型轮询均分，
+       类型内按任务进度 tier 分桶、桶内随机；不足则跨源补齐。
+    """
     kw = _normalize_kw_list(reward_keywords)
-    if not kw:
-        shop = [c for c in candidates if c.get("source") == "NPC商店"]
-        t1: list[dict[str, Any]] = []
-        t2: list[dict[str, Any]] = []
-        t3: list[dict[str, Any]] = []
-        t4: list[dict[str, Any]] = []
-        for c in candidates:
-            if c.get("source") == "NPC商店":
-                continue
-            tr = reward_task_tier_by_name.get(c.get("name") or "", 5)
-            if tr <= 1:
-                t1.append(c)
-            elif tr == 2:
-                t2.append(c)
-            elif tr == 3:
-                t3.append(c)
-            else:
-                t4.append(c)
-        ordered = _shuffle_each_bucket_concat([shop, t1, t2, t3, t4])
-        return ordered[:max_n]
+    sel = list(selected_reward_types or [])
+    pinned, pinned_names = _pin_requested_singleton_candidates(
+        candidates, sel, item_registry, equipment_mods,
+    )
+    pool = [c for c in candidates if (c.get("name") or "") not in pinned_names]
+    budget = max(0, max_n - len(pinned))
+    non_sing = [t for t in sel if t not in SINGLETON_REWARD_LABELS]
 
+    if budget <= 0:
+        return pinned[:max_n]
+
+    if not kw:
+        rest = _pick_layer_shop_task_82_proportional(
+            pool, budget, non_sing,
+            item_registry, equipment_mods, reward_task_tier_by_name,
+        )
+        return (pinned + rest)[:max_n]
+
+    # 关键词分层在单例占位之后；命中池、未命中池各自内部仍为 8:2 商店优先 + 类型轮询。
     matched: list[dict[str, Any]] = []
     unmatched: list[dict[str, Any]] = []
-    for c in candidates:
+    for c in pool:
         it = item_registry.get_by_name(c.get("name") or "")
         if _entry_matches_item_keywords(c, it, equipment_mods, kw):
             matched.append(c)
         else:
             unmatched.append(c)
 
-    m_shop = [c for c in matched if c.get("source") == "NPC商店"]
-    m_t1: list[dict[str, Any]] = []
-    m_t2: list[dict[str, Any]] = []
-    m_t3: list[dict[str, Any]] = []
-    m_t4: list[dict[str, Any]] = []
-    for c in matched:
-        if c.get("source") == "NPC商店":
-            continue
-        tr = reward_task_tier_by_name.get(c.get("name") or "", 5)
-        if tr <= 1:
-            m_t1.append(c)
-        elif tr == 2:
-            m_t2.append(c)
-        elif tr == 3:
-            m_t3.append(c)
-        else:
-            m_t4.append(c)
-    mk = _shuffle_each_bucket_concat([m_shop, m_t1, m_t2, m_t3, m_t4])
-    picked = mk[:max_n]
-    if len(picked) >= max_n:
-        return picked
-    rem = max_n - len(picked)
-    shop_u = [c for c in unmatched if c.get("source") == "NPC商店"]
-    task_u = [c for c in unmatched if c.get("source") != "NPC商店"]
-    picked.extend(_allocate_remainder_quota_pools(rem, [shop_u, task_u], "82"))
-    return picked[:max_n]
+    take_kw = min(budget, len(matched))
+    p_kw = _pick_layer_shop_task_82_proportional(
+        matched, take_kw, non_sing,
+        item_registry, equipment_mods, reward_task_tier_by_name,
+    )
+    budget -= len(p_kw)
+    p_nkw: list[dict[str, Any]] = []
+    if budget > 0 and unmatched:
+        p_nkw = _pick_layer_shop_task_82_proportional(
+            unmatched, budget, non_sing,
+            item_registry, equipment_mods, reward_task_tier_by_name,
+        )
+    return (pinned + p_kw + p_nkw)[:max_n]
 
 
 # ---------------------------------------------------------------------------
