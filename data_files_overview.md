@@ -1343,13 +1343,14 @@ class GameDataRegistry:
 
 所有工具使用 OpenAI Function Calling 格式定义（兼容 LangChain `@tool` 装饰器）。工具按职责划分为**任务准备工具**、**任务写入工具**、**好感度工具**和**通用查询工具**四类。
 
-现设计为**两步式调用**流程——由后端根据任务类型一次性返回所需的全部筛选后数据，减少 LLM 的决策负担：
+现设计为**准备上下文 → 拟定草案 → 玩家确认写入**流程（其中「拟定」与「确认」为两步工具调用）——由后端根据任务类型一次性返回所需的全部筛选后数据，减少 LLM 的决策负担：
 
 ```
 Step 1: LLM 调用 prepare_task_context(task_type, reward_types)
         → 后端根据类型筛选数据，返回该类型所需的完整上下文 + 规则说明
 Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
-        → 后端校验并暂存草案
+        → 后端校验并暂存草案（不含任务说明与接取/完成对话）
+Step 3: 玩家接受后调用 confirm_agent_task，传入说明与对话，后端合并后写入
 ```
 
 ---
@@ -1473,9 +1474,9 @@ Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
 
 | 工具名 | 参数 | 返回值 | 说明 |
 |--------|------|--------|------|
-| `draft_agent_task` | `TaskDraft`（完整的结构化任务草案） | `{success, draft_id, validation_errors?}` | 第二步：生成并校验任务草案，暂存到 DB |
-| `update_task_draft` | `draft_id: str, modify_fields: dict` | `{success, draft_id, validation_errors?}` | 局部修改已有草案（如仅调整奖励、更换关卡），后端对修改字段重新校验，无需重新生成完整草案 |
-| `confirm_agent_task` | 无（读取当前会话的 pending draft） | `{success, task_id?, error?}` | 确认并写入任务到游戏文件 |
+| `draft_agent_task` | 结构化草案（**不含** `description` / `get_dialogue` / `finish_dialogue`） | `{success, draft_id, validation_errors?}` | 第二步：生成并校验任务草案，暂存到 DB |
+| `update_task_draft` | `draft_id: str, modify_fields: dict` | `{success, draft_id, validation_errors?}` | 局部修改已有草案；**不可**通过此工具修改说明与对话 |
+| `confirm_agent_task` | `draft_id` + `description` + `get_dialogue` + `finish_dialogue`（及可选 `ui_hint`） | `{success, task_id?, error?}` | 与 pending 草案合并后最终校验并写入游戏文件 |
 | `cancel_agent_task` | 无 | `{success}` | 取消当前待确认的任务草案 |
 
 **C. 好感度工具**
@@ -1508,7 +1509,7 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 - 格式一致性由代码保证，不依赖 LLM 的格式遵从能力。
 - 注意，"问候"、"传话"大体上是一类任务，"通关"、"清理"大体上是一类任务，"装备缴纳"、 "特殊物品获取"大体上是一类任务，这里细分只是为了让LLM能更好的对应当前情景，其返回的所需数据以及管控说明是基本一致的。
 
-`draft_agent_task` 工具的参数 JSON Schema：
+`draft_agent_task` 工具的参数 JSON Schema（**权威定义以** `services/agent_tools/schemas.py` **为准**；任务说明与接取/完成对话在 `confirm_agent_task` 传入）：
 
 ```json
 {
@@ -1518,18 +1519,17 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
       "type": "string",
       "enum": ["问候", "传话", "通关", "清理", "挑战", "切磋", "资源收集", "装备缴纳", "特殊物品获取", "物品持有", "通关并收集", "通关并持有"]
     },
-    "title": { "type": "string", "description": "任务标题，简洁明了" },
-    "description": { "type": "string", "description": "任务描述，简要说明目标" },
+    "title": { "type": "string" },
     "get_requirements": {
-      "type": "array", "items": { "type": "integer" },
-      "description": "前置主线任务 ID 数组，空数组表示无前置。禁止使用 -1。"
+      "type": "array",
+      "items": { "type": "integer" }
     },
     "finish_requirements": {
       "type": "array",
       "items": {
         "type": "object",
         "properties": {
-          "stage_name": { "type": "string", "description": "关卡名，如 '商业区'" },
+          "stage_name": { "type": "string" },
           "difficulty": { "type": "string", "enum": ["简单", "冒险", "修罗", "地狱"] }
         },
         "required": ["stage_name", "difficulty"]
@@ -1568,10 +1568,11 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
         "required": ["item_name", "count"]
       }
     },
-    "get_conversation_text": { "type": "string", "description": "接取时 NPC 的对话文本" },
-    "finish_conversation_text": { "type": "string", "description": "完成时 NPC 的对话文本" }
+    "get_npc": { "type": "string" },
+    "finish_npc": { "type": "string" },
+    "ui_hint": { "type": "string", "maxLength": 12 }
   },
-  "required": ["task_type", "title", "description", "get_requirements", "rewards", "get_conversation_text", "finish_conversation_text"]
+  "required": ["task_type", "title", "get_requirements", "rewards"]
 }
 ```
 
@@ -1581,22 +1582,18 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 {
   "type": "object",
   "properties": {
-    "draft_id": {
-      "type": "string",
-      "description": "要修改的草案 ID（从 draft_agent_task 返回值获取）"
-    },
+    "draft_id": { "type": "string" },
+    "ui_hint": { "type": "string", "maxLength": 12 },
     "modify_fields": {
       "type": "object",
-      "description": "要修改的字段集合，仅包含需要变更的字段，未包含的字段保持原值不变",
       "properties": {
         "title": { "type": "string" },
-        "description": { "type": "string" },
-        "finish_requirements": { "type": "array", "description": "替换整个通关要求列表" },
-        "finish_submit_items": { "type": "array", "description": "替换整个提交物品列表" },
-        "finish_contain_items": { "type": "array", "description": "替换整个持有物品列表" },
-        "rewards": { "type": "array", "description": "替换整个奖励列表" },
-        "get_conversation_text": { "type": "string" },
-        "finish_conversation_text": { "type": "string" }
+        "finish_requirements": { "type": "array" },
+        "finish_submit_items": { "type": "array" },
+        "finish_contain_items": { "type": "array" },
+        "rewards": { "type": "array" },
+        "get_npc": { "type": "string" },
+        "finish_npc": { "type": "string" }
       },
       "additionalProperties": false
     }
@@ -1605,7 +1602,47 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 }
 ```
 
-> **设计说明**：`update_task_draft` 采用**整字段替换**策略（而非深层合并），即 `modify_fields` 中出现的字段会完全替换草案中对应字段的值，未出现的字段保持不变。这样 LLM 只需关注要改什么，不需要重新构造整个草案，同时语义清晰、不易出错。后端收到修改后，对变更的字段执行与 `draft_agent_task` 相同的校验管线（见 6.4.2），校验不通过则返回 `validation_errors`。注意 `task_type` 和 `get_requirements` 不允许通过此工具修改——如需更改任务类型，应重新调用 `prepare_task_context` + `draft_agent_task`。
+`confirm_agent_task` 工具的参数 JSON Schema：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "draft_id": { "type": "string" },
+    "description": { "type": "string" },
+    "get_dialogue": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "title": { "type": "string" },
+          "emotion": { "type": "string" },
+          "text": { "type": "string" }
+        },
+        "required": ["name", "title", "text"]
+      }
+    },
+    "finish_dialogue": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "title": { "type": "string" },
+          "emotion": { "type": "string" },
+          "text": { "type": "string" }
+        },
+        "required": ["name", "title", "text"]
+      }
+    },
+    "ui_hint": { "type": "string", "maxLength": 12 }
+  },
+  "required": ["draft_id", "description", "get_dialogue", "finish_dialogue"]
+}
+```
+
+> **设计说明**：`update_task_draft` 采用**整字段替换**策略（而非深层合并），即 `modify_fields` 中出现的字段会完全替换草案中对应字段的值，未出现的字段保持不变。这样 LLM 只需关注要改什么，不需要重新构造整个草案，同时语义清晰、不易出错。后端收到修改后，对变更的字段执行与 `draft_agent_task` 相同的校验管线（见 6.4.2），校验不通过则返回 `validation_errors`。注意 `task_type` 和 `get_requirements` 不允许通过此工具修改——如需更改任务类型，应重新调用 `prepare_task_context` + `draft_agent_task`。任务说明与接取/完成对话**仅**在 `confirm_agent_task` 合并进草案并落库。
 
 ##### 6.4.2 后端校验管线（Validation Pipeline）
 

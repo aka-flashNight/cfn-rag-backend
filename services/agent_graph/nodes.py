@@ -31,6 +31,7 @@ from services.npc_mood_agent import (
 )
 from services.agent_tools.tool_executor import dispatch_tool_call
 from services.agent_tools import (
+    CONFIRM_AGENT_TASK_TOOL,
     PREPARE_TASK_CONTEXT_TOOL,
     SEARCH_KNOWLEDGE_TOOL,
     DRAFT_AGENT_TASK_TOOL,
@@ -54,24 +55,6 @@ ALL_TOOLS = [
     UPDATE_TASK_DRAFT_TOOL,
     UPDATE_NPC_MOOD_TOOL,
 ]
-
-CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "confirm_agent_task",
-        "description": "确认当前草案并写入任务系统。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": "string"},
-                # 用于 SSE/前端显示：非常短的“正在进行中”提示
-                "ui_hint": {"type": "string", "maxLength": 12},
-            },
-            "required": ["draft_id"],
-            "additionalProperties": False,
-        },
-    },
-}
 
 CANCEL_AGENT_TASK_TOOL: dict[str, Any] = {
     "type": "function",

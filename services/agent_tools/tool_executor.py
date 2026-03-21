@@ -107,11 +107,16 @@ def execute_draft_agent_task(
         game_data = get_game_data_registry()
 
     draft_id = str(uuid.uuid4())[:8]
+    # 任务说明与接取/完成对话仅在 confirm_agent_task 写入；忽略拟定阶段若误传的这些字段
+    args_clean = dict(args)
+    for _k in ("description", "get_dialogue", "finish_dialogue"):
+        args_clean.pop(_k, None)
+
     draft: dict[str, Any] = {
         "draft_id": draft_id,
         "npc_name": npc_name,
         "bargain_count": 0,  # 讨价还价次数，上限 2 次（仅调整奖励时计数）
-        **args,
+        **args_clean,
     }
     draft.pop("_draft_commit_valid", None)
 
@@ -169,6 +174,21 @@ def execute_update_task_draft(
     modify_fields = args.get("modify_fields", {})
     if not isinstance(modify_fields, dict):
         modify_fields = {}
+    # 文案类字段仅能通过 confirm_agent_task 写入
+    _text_only_on_confirm = {"description", "get_dialogue", "finish_dialogue"}
+    modify_fields = {k: v for k, v in modify_fields.items() if k not in _text_only_on_confirm}
+    if not modify_fields:
+        return json.dumps(
+            {
+                "status": "error",
+                "message": (
+                    "modify_fields 不能为空。"
+                    "任务说明与接取/完成对话请仅在玩家接受任务时通过 confirm_agent_task 传入，"
+                    "不要写在 update_task_draft 中。"
+                ),
+            },
+            ensure_ascii=False,
+        ), pending_draft
 
     prev_commit_ok = bool(pending_draft.get("_draft_commit_valid"))
 
@@ -257,13 +277,43 @@ def execute_confirm_agent_task(
     if game_data is None:
         game_data = get_game_data_registry()
 
-    # 最终校验
+    arg_draft_id = str(args.get("draft_id") or "").strip()
+    pending_id = str(pending_draft.get("draft_id") or "").strip()
+    if not arg_draft_id or arg_draft_id != pending_id:
+        return json.dumps(
+            {
+                "status": "error",
+                "message": (
+                    "draft_id 与当前待确认草案不一致或缺失；请使用工具返回的 draft_summary 中的草案 ID。"
+                ),
+                "expected_draft_id": pending_id,
+                "got_draft_id": arg_draft_id,
+            },
+            ensure_ascii=False,
+        ), pending_draft, None
+
+    desc = args.get("description", "")
+    if not isinstance(desc, str):
+        desc = str(desc) if desc is not None else ""
+    get_dg = args.get("get_dialogue")
+    fin_dg = args.get("finish_dialogue")
+    if not isinstance(get_dg, list):
+        get_dg = []
+    if not isinstance(fin_dg, list):
+        fin_dg = []
+
+    draft_for_commit = dict(pending_draft)
+    draft_for_commit["description"] = desc
+    draft_for_commit["get_dialogue"] = get_dg
+    draft_for_commit["finish_dialogue"] = fin_dg
+
+    # 最终校验（含合并后的说明与对话）
     validation_ctx = _build_validation_ctx(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
     )
-    result = validate_task_draft(pending_draft, context=validation_ctx, game_data=game_data)
+    result = validate_task_draft(draft_for_commit, context=validation_ctx, game_data=game_data)
     if not result.success:
         return json.dumps({
             "status": "validation_failed",
@@ -276,12 +326,12 @@ def execute_confirm_agent_task(
         from services.agent_tools.task_tools import write_confirmed_agent_task_files
 
         write_desc, task_id = write_confirmed_agent_task_files(
-            draft=pending_draft,
+            draft=draft_for_commit,
             npc_name_fallback=npc_name or str(pending_draft.get("npc_name") or ""),
             game_data=game_data,
         )
     except Exception as e:
-        detailed = _detailed_draft_summary(pending_draft, game_data)
+        detailed = _detailed_draft_summary(draft_for_commit, game_data)
         return json.dumps(
             {
                 "status": "error",
@@ -291,7 +341,7 @@ def execute_confirm_agent_task(
             ensure_ascii=False,
         ), pending_draft, None
 
-    detailed = _detailed_draft_summary(pending_draft, game_data)
+    detailed = _detailed_draft_summary(draft_for_commit, game_data)
     confirm_payload: dict[str, Any] = {
         "status": "confirmed",
         "task_id": task_id,
@@ -407,7 +457,11 @@ def _detailed_draft_summary(
     lines.append(f"发布NPC: {draft.get('npc_name', '?')}")
     lines.append(f"类型: {draft.get('task_type', '?')}")
     lines.append(f"标题: {draft.get('title', '?')}")
-    lines.append(f"描述: {draft.get('description', '?')}")
+    _desc = draft.get("description")
+    if isinstance(_desc, str) and _desc.strip():
+        lines.append(f"描述: {_desc}")
+    else:
+        lines.append("描述: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
     # get/finish NPC：缺省时用 npc_name 兜底（后端写入逻辑一致）
     npc_name_fallback = draft.get("npc_name") or "?"
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
@@ -475,6 +529,8 @@ def _detailed_draft_summary(
         get_text = draft.get("get_conversation_text", "")
         if isinstance(get_text, str) and get_text.strip():
             lines.append(f"接取对话(旧字段): {get_text.strip()[:120]}{'…' if len(get_text.strip()) > 120 else ''}")
+        else:
+            lines.append("接取对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     finish_dialogue = draft.get("finish_dialogue")
     finish_summary = _summarize_dialogue(finish_dialogue)
@@ -484,6 +540,8 @@ def _detailed_draft_summary(
         finish_text = draft.get("finish_conversation_text", "")
         if isinstance(finish_text, str) and finish_text.strip():
             lines.append(f"完成对话(旧字段): {finish_text.strip()[:120]}{'…' if len(finish_text.strip()) > 120 else ''}")
+        else:
+            lines.append("完成对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     return "\n".join(lines)
 
@@ -542,13 +600,13 @@ def dispatch_tool_call(
     # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
     # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
 
-    if tool_name in _task_tool_names:
-        try:
-            pretty_args = json.dumps(tool_args, ensure_ascii=False)
-        except Exception:
-            pretty_args = str(tool_args)
-        print('——————【工具调用】——————')
-        print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         pretty_args = json.dumps(tool_args, ensure_ascii=False)
+    #     except Exception:
+    #         pretty_args = str(tool_args)
+    #     print('——————【工具调用】——————')
+    #     print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
 
     updated_draft = pending_draft
     task_write_result = None
@@ -617,15 +675,15 @@ def dispatch_tool_call(
         }, ensure_ascii=False)
 
     # Debug: 
-    if tool_name in _task_tool_names:
-        try:
-            # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
-            preview = (result or "")
-            # if isinstance(preview, str) and len(preview) > 3000:
-            #     preview = preview[:3000] + "…"
-        except Exception:
-            preview = "<preview-unavailable>"
-        print('——————【结果】——————')
-        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
+    #         preview = (result or "")
+    #         # if isinstance(preview, str) and len(preview) > 3000:
+    #         #     preview = preview[:3000] + "…"
+    #     except Exception:
+    #         preview = "<preview-unavailable>"
+    #     print('——————【结果】——————')
+    #     print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result

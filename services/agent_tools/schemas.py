@@ -63,6 +63,7 @@ class StageRequirement(TypedDict, total=False):
 class TaskDraft(TypedDict, total=False):
     task_type: str
     title: str
+    # 以下三项仅在 confirm_agent_task 时写入草案并落库；拟定/更新阶段不包含
     description: str
     get_requirements: List[int]
     finish_requirements: List[StageRequirement]
@@ -72,7 +73,7 @@ class TaskDraft(TypedDict, total=False):
     # 发布/完成 NPC：可选；为空时由后端默认当前 NPC
     get_npc: str
     finish_npc: str
-    # 接取/完成对话：数组，每项为纯对话文本（不要包含【动作/神态/旁白】）
+    # 接取/完成对话：数组，每项为纯对话文本（不要包含【动作/神态/旁白】）；仅 confirm 时写入
     get_dialogue: List[dict[str, Any]]
     finish_dialogue: List[dict[str, Any]]
 
@@ -182,7 +183,6 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
     "properties": {
         "task_type": {"type": "string", "enum": TASK_TYPES},
         "title": {"type": "string", "description": "任务标题，简洁明了"},
-        "description": {"type": "string", "description": "任务描述，简要说明目标"},
         "get_requirements": {
             "type": "array",
             "items": {"type": "integer"},
@@ -206,27 +206,14 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
         },
         "get_npc": {"type": "string", "description": "接取时由谁发布（可为空，后端默认当前 NPC）"},
         "finish_npc": {"type": "string", "description": "完成时由谁发言（可为空，后端默认当前 NPC）"},
-        "get_dialogue": {
-            "type": "array",
-            "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "接取对话数组；可以包含 NPC 与玩家($PC)多条。",
-        },
-        "finish_dialogue": {
-            "type": "array",
-            "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "完成对话数组；可以包含 NPC 与玩家($PC)多条。",
-        },
         # 用于 SSE/前端显示：非常短的“正在进行中”提示
         "ui_hint": {"type": "string", "maxLength": 12, "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。"},
     },
     "required": [
         "task_type",
         "title",
-        "description",
         "get_requirements",
         "rewards",
-        "get_dialogue",
-        "finish_dialogue",
     ],
     "additionalProperties": False,
 }
@@ -255,15 +242,12 @@ UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA: dict[str, Any] = {
             "description": "要修改的字段集合，仅包含需要变更的字段，未包含的字段保持原值不变",
             "properties": {
                 "title": {"type": "string"},
-                "description": {"type": "string"},
                 "finish_requirements": {"type": "array", "items": STAGE_REQUIREMENT_SCHEMA},
                 "finish_submit_items": {"type": "array", "items": REWARD_ITEM_SCHEMA},
                 "finish_contain_items": {"type": "array", "items": REWARD_ITEM_SCHEMA},
                 "rewards": {"type": "array", "items": REWARD_ITEM_SCHEMA},
                 "get_npc": {"type": "string"},
                 "finish_npc": {"type": "string"},
-                "get_dialogue": {"type": "array", "items": DIALOGUE_ENTRY_SCHEMA},
-                "finish_dialogue": {"type": "array", "items": DIALOGUE_ENTRY_SCHEMA},
             },
             "additionalProperties": False,
         },
@@ -278,6 +262,47 @@ UPDATE_TASK_DRAFT_TOOL: dict[str, Any] = {
         "name": "update_task_draft",
         "description": "局部修改已有草案并触发增量校验（仅校验变更字段）。",
         "parameters": UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA,
+    },
+}
+
+
+CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "draft_id": {
+            "type": "string",
+            "description": "待确认的草案 ID（与 draft_summary 中一致）。",
+        },
+        "description": {
+            "type": "string",
+            "description": "任务说明/描述，须与最终确定的关卡、物品与奖励一致。",
+        },
+        "get_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": "接取对话数组；可含 NPC 与玩家($PC)多条。",
+        },
+        "finish_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": "完成对话数组；可含 NPC 与玩家($PC)多条。",
+        },
+        "ui_hint": {
+            "type": "string",
+            "maxLength": 12,
+            "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。",
+        },
+    },
+    "required": ["draft_id", "description", "get_dialogue", "finish_dialogue"],
+    "additionalProperties": False,
+}
+
+CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "confirm_agent_task",
+        "description": "玩家明确接受任务后调用：传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。",
+        "parameters": CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA,
     },
 }
 

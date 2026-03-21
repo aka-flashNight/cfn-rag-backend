@@ -33,8 +33,8 @@ TOOL_USAGE_GUIDE = """\
 3. 任务发布工具（两步式流程，详见下文【任务发布流程】）：
    - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，获取筛选后的可选数据与规则。
    - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。
-   - update_task_draft：局部修改已有的待确认草案（如调整奖励、更换关卡、更换提交物品，可同时修改多个属性），注意如果修改了任务要求或奖励类型，需要同步考虑是否更新任务描述与接取、完成对话。
-   - confirm_agent_task：玩家明确接受任务后，调用此工具确认并写入。
+   - update_task_draft：局部修改已有的待确认草案（如调整奖励、更换关卡、更换提交物品等，可同时修改多个属性）。
+   - confirm_agent_task：玩家明确接受任务后调用，传入与最终草案一致的任务说明（description）及接取/完成对话数组，后端合并后校验并写入。
    - cancel_agent_task：取消当前待确认的任务草案（玩家拒绝或你决定撤回时使用）。
 
 在调用上述工具时，如要求填入 `ui_hint`，可填非常短的“正在进行中……”类提示，且适配你的当前行为或聊天情景，必须 <=12 字符，用于前端展示。
@@ -57,10 +57,7 @@ TOOL_USAGE_GUIDE = """\
       - `emotions`（可选情绪列表）
       - `titles`（可选称号列表，name=当前 NPC 时可作为称呼参考）
   Step 2: 根据返回数据调用 draft_agent_task(TaskDraft)
-    - 以 JSON 结构化参数输出任务草案（标题、描述、前置任务、通关要求、提交物品、持有物品、奖励、接取对话数组、完成对话数组）。
-    - 接取对话数组和完成对话数组：每项都是 {name,title,emotion?,text}。
-      - `text` 必须是纯对话，不要包含任何动作/神态/旁白/【...】；需要表达神态/情绪请用 `emotion` 字段（可选情绪列表中选择，可为空/可缺省）。
-      - 任务对话数组中可以包含玩家：name 固定为 `"$PC"`，title 用 `"$PC_TITLE"`，并用 `emotion` 填玩家情绪（可为空/可缺省）。
+    - 以 JSON 结构化参数输出任务草案（标题、前置任务、通关要求、提交物品、持有物品、奖励、接取/完成 NPC 等）。
     - 后端会校验草案合法性，校验通过则暂存等待玩家确认；
       校验失败会返回具体错误，你需要根据错误调整后重新提交。如果一直错误，可取消任务发布。
 
@@ -78,11 +75,16 @@ TOOL_USAGE_GUIDE = """\
 ■ 协商流程（跨多轮对话）：
   - 草案创建后，以自然语言向玩家描述任务内容，并可以选择是否简述任务奖励。
   - 玩家可以接受、拒绝、讨价还价或要求修改：
-    · 接受 → 调用 confirm_agent_task 写入。
+    · 接受 → 调用 confirm_agent_task(draft_id, description, get_dialogue, finish_dialogue) 写入。
+      - `description`：写入任务系统的任务说明，须与最终关卡/物品/奖励一致。
+      - `get_dialogue` / `finish_dialogue`：数组，每项 {name,title,emotion?,text}；
+      - `text` 必须是纯对话，不要包含任何动作/神态/旁白/【...】；需要表达神态/情绪请用 `emotion` 字段（可选情绪列表中选择，可为空/可缺省）。
+      - 任务对话数组中可以包含玩家：name 固定为 `"$PC"`，title 用 `"$PC_TITLE"`，并用 `emotion` 填玩家情绪（可为空/可缺省）。
+      - 注意对话的顺序，对话/完成数组中分别按时间从前往后排列。
     · 拒绝 → 调用 cancel_agent_task 清除草案，以角色身份自然回应。
     · 讨价还价 → 你可视情况接受或拒绝；若接受，调用 update_task_draft 在允许范围内调整要求或奖励（最多 2 次），拒绝则不调用并在后续对话中拒绝。
       调整幅度受好感度影响：好感≥50可+30%~50%，好感20~49可+10%~50%，好感<20可+0%~30%，也可以不让步。
-    · 修改要求 → 调用 update_task_draft 做局部修改（调整数量、难度等）；若改动涉及提交物品类型、关卡类型或奖励类型，须同时考虑任务描述与接取、完成对话是否应修改。
+    · 修改要求 → 调用 update_task_draft 做局部修改（调整数量、难度等）。
     · 整体重拟 → 当玩家想要的任务类型/奖励类型与当前草案差别较大时，应主动重新调用 prepare_task_context + draft_agent_task，生成全新草案。
   - 如果玩家连续多轮对话未提及任务，草案会自动过期清除。
 
@@ -249,7 +251,8 @@ def build_layer3(
             "【待确认的任务草案】\n"
             f"{pending_draft_summary}\n"
             "玩家可能会接受、拒绝、讨价还价、要求变更任务类型或大幅调整。\n"
-            "讨价还价时调用 update_task_draft；变更任务类型或大幅调整用 prepare_task_context + draft_agent_task 重新拟定。"
+            "讨价还价时调用 update_task_draft；变更任务类型或大幅调整用 prepare_task_context + draft_agent_task 重新拟定。\n"
+            "玩家接受任务时，调用 confirm_agent_task 并传入任务描述和接取、完成对话。"
         )
 
     return "\n".join(parts)
