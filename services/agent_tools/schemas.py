@@ -85,17 +85,28 @@ class TaskDraft(TypedDict, total=False):
 PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "task_type": {"type": "string", "enum": TASK_TYPES},
+        "task_type": {
+            "type": "string",
+            "enum": TASK_TYPES,
+            "description": (
+                "NPC让玩家去做的事，例如让玩家打某关、让玩家提交某物给NPC等，满足NPC的需求。"
+            ),
+        },
         "reward_types": {
             "type": "object",
+            "description": (
+                "NPC给玩家的东西，也是玩家得到的东西，满足玩家的需求。"
+            ),
             "properties": {
                 "regular": {
                     "type": "array",
                     "items": {"type": "string", "enum": REWARD_REGULAR},
+                    "description": "常规奖励类型（如金币、经验）。",
                 },
                 "optional": {
                     "type": "array",
                     "items": {"type": "string", "enum": REWARD_OPTIONAL},
+                    "description": "可选/附加奖励类型，可按玩家的需要勾选。",
                 },
             },
             "required": ["regular", "optional"],
@@ -103,6 +114,22 @@ PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
         },
         # 用于 SSE/前端显示：非常短的“正在进行中”提示
         "ui_hint": {"type": "string", "maxLength": 12, "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。"},
+        "requirement_keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "可选。任务要求的关键词（模糊搜索）：用于将关卡名/区域说明/需提交或持有的物品名/物品类型等相关的候选项排到前面；"
+                "如果你需要玩家给你更具体的某个/某类物品，或者让玩家去某关卡/某区域，请在此填写关键词，可以填多个。示例：「食品」「食材」「抗生素」「矛」「废城」等。"
+            ),
+        },
+        "reward_keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "可选。奖励物品的关键词（模糊搜索），作用于 reward_item_candidates；"
+                "如果你想给玩家更具体的某类/某个奖励，请在此填写关键词，可以填多个。示例：「头部装备」「上装装备」「手枪」「增效剂」「罐头」「食材」「霰弹」等。"
+            ),
+        },
     },
     "required": ["task_type", "reward_types"],
     "additionalProperties": False,
@@ -112,7 +139,10 @@ PREPARE_TASK_CONTEXT_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "prepare_task_context",
-        "description": "根据意向任务类型与奖励偏好筛选数据，返回该类型的完整上下文与规则说明。",
+        "description": (
+            "根据意向任务类型与奖励偏好筛选数据，返回该类型的完整上下文与规则说明。"
+            "可选用 requirement_keywords / reward_keywords 优先展示与当前情境更相关的关卡与物品。"
+        ),
         "parameters": PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA,
     },
 }

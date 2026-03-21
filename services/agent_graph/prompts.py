@@ -31,7 +31,7 @@ TOOL_USAGE_GUIDE = """\
    参数: keyword（关键词）。当你不确定某个设定或信息时使用。
 
 3. 任务发布工具（两步式流程，详见下文【任务发布流程】）：
-   - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，获取筛选后的可选数据与规则。
+   - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，以及可选的需求/奖励关键词，获取筛选后的可选数据与规则。
    - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。
    - update_task_draft：局部修改已有的待确认草案（如调整奖励、更换关卡、更换提交物品等，可同时修改多个属性）。
    - confirm_agent_task：玩家明确接受任务后调用，传入与最终草案一致的任务说明（description）及接取/完成对话数组，后端合并后校验并写入。
@@ -43,7 +43,7 @@ TOOL_USAGE_GUIDE = """\
 【任务发布流程】
 
 ■ 两步式调用流程：
-  Step 1: 调用 prepare_task_context(task_type, reward_types)
+  Step 1: 调用 prepare_task_context(task_type, reward_types [, requirement_keywords?, reward_keywords?])
     - task_type （让玩家做的事）从以下类型中选择：
       "问候"、"传话"、"通关"、"清理"、"挑战"、"切磋"、"资源收集"、"装备缴纳"、"特殊物品获取"、"物品持有"、"通关并收集"、"通关并持有"
     - reward_types （给玩家的奖励）结构: 

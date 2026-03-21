@@ -8,6 +8,7 @@ prepare_task_context 工具执行器。
 from __future__ import annotations
 
 import json
+import random
 from typing import Any, Optional
 
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
@@ -17,6 +18,7 @@ from services.game_data.reward_utils import (
     parse_name_count,
 )
 from services.game_progress import (
+    _STAGE_ROOT_REGION_HINT_EXTRA,
     get_progress_stage_config,
     get_progress_stage_level_range,
     get_progress_stage_main_task_range,
@@ -26,6 +28,198 @@ from services.game_progress import (
 
 # 当 challenge 无 llm_hint 时使用的默认提醒（仅在选择该难度时随 challenge_modes 返回，按需占用 token）
 DEFAULT_CHALLENGE_LLM_HINT = "若选择此难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
+
+
+# ---------------------------------------------------------------------------
+# 关键词筛选（prepare_task_context 可选参数）
+# ---------------------------------------------------------------------------
+
+def _normalize_kw_list(keywords: Optional[list[str]]) -> list[str]:
+    if not keywords:
+        return []
+    out: list[str] = []
+    for k in keywords:
+        if not isinstance(k, str):
+            continue
+        s = k.strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _any_keyword_in_text(text: str, keywords: list[str]) -> bool:
+    if not text or not keywords:
+        return False
+    return any(kw in text for kw in keywords)
+
+
+def _item_keyword_search_text(item: Any, equipment_mods: Any) -> str:
+    """用于子串匹配：name / displayname / type / use，并补充 插件、食材、食品 等语义标签。"""
+    parts: list[str] = [
+        getattr(item, "name", "") or "",
+        getattr(item, "displayname", "") or "",
+        getattr(item, "type", "") or "",
+        getattr(item, "use", "") or "",
+    ]
+    name = getattr(item, "name", "") or ""
+    if name and equipment_mods.is_plugin(name):
+        parts.append("插件")
+    use = getattr(item, "use", "") or ""
+    typ = getattr(item, "type", "") or ""
+    if use == "食材" or typ == "食材":
+        parts.append("食材")
+    if "食品" in typ or use == "食品" or "菜" in typ:
+        parts.append("食品")
+    return "".join(parts)
+
+
+def _entry_matches_item_keywords(
+    entry: dict[str, Any],
+    item: Optional[Any],
+    equipment_mods: Any,
+    keywords: list[str],
+) -> bool:
+    if not keywords:
+        return False
+    blob = "".join([
+        str(entry.get("name") or ""),
+        str(entry.get("type") or ""),
+        str(entry.get("source") or ""),
+    ])
+    if _any_keyword_in_text(blob, keywords):
+        return True
+    if item is not None:
+        if _any_keyword_in_text(_item_keyword_search_text(item, equipment_mods), keywords):
+            return True
+    return False
+
+
+def _allocate_remainder_quota_pools(
+    remainder: int,
+    pools: list[list[dict[str, Any]]],
+    mode: str,
+) -> list[dict[str, Any]]:
+    """
+    关键词等优先档占满后，对「剩余名额」按档位比例分配：
+    - mode '82'：两档 pools[0] 高 : pools[1] 低 = 8 : 2（低档为 round(remainder×20%)，四舍五入）；
+    - mode '55'：两档 pools[0] : pools[1] = 5 : 5（先 round(remainder×50%)，余数给另一档）；
+    - mode '532'：三档 = 5 : 3 : 2（先 round 前两档，余数给第三档）。
+
+    pools 顺序为高优先级 → 低优先级；各池内部会先 shuffle。
+    某档数量不足时，先从高档池依次补齐，再从中档、低档耗尽为止。
+    """
+    if remainder <= 0 or not pools:
+        return []
+    n = len(pools)
+    if mode == "82":
+        if n != 2:
+            raise ValueError("mode 82 requires exactly 2 pools")
+        q_low = int(round(remainder * 2 / 10))
+        q_high = remainder - q_low
+        quotas = [q_high, q_low]
+    elif mode == "55":
+        if n != 2:
+            raise ValueError("mode 55 requires exactly 2 pools")
+        q0 = int(round(remainder * 5 / 10))
+        q1 = remainder - q0
+        quotas = [q0, q1]
+    elif mode == "532":
+        if n != 3:
+            raise ValueError("mode 532 requires exactly 3 pools")
+        q0 = int(round(remainder * 5 / 10))
+        q1 = int(round(remainder * 3 / 10))
+        q2 = remainder - q0 - q1
+        quotas = [q0, q1, q2]
+    else:
+        raise ValueError(f"unknown remainder quota mode: {mode!r}")
+
+    work = [list(p) for p in pools]
+    for w in work:
+        random.shuffle(w)
+    out: list[dict[str, Any]] = []
+    for i, q in enumerate(quotas):
+        take = min(q, len(work[i]))
+        out.extend(work[i][:take])
+        work[i] = work[i][take:]
+    while len(out) < remainder:
+        progressed = False
+        for i in range(len(work)):
+            if work[i]:
+                out.append(work[i].pop(0))
+                progressed = True
+                if len(out) >= remainder:
+                    break
+        if not progressed:
+            break
+    return out[:remainder]
+
+
+def _shuffle_each_bucket_concat(buckets: list[list[Any]]) -> list[Any]:
+    """保持桶之间的优先级顺序；同一优先级桶内随机打乱，避免长尾条目永远进不了截断列表。"""
+    out: list[Any] = []
+    for b in buckets:
+        bb = list(b)
+        random.shuffle(bb)
+        out.extend(bb)
+    return out
+
+
+def _item_level_matches_stage(item: Optional[Any], min_level: int, max_level: int) -> bool:
+    """等级为 0 或落在玩家阶段等级区间内视为「符合当前进度」。"""
+    if item is None:
+        return True
+    lv = int(getattr(item, "level", 0) or 0)
+    if lv == 0:
+        return True
+    return min_level <= lv <= max_level
+
+
+def _matched_items_ordered_level_then_source(
+    matched: list[dict[str, Any]],
+    *,
+    item_registry: Any,
+    min_level: int,
+    max_level: int,
+) -> list[dict[str, Any]]:
+    """装备缴纳：关键词命中项先「等级在阶段内」再「等级外」；各档内再按 合成 > 非本阵营商店 > K点商店；桶内随机。"""
+    mk_ok_synth: list[dict[str, Any]] = []
+    mk_ok_shop: list[dict[str, Any]] = []
+    mk_ok_k: list[dict[str, Any]] = []
+    mk_bad_synth: list[dict[str, Any]] = []
+    mk_bad_shop: list[dict[str, Any]] = []
+    mk_bad_k: list[dict[str, Any]] = []
+    for e in matched:
+        it = item_registry.get_by_name(e.get("name") or "")
+        ok = _item_level_matches_stage(it, min_level, max_level)
+        src = e.get("source")
+        if ok:
+            if src == "合成":
+                mk_ok_synth.append(e)
+            elif src == "非本阵营商店":
+                mk_ok_shop.append(e)
+            elif src == "K点商店":
+                mk_ok_k.append(e)
+            else:
+                mk_ok_synth.append(e)
+        else:
+            if src == "合成":
+                mk_bad_synth.append(e)
+            elif src == "非本阵营商店":
+                mk_bad_shop.append(e)
+            elif src == "K点商店":
+                mk_bad_k.append(e)
+            else:
+                mk_bad_synth.append(e)
+    return _shuffle_each_bucket_concat(
+        [
+            mk_ok_synth,
+            mk_ok_shop,
+            mk_ok_k,
+            mk_bad_synth,
+            mk_bad_shop,
+            mk_bad_k,
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +368,12 @@ def _matches_reward_type(
     if reward_type == "插件":
         return equipment_mods.is_plugin(item.name)
 
+    if reward_type == "武器":
+        if item.type == "武器":
+            return True
+        if item.use == "手雷":
+            return True
+
     if item.name == reward_type:
         return True
     if item.type and item.type == reward_type:
@@ -237,6 +437,65 @@ def _ordered_reward_item_names_from_tasks(
             if name:
                 out.append(name)
     return out
+
+
+def _reward_item_name_progress_tier_map(
+    *,
+    task_registry: Any,
+    mercenary_registry: Any,
+    main_task_min_id: int,
+    main_task_max_id: int,
+    level_min: int,
+    level_max: int,
+) -> dict[str, int]:
+    """
+    任务奖励物品名 → 进度档 1~4（与 _ordered_reward_item_names_from_tasks 分档一致），
+    未出现在任务奖励池中的名不会出现在 map 中。
+    """
+    all_tasks = task_registry.list_all_tasks()
+    main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
+    precondition_in_range_ids = {
+        t.id for t in all_tasks
+        if t.id not in main_range_ids
+        and (t.get_requirements or [])
+        and any(rid in main_range_ids for rid in (t.get_requirements or []))
+    }
+    merc_level_overlap_ids: set[int] = set()
+    for m in (mercenary_registry.list_all() if hasattr(mercenary_registry, "list_all") else []):
+        rmin = getattr(m, "recommended_min_level", None)
+        rmax = getattr(m, "recommended_max_level", None)
+        if rmin is None and rmax is None:
+            continue
+        rmin = rmin if rmin is not None else 0
+        rmax = rmax if rmax is not None else 999
+        if rmax < level_min or rmin > level_max:
+            continue
+        merc_level_overlap_ids.add(m.id)
+    tier1: list[int] = [t.id for t in all_tasks if t.id in main_range_ids]
+    tier2: list[int] = [t.id for t in all_tasks if t.id in precondition_in_range_ids]
+    tier3: list[int] = [
+        t.id for t in all_tasks
+        if t.id in merc_level_overlap_ids
+        and t.id not in main_range_ids
+        and t.id not in precondition_in_range_ids
+    ]
+    tier4: list[int] = [
+        t.id for t in all_tasks
+        if t.id not in main_range_ids
+        and t.id not in precondition_in_range_ids
+        and t.id not in merc_level_overlap_ids
+    ]
+    name_tier: dict[str, int] = {}
+    for tier_num, tier_ids in enumerate([tier1, tier2, tier3, tier4], start=1):
+        for tid in tier_ids:
+            t = task_registry.get_by_id(tid)
+            if not t or not t.rewards:
+                continue
+            for r in t.rewards:
+                n, _ = parse_name_count(r)
+                if n and n not in name_tier:
+                    name_tier[n] = tier_num
+    return name_tier
 
 
 def _ordered_collectable_item_names_from_tasks(
@@ -319,6 +578,7 @@ def _build_reward_item_candidates(
     min_level: int,
     max_level: int,
     main_task_range: tuple[int, int],
+    reward_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """
     组装奖励物品候选列表（文档 6.3.2 通用字段 reward_item_candidates）。
@@ -349,6 +609,14 @@ def _build_reward_item_candidates(
     reward_stats = task_registry.get_reward_stats()
     main_min, main_max = main_task_range
     ordered_task_item_names = _ordered_reward_item_names_from_tasks(
+        task_registry=task_registry,
+        mercenary_registry=mercenary_registry,
+        main_task_min_id=main_min,
+        main_task_max_id=main_max,
+        level_min=min_level,
+        level_max=max_level,
+    )
+    reward_task_tier_by_name = _reward_item_name_progress_tier_map(
         task_registry=task_registry,
         mercenary_registry=mercenary_registry,
         main_task_min_id=main_min,
@@ -404,7 +672,7 @@ def _build_reward_item_candidates(
             continue
         if item.level > max_level:
             continue
-        if item.type in ("武器", "防具"):
+        if item.type in ("武器", "防具") and getattr(item, "use", None) != "手雷":
             continue
         for rt in all_types:
             if _matches_reward_type(item, rt, equipment_mods):
@@ -428,7 +696,14 @@ def _build_reward_item_candidates(
                 seen.add(item_name)
                 break
 
-    return candidates[:20]
+    return _finalize_reward_item_candidates(
+        candidates,
+        item_registry=item_registry,
+        equipment_mods=equipment_mods,
+        reward_keywords=reward_keywords,
+        reward_task_tier_by_name=reward_task_tier_by_name,
+        max_n=20,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,9 +720,83 @@ def _pick_stage_root_for_stage_name(stage_registry: Any, stage_name: str) -> Opt
     return min(areas)
 
 
+def _reorder_stage_list_by_keywords(
+    stage_list: list[dict[str, Any]],
+    requirement_keywords: Optional[list[str]],
+) -> None:
+    kw = _normalize_kw_list(requirement_keywords)
+    for block in stage_list:
+        stages = block.get("stages") or []
+        if not stages:
+            continue
+        area = block.get("area") or ""
+        hint_p = stage_root_region_hint(area)
+        extra = _STAGE_ROOT_REGION_HINT_EXTRA.get(area, "")
+
+        def _stage_kw_hit(s: dict[str, Any]) -> bool:
+            if not kw:
+                return False
+            blob = "".join([
+                area,
+                hint_p,
+                extra,
+                str(s.get("name") or ""),
+                str(s.get("area_region_hint") or ""),
+            ])
+            return _any_keyword_in_text(blob, kw)
+
+        if not kw:
+            in_prog = [s for s in stages if not s.get("below_progress")]
+            below = [s for s in stages if s.get("below_progress")]
+            block["stages"] = _shuffle_each_bucket_concat([in_prog, below])
+            continue
+
+        b0: list[dict[str, Any]] = []  # 关键词 + 当前进度内
+        b1: list[dict[str, Any]] = []  # 关键词 + 低于进度
+        b2: list[dict[str, Any]] = []  # 无关键词 + 当前进度内
+        b3: list[dict[str, Any]] = []  # 无关键词 + 低于进度
+        for s in stages:
+            kh = _stage_kw_hit(s)
+            bp = bool(s.get("below_progress"))
+            if kh and not bp:
+                b0.append(s)
+            elif kh and bp:
+                b1.append(s)
+            elif not kh and not bp:
+                b2.append(s)
+            else:
+                b3.append(s)
+        block["stages"] = _shuffle_each_bucket_concat([b0, b1, b2, b3])
+
+
+def _stage_loot_row_matches_keywords(
+    entry: dict[str, Any],
+    keywords: list[str],
+    item_registry: Any,
+    equipment_mods: Any,
+) -> bool:
+    blob = "".join([
+        str(entry.get("area") or ""),
+        str(entry.get("area_region_hint") or ""),
+        str(entry.get("stage_name") or ""),
+    ])
+    if _any_keyword_in_text(blob, keywords):
+        return True
+    for li in entry.get("loot_items") or []:
+        name = li.get("item_name")
+        if not name:
+            continue
+        item = item_registry.get_by_name(name)
+        ed: dict[str, Any] = {"name": name}
+        if _entry_matches_item_keywords(ed, item, equipment_mods, keywords):
+            return True
+    return False
+
+
 def _get_all_stages_for_progress(
     game_data: GameDataRegistry,
     stage: int,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """
     获取所有有效关卡的二级结构列表（通关/清理/挑战类用）。
@@ -579,6 +928,7 @@ def _get_all_stages_for_progress(
                 "stages": area_map[cross_area],
             })
 
+    _reorder_stage_list_by_keywords(result, requirement_keywords)
     return result
 
 
@@ -586,6 +936,7 @@ def _build_npc_list(
     game_data: GameDataRegistry,
     npc_states: dict[str, Any],
     current_npc: str,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """问候/传话类：所有NPC列表。"""
     # 文档约束：如果当前NPC不是“成员/彩蛋”阵营，则候选列表里排除这些类型NPC，
@@ -624,7 +975,45 @@ def _build_npc_list(
         if name == current_npc:
             entry["is_current"] = True
         result.append(entry)
-    return result[:30]
+
+    kw = _normalize_kw_list(requirement_keywords)
+
+    def _npc_kw_hit(entry: dict[str, Any]) -> bool:
+        if not kw:
+            return False
+        titles = entry.get("titles") or []
+        title_parts = list(titles) if isinstance(titles, list) else [str(titles)]
+        blob = "".join([
+            str(entry.get("name") or ""),
+            str(entry.get("faction") or ""),
+            str(entry.get("title") or ""),
+            *title_parts,
+        ])
+        return _any_keyword_in_text(blob, kw)
+
+    if not kw:
+        cur = [e for e in result if e.get("is_current")]
+        rest = [e for e in result if not e.get("is_current")]
+        ordered = _shuffle_each_bucket_concat([cur, rest])
+        return ordered[:30]
+
+    b0: list[dict[str, Any]] = []  # 关键词 + 当前 NPC
+    b1: list[dict[str, Any]] = []  # 关键词 + 其他
+    b2: list[dict[str, Any]] = []  # 无关键词 + 当前 NPC
+    b3: list[dict[str, Any]] = []  # 无关键词 + 其他
+    for entry in result:
+        kh = _npc_kw_hit(entry)
+        cur = bool(entry.get("is_current"))
+        if kh and cur:
+            b0.append(entry)
+        elif kh and not cur:
+            b1.append(entry)
+        elif not kh and cur:
+            b2.append(entry)
+        else:
+            b3.append(entry)
+    ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
+    return ordered[:30]
 
 
 def _build_challenge_targets(
@@ -697,22 +1086,60 @@ def _build_challenge_targets(
     return [entry]
 
 
+_COLLECTABLE_MAX_ITEMS = 20
+
+
+def _collectable_entry_for_name(
+    item_name: str,
+    *,
+    item_registry: Any,
+    submit_stats: Any,
+    reward_stats: Any,
+    base_max: int,
+    max_level: int,
+) -> Optional[dict[str, Any]]:
+    item = item_registry.get_by_name(item_name)
+    if item is None or item.level > max_level:
+        return None
+    price = item.price or 0
+    entry: dict[str, Any] = {
+        "name": item.name,
+        "type": item.type,
+        "price": price,
+        "min_qty": 1,
+    }
+    stats = submit_stats.get(item_name)
+    submit_max = int(stats[1] or 0) if stats and int(stats[1] or 0) > 0 else 0
+    reward_max = int(reward_stats.get(item_name, (None, 0))[1] or 0)
+    effective_max = max(submit_max, reward_max)
+    if effective_max > 0:
+        entry["max_qty"] = effective_max * 2
+    else:
+        unit_price = price or 1
+        entry["max_qty"] = max(1, int(base_max / unit_price))
+    if item.level > 0:
+        entry["level"] = item.level
+    return entry
+
+
 def _build_collectable_items(
     game_data: GameDataRegistry,
     stage: int,
     max_level: int,
     base_max: int,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """资源收集类：食材/药剂/材料/弹夹，且在现有任务物品池中。"""
     item_registry = game_data.items
     task_registry = game_data.tasks
     mercenary_registry = game_data.mercenary_tasks
+    equipment_mods = game_data.equipment_mods
+    keywords = _normalize_kw_list(requirement_keywords)
 
     allowed_uses = {"食材", "药剂", "材料", "弹夹"}
     pool = task_registry.list_submit_items() | task_registry.list_reward_item_names()
     price_cap = base_max * 2
 
-    # 资源池按“当前区间任务优先级”排序（提交物品 + 奖励物品都参与）
     main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)
     level_range = get_progress_stage_level_range(stage) or (1, 50)
     ordered_item_names = _ordered_collectable_item_names_from_tasks(
@@ -727,87 +1154,81 @@ def _build_collectable_items(
     submit_stats = task_registry.get_submit_stats()
     reward_stats = task_registry.get_reward_stats()
 
-    result: list[dict[str, Any]] = []
-    total = 0
-
     def _can_use_item(it: Any) -> bool:
         return (it.use in allowed_uses) or (it.type in allowed_uses) or (it.name in allowed_uses)
+
+    candidates: list[dict[str, Any]] = []
 
     for item_name in ordered_item_names:
         if item_name in seen or item_name not in pool:
             continue
         item = item_registry.get_by_name(item_name)
-        if item is None:
+        if item is None or not _can_use_item(item):
             continue
-        if item.level > max_level:
+        entry = _collectable_entry_for_name(
+            item_name,
+            item_registry=item_registry,
+            submit_stats=submit_stats,
+            reward_stats=reward_stats,
+            base_max=base_max,
+            max_level=max_level,
+        )
+        if entry:
+            entry["_from_ordered"] = True
+            candidates.append(entry)
+            seen.add(item_name)
+
+    for item_name in sorted(pool - seen):
+        item = item_registry.get_by_name(item_name)
+        if item is None or not _can_use_item(item):
             continue
-        if not _can_use_item(item):
-            continue
+        entry = _collectable_entry_for_name(
+            item_name,
+            item_registry=item_registry,
+            submit_stats=submit_stats,
+            reward_stats=reward_stats,
+            base_max=base_max,
+            max_level=max_level,
+        )
+        if entry:
+            entry["_from_ordered"] = False
+            candidates.append(entry)
+            seen.add(item_name)
 
-        price = item.price or 0
-        if total + price > price_cap:
-            continue
-        total += price
+    if keywords:
+        b0, b1, b2, b3 = [], [], [], []
+        for e in candidates:
+            it = item_registry.get_by_name(e.get("name") or "")
+            km = _entry_matches_item_keywords(e, it, equipment_mods, keywords)
+            fo = bool(e.get("_from_ordered"))
+            if km and fo:
+                b0.append(e)
+            elif km and not fo:
+                b1.append(e)
+            elif not km and fo:
+                b2.append(e)
+            else:
+                b3.append(e)
+        ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
+    else:
+        fo_yes = [e for e in candidates if e.get("_from_ordered")]
+        fo_no = [e for e in candidates if not e.get("_from_ordered")]
+        ordered = _shuffle_each_bucket_concat([fo_yes, fo_no])
 
-        entry: dict[str, Any] = {
-            "name": item.name,
-            "type": item.type,
-            "price": price,
-            "min_qty": 1,
-        }
-
-        stats = submit_stats.get(item_name)
-        submit_max = int(stats[1] or 0) if stats and int(stats[1] or 0) > 0 else 0
-        reward_max = int(reward_stats.get(item_name, (None, 0))[1] or 0)
-        # 并集原则：提交历史 max_qty 与奖励历史 max_qty 取并集上限
-        effective_max = max(submit_max, reward_max)
-        if effective_max > 0:
-            # 统一沿用 V2 的 allowed_max = effective_max * 2
-            entry["max_qty"] = effective_max * 2
-        else:
-            # 历史统计缺失：用当前阶段奖励上限/单价估算一个“不会轻易超限”的数量上限
-            unit_price = price or 1
-            entry["max_qty"] = max(1, int(base_max / unit_price))
-
-        if item.level > 0:
-            entry["level"] = item.level
-
-        result.append(entry)
-        seen.add(item_name)
-        if len(result) >= 20:
+    result: list[dict[str, Any]] = []
+    for e in ordered:
+        e.pop("_from_ordered", None)
+        if len(result) >= _COLLECTABLE_MAX_ITEMS:
             break
-
-    # 若区间优先池不足，再补齐剩余物品（按名称稳定排序）
-    if len(result) < 20:
-        remaining = sorted(pool - seen)
-        for item_name in remaining:
-            if len(result) >= 20:
-                break
-            item = item_registry.get_by_name(item_name)
-            if item is None or item.level > max_level:
-                continue
-            if not _can_use_item(item):
-                continue
-            price = item.price or 0
-            if total + price > price_cap:
-                continue
-
-            stats = submit_stats.get(item_name)
-            submit_max = int(stats[1] or 0) if stats and int(stats[1] or 0) > 0 else 0
-            reward_max = int(reward_stats.get(item_name, (None, 0))[1] or 0)
-            effective_max = max(submit_max, reward_max)
-            max_qty = effective_max * 2 if effective_max > 0 else max(1, int(base_max / (price or 1)))
-
-            result.append({
-                "name": item.name,
-                "type": item.type,
-                "price": price,
-                "min_qty": 1,
-                "max_qty": max_qty,
-                **({"level": item.level} if item.level > 0 else {}),
-            })
-            total += price
+        p = e.get("price") or 0
+        # 候选项池只按「单件」对照任务规则（提交品单价不超过基础奖励 200%），不累加列表总价。
+        if p > price_cap:
+            continue
+        result.append(e)
     return result
+
+
+_EQUIPMENT_ITEMS_MAX_COUNT = 20
 
 
 def _build_equipment_items(
@@ -815,20 +1236,41 @@ def _build_equipment_items(
     npc_name: str,
     npc_faction: str,
     stage: int,
+    min_level: int,
     max_level: int,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
-    """装备缴纳类：非本阵营商店+合成+K点商店的装备。"""
+    """装备缴纳类：合成 + 非本阵营商店 + K 点（同名保留合成优先）。"""
     item_registry = game_data.items
     shop_registry = game_data.shops
     crafting_registry = game_data.crafting
     kshop_registry = game_data.kshop
+    equipment_mods = game_data.equipment_mods
+    keywords = _normalize_kw_list(requirement_keywords)
 
     equipment_types = {"武器", "防具"}
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    # 1. 非本阵营NPC商店的装备
-    # (简化：遍历所有商店，排除当前NPC)
+    # 1. 合成配方产出的装备（去重优先级最高）
+    for recipe in crafting_registry._recipes:
+        if recipe.name in seen:
+            continue
+        item = item_registry.get_by_name(recipe.name)
+        if item is None or item.type not in equipment_types:
+            continue
+        if item.level > max_level:
+            continue
+        seen.add(recipe.name)
+        result.append({
+            "name": item.name,
+            "type": item.type,
+            "price": item.price or 0,
+            "level": item.level,
+            "source": "合成",
+        })
+
+    # 2. 非本阵营 NPC 商店的装备
     for other_npc in shop_registry._shops:
         if other_npc == npc_name:
             continue
@@ -849,25 +1291,7 @@ def _build_equipment_items(
                 "source": "非本阵营商店",
             })
 
-    # 2. 合成配方产出的装备
-    for recipe in crafting_registry._recipes:
-        if recipe.name in seen:
-            continue
-        item = item_registry.get_by_name(recipe.name)
-        if item is None or item.type not in equipment_types:
-            continue
-        if item.level > max_level:
-            continue
-        seen.add(recipe.name)
-        result.append({
-            "name": item.name,
-            "type": item.type,
-            "price": item.price or 0,
-            "level": item.level,
-            "source": "合成",
-        })
-
-    # 3. K点商店装备（筛选价格合理的）
+    # 3. K点商店装备
     kprice_cap = stage * 100
     for kitem in kshop_registry.list_items():
         if kitem.item in seen:
@@ -888,27 +1312,119 @@ def _build_equipment_items(
             "source": "K点商店",
         })
 
-    return result[:20]
+    max_total = _EQUIPMENT_ITEMS_MAX_COUNT
+    matched: list[dict[str, Any]] = []
+    if keywords:
+        for e in result:
+            it = item_registry.get_by_name(e.get("name") or "")
+            if _entry_matches_item_keywords(e, it, equipment_mods, keywords):
+                matched.append(e)
+
+    matched_names = {e.get("name") for e in matched}
+    unmatched = [e for e in result if e.get("name") not in matched_names]
+
+    synth_u, shop_u, k_u = _partition_special_by_source(unmatched)
+    random.shuffle(synth_u)
+    random.shuffle(shop_u)
+    random.shuffle(k_u)
+
+    picked: list[dict[str, Any]] = []
+    if keywords:
+        mk = _matched_items_ordered_level_then_source(
+            matched,
+            item_registry=item_registry,
+            min_level=min_level,
+            max_level=max_level,
+        )
+        take_m = min(len(mk), max_total)
+        picked.extend(mk[:take_m])
+        rem = max_total - len(picked)
+    else:
+        rem = max_total
+
+    if rem > 0:
+        picked.extend(
+            _allocate_remainder_quota_pools(rem, [synth_u, shop_u, k_u], "532")
+        )
+
+    return picked[:max_total]
+
+
+# 合成产出（如菜品）单价常低于「奖励下限×10%」，此处单独用固定门槛，避免被筛掉
+_SPECIAL_ITEM_SYNTHESIS_MIN_PRICE = 1000
+_SPECIAL_ITEMS_MAX_COUNT = 25
+# 有关键词时略抬高上限，便于列出匹配项后再按比例补足
+_SPECIAL_ITEMS_MAX_COUNT_WITH_KEYWORDS = 40
+
+
+def _partition_special_by_source(entries: list[dict[str, Any]]) -> tuple[list, list, list]:
+    synth: list[dict[str, Any]] = []
+    shop: list[dict[str, Any]] = []
+    ksh: list[dict[str, Any]] = []
+    for e in entries:
+        src = e.get("source")
+        if src == "合成":
+            synth.append(e)
+        elif src == "非本阵营商店":
+            shop.append(e)
+        elif src == "K点商店":
+            ksh.append(e)
+    return synth, shop, ksh
+
+
+def _matched_special_items_ordered_by_source(
+    matched: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """特殊物品获取：关键词命中项不按等级分档，仅按 合成 > 非本阵营商店 > K点商店；桶内随机。"""
+    s, sh, k = _partition_special_by_source(matched)
+    return _shuffle_each_bucket_concat([s, sh, k])
 
 
 def _build_special_items(
     game_data: GameDataRegistry,
     npc_name: str,
     stage: int,
+    min_level: int,
     max_level: int,
+    reward_final_min: Optional[int] = None,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
-    """特殊物品获取类：非装备的特殊物品。"""
+    """特殊物品获取类：非装备的特殊物品（合成 / 非本阵营商店 / K 点）。"""
     item_registry = game_data.items
     shop_registry = game_data.shops
     crafting_registry = game_data.crafting
     kshop_registry = game_data.kshop
     equipment_mods = game_data.equipment_mods
+    keywords = _normalize_kw_list(requirement_keywords)
 
     equipment_types = {"武器", "防具"}
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    # 1. 非本阵营商店的非装备物品
+    # 按来源优先级依次收录，同名物品保留优先级更高来源（合成 > 非本阵营商店 > K 点）
+    # 1. 合成配方产出的非装备物品
+    for recipe in crafting_registry._recipes:
+        if recipe.name in seen:
+            continue
+        item = item_registry.get_by_name(recipe.name)
+        if item is None or item.type in equipment_types:
+            continue
+        if item.level > max_level:
+            continue
+        seen.add(recipe.name)
+        entry: dict[str, Any] = {
+            "name": item.name if item else recipe.name,
+            "type": item.type if item else None,
+            "price": (item.price if item else recipe.price) or 0,
+            "source": "合成",
+        }
+        if equipment_mods.is_plugin(recipe.name):
+            tier = equipment_mods.get_plugin_tier(recipe.name)
+            if tier:
+                entry["plugin_tier"] = tier
+        result.append(entry)
+
+    # 2. 非本阵营商店的非装备物品
     for other_npc in shop_registry._shops:
         if other_npc == npc_name:
             continue
@@ -921,7 +1437,7 @@ def _build_special_items(
             if item.level > max_level:
                 continue
             seen.add(item_name)
-            entry: dict[str, Any] = {
+            entry = {
                 "name": item.name,
                 "type": item.type,
                 "price": item.price or 0,
@@ -932,28 +1448,6 @@ def _build_special_items(
                 if tier:
                     entry["plugin_tier"] = tier
             result.append(entry)
-
-    # 2. 合成配方产出的非装备物品
-    for recipe in crafting_registry._recipes:
-        if recipe.name in seen:
-            continue
-        item = item_registry.get_by_name(recipe.name)
-        if item is None or item.type in equipment_types:
-            continue
-        if item.level > max_level:
-            continue
-        seen.add(recipe.name)
-        entry = {
-            "name": item.name if item else recipe.name,
-            "type": item.type if item else None,
-            "price": (item.price if item else recipe.price) or 0,
-            "source": "合成",
-        }
-        if equipment_mods.is_plugin(recipe.name):
-            tier = equipment_mods.get_plugin_tier(recipe.name)
-            if tier:
-                entry["plugin_tier"] = tier
-        result.append(entry)
 
     # 3. K点商店非装备物品
     kprice_cap = stage * 100
@@ -975,7 +1469,58 @@ def _build_special_items(
             "source": "K点商店",
         })
 
-    return result[:20]
+    min_shop_k_price = 0
+    if reward_final_min is not None and reward_final_min > 0:
+        min_shop_k_price = int(reward_final_min * 0.1)
+
+    def _passes_non_keyword_price(e: dict[str, Any]) -> bool:
+        p = e.get("price") or 0
+        if e.get("source") == "合成":
+            return p >= _SPECIAL_ITEM_SYNTHESIS_MIN_PRICE
+        return p >= min_shop_k_price
+
+    max_total = (
+        _SPECIAL_ITEMS_MAX_COUNT_WITH_KEYWORDS if keywords else _SPECIAL_ITEMS_MAX_COUNT
+    )
+
+    matched: list[dict[str, Any]] = []
+    if keywords:
+        for e in result:
+            it = item_registry.get_by_name(e.get("name") or "")
+            if _entry_matches_item_keywords(e, it, equipment_mods, keywords):
+                matched.append(e)
+
+    matched_names = {e.get("name") for e in matched}
+    unmatched_price_ok: list[dict[str, Any]] = []
+    for e in result:
+        if e.get("name") in matched_names:
+            continue
+        if _passes_non_keyword_price(e):
+            unmatched_price_ok.append(e)
+
+    synth_u, shop_u, k_u = _partition_special_by_source(unmatched_price_ok)
+    random.shuffle(synth_u)
+    random.shuffle(shop_u)
+    random.shuffle(k_u)
+
+    picked: list[dict[str, Any]] = []
+    if keywords:
+        mk = _matched_special_items_ordered_by_source(matched)
+        take_m = min(len(mk), max_total)
+        picked.extend(mk[:take_m])
+        rem = max_total - len(picked)
+    else:
+        rem = max_total
+
+    if rem > 0:
+        picked.extend(
+            _allocate_remainder_quota_pools(rem, [synth_u, shop_u, k_u], "532")
+        )
+
+    return picked[:max_total]
+
+
+_HOLDABLE_MAX_ITEMS = 20
 
 
 def _build_holdable_items(
@@ -983,36 +1528,31 @@ def _build_holdable_items(
     stage: int,
     max_level: int,
     base_max: int,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """物品持有类：情报类物品 + 合成配方产出。"""
     item_registry = game_data.items
     crafting_registry = game_data.crafting
     equipment_mods = game_data.equipment_mods
+    keywords = _normalize_kw_list(requirement_keywords)
     price_cap = base_max * 2
 
-    result: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
-    total = 0
 
-    # 1. 情报类物品
     for item in item_registry.find(use="情报"):
         if item.name in seen:
             continue
         if item.level > max_level:
             continue
-        price = item.price or 0
-        if total + price > price_cap:
-            continue
-        total += price
         seen.add(item.name)
-        result.append({
+        candidates.append({
             "name": item.name,
             "type": item.type,
-            "price": price,
+            "price": item.price or 0,
             "source": "情报",
         })
 
-    # 2. 合成配方产出
     for recipe in crafting_registry._recipes:
         if recipe.name in seen:
             continue
@@ -1020,9 +1560,6 @@ def _build_holdable_items(
         if item and item.level > max_level:
             continue
         price = (item.price if item else recipe.price) or 0
-        if total + price > price_cap:
-            continue
-        total += price
         seen.add(recipe.name)
         entry: dict[str, Any] = {
             "name": recipe.name,
@@ -1036,21 +1573,53 @@ def _build_holdable_items(
             tier = equipment_mods.get_plugin_tier(recipe.name)
             if tier:
                 entry["plugin_tier"] = tier
-        result.append(entry)
-        if len(result) >= 20:
-            break
+        candidates.append(entry)
 
+    if keywords:
+        b0, b1, b2, b3 = [], [], [], []
+        for e in candidates:
+            it = item_registry.get_by_name(e.get("name") or "")
+            km = _entry_matches_item_keywords(e, it, equipment_mods, keywords)
+            intel = e.get("source") == "情报"
+            if km and intel:
+                b0.append(e)
+            elif km and not intel:
+                b1.append(e)
+            elif not km and intel:
+                b2.append(e)
+            else:
+                b3.append(e)
+        ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
+    else:
+        intel_e = [e for e in candidates if e.get("source") == "情报"]
+        craft_e = [e for e in candidates if e.get("source") != "情报"]
+        intel_ok = [e for e in intel_e if (e.get("price") or 0) <= price_cap]
+        craft_ok = [e for e in craft_e if (e.get("price") or 0) <= price_cap]
+        return _allocate_remainder_quota_pools(
+            _HOLDABLE_MAX_ITEMS, [intel_ok, craft_ok], "55"
+        )
+
+    result: list[dict[str, Any]] = []
+    for e in ordered:
+        if len(result) >= _HOLDABLE_MAX_ITEMS:
+            break
+        p = e.get("price") or 0
+        if p > price_cap:
+            continue
+        result.append(e)
     return result
 
 
 def _build_stage_loot_list(
     game_data: GameDataRegistry,
     stage: int,
+    requirement_keywords: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """通关并收集/通关并持有：仅有箱子掉落的关卡。"""
     stage_registry = game_data.stages
     item_registry = game_data.items
     mercenary_registry = game_data.mercenary_tasks
+    equipment_mods = game_data.equipment_mods
 
     cfg = get_progress_stage_config(stage)
     if cfg is None:
@@ -1126,7 +1695,7 @@ def _build_stage_loot_list(
         total_loot_value = 0
         for crate in crates:
             for drop in crate.drops:
-                unit_price = item_registry.get_price(drop.name)
+                unit_price = item_registry.get_price(drop.name) or 0
                 prev = loot_map.get(drop.name)
                 if prev is None:
                     entry = {
@@ -1176,7 +1745,95 @@ def _build_stage_loot_list(
 
         result.append(entry)
 
+    kw = _normalize_kw_list(requirement_keywords)
+    if not kw:
+        in_prog = [r for r in result if not r.get("below_progress")]
+        below = [r for r in result if r.get("below_progress")]
+        result = _shuffle_each_bucket_concat([in_prog, below])
+    else:
+        b0, b1, b2, b3 = [], [], [], []
+        for row in result:
+            kh = _stage_loot_row_matches_keywords(row, kw, item_registry, equipment_mods)
+            bp = bool(row.get("below_progress"))
+            if kh and not bp:
+                b0.append(row)
+            elif kh and bp:
+                b1.append(row)
+            elif not kh and not bp:
+                b2.append(row)
+            else:
+                b3.append(row)
+        result = _shuffle_each_bucket_concat([b0, b1, b2, b3])
+
     return result[:20]
+
+
+def _finalize_reward_item_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    item_registry: Any,
+    equipment_mods: Any,
+    reward_keywords: Optional[list[str]],
+    reward_task_tier_by_name: dict[str, int],
+    max_n: int = 20,
+) -> list[dict[str, Any]]:
+    kw = _normalize_kw_list(reward_keywords)
+    if not kw:
+        shop = [c for c in candidates if c.get("source") == "NPC商店"]
+        t1: list[dict[str, Any]] = []
+        t2: list[dict[str, Any]] = []
+        t3: list[dict[str, Any]] = []
+        t4: list[dict[str, Any]] = []
+        for c in candidates:
+            if c.get("source") == "NPC商店":
+                continue
+            tr = reward_task_tier_by_name.get(c.get("name") or "", 5)
+            if tr <= 1:
+                t1.append(c)
+            elif tr == 2:
+                t2.append(c)
+            elif tr == 3:
+                t3.append(c)
+            else:
+                t4.append(c)
+        ordered = _shuffle_each_bucket_concat([shop, t1, t2, t3, t4])
+        return ordered[:max_n]
+
+    matched: list[dict[str, Any]] = []
+    unmatched: list[dict[str, Any]] = []
+    for c in candidates:
+        it = item_registry.get_by_name(c.get("name") or "")
+        if _entry_matches_item_keywords(c, it, equipment_mods, kw):
+            matched.append(c)
+        else:
+            unmatched.append(c)
+
+    m_shop = [c for c in matched if c.get("source") == "NPC商店"]
+    m_t1: list[dict[str, Any]] = []
+    m_t2: list[dict[str, Any]] = []
+    m_t3: list[dict[str, Any]] = []
+    m_t4: list[dict[str, Any]] = []
+    for c in matched:
+        if c.get("source") == "NPC商店":
+            continue
+        tr = reward_task_tier_by_name.get(c.get("name") or "", 5)
+        if tr <= 1:
+            m_t1.append(c)
+        elif tr == 2:
+            m_t2.append(c)
+        elif tr == 3:
+            m_t3.append(c)
+        else:
+            m_t4.append(c)
+    mk = _shuffle_each_bucket_concat([m_shop, m_t1, m_t2, m_t3, m_t4])
+    picked = mk[:max_n]
+    if len(picked) >= max_n:
+        return picked
+    rem = max_n - len(picked)
+    shop_u = [c for c in unmatched if c.get("source") == "NPC商店"]
+    task_u = [c for c in unmatched if c.get("source") != "NPC商店"]
+    picked.extend(_allocate_remainder_quota_pools(rem, [shop_u, task_u], "82"))
+    return picked[:max_n]
 
 
 # ---------------------------------------------------------------------------
@@ -1193,6 +1850,8 @@ def prepare_task_context(
     player_progress: int = 1,
     npc_affinity: int = 0,
     npc_states: Optional[dict[str, Any]] = None,
+    requirement_keywords: Optional[list[str]] = None,
+    reward_keywords: Optional[list[str]] = None,
     game_data: Optional[GameDataRegistry] = None,
 ) -> str:
     """
@@ -1232,6 +1891,7 @@ def prepare_task_context(
         min_level=level_range[0],
         max_level=max_level,
         main_task_range=(main_task_range[0], main_task_range[1]),
+        reward_keywords=reward_keywords,
     )
 
     task_rules = _TASK_RULES.get(task_type, "")
@@ -1251,11 +1911,16 @@ def prepare_task_context(
     # 类型专属字段
     if task_type in ("问候", "传话"):
         context["npc_list"] = _build_npc_list(
-            game_data, npc_states or {}, npc_name,
+            game_data,
+            npc_states or {},
+            npc_name,
+            requirement_keywords=requirement_keywords,
         )
 
     elif task_type in ("通关", "清理", "挑战"):
-        context["stage_list"] = _get_all_stages_for_progress(game_data, stage)
+        context["stage_list"] = _get_all_stages_for_progress(
+            game_data, stage, requirement_keywords=requirement_keywords,
+        )
 
     elif task_type == "切磋":
         context["challenge_targets"] = _build_challenge_targets(
@@ -1265,27 +1930,49 @@ def prepare_task_context(
     elif task_type == "资源收集":
         base_max = stage * REWARD_STAGE_BASE_MAX
         context["collectable_items"] = _build_collectable_items(
-            game_data, stage, max_level, base_max,
+            game_data,
+            stage,
+            max_level,
+            base_max,
+            requirement_keywords=requirement_keywords,
         )
 
     elif task_type == "装备缴纳":
         context["equipment_items"] = _build_equipment_items(
-            game_data, npc_name, npc_faction, stage, max_level,
+            game_data,
+            npc_name,
+            npc_faction,
+            stage,
+            level_range[0],
+            max_level,
+            requirement_keywords=requirement_keywords,
         )
 
     elif task_type == "特殊物品获取":
         context["special_items"] = _build_special_items(
-            game_data, npc_name, stage, max_level,
+            game_data,
+            npc_name,
+            stage,
+            level_range[0],
+            max_level,
+            reward_final_min=reward_budget.get("final_min"),
+            requirement_keywords=requirement_keywords,
         )
 
     elif task_type == "物品持有":
         base_max = stage * REWARD_STAGE_BASE_MAX
         context["holdable_items"] = _build_holdable_items(
-            game_data, stage, max_level, base_max,
+            game_data,
+            stage,
+            max_level,
+            base_max,
+            requirement_keywords=requirement_keywords,
         )
 
     elif task_type in ("通关并收集", "通关并持有"):
-        context["stage_loot_list"] = _build_stage_loot_list(game_data, stage)
+        context["stage_loot_list"] = _build_stage_loot_list(
+            game_data, stage, requirement_keywords=requirement_keywords,
+        )
 
     if task_type in ("资源收集", "装备缴纳", "特殊物品获取", "通关并收集"):
         context["submit_vs_reward_hint"] = (

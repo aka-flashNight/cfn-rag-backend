@@ -77,6 +77,12 @@ def execute_prepare_task_context(
 ) -> str:
     task_type = args.get("task_type", "问候")
     reward_types = args.get("reward_types", {"regular": ["金币", "经验"], "optional": []})
+    requirement_keywords = args.get("requirement_keywords")
+    reward_keywords = args.get("reward_keywords")
+    if not isinstance(requirement_keywords, list):
+        requirement_keywords = None
+    if not isinstance(reward_keywords, list):
+        reward_keywords = None
     return prepare_task_context(
         task_type=task_type,
         reward_types=reward_types,
@@ -86,6 +92,8 @@ def execute_prepare_task_context(
         player_progress=player_progress,
         npc_affinity=npc_affinity,
         npc_states=npc_states,
+        requirement_keywords=requirement_keywords,
+        reward_keywords=reward_keywords,
         game_data=game_data,
     )
 
@@ -600,13 +608,14 @@ def dispatch_tool_call(
     # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
     # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
 
-    # if tool_name in _task_tool_names:
-    #     try:
-    #         pretty_args = json.dumps(tool_args, ensure_ascii=False)
-    #     except Exception:
-    #         pretty_args = str(tool_args)
-    #     print('——————【工具调用】——————')
-    #     print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+    if tool_name in _task_tool_names:
+        try:
+            pretty_args = json.dumps(tool_args, ensure_ascii=False)
+        except Exception:
+            pretty_args = str(tool_args)
+        print('——————【工具调用】——————')
+        print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+
 
     updated_draft = pending_draft
     task_write_result = None
@@ -675,15 +684,15 @@ def dispatch_tool_call(
         }, ensure_ascii=False)
 
     # Debug: 
-    # if tool_name in _task_tool_names:
-    #     try:
-    #         # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
-    #         preview = (result or "")
-    #         # if isinstance(preview, str) and len(preview) > 3000:
-    #         #     preview = preview[:3000] + "…"
-    #     except Exception:
-    #         preview = "<preview-unavailable>"
-    #     print('——————【结果】——————')
-    #     print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+    if tool_name in _task_tool_names:
+        try:
+            # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
+            preview = (result or "")
+            # if isinstance(preview, str) and len(preview) > 3000:
+            #     preview = preview[:3000] + "…"
+        except Exception:
+            preview = "<preview-unavailable>"
+        print('——————【结果】——————')
+        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result
