@@ -331,7 +331,7 @@ CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "confirm_agent_task",
-        "description": "玩家明确接受任务后调用：传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。",
+        "description": "玩家认可/接受/同意任务后调用：传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。",
         "parameters": CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA,
     },
 }
