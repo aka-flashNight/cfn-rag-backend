@@ -201,7 +201,7 @@ def _validate_v1_item_existence(
     if missing:
         return {
             "step": "V1",
-            "error": "物品不存在",
+            "error": "物品不存在，请使用合适的任务类型，重新调用prepare_task_context，查看可选物品。",
             "missing_item_names": sorted(missing),
         }
     return None
@@ -355,7 +355,7 @@ def _validate_v3_stage_existence_and_area(
     if invalid:
         return {
             "step": "V3",
-            "error": "关卡存在性与解锁",
+            "error": "关卡存在性与解锁有问题，请使用合适的任务类型，重新调用prepare_task_context，查看可选关卡。",
             "invalid_stages": invalid,
         }
     return None
