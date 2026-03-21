@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, TypedDict
+from typing import Any, List, Optional, TypedDict
 
 from services.npc_mood_agent import UPDATE_NPC_MOOD_TOOL
 
@@ -25,7 +25,7 @@ TASK_TYPES: List[str] = [
 
 DIFFICULTIES: List[str] = ["简单", "冒险", "修罗", "地狱"]
 
-REWARD_REGULAR: List[str] = ["金币", "经验"]
+REWARD_REGULAR: List[str] = ["金币", "经验值"]
 REWARD_OPTIONAL: List[str] = [
     "药剂",
     "弹夹",
@@ -39,6 +39,78 @@ REWARD_OPTIONAL: List[str] = [
     "防具",
     "插件",
 ]
+
+# prepare_task_context：LLM 漏传或传空 reward_types 时的兜底默认（与 context_builder 单例集合一致）
+REWARD_TYPES_DEFAULT_SINGLETON_REGULAR: List[str] = ["金币", "经验值"]
+REWARD_TYPES_DEFAULT_SINGLETON_OPTIONAL: List[str] = ["K点", "技能点", "强化石"]
+
+
+def normalize_reward_types_for_prepare_context(
+    reward_types: Any,
+    reward_keywords: Optional[list[str]],
+) -> dict[str, list[str]]:
+    """
+    规范化 prepare_task_context 的 reward_types。
+
+    - 若 regular/optional 合并后非空（且枚举合法），原样采用（非法项丢弃）。
+    - 若合并后为空：从 reward_keywords 中抽取与 REWARD_REGULAR / REWARD_OPTIONAL **完全一致** 的字符串，
+      分别归入 regular / optional（顺序为关键词出现顺序，同项去重）。
+    - 若仍为空：使用默认单例组合（金币/经验值 + K点/技能点/强化石），避免 reward_item_candidates 整表为空。
+    """
+    reg_set = frozenset(REWARD_REGULAR)
+    opt_set = frozenset(REWARD_OPTIONAL)
+
+    def _canonical_reward_type_label(s: str) -> str:
+        # 历史/口语简称「经验」与物品库正式名「经验值」对齐
+        if s == "经验":
+            return "经验值"
+        return s
+
+    def _coerce_list(v: Any) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        out: list[str] = []
+        for x in v:
+            if isinstance(x, str):
+                s = _canonical_reward_type_label(x.strip())
+                if s and (s in reg_set or s in opt_set):
+                    out.append(s)
+        return out
+
+    regular: list[str] = []
+    optional: list[str] = []
+    if isinstance(reward_types, dict):
+        regular = _coerce_list(reward_types.get("regular"))
+        optional = _coerce_list(reward_types.get("optional"))
+
+    if regular or optional:
+        return {"regular": regular, "optional": optional}
+
+    inferred_r: list[str] = []
+    inferred_o: list[str] = []
+    seen_r: set[str] = set()
+    seen_o: set[str] = set()
+    if isinstance(reward_keywords, list):
+        for k in reward_keywords:
+            if not isinstance(k, str):
+                continue
+            s = _canonical_reward_type_label(k.strip())
+            if not s:
+                continue
+            if s in reg_set and s not in seen_r:
+                inferred_r.append(s)
+                seen_r.add(s)
+            elif s in opt_set and s not in seen_o:
+                inferred_o.append(s)
+                seen_o.add(s)
+
+    if inferred_r or inferred_o:
+        return {"regular": inferred_r, "optional": inferred_o}
+
+    return {
+        "regular": list(REWARD_TYPES_DEFAULT_SINGLETON_REGULAR),
+        "optional": list(REWARD_TYPES_DEFAULT_SINGLETON_OPTIONAL),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +173,7 @@ PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
                 "regular": {
                     "type": "array",
                     "items": {"type": "string", "enum": REWARD_REGULAR},
-                    "description": "常规奖励类型（如金币、经验）。",
+                    "description": "常规奖励类型（如金币、经验值）。",
                 },
                 "optional": {
                     "type": "array",

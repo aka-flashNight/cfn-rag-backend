@@ -14,6 +14,7 @@ from typing import Any, Optional
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
 from services.game_progress import get_progress_stage_config
 from services.agent_tools.context_builder import prepare_task_context
+from services.agent_tools.schemas import normalize_reward_types_for_prepare_context
 from services.agent_tools.validator import validate_task_draft, DraftValidationContext
 
 logger = logging.getLogger(__name__)
@@ -76,13 +77,16 @@ def execute_prepare_task_context(
     game_data: Optional[GameDataRegistry] = None,
 ) -> str:
     task_type = args.get("task_type", "问候")
-    reward_types = args.get("reward_types", {"regular": ["金币", "经验"], "optional": []})
     requirement_keywords = args.get("requirement_keywords")
     reward_keywords = args.get("reward_keywords")
     if not isinstance(requirement_keywords, list):
         requirement_keywords = None
     if not isinstance(reward_keywords, list):
         reward_keywords = None
+    reward_types = normalize_reward_types_for_prepare_context(
+        args.get("reward_types"),
+        reward_keywords,
+    )
     return prepare_task_context(
         task_type=task_type,
         reward_types=reward_types,
