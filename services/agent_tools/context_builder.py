@@ -1232,6 +1232,27 @@ def _build_collectable_items(
 _EQUIPMENT_ITEMS_MAX_COUNT = 20
 
 
+def _npc_faction_from_states(
+    npc_states: Optional[dict[str, Any]], npc_name: str
+) -> str:
+    if not npc_states:
+        return ""
+    st = npc_states.get(npc_name)
+    if st is None:
+        return ""
+    if isinstance(st, dict):
+        return str(st.get("faction") or "").strip()
+    fac = getattr(st, "faction", None)
+    return (str(fac).strip() if fac is not None else "") or ""
+
+
+def _skip_easter_egg_shop_for_cross_faction_pool(
+    other_npc: str, npc_states: Optional[dict[str, Any]]
+) -> bool:
+    """「非本阵营商店」候选不收录彩蛋阵营 NPC 的商店。"""
+    return _npc_faction_from_states(npc_states, other_npc) == "彩蛋"
+
+
 def _build_equipment_items(
     game_data: GameDataRegistry,
     npc_name: str,
@@ -1240,6 +1261,7 @@ def _build_equipment_items(
     min_level: int,
     max_level: int,
     requirement_keywords: Optional[list[str]] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """装备缴纳类：合成 + 非本阵营商店 + K 点（同名保留合成优先）。"""
     item_registry = game_data.items
@@ -1271,9 +1293,11 @@ def _build_equipment_items(
             "source": "合成",
         })
 
-    # 2. 非本阵营 NPC 商店的装备
+    # 2. 非本阵营 NPC 商店的装备（排除彩蛋阵营商人的商店）
     for other_npc in shop_registry._shops:
         if other_npc == npc_name:
+            continue
+        if _skip_easter_egg_shop_for_cross_faction_pool(other_npc, npc_states):
             continue
         for item_name in shop_registry.get_npc_shop(other_npc):
             if item_name in seen:
@@ -1389,6 +1413,7 @@ def _build_special_items(
     max_level: int,
     reward_final_min: Optional[int] = None,
     requirement_keywords: Optional[list[str]] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """特殊物品获取类：非装备的特殊物品（合成 / 非本阵营商店 / K 点）。"""
     item_registry = game_data.items
@@ -1425,9 +1450,11 @@ def _build_special_items(
                 entry["plugin_tier"] = tier
         result.append(entry)
 
-    # 2. 非本阵营商店的非装备物品
+    # 2. 非本阵营商店的非装备物品（排除彩蛋阵营商人的商店）
     for other_npc in shop_registry._shops:
         if other_npc == npc_name:
+            continue
+        if _skip_easter_egg_shop_for_cross_faction_pool(other_npc, npc_states):
             continue
         for item_name in shop_registry.get_npc_shop(other_npc):
             if item_name in seen:
@@ -2118,6 +2145,7 @@ def prepare_task_context(
             level_range[0],
             max_level,
             requirement_keywords=requirement_keywords,
+            npc_states=npc_states,
         )
 
     elif task_type == "特殊物品获取":
@@ -2129,6 +2157,7 @@ def prepare_task_context(
             max_level,
             reward_final_min=reward_budget.get("final_min"),
             requirement_keywords=requirement_keywords,
+            npc_states=npc_states,
         )
 
     elif task_type == "物品持有":
