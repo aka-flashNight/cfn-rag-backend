@@ -626,7 +626,7 @@ def open_browser_when_ready(frontend_port):
 
     splash_update(
         "服务运行中……",
-        "浏览器已打开页面，也可手动输入网址127.0.0.1:7080访问。\n如需停止服务，可关闭本窗口。",
+        f"浏览器已打开页面，也可手动输入网址 127.0.0.1:{frontend_port} 访问。\n如需停止服务，可关闭本窗口。",
     )
 
     print("\n" + "=" * 50)
