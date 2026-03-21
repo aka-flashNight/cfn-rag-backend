@@ -134,6 +134,23 @@ def _sanitize_ui_hint(value: Any, default_hint: str) -> str:
     return s
 
 
+def _strip_instruction_for_assistant_from_confirm_json(result: str) -> str:
+    """
+    confirm_agent_task 成功时的 instruction_for_assistant 只给「紧随其后的决策轮」用；
+    拼正式对话 prompt 时去掉，避免模型在台词里被长期约束，也避免与「下一条玩家消息可再议任务」冲突。
+    """
+    try:
+        parsed = json.loads(result or "{}")
+    except Exception:
+        return result
+    if not isinstance(parsed, dict) or parsed.get("status") != "confirmed":
+        return result
+    if "instruction_for_assistant" not in parsed:
+        return result
+    trimmed = {k: v for k, v in parsed.items() if k != "instruction_for_assistant"}
+    return json.dumps(trimmed, ensure_ascii=False)
+
+
 def _build_gen_tool_messages(
     tool_messages: list[dict[str, str]],
 ) -> list[dict[str, str]]:
@@ -142,6 +159,18 @@ def _build_gen_tool_messages(
     如果 draft_agent_task / update_task_draft / confirm_agent_task 已成功，
     其返回的 draft_summary 已包含完整信息，就不再保留冗长的 prepare_task_context 输出。
     """
+    tool_messages = [
+        {
+            "tool_name": tm.get("tool_name") or "",
+            "result": (
+                _strip_instruction_for_assistant_from_confirm_json(tm.get("result") or "")
+                if (tm.get("tool_name") == "confirm_agent_task")
+                else (tm.get("result") or "")
+            ),
+        }
+        for tm in tool_messages
+    ]
+
     def _get_status(tm: dict[str, str]) -> Optional[str]:
         try:
             parsed = json.loads(tm.get("result") or "{}")
