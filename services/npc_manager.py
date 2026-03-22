@@ -1,69 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aiofiles
 
-
-def _get_resources_dir() -> Path:
-    """
-    获取resources目录路径。
-    resources是外部项目文件夹，和本项目放在同一目录下。
-
-    目录结构：
-        父目录/
-        ├── resources/          # 外部游戏数据
-        └── cfn-rag-backend/    # 本项目（开发环境）
-            └── ...
-
-        或打包后：
-        部署目录/
-        ├── resources/          # 外部游戏数据
-        └── CFN-RAG.exe         # 打包后的exe
-    """
-    # 1. 检查环境变量（由launcher.py设置）
-    env_path = os.environ.get('CFN_RESOURCES_DIR')
-    if env_path:
-        return Path(env_path)
-
-    # 2. 检查是否在PyInstaller打包环境
-    if getattr(sys, 'frozen', False):
-        # 打包环境：exe和resources在同一目录
-        exe_dir = Path(sys.executable).parent
-        resources_path = exe_dir / "resources"
-        if resources_path.exists():
-            return resources_path
-        raise FileNotFoundError(
-            f"打包环境未找到resources目录。\n"
-            f"已查找: {resources_path}\n"
-            f"请确保CFN-RAG.exe和resources文件夹在同一目录"
-        )
-
-    # 3. 开发环境：resources在父目录
-    # 当前文件位置: cfn-rag-backend/services/npc_manager.py
-    # resources位置: cfn-rag-backend/../resources
-    project_dir = Path(__file__).resolve().parent.parent  # cfn-rag-backend
-    parent_dir = project_dir.parent
-    resources_path = parent_dir / "resources"
-
-    if resources_path.exists():
-        return resources_path
-
-    # 如果父目录没有，再检查同级目录（兼容其他部署方式）
-    sibling_path = project_dir / "resources"
-    if sibling_path.exists():
-        return sibling_path
-
-    raise FileNotFoundError(
-        f"开发环境未找到resources目录。\n"
-        f"已查找: {resources_path} 和 {sibling_path}\n"
-        f"请确保resources文件夹在项目父目录或同级目录"
-    )
+from services.game_data.paths import find_resources_directory as _get_resources_dir
 
 
 def _get_npc_state_path() -> Path:

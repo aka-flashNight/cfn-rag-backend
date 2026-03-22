@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import zipfile
 from pathlib import Path
@@ -12,6 +11,7 @@ from pydantic import BaseModel
 
 from core.startup import _get_ffdec_path, _has_java
 from scripts.extract_portraits_from_swf import run_extract
+from services.game_data.paths import find_resources_directory
 
 
 router: APIRouter = APIRouter()
@@ -38,9 +38,8 @@ def _get_illustration_zip_path() -> Path | None:
 
 
 def _get_illustration_extract_target() -> Path:
-    """解压 illustration.zip 的目标目录：resources/flashswf/portraits/illustration。"""
-    base = _get_exe_or_project_dir()
-    return base / "resources" / "flashswf" / "portraits" / "illustration"
+    """解压 illustration.zip 的目标目录：游戏资源根/flashswf/portraits/illustration。"""
+    return find_resources_directory() / "flashswf" / "portraits" / "illustration"
 
 
 def _extract_illustration_zip() -> tuple[bool, str]:
@@ -78,39 +77,8 @@ class ExportIllustrationsResponse(BaseModel):
 
 
 def _get_resources_dir() -> Path:
-    """
-    获取resources目录路径。
-    resources是外部项目文件夹，和本项目放在同一目录下。
-    """
-    # 1. 检查环境变量（由launcher.py设置）
-    env_path = os.environ.get('CFN_RESOURCES_DIR')
-    if env_path:
-        return Path(env_path)
-
-    # 2. 检查是否在PyInstaller打包环境
-    if getattr(sys, 'frozen', False):
-        exe_dir = Path(sys.executable).parent
-        resources_path = exe_dir / "resources"
-        if resources_path.exists():
-            return resources_path
-        raise FileNotFoundError(f"打包环境未找到resources目录: {resources_path}")
-
-    # 3. 开发环境：resources在父目录
-    # 当前文件位置: cfn-rag-backend/api/assets_api.py
-    # resources位置: cfn-rag-backend/../resources
-    project_dir = Path(__file__).resolve().parent.parent  # cfn-rag-backend
-    parent_dir = project_dir.parent
-    resources_path = parent_dir / "resources"
-
-    if resources_path.exists():
-        return resources_path
-
-    # 如果父目录没有，再检查同级目录
-    sibling_path = project_dir / "resources"
-    if sibling_path.exists():
-        return sibling_path
-
-    raise FileNotFoundError(f"开发环境未找到resources目录")
+    """与全局逻辑一致：resources 或 CrazyFlashNight 资源根目录。"""
+    return find_resources_directory()
 
 
 @router.get("/avatar/{npc_name}", summary="获取 NPC 头像")

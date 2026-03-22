@@ -19,6 +19,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from services.game_data.paths import find_resources_directory
+
 # 模型加载状态
 _EMBED_MODEL_LOADING = False
 _EMBED_MODEL_LOADED = False
@@ -194,40 +196,8 @@ def ensure_task_agent_files_and_lists() -> None:
 
 
 def _get_resources_dir() -> Path:
-    """
-    获取 resources 目录路径
-    """
-    # 1. 检查环境变量（由 launcher.py 设置）
-    env_path = os.environ.get('CFN_RESOURCES_DIR')
-    if env_path:
-        return Path(env_path)
-
-    # 2. 检查是否在 PyInstaller 打包环境
-    if getattr(sys, 'frozen', False):
-        exe_dir = Path(sys.executable).parent
-        resources_path = exe_dir / "resources"
-        if resources_path.exists():
-            return resources_path
-
-    # 3. 开发环境：resources 在父目录
-    # 当前文件位置: cfn-rag-backend/core/startup.py
-    # resources 位置: cfn-rag-backend/../resources
-    project_dir = Path(__file__).resolve().parent.parent
-    parent_dir = project_dir.parent
-    resources_path = parent_dir / "resources"
-
-    if resources_path.exists():
-        return resources_path
-
-    # 检查同级目录
-    sibling_path = project_dir / "resources"
-    if sibling_path.exists():
-        return sibling_path
-
-    raise FileNotFoundError(
-        f"未找到 resources 目录。\n"
-        f"已查找: {resources_path} 和 {sibling_path}"
-    )
+    """游戏资源根目录（resources 或 CrazyFlashNight）。"""
+    return find_resources_directory()
 
 
 def _get_portraits_dir() -> Path:
@@ -297,7 +267,7 @@ def _extract_illustration_zip_if_present() -> None:
     zip_path = base / "illustration.zip"
     if not zip_path.is_file():
         return
-    target_dir = base / "resources" / "flashswf" / "portraits" / "illustration"
+    target_dir = find_resources_directory() / "flashswf" / "portraits" / "illustration"
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         # 使用默认编码（UTF-8）：请用 UTF-8 制作 illustration.zip，避免解压后文件名乱码

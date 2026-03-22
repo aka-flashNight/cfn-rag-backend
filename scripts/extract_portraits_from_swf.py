@@ -61,41 +61,13 @@ def _get_project_root() -> Path:
 
 
 def _get_resources_dir() -> Path:
-    """
-    获取 resources 目录路径。
-    与 api/assets_api.py、services/game_rag_service.py 中逻辑保持一致：
-    1. 优先 CFN_RESOURCES_DIR 环境变量
-    2. 如果是 PyInstaller 打包环境，则在 exe 同目录下寻找 resources
-    3. 否则在项目根目录的父目录下寻找 ../resources
-       如果没有，再检查项目根目录下的 ./resources
-    """
-    # 1. 环境变量
-    env_path = os.environ.get("CFN_RESOURCES_DIR")
-    if env_path:
-        p = Path(env_path)
-        if p.exists():
-            return p
+    """与后端一致：resources 或 CrazyFlashNight 资源根目录。"""
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from services.game_data.paths import find_resources_directory
 
-    # 2. 打包环境
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).parent
-        resources_path = exe_dir / "resources"
-        if resources_path.exists():
-            return resources_path
-        raise FileNotFoundError(f"打包环境未找到 resources 目录: {resources_path}")
-
-    # 3. 开发环境
-    project_dir = _get_project_root()
-    parent_dir = project_dir.parent
-    resources_path = parent_dir / "resources"
-    if resources_path.exists():
-        return resources_path
-
-    sibling_path = project_dir / "resources"
-    if sibling_path.exists():
-        return sibling_path
-
-    raise FileNotFoundError("开发环境未找到 resources 目录（父目录和同级目录都不存在）")
+    return find_resources_directory()
 
 
 def _build_ffdec_cmd(ffdec_path: Path, extra_args: List[str]) -> List[str]:

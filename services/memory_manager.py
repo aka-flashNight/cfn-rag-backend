@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Literal
 
 from openai import AsyncOpenAI
 
+from services.game_data.paths import RESOURCE_FOLDER_NAMES, pick_existing_or_default_resource_root
+
 logger = logging.getLogger(__name__)
 
 SUMMARIZE_INTERVAL = 30
@@ -51,23 +53,28 @@ def get_db_path() -> Path:
         script_dir = Path(__file__).resolve().parent
         base_dir = script_dir.parent.parent
 
-    # 情况1: base_dir/resources/tools/memory.db（打包后或resources和项目同级）
-    db_path = base_dir / "resources" / "tools" / "memory.db"
-    if db_path.parent.exists():
-        return db_path
+    # 情况1: base_dir/<resources|CrazyFlashNight>/tools/memory.db
+    for name in RESOURCE_FOLDER_NAMES:
+        db_path = base_dir / name / "tools" / "memory.db"
+        if db_path.parent.exists():
+            return db_path
 
-    # 情况2: 开发环境特殊情况，resources在当前工作目录
+    # 情况2: 开发环境特殊情况，资源目录在当前工作目录
     cwd = Path(os.getcwd()).resolve()
-    cwd_db_path = cwd / "resources" / "tools" / "memory.db"
-    if cwd_db_path.parent.exists():
-        return cwd_db_path
+    for name in RESOURCE_FOLDER_NAMES:
+        cwd_db_path = cwd / name / "tools" / "memory.db"
+        if cwd_db_path.parent.exists():
+            return cwd_db_path
 
     # 情况3: 尝试查找工作目录的父目录
-    parent_cwd_db_path = cwd.parent / "resources" / "tools" / "memory.db"
-    if parent_cwd_db_path.parent.exists():
-        return parent_cwd_db_path
+    for name in RESOURCE_FOLDER_NAMES:
+        parent_cwd_db_path = cwd.parent / name / "tools" / "memory.db"
+        if parent_cwd_db_path.parent.exists():
+            return parent_cwd_db_path
 
-    # 如果都找不到，使用默认路径（base_dir），并创建目录
+    # 找不到已有 tools：在已存在的资源根下新建 tools；否则优先 resources，仅有别名目录时建在别名下
+    root = pick_existing_or_default_resource_root(base_dir)
+    db_path = root / "tools" / "memory.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path
 

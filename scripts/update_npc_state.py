@@ -6,6 +6,12 @@ import re
 from pathlib import Path
 from collections import defaultdict
 
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from services.game_data.paths import RESOURCE_FOLDER_NAMES, pick_existing_or_default_resource_root
+
 # ================= 路径获取函数 =================
 def is_packaged_environment() -> bool:
     """检查是否在PyInstaller打包环境中运行"""
@@ -25,23 +31,24 @@ def get_resources_dir() -> Path:
         script_dir = Path(__file__).resolve().parent
         base_dir = script_dir.parent.parent
     
-    # 情况 1: base_dir/resources（打包后或 resources 和项目同级）
-    resources_path = base_dir / "resources"
-    if resources_path.exists():
-        return resources_path
-    
-    # 情况 2: 开发环境特殊情况，resources 在当前工作目录
+    # 情况 1: base_dir/<resources|CrazyFlashNight>
+    for name in RESOURCE_FOLDER_NAMES:
+        resources_path = base_dir / name
+        if resources_path.exists():
+            return resources_path
+
+    # 情况 2–3: 当前目录及其父目录
     cwd = Path(os.getcwd()).resolve()
-    cwd_resources_path = cwd / "resources"
-    if cwd_resources_path.exists():
-        return cwd_resources_path
-    
-    # 情况 3: 尝试查找工作目录的父目录
-    parent_cwd_resources_path = cwd.parent / "resources"
-    if parent_cwd_resources_path.exists():
-        return parent_cwd_resources_path
-    
-    # 如果都找不到，使用默认路径（base_dir/resources），并创建目录
+    for name in RESOURCE_FOLDER_NAMES:
+        p = cwd / name
+        if p.exists():
+            return p
+        p = cwd.parent / name
+        if p.exists():
+            return p
+
+    # 若均不存在：有 resources 用 resources；仅有 CrazyFlashNight 等别名时建在别名下；都没有则新建 resources
+    resources_path = pick_existing_or_default_resource_root(base_dir)
     resources_path.mkdir(parents=True, exist_ok=True)
     return resources_path
 

@@ -4,6 +4,31 @@ import os
 import sys
 from pathlib import Path
 
+# 游戏资源根目录的常见文件夹名：优先 resources，其次为 GitHub 克隆仓库默认目录名 CrazyFlashNight
+RESOURCE_FOLDER_NAMES: tuple[str, ...] = ("resources", "CrazyFlashNight")
+
+
+def _pick_resources_under(parent: Path) -> Path | None:
+    """在 parent 下按顺序查找 RESOURCE_FOLDER_NAMES 中第一个已存在的目录。"""
+    for name in RESOURCE_FOLDER_NAMES:
+        p = (parent / name).resolve()
+        if p.exists() and p.is_dir():
+            return p
+    return None
+
+
+def pick_existing_or_default_resource_root(parent: Path) -> Path:
+    """
+    在 parent 下选择「默认落盘」用的资源根目录（用于新建 tools 等子路径）：
+    若已存在名为 resources 的目录则用之；否则若存在列表中其它已存在的别名目录（如 CrazyFlashNight）则用之；
+    若均不存在，则返回 parent/resources（由调用方 mkdir 创建）。
+    """
+    for name in RESOURCE_FOLDER_NAMES:
+        p = (parent / name).resolve()
+        if p.is_dir():
+            return p
+    return (parent / RESOURCE_FOLDER_NAMES[0]).resolve()
+
 
 def is_packaged_environment() -> bool:
     """
@@ -16,11 +41,13 @@ def is_packaged_environment() -> bool:
 
 def find_resources_directory() -> Path:
     """
-    定位 resources 目录（非交互版）。
+    定位游戏资源根目录（非交互版），对应原 `resources` 文件夹内容。
 
     约定与 launcher.py 一致：
-    - 开发环境：resources 与项目（cfn-rag-backend）同级
-    - 打包环境：resources 与 exe 同级
+    - 开发环境：与项目（cfn-rag-backend）同级或位于项目根下
+    - 打包环境：与 exe 同级
+
+    若不存在名为 `resources` 的文件夹，则按相同规则尝试 `CrazyFlashNight`（游戏仓库默认克隆目录名）。
 
     同时支持通过环境变量 `CFN_RESOURCES_DIR` 显式指定。
     """
@@ -32,25 +59,21 @@ def find_resources_directory() -> Path:
             return p
 
     if is_packaged_environment():
-        base_dir = Path(sys.executable).resolve().parent
+        candidates = [Path(sys.executable).resolve().parent, Path.cwd()]
     else:
-        # 开发环境：resources 与项目根目录同级
-        # services/game_data/paths.py -> services/game_data -> services -> <project_root>
+        # services/game_data/paths.py -> parents[2] = <project_root>（cfn-rag-backend）
         project_root = Path(__file__).resolve().parents[2]
-        base_dir = project_root.parent
+        candidates = [project_root.parent, project_root, Path.cwd()]
 
-    p1 = (base_dir / "resources").resolve()
-    if p1.exists() and p1.is_dir():
-        return p1
-
-    # 兜底：当前工作目录下
-    p2 = (Path.cwd() / "resources").resolve()
-    if p2.exists() and p2.is_dir():
-        return p2
+    for parent in candidates:
+        found = _pick_resources_under(parent)
+        if found is not None:
+            return found
 
     raise FileNotFoundError(
-        "未找到 resources 文件夹。请确保 resources 与项目/EXE 同级，"
-        "或设置环境变量 CFN_RESOURCES_DIR 指向 resources 目录。"
+        "未找到游戏资源文件夹（已依次尝试 resources 与 CrazyFlashNight）。"
+        "请将其与项目/EXE 同级或置于项目根目录下，"
+        "或设置环境变量 CFN_RESOURCES_DIR 指向该资源根目录。"
     )
 
 

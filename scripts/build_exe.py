@@ -189,9 +189,17 @@ def _ensure_resources_tools_and_rebuild_index(project_root):
     若用户仅下载单 exe，首次运行会在同目录下 resources/tools/vector_index 生成。
     """
     from pathlib import Path
-    resources_dir = Path(project_root) / "resources"
-    if not resources_dir.exists():
-        resources_dir = Path(project_root).parent / "resources"
+
+    pr = Path(project_root).resolve()
+    if str(pr) not in sys.path:
+        sys.path.insert(0, str(pr))
+
+    from services.game_data.paths import RESOURCE_FOLDER_NAMES
+
+    candidates = [
+        Path(project_root) / name for name in RESOURCE_FOLDER_NAMES
+    ] + [Path(project_root).parent / name for name in RESOURCE_FOLDER_NAMES]
+    resources_dir = next((p for p in candidates if p.exists()), Path(project_root) / "resources")
     resources_dir.mkdir(parents=True, exist_ok=True)
     tools_dir = resources_dir / "tools"
     tools_dir.mkdir(parents=True, exist_ok=True)

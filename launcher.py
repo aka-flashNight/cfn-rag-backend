@@ -267,49 +267,30 @@ def shutdown_launcher():
 
 def find_resources_directory():
     """
-    查找resources数据目录。
-    resources是外部项目文件夹，和本项目放在同一目录下。
-
-    目录结构：
-        父目录/
-        ├── resources/          # 外部游戏数据
-        └── cfn-rag-backend/    # 本项目（开发环境）
-            └── ...
-
-        或打包后：
-        部署目录/
-        ├── resources/          # 外部游戏数据
-        └── CFN-RAG.exe         # 打包后的exe
+    查找游戏资源数据目录（原 resources 文件夹；若无则尝试 CrazyFlashNight）。
+    优先使用与 services.game_data.paths.find_resources_directory 相同的自动推断；
+    失败时进入交互式输入。
     """
-    # 获取基础目录
-    if is_packaged_environment():
-        # 打包环境：exe所在目录
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        # 开发环境：脚本所在目录的父目录（因为代码在项目文件夹内，resources在父目录）
-        # launcher.py 位置: cfn-rag-backend/launcher.py
-        # resources 位置: cfn-rag-backend/../resources
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        base_dir = os.path.dirname(script_dir)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if not is_packaged_environment() and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    try:
+        from services.game_data.paths import find_resources_directory as _auto_find_resources
 
-    # 情况1: base_dir/resources（打包后或resources和项目同级）
-    resources_path = os.path.join(base_dir, "resources")
-    if os.path.exists(resources_path) and os.path.isdir(resources_path):
-        print(f"[定位] 找到resources: {resources_path}")
-        return os.path.abspath(resources_path)
+        p = _auto_find_resources()
+        print(f"[定位] 找到游戏资源目录: {p}")
+        return os.path.abspath(str(p))
+    except FileNotFoundError:
+        pass
 
-    # 情况2: 开发环境特殊情况，resources在当前工作目录
+    # 自动推断失败：让用户指定
     cwd = os.path.abspath(".")
-    cwd_resources = os.path.join(cwd, "resources")
-    if os.path.exists(cwd_resources) and os.path.isdir(cwd_resources):
-        print(f"[定位] 找到resources (当前目录): {cwd_resources}")
-        return os.path.abspath(cwd_resources)
-
-    # 情况3: 让用户指定
-    print(f"\n[定位] 未自动找到resources文件夹")
-    print(f"查找位置: {resources_path}")
+    print("\n[定位] 未自动找到游戏资源目录（已尝试 resources 与 CrazyFlashNight）")
     print(f"当前工作目录: {cwd}")
-    print(f"当前目录内容: {os.listdir(cwd)[:10]}...")
+    try:
+        print(f"当前目录内容: {os.listdir(cwd)[:10]}...")
+    except OSError:
+        pass
 
     while True:
         folder_path = input("\n请输入resources文件夹路径（或直接回车退出）: ").strip()

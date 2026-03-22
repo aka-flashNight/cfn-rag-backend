@@ -30,6 +30,7 @@ from services.npc_mood_agent import (
     strip_trailing_tool_call_text,
 )
 from services.game_progress import get_progress_stage_name
+from services.game_data.paths import find_resources_directory as _get_resources_dir
 
 
 # 前端档位对应的总结间隔（短/中/长/几乎无限），未传或非法值时用默认 30
@@ -121,42 +122,6 @@ def _normalize_text(text: str) -> str:
     # 移除所有空白字符（空格、制表符、换行等）
     text = "".join(text.split())
     return text
-
-
-def _get_resources_dir() -> Path:
-    """
-    获取 resources 目录路径。
-    resources 是外部项目文件夹，和本项目放在同一目录下。
-    """
-    import os
-    import sys
-
-    # 1. 检查环境变量（由 launcher.py 设置）
-    env_path = os.environ.get('CFN_RESOURCES_DIR')
-    if env_path:
-        return Path(env_path)
-
-    # 2. 检查是否在 PyInstaller 打包环境
-    if getattr(sys, 'frozen', False):
-        exe_dir = Path(sys.executable).parent
-        resources_path = exe_dir / "resources"
-        if resources_path.exists():
-            return resources_path
-
-    # 3. 开发环境：resources 在父目录
-    project_dir = Path(__file__).resolve().parent.parent
-    parent_dir = project_dir.parent
-    resources_path = parent_dir / "resources"
-
-    if resources_path.exists():
-        return resources_path
-
-    # 如果父目录没有，再检查同级目录
-    sibling_path = project_dir / "resources"
-    if sibling_path.exists():
-        return sibling_path
-
-    raise FileNotFoundError(f"开发环境未找到 resources 目录")
 
 
 class GameRAGService:
