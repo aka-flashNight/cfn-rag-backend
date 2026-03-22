@@ -382,12 +382,12 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
         "get_dialogue": {
             "type": "array",
             "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "接取对话数组；可含 NPC 与玩家($PC)多条。",
+            "description": "接取对话数组；可含 接取NPC 与玩家($PC)多条。对话发生在任务开始前， 接取NPC 向 玩家 发布任务",
         },
         "finish_dialogue": {
             "type": "array",
             "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "完成对话数组；可含 NPC 与玩家($PC)多条。",
+            "description": "完成对话数组；可含 完成NPC 与玩家($PC)多条。对话发生在任务完成后， 玩家 向 完成NPC 交付任务。",
         },
         "ui_hint": {
             "type": "string",
