@@ -66,6 +66,83 @@ def is_packaged_environment():
     return hasattr(sys, '_MEIPASS') or getattr(sys, 'frozen', False)
 
 
+# 打包 exe 单实例：进程持有期间不关闭，退出时由系统回收
+_single_instance_mutex_handle = None
+
+
+def _show_packaged_notice(message: str, title: str = "CFN-RAG"):
+    """无控制台 exe 下用系统对话框提示"""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            MB_ICONINFORMATION = 0x40
+            ctypes.windll.user32.MessageBoxW(None, message, title, MB_ICONINFORMATION)
+        except Exception:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def _try_acquire_packaged_single_instance() -> bool:
+    """
+    打包环境下确保全局单实例（Windows 命名互斥体）。
+    返回 True 表示可继续启动；False 表示已有同程序实例在运行。
+    """
+    global _single_instance_mutex_handle
+    if not is_packaged_environment():
+        return True
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetLastError(0)
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        ERROR_ALREADY_EXISTS = 183
+        name = "Global\\CFN-RAG-Launcher-SingleInstance-v1"
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        _single_instance_mutex_handle = handle
+        return True
+    except Exception:
+        return True
+
+
+def _tcp_local_port_open(port: int) -> bool:
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.25)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _packaged_ports_suggest_already_running() -> bool:
+    """7077（API）与 7080（默认前端）均可连时，高度疑似本程序栈已在运行（含旧版无互斥体）。"""
+    if not is_packaged_environment():
+        return False
+    return _tcp_local_port_open(7077) and _tcp_local_port_open(7080)
+
+
 def _configure_stdio_line_buffering():
     """尽量行缓冲；无控制台（windowed exe）时忽略失败"""
     for stream in (sys.stdout, sys.stderr):
@@ -812,6 +889,19 @@ def main_packaged_gui():
 def main():
     if is_packaged_environment():
         _ensure_stdio_for_windowed()
+        if not _try_acquire_packaged_single_instance():
+            _show_packaged_notice(
+                "检测到 CFN-RAG 已在运行。\n\n请勿重复启动；"
+                "若需重启请先关闭已打开的启动器窗口。",
+            )
+            sys.exit(1)
+        if _packaged_ports_suggest_already_running():
+            _show_packaged_notice(
+                "本机 7077 与 7080 端口均已被占用，"
+                "可能已有 CFN-RAG 或其它程序在使用相同端口。\n\n"
+                "请先关闭已运行的实例或释放端口后再启动。",
+            )
+            sys.exit(1)
         main_packaged_gui()
     else:
         main_console()
