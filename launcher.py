@@ -226,6 +226,13 @@ def _close_pyi_splash_if_any():
         pass
 
 
+def _exit_packaged_early_notice(message: str) -> None:
+    """重复启动等早退：先关闪屏再弹窗，避免 Splash 挡住 MessageBox。"""
+    _close_pyi_splash_if_any()
+    _show_packaged_notice(message)
+    sys.exit(1)
+
+
 def splash_update(main_text, sub_text=""):
     """从任意线程更新打包模式下的状态窗（通过 tk after 切回主线程）"""
     global _splash_root, _splash_main_label, _splash_sub_label
@@ -890,18 +897,16 @@ def main():
     if is_packaged_environment():
         _ensure_stdio_for_windowed()
         if not _try_acquire_packaged_single_instance():
-            _show_packaged_notice(
+            _exit_packaged_early_notice(
                 "检测到 CFN-RAG 已在运行。\n\n请勿重复启动；"
                 "若需重启请先关闭已打开的启动器窗口。",
             )
-            sys.exit(1)
         if _packaged_ports_suggest_already_running():
-            _show_packaged_notice(
+            _exit_packaged_early_notice(
                 "本机 7077 与 7080 端口均已被占用，"
                 "可能已有 CFN-RAG 或其它程序在使用相同端口。\n\n"
                 "请先关闭已运行的实例或释放端口后再启动。",
             )
-            sys.exit(1)
         main_packaged_gui()
     else:
         main_console()
