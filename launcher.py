@@ -366,7 +366,8 @@ def setup_environment():
     print(f"[环境] 基础路径: {base_path}")
     print(f"[环境] 资源路径: {resources_path}")
 
-    # 设置资源目录环境变量（供game_data_loader使用）
+    # 设置资源目录环境变量（供 game_data_loader 使用；向量索引在 resources/tools/vector_index）
+    # 打包时默认不重建向量库以节省时间，需要刷新索引时: python scripts/build_exe.py --rebuild-vector
     os.environ['CFN_RESOURCES_DIR'] = resources_path
 
     # 在打包环境中，代码已在sys.path中，不需要额外添加

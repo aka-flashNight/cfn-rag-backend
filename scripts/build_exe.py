@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
 打包脚本：将launcher.py和后端代码打包成单个exe文件
+
+向量索引（resources/tools/vector_index）默认不在打包时重建，以缩短打包时间；
+仅在显式传入 --rebuild-vector 时才会在打包前强制重建。
+
+示例：
+  # 日常打包（沿用已有 vector_index，若无则首次运行 exe 时会自动生成）
+  python scripts/build_exe.py
+
+  # 知识库/嵌入源有更新，需要在打包前刷新向量库再分发时
+  python scripts/build_exe.py --rebuild-vector
 """
 
+import argparse
 import os
 import sys
 import shutil
@@ -182,11 +193,16 @@ exe = EXE(
     return spec_content
 
 
-def _ensure_resources_tools_and_rebuild_index(project_root):
+def _ensure_resources_tools(project_root, rebuild_vector: bool = False):
     """
-    确保 resources/tools 存在，并强制重建知识库向量索引到该目录。
+    确保 resources/tools 存在；可选地在打包前重建知识库向量索引。
+
     与 memory.db 同位于外部 resources/tools，exe 不打包索引，full zip 可将其与 exe 一起分发；
     若用户仅下载单 exe，首次运行会在同目录下 resources/tools/vector_index 生成。
+
+    rebuild_vector:
+      False（默认）：不重建，沿用已有 vector_index；无索引时由 exe 首次运行生成。
+      True：打包前强制 rebuild_vector_index()，与「python scripts/build_exe.py --rebuild-vector」一致。
     """
     from pathlib import Path
 
@@ -207,6 +223,9 @@ def _ensure_resources_tools_and_rebuild_index(project_root):
     # 通过环境变量固定 resources 位置，避免脚本与 exe 解析不一致
     os.environ["CFN_RESOURCES_DIR"] = str(resources_dir.resolve())
     print(f"  使用 resources 目录: {resources_dir.resolve()}")
+    if not rebuild_vector:
+        print("  跳过向量索引重建（未传 --rebuild-vector；沿用已有 vector_index）")
+        return
     print("  正在强制重建知识库向量索引（写入 resources/tools/vector_index）...")
     try:
         sys.path.insert(0, str(project_root))
@@ -224,14 +243,24 @@ def main():
     project_root = os.path.dirname(script_dir)
     os.chdir(project_root)
 
+    parser = argparse.ArgumentParser(
+        description="将 launcher.py 与后端打包为 CFN-RAG.exe",
+    )
+    parser.add_argument(
+        "--rebuild-vector",
+        action="store_true",
+        help="打包前强制重建 resources/tools/vector_index；不传则跳过以加快打包",
+    )
+    args = parser.parse_args()
+
     print("=" * 50)
     print("CFN-RAG 完整打包工具")
     print(f"项目根目录: {project_root}")
     print("=" * 50)
 
-    # 打包前：强制重建向量索引到外部 resources/tools（与 db 同位置），不打进 exe
-    print("\n预处理：知识库向量索引...")
-    _ensure_resources_tools_and_rebuild_index(project_root)
+    # 打包前：默认不重建向量索引（见模块顶部示例）；仅 --rebuild-vector 时强制重建
+    print("\n预处理：resources / 知识库向量索引...")
+    _ensure_resources_tools(project_root, rebuild_vector=args.rebuild_vector)
 
     # 检查是否安装了 PyInstaller
     try:
