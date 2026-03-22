@@ -44,6 +44,39 @@ def _dump_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
+def _sync_state_path(data_root: Path) -> Path:
+    """RAG 同步状态：与 npc_state_db 等并列于 <data>/rag/。"""
+    return (Path(data_root).resolve() / "rag" / "sync_state.json").resolve()
+
+
+def _bump_task_publish_version(sync_path: Path) -> None:
+    """
+    任务成功落盘后更新 task_publish_version：
+    - 文件不存在：写入 {"task_publish_version": 1}
+    - 已存在：若有该键则 +1；若无该键则置为 1；其它键原样保留。
+    """
+    sync_path.parent.mkdir(parents=True, exist_ok=True)
+    if not sync_path.exists():
+        _atomic_write_text(sync_path, _dump_json({"task_publish_version": 1}))
+        return
+    try:
+        raw = sync_path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if "task_publish_version" not in data:
+        data["task_publish_version"] = 1
+    else:
+        try:
+            cur = int(data["task_publish_version"])
+        except (TypeError, ValueError):
+            cur = 0
+        data["task_publish_version"] = cur + 1
+    _atomic_write_text(sync_path, _dump_json(data))
+
+
 def _reward_items_to_expr(items: Any) -> List[str]:
     """
     [{item_name, count}] -> ["物品名#数量", ...]
@@ -366,6 +399,8 @@ def write_confirmed_agent_task_files(
 
         _atomic_write_text(agent_tasks_path, _dump_json(new_tasks_doc))
         _atomic_write_text(agent_text_path, _dump_json(text_doc))
+
+        _bump_task_publish_version(_sync_state_path(data_root))
 
         msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
         return msg, task_id_int

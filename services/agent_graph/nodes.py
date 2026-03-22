@@ -48,6 +48,35 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 
+# 同一批 tool_calls 内保证任务流水线顺序，避免模型先 confirm 后 draft 导致「无草案」失败。
+_TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
+    "prepare_task_context": 10,
+    "draft_agent_task": 20,
+    "update_task_draft": 30,
+    "confirm_agent_task": 40,
+    "cancel_agent_task": 50,
+}
+
+
+def _sort_pending_tool_calls_for_task_pipeline(
+    pending_calls: list[dict],
+) -> list[dict]:
+    if len(pending_calls) <= 1:
+        return pending_calls
+
+    def _name(tc: dict) -> str:
+        func_info = tc.get("function", tc)
+        return str(func_info.get("name", "") or "")
+
+    return [
+        tc
+        for _, tc in sorted(
+            enumerate(pending_calls),
+            key=lambda pair: (_TASK_TOOL_PIPELINE_ORDER.get(_name(pair[1]), 1000), pair[0]),
+        )
+    ]
+
+
 ALL_TOOLS = [
     PREPARE_TASK_CONTEXT_TOOL,
     SEARCH_KNOWLEDGE_TOOL,
@@ -603,7 +632,9 @@ async def tool_executor_node(
     npc_manager = cfgable.get("npc_manager")
     rag_service = cfgable.get("rag_service")
 
-    pending_calls = state.get("_pending_tool_calls", [])
+    pending_calls = _sort_pending_tool_calls_for_task_pipeline(
+        list(state.get("_pending_tool_calls", [])),
+    )
     pending_draft = state.get("pending_task_draft")
     npc_name = state.get("npc_name", "")
     npc_faction = state.get("npc_faction", "")

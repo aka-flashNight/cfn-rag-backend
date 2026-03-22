@@ -34,7 +34,7 @@ TOOL_USAGE_GUIDE = """\
    - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，以及可选的需求/奖励关键词，获取筛选后的可选数据与规则。
    - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。
    - update_task_draft：局部修改已有的待确认草案（如调整奖励、更换关卡、更换提交物品等，可同时修改多个属性）。
-   - confirm_agent_task：玩家认可/接受/同意任务草案后调用；传入与最终草案一致的任务说明（description）及接取/完成对话数组，后端合并后校验并写入。
+   - confirm_agent_task：玩家认可/接受/同意任务后调用；传入与最终草案一致的任务说明（description）及接取/完成对话数组，后端合并后校验并写入。
    - cancel_agent_task：取消当前待确认的任务草案（玩家拒绝或你决定撤回时使用）。
 
 在调用上述工具时，如要求填入 `ui_hint`，可填非常短的“正在进行中……”类提示，且适配你的当前行为或聊天情景，必须 <=12 字符，用于前端展示。
@@ -75,6 +75,7 @@ TOOL_USAGE_GUIDE = """\
 
 ■ 协商流程（跨多轮对话）：
   - 草案创建后，以自然语言向玩家描述任务内容，并可以选择是否简述任务奖励。
+  - 若玩家在消息中已明确答应承接任务，但你尚未调用 draft_agent_task 产出草案：可在同一轮决策中先产生有效草案，并紧接着调用 confirm_agent_task 一次完成发布，无需再等玩家回复一次「确认」。
   - 玩家可以接受、拒绝、讨价还价或要求修改：
     · 接受 → 调用 confirm_agent_task(draft_id, description, get_dialogue, finish_dialogue) 写入。
       - `description`：写入任务系统的任务说明，须与最终关卡/物品/奖励一致。
@@ -254,7 +255,7 @@ def build_layer3(
             f"{pending_draft_summary}\n"
             "玩家可能会接受、拒绝、讨价还价、要求变更任务类型或大幅调整。\n"
             "讨价还价时调用 update_task_draft；变更任务类型或大幅调整用 prepare_task_context + draft_agent_task 重新拟定。\n"
-            "玩家接受任务时，调用 confirm_agent_task 并传入任务描述和接取、完成对话。"
+            "玩家接受任务时（包括此前消息已同意接受任务的情况），调用 confirm_agent_task 并传入任务描述和接取、完成对话；"
         )
 
     return "\n".join(parts)
