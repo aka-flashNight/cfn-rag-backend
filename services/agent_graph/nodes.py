@@ -418,7 +418,11 @@ async def prepare_context_node(
     pending_draft_summary = ""
     if pending_draft:
         from services.agent_tools.tool_executor import _detailed_draft_summary
-        pending_draft_summary = _detailed_draft_summary(pending_draft, game_data)
+        pending_draft_summary = _detailed_draft_summary(
+            pending_draft,
+            game_data,
+            rag_context_text=retrieved_context or "",
+        )
 
     summary_text = await memory.get_summary(payload.session_id)
     history_lines = []
@@ -699,6 +703,7 @@ async def tool_executor_node(
             game_data=game_data,
             pending_draft=pending_draft,
             retrieve_fn=_make_retrieve_fn(),
+            rag_context_text=state.get("retrieved_context") or "",
         )
 
         if updated_draft is not None:

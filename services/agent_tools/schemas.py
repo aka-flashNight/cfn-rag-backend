@@ -405,7 +405,7 @@ CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
         "name": "confirm_agent_task",
         "description": (
             "玩家认可/接受/同意任务后调用（含此前已口头答应承接、本轮内刚拟定草案的情况）："
-            "传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。"
+            "传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。不要和已有的任务对话高度重复。"
         ),
         "parameters": CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA,
     },

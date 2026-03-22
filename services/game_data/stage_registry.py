@@ -8,6 +8,7 @@ from services.game_progress import get_progress_stage_config, is_valid_stage_roo
 
 from .models import LootCrate, LootDrop, StageInfo
 from .parsers import _safe_int, discover_list_entries, parse_xml
+from .text_utils import strip_game_markup
 
 
 class StageRegistry:
@@ -62,12 +63,16 @@ class StageRegistry:
             if unlock is not None and unlock <= 0:
                 # 文档规则：没有 UnlockCondition 不作为 agent 候选关卡
                 unlock = None
+            desc_raw = (el.findtext("Description") or "").strip()
+            desc_clean = strip_game_markup(desc_raw) if desc_raw else None
+            if desc_clean == "":
+                desc_clean = None
             si = StageInfo(
                 area=area,
                 name=name,
                 type=(el.findtext("Type") or "").strip() or None,
                 unlock_condition=unlock,
-                description=(el.findtext("Description") or "").strip() or None,
+                description=desc_clean,
                 raw={"list_path": str(list_path)},
             )
             out.append(si)

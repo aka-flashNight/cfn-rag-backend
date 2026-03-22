@@ -170,8 +170,9 @@ def extract_data_level_from_item_element(item_el: ET.Element) -> int:
 
 def extract_item_attributes(item_el: ET.Element) -> dict[str, Any]:
     """
-    提取 items XML 里你明确要求记录的字段：
-    name, displayname, type, use, actiontype, weapontype, price, data.level
+    提取 items XML 里记录的字段：
+    name, displayname, type, use, actiontype, weapontype, price, description,
+    data.level, data.weight, data.clipname
 
     注意：weapontype 在 <item> 标签属性上（仅枪械有）。
     """
@@ -194,6 +195,32 @@ def extract_item_attributes(item_el: ET.Element) -> dict[str, Any]:
             attrs[k] = v.strip()
 
     attrs["level"] = extract_data_level_from_item_element(item_el)
+
+    # description：属性或子节点
+    if "description" in item_el.attrib:
+        dv = (item_el.attrib.get("description") or "").strip()
+        if dv:
+            attrs["description"] = dv
+    if "description" not in attrs:
+        for tag in ("description", "Description"):
+            v = item_el.findtext(tag)
+            if v is not None and str(v).strip():
+                attrs["description"] = str(v).strip()
+                break
+
+    # data：weight / clipname（大小写兼容）
+    data_el = item_el.find("data")
+    if data_el is not None:
+        for key in ("weight", "Weight"):
+            v = data_el.findtext(key)
+            if v is not None and str(v).strip():
+                attrs["weight"] = str(v).strip()
+                break
+        for key in ("clipname", "clipName"):
+            v = data_el.findtext(key)
+            if v is not None and str(v).strip():
+                attrs["clipname"] = str(v).strip()
+                break
 
     # price 转 int（保留原始值在 raw 里由上层决定）
     if "price" in attrs:

@@ -110,6 +110,7 @@ def execute_draft_agent_task(
     player_progress: int = 1,
     npc_affinity: int = 0,
     game_data: Optional[GameDataRegistry] = None,
+    rag_context_text: Optional[str] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     """
     创建任务草案并校验。
@@ -139,14 +140,14 @@ def execute_draft_agent_task(
     )
 
     result = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
-    detailed = _detailed_draft_summary(draft, game_data)
+    detailed = _detailed_draft_summary(draft, game_data, rag_context_text=rag_context_text)
     if not result.success:
         draft["_draft_commit_valid"] = False
         return json.dumps({
             "status": "validation_failed",
             "draft_id": draft_id,
             "errors": result.validation_errors,
-            "draft_summary": detailed,
+            "draft_summary": "",
         }, ensure_ascii=False), draft
     draft["_draft_commit_valid"] = True
     payload: dict[str, Any] = {
@@ -169,6 +170,7 @@ def execute_update_task_draft(
     player_progress: int = 1,
     npc_affinity: int = 0,
     game_data: Optional[GameDataRegistry] = None,
+    rag_context_text: Optional[str] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     """
     局部修改已有草案并重新校验。
@@ -241,13 +243,13 @@ def execute_update_task_draft(
         pending_draft, context=validation_ctx,
         changed_fields=changed, game_data=game_data,
     )
-    detailed = _detailed_draft_summary(pending_draft, game_data)
+    detailed = _detailed_draft_summary(pending_draft, game_data, rag_context_text=rag_context_text)
     if not result.success:
         return json.dumps({
             "status": "validation_failed",
             "draft_id": pending_draft.get("draft_id", ""),
             "errors": result.validation_errors,
-            "draft_summary": detailed,
+            "draft_summary": "",
         }, ensure_ascii=False), pending_draft
 
     pending_draft["_draft_commit_valid"] = True
@@ -275,6 +277,7 @@ def execute_confirm_agent_task(
     player_progress: int = 1,
     npc_affinity: int = 0,
     game_data: Optional[GameDataRegistry] = None,
+    rag_context_text: Optional[str] = None,
 ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
     """
     确认任务草案并写入。
@@ -343,17 +346,21 @@ def execute_confirm_agent_task(
             game_data=game_data,
         )
     except Exception as e:
-        detailed = _detailed_draft_summary(draft_for_commit, game_data)
+        # detailed = _detailed_draft_summary(
+        #     draft_for_commit, game_data, rag_context_text=rag_context_text,
+        # )
         return json.dumps(
             {
                 "status": "error",
                 "message": f"任务写入失败：{str(e)}",
-                "draft_summary": detailed,
+                "draft_summary": "",
             },
             ensure_ascii=False,
         ), pending_draft, None
 
-    detailed = _detailed_draft_summary(draft_for_commit, game_data)
+    detailed = _detailed_draft_summary(
+        draft_for_commit, game_data, rag_context_text=rag_context_text,
+    )
     confirm_payload: dict[str, Any] = {
         "status": "confirmed",
         "task_id": task_id,
@@ -455,9 +462,115 @@ def _summarize_draft(draft: dict[str, Any]) -> str:
     return " | ".join(parts) if parts else "(空草案)"
 
 
+def _draft_item_role_notes(draft: dict[str, Any], item_name: str) -> list[str]:
+    """草案中该物品出现的角色与数量（奖励/提交/持有）。"""
+    notes: list[str] = []
+    for r in draft.get("rewards") or []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("item_name") or "").strip() != item_name:
+            continue
+        notes.append(f"奖励×{r.get('count', '?')}")
+    for r in draft.get("finish_submit_items") or []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("item_name") or "").strip() != item_name:
+            continue
+        notes.append(f"提交×{r.get('count', '?')}")
+    for r in draft.get("finish_contain_items") or []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("item_name") or "").strip() != item_name:
+            continue
+        notes.append(f"持有×{r.get('count', '?')}")
+    return notes
+
+
+def _build_draft_entity_context_lines(
+    draft: dict[str, Any],
+    game_data: Optional[GameDataRegistry],
+    *,
+    rag_context_text: Optional[str] = None,
+) -> list[str]:
+    """
+    与本轮检索上下文中的【玩家可能提到的物品类型】【玩家可能提到的关卡】按名称去重：
+    已在 RAG 块出现过的实体不再重复；未出现的实体给出与 RAG 相同格式的完整说明（另附草案数量/难度等）。
+    """
+    if game_data is None:
+        return []
+    from services.game_entity_prompts import (
+        compute_reward_tags,
+        format_item_prompt_line,
+        format_stage_detail_line,
+        get_stage_info_for_name,
+        parse_rag_game_entity_mentions,
+    )
+
+    already_items, already_stages = parse_rag_game_entity_mentions(rag_context_text)
+
+    lines: list[str] = []
+    seen_stage: set[str] = set()
+    for fr in draft.get("finish_requirements") or []:
+        if not isinstance(fr, dict):
+            continue
+        sn = (fr.get("stage_name") or "").strip()
+        if not sn or sn in seen_stage:
+            continue
+        seen_stage.add(sn)
+        if sn in already_stages:
+            continue
+        diff = (fr.get("difficulty") or "").strip() or None
+        si = get_stage_info_for_name(game_data.stages, sn)
+        if si is not None:
+            seg = format_stage_detail_line(si)
+            if diff:
+                seg += f"；草案要求难度：{diff}"
+            lines.append(f"[关卡] {seg}")
+        else:
+            seg = f"关卡名称：{sn}"
+            if diff:
+                seg += f"；草案要求难度：{diff}"
+            lines.append(f"[关卡] {seg}（未在库中解析到详情）")
+
+    item_names: list[str] = []
+
+    def _collect_from_items(arr: Any) -> None:
+        if not isinstance(arr, list):
+            return
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            nm = (it.get("item_name") or "").strip()
+            if nm and nm not in item_names:
+                item_names.append(nm)
+
+    _collect_from_items(draft.get("finish_submit_items"))
+    _collect_from_items(draft.get("finish_contain_items"))
+    _collect_from_items(draft.get("rewards"))
+
+    for nm in item_names:
+        if nm in already_items:
+            continue
+        it = game_data.items.get_by_name(nm)
+        notes = _draft_item_role_notes(draft, nm)
+        if it is not None:
+            tags = compute_reward_tags(it, game_data.equipment_mods)
+            seg = format_item_prompt_line(it, reward_tags=tags, price=it.price)
+            if notes:
+                seg += f"；草案涉及：{'；'.join(notes)}"
+            lines.append(f"[物品] {seg}")
+        else:
+            extra = f"；{'；'.join(notes)}" if notes else ""
+            lines.append(f"[物品] 名称：{nm}{extra}（未在库中解析到详情）")
+
+    return lines
+
+
 def _detailed_draft_summary(
     draft: dict[str, Any],
     game_data: Optional[GameDataRegistry] = None,
+    *,
+    rag_context_text: Optional[str] = None,
 ) -> str:
     """
     生成包含完整字段和物品单价的草案摘要，
@@ -555,6 +668,16 @@ def _detailed_draft_summary(
         else:
             lines.append("完成对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
+    entity_lines = _build_draft_entity_context_lines(
+        draft, game_data, rag_context_text=rag_context_text,
+    )
+    if entity_lines:
+        lines.append("---")
+        lines.append(
+            "涉及关卡与物品补充说明（前文已有的内容此处不再重复）"
+        )
+        lines.extend(entity_lines)
+
     return "\n".join(lines)
 
 
@@ -596,6 +719,7 @@ def dispatch_tool_call(
     game_data: Optional[GameDataRegistry] = None,
     pending_draft: Optional[dict[str, Any]] = None,
     retrieve_fn: Any = None,
+    rag_context_text: Optional[str] = None,
 ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
     """
     统一工具分发入口。
@@ -612,13 +736,13 @@ def dispatch_tool_call(
     # Debug: 仅打印任务发布相关工具的入参，便于排查协商/落库逻辑。
     # 注意：这里打印的是 LLM 传入的结构化参数（一般不包含敏感信息）。
 
-    if tool_name in _task_tool_names:
-        try:
-            pretty_args = json.dumps(tool_args, ensure_ascii=False)
-        except Exception:
-            pretty_args = str(tool_args)
-        print('——————【工具调用】——————')
-        print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         pretty_args = json.dumps(tool_args, ensure_ascii=False)
+    #     except Exception:
+    #         pretty_args = str(tool_args)
+    #     print('——————【工具调用】——————')
+    #     print(f"[agent_tool_call] 工具名称： {tool_name} args={pretty_args}")
 
 
     updated_draft = pending_draft
@@ -644,6 +768,7 @@ def dispatch_tool_call(
             player_progress=player_progress,
             npc_affinity=npc_affinity,
             game_data=game_data,
+            rag_context_text=rag_context_text,
         )
 
     elif tool_name == "update_task_draft":
@@ -654,6 +779,7 @@ def dispatch_tool_call(
             player_progress=player_progress,
             npc_affinity=npc_affinity,
             game_data=game_data,
+            rag_context_text=rag_context_text,
         )
 
     elif tool_name == "confirm_agent_task":
@@ -664,6 +790,7 @@ def dispatch_tool_call(
             player_progress=player_progress,
             npc_affinity=npc_affinity,
             game_data=game_data,
+            rag_context_text=rag_context_text,
         )
 
     elif tool_name == "cancel_agent_task":
@@ -688,15 +815,15 @@ def dispatch_tool_call(
         }, ensure_ascii=False)
 
     # Debug: 
-    if tool_name in _task_tool_names:
-        try:
-            # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
-            preview = (result or "")
-            # if isinstance(preview, str) and len(preview) > 3000:
-            #     preview = preview[:3000] + "…"
-        except Exception:
-            preview = "<preview-unavailable>"
-        print('——————【结果】——————')
-        print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
+    # if tool_name in _task_tool_names:
+    #     try:
+    #         # 截断避免控制台刷屏（尤其是 prepare_task_context 返回的大列表）
+    #         preview = (result or "")
+    #         # if isinstance(preview, str) and len(preview) > 3000:
+    #         #     preview = preview[:3000] + "…"
+    #     except Exception:
+    #         preview = "<preview-unavailable>"
+    #     print('——————【结果】——————')
+    #     print(f"————/n[agent_tool_result] 工具名称： {tool_name} result={preview}")
 
     return result, updated_draft, task_write_result

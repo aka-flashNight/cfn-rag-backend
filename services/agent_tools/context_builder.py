@@ -652,7 +652,7 @@ def _build_reward_item_candidates(
             "name": item.name,
             "type": item.type,
             "price": item.price or 0,
-            "source": "NPC商店",
+            "source": "本NPC商店",
         }
         if item.level > 0:
             entry["level"] = item.level
@@ -1852,7 +1852,7 @@ def _pin_requested_singleton_candidates(
                 matches.append(c)
         if not matches:
             continue
-        matches.sort(key=lambda x: 0 if x.get("source") == "NPC商店" else 1)
+        matches.sort(key=lambda x: 0 if x.get("source") == "本NPC商店" else 1)
         best = matches[0]
         nm = best.get("name") or ""
         if nm:
@@ -1939,8 +1939,8 @@ def _pick_layer_shop_task_82_proportional(
     """
     if n <= 0 or not items:
         return []
-    shop = [c for c in items if c.get("source") == "NPC商店"]
-    task = [c for c in items if c.get("source") != "NPC商店"]
+    shop = [c for c in items if c.get("source") == "本NPC商店"]
+    task = [c for c in items if c.get("source") != "本NPC商店"]
     q_task = int(round(n * 2 / 10))
     q_shop = n - q_task
     ps = _proportional_pick_one_source(

@@ -835,6 +835,55 @@ def load_loading_documents() -> List[Document]:
     return documents
 
 
+def load_game_entity_documents() -> List[Document]:
+    """
+    为物品与关卡各建一条向量文档（整实体一条，不切分），metadata.type 分别为 game_item / game_stage。
+    构建索引时直接实例化 Registry 读盘，不依赖全局 GAME_DATA 是否已初始化。
+    """
+    from services.game_data.item_registry import ItemRegistry
+    from services.game_data.paths import get_game_data_root
+    from services.game_data.stage_registry import StageRegistry
+    from services.game_entity_prompts import format_item_embedding_text, format_stage_embedding_text
+
+    root = get_game_data_root()
+    items = ItemRegistry(data_root=root)
+    items.load()
+    stages = StageRegistry(data_root=root)
+    stages.load()
+
+    docs: List[Document] = []
+    for it in items.items:
+        text = format_item_embedding_text(it)
+        if not (text or "").strip():
+            continue
+        docs.append(
+            Document(
+                text=text,
+                metadata={
+                    "type": "game_item",
+                    "item_name": it.name,
+                },
+            )
+        )
+    for si in stages._stage_infos.values():
+        text = format_stage_embedding_text(si)
+        docs.append(
+            Document(
+                text=text,
+                metadata={
+                    "type": "game_stage",
+                    "stage_area": si.area,
+                    "stage_name": si.name,
+                    "entity_key": f"{si.area}::{si.name}",
+                },
+            )
+        )
+    print(
+        f"[知识库] 游戏实体向量：物品文档={len(items.items)}，关卡文档={len(stages._stage_infos)}，合计={len(docs)}"
+    )
+    return docs
+
+
 def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     """
     统一构建向量索引（对话、任务、世界观设定等）。
@@ -877,6 +926,12 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
         print(f"[知识库] 加载情报文件时出错，跳过: {exc}")
         intel_docs = []
 
+    game_entity_docs: List[Document] = []
+    try:
+        game_entity_docs = load_game_entity_documents()
+    except Exception as exc:
+        print(f"[知识库] 加载游戏实体向量文档时出错，跳过: {exc}")
+
     # 设定文档单独按章节/段落切分（256/512 token 规则），插入时用 TextNode 避免检索时报 "Node must be a TextNode to get text"
     lore_chunk_nodes: List[TextNode] = []
     if lore_docs:
@@ -892,11 +947,13 @@ def build_index(persist_dir: Path | None = None) -> VectorStoreIndex:
     all_docs.extend(task_docs)
     all_docs.extend(loading_docs)
     all_docs.extend(intel_docs)
+    all_docs.extend(game_entity_docs)
 
     print(
         f"[知识库] 共加载 {len(all_docs)} 个文档 "
         f"(对话={len(dialogue_docs)}, 任务={len(task_docs)}, "
-        f"设定块={len(lore_chunk_nodes)}, loading={len(loading_docs)}, 情报={len(intel_docs)})"
+        f"设定块={len(lore_chunk_nodes)}, loading={len(loading_docs)}, 情报={len(intel_docs)}, "
+        f"游戏实体={len(game_entity_docs)})"
     )
 
     if not all_docs and not lore_chunk_nodes:

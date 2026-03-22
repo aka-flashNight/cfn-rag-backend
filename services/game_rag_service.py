@@ -1543,52 +1543,134 @@ class GameRAGService:
         if pooled:
             parts.append("【补充设定与情报参考（用户输入相似度检索结果，可能与你无关，无关时忽略）】\n" + _nodes_to_text(pooled, max_chars=350))
 
-        # 额外：从玩家输入中按 name 精确匹配物品，并标注其可能的奖励类型（仅用于任务/奖励类型判断）
-        # 目标类型集合来自 reward_types 的可选项：
-        # ["药剂","弹夹","K点","技能点","强化石","战宠灵石","材料","食品","武器","防具","插件"]
-        item_type_hints = self._build_item_type_hints(user_query)
-        if item_type_hints:
-            parts.append(item_type_hints)
+        # 关键词命中物品/关卡 + 语义检索补充（与关键词去重）
+        game_hints = self._build_game_data_context_hints(
+            user_query=user_query,
+            npc_last_message=npc_last_message,
+        )
+        if game_hints:
+            parts.append(game_hints)
 
         return "\n\n".join(parts)
 
-    @staticmethod
-    def _build_item_type_hints(user_query: str) -> str:
-        """
-        从玩家输入中提取“按 name 精确命中的物品”，并标注其可能的奖励类型。
-
-        标注规则（与任务奖励类型一致）：
-        - "药剂","弹夹","材料","食品"：来自 item.use（非装备类）
-        - "武器","防具"：来自 item.type；若 item.use 非空则一并附上（不限于奖励白名单，供 LLM 理解用途）
-        - "插件"：通过 equipment_mods.is_plugin(item.name) 判断
-        - 材料与插件可能重合，重合时两个都要标注
-        - 单价：来自 item.price；缺失（None）则不写
-
-        输出为两行：首行标题，次行用分号拼接各物品：
-        【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】
-        物品A：材料，单价100；物品B：材料、插件，单价50
-        """
+    def _build_game_data_context_hints(
+        self,
+        user_query: str,
+        npc_last_message: str | None,
+    ) -> str:
         q = (user_query or "").strip()
-        if not q:
+        if not q and not (npc_last_message or "").strip():
             return ""
-
         try:
             from services.game_data.registry import get_game_data_registry
+
             game_data = get_game_data_registry()
-            items = game_data.items
-            equipment_mods = game_data.equipment_mods
         except Exception:
             return ""
 
+        return self._compose_game_data_context_hints(
+            user_query=q,
+            npc_last_message=npc_last_message,
+            game_data=game_data,
+        )
+
+    def _compose_game_data_context_hints(
+        self,
+        user_query: str,
+        npc_last_message: str | None,
+        game_data: Any,
+    ) -> str:
+        from services.game_entity_prompts import (
+            compute_reward_tags,
+            format_item_prompt_line,
+            format_stage_detail_line,
+        )
+
+        q = (user_query or "").strip()
+        nq = (npc_last_message or "").strip()
+
+        item_rows, stage_sis, item_hit, stage_hit = self._collect_keyword_matches(
+            user_query=q,
+            items=game_data.items,
+            equipment_mods=game_data.equipment_mods,
+            stage_registry=game_data.stages,
+        )
+        vec_item_names, vec_stage_keys = self._collect_vector_game_entity_extras(
+            user_query=q,
+            npc_last_message=npc_last_message,
+            exclude_item_names=item_hit,
+            exclude_stage_keys=stage_hit,
+        )
+
+        keyword_item_map: dict[str, tuple[Any, list[str], int | None]] = {
+            it.name: (it, tags, price) for it, tags, price in item_rows
+        }
+
+        item_order: list[str] = [it.name for it, _, _ in item_rows]
+        for nm in vec_item_names:
+            if nm not in item_order:
+                item_order.append(nm)
+
+        item_lines: list[str] = []
+        for nm in item_order:
+            it = game_data.items.get_by_name(nm)
+            if it is None:
+                continue
+            if nm in keyword_item_map:
+                _it, tags, price = keyword_item_map[nm]
+                item_lines.append(format_item_prompt_line(_it, reward_tags=tags, price=price))
+            else:
+                tags = compute_reward_tags(it, game_data.equipment_mods)
+                item_lines.append(
+                    format_item_prompt_line(it, reward_tags=tags, price=it.price)
+                )
+
+        stage_lines: list[str] = [format_stage_detail_line(si) for si in stage_sis]
+        seen_stage_k = {f"{si.area}::{si.name}" for si in stage_sis}
+        for ek in vec_stage_keys:
+            if ek in seen_stage_k:
+                continue
+            area, _, name = ek.partition("::")
+            si = game_data.stages._stage_infos.get((area, name))
+            if si is None:
+                continue
+            stage_lines.append(format_stage_detail_line(si))
+            seen_stage_k.add(ek)
+
+        chunks: list[str] = []
+        if item_lines:
+            chunks.append(
+                "【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】\n" + "\n".join(item_lines)
+            )
+        if stage_lines:
+            chunks.append("【玩家可能提到的关卡】\n" + "\n".join(stage_lines))
+
+        return "\n\n".join(chunks)
+
+    @staticmethod
+    def _collect_keyword_matches(
+        user_query: str,
+        items: Any,
+        equipment_mods: Any,
+        stage_registry: Any,
+    ) -> tuple[list[tuple[Any, list[str], int | None]], list[Any], set[str], set[str]]:
+        """
+        关键词命中：物品 (Item, tags, price)、关卡 StageInfo 列表；
+        以及已覆盖的 item 名与 stage entity_key，供向量去重。
+        """
+        q = (user_query or "").strip()
+        item_names_hit: set[str] = set()
+        stage_keys_hit: set[str] = set()
+        matches: list[tuple[Any, list[str], int | None]] = []
+        stage_matches: list[Any] = []
+
+        if not q:
+            return matches, stage_matches, item_names_hit, stage_keys_hit
+
         allowed_use = {"药剂", "弹夹", "材料", "食品"}
         allowed_type = {"武器", "防具"}
-
-        # name 精确匹配：只要物品名作为子串出现即视为“被提到”
-        # 为避免 token 膨胀，最多输出前 N 个命中（按物品名长度降序优先更具体的名字）
-        matches: list[tuple[str, list[str], int | None]] = []
         seen_names: set[str] = set()
 
-        # items.items 返回的是 list[Item]（复制），这里仍是 O(N) 扫描；考虑到仅做字符串包含匹配，通常可接受
         candidates = list(items.items)
         candidates.sort(key=lambda it: len(getattr(it, "name", "") or ""), reverse=True)
 
@@ -1605,7 +1687,6 @@ class GameRAGService:
 
             type_tags: list[str] = []
             use_tags: list[str] = []
-            # 武器/防具：type 在前；无论 use 是否在奖励白名单内，都把原始 use 一并给 LLM 作参考（非空才写）
             if it_type in allowed_type:
                 type_tags.append(it_type)
                 if it_use:
@@ -1620,32 +1701,150 @@ class GameRAGService:
                 plugin = False
 
             if not type_tags and not use_tags and not plugin:
-                # 命中 name 但不属于可标注的类型则忽略
                 continue
 
-            # 顺序：type → use → 插件（去重保序）
             ordered = type_tags + use_tags + (["插件"] if plugin else [])
             dedup: list[str] = []
             for t in ordered:
                 if t not in dedup:
                     dedup.append(t)
 
-            matches.append((name, dedup, it_price))
+            matches.append((it, dedup, it_price))
+            item_names_hit.add(name)
             seen_names.add(name)
             if len(matches) >= 10:
                 break
 
-        if not matches:
-            return ""
+        seen_stage: set[str] = set()
+        st_candidates = list(stage_registry._stage_infos.values())
+        st_candidates.sort(key=lambda si: len(getattr(si, "name", "") or ""), reverse=True)
+        for si in st_candidates:
+            sn = (getattr(si, "name", None) or "").strip()
+            if not sn or sn in seen_stage:
+                continue
+            if sn not in q:
+                continue
+            stage_matches.append(si)
+            stage_keys_hit.add(f"{si.area}::{si.name}")
+            seen_stage.add(sn)
+            if len(stage_matches) >= 10:
+                break
 
-        # 次行：分号分隔物品；同一物品多标签用 "、"；有 price 则追加「，单价n」
-        pairs: list[str] = []
-        for name, tags, price in matches:
-            seg = f"{name}：{'、'.join(tags)}"
-            if price is not None:
-                seg += f"，单价{price}"
-            pairs.append(seg)
-        return "【玩家可能提到的物品类型（仅用于任务/奖励类型判断）】\n" + "；".join(pairs)
+        return matches, stage_matches, item_names_hit, stage_keys_hit
+
+    def _collect_vector_game_entity_extras(
+        self,
+        user_query: str,
+        npc_last_message: str | None,
+        exclude_item_names: set[str],
+        exclude_stage_keys: set[str],
+    ) -> tuple[list[str], list[str]]:
+        """语义检索补充（与关键词去重）：返回额外物品名列表、额外关卡 entity_key 列表。"""
+        try:
+            from services.game_data.registry import get_game_data_registry
+
+            game_data = get_game_data_registry()
+        except Exception:
+            return [], []
+
+        index = self._get_index()
+        SCORE_TH = 0.48
+
+        item_retriever = index.as_retriever(
+            similarity_top_k=4,
+            filters=MetadataFilters(filters=[MetadataFilter(key="type", value="game_item")]),
+        )
+        stage_retriever = index.as_retriever(
+            similarity_top_k=4,
+            filters=MetadataFilters(filters=[MetadataFilter(key="type", value="game_stage")]),
+        )
+
+        def _pull_item_name(meta: dict[str, Any]) -> str | None:
+            n = (meta.get("item_name") or "").strip()
+            return n or None
+
+        def _pull_stage_key(meta: dict[str, Any]) -> str | None:
+            ek = (meta.get("entity_key") or "").strip()
+            if ek:
+                return ek
+            a = (meta.get("stage_area") or "").strip()
+            n = (meta.get("stage_name") or "").strip()
+            if a and n:
+                return f"{a}::{n}"
+            return None
+
+        def _meta_from_node(n: Any) -> dict[str, Any]:
+            node = getattr(n, "node", n)
+            return getattr(node, "metadata", None) or {}
+
+        picked_items: list[str] = []
+        seen_item: set[str] = set()
+
+        uq = (user_query or "").strip()
+        nq = (npc_last_message or "").strip()
+
+        if uq:
+            for n in item_retriever.retrieve(uq):
+                if (getattr(n, "score", None) or 0) < SCORE_TH:
+                    continue
+                meta = _meta_from_node(n)
+                nm = _pull_item_name(meta)
+                if not nm or nm in exclude_item_names or nm in seen_item:
+                    continue
+                if game_data.items.get_by_name(nm) is None:
+                    continue
+                seen_item.add(nm)
+                picked_items.append(nm)
+                break
+
+        if nq:
+            for n in item_retriever.retrieve(nq):
+                if (getattr(n, "score", None) or 0) < SCORE_TH:
+                    continue
+                meta = _meta_from_node(n)
+                nm = _pull_item_name(meta)
+                if not nm or nm in exclude_item_names or nm in seen_item:
+                    continue
+                if game_data.items.get_by_name(nm) is None:
+                    continue
+                seen_item.add(nm)
+                picked_items.append(nm)
+                break
+
+        picked_stages: list[str] = []
+        seen_stage: set[str] = set()
+
+        if uq:
+            for n in stage_retriever.retrieve(uq):
+                if (getattr(n, "score", None) or 0) < SCORE_TH:
+                    continue
+                meta = _meta_from_node(n)
+                ek = _pull_stage_key(meta)
+                if not ek or ek in exclude_stage_keys or ek in seen_stage:
+                    continue
+                area, _, sname = ek.partition("::")
+                if game_data.stages._stage_infos.get((area, sname)) is None:
+                    continue
+                seen_stage.add(ek)
+                picked_stages.append(ek)
+                break
+
+        if nq:
+            for n in stage_retriever.retrieve(nq):
+                if (getattr(n, "score", None) or 0) < SCORE_TH:
+                    continue
+                meta = _meta_from_node(n)
+                ek = _pull_stage_key(meta)
+                if not ek or ek in exclude_stage_keys or ek in seen_stage:
+                    continue
+                area, _, sname = ek.partition("::")
+                if game_data.stages._stage_infos.get((area, sname)) is None:
+                    continue
+                seen_stage.add(ek)
+                picked_stages.append(ek)
+                break
+
+        return picked_items, picked_stages
 
     async def get_npc_favorability(
         self,

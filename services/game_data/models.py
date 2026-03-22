@@ -33,6 +33,20 @@ class Item(BaseModel):
 
     price: Optional[int] = Field(default=None, description="价格（XML: price）")
 
+    description: Optional[str] = Field(
+        default=None,
+        description="物品说明（XML: description 子节点或属性；入库前已去 HTML）",
+    )
+
+    weight: Optional[str] = Field(
+        default=None,
+        description="重量（XML: data/weight 等，保留原文）",
+    )
+    clipname: Optional[str] = Field(
+        default=None,
+        description="弹夹名（XML: data/clipname 等）",
+    )
+
     level: int = Field(
         default=0,
         description="等级（XML: data.level；data 或 level 可能缺失，缺失则为 0）",

@@ -14,6 +14,7 @@ from .parsers import (
     parse_xml,
 )
 from .paths import get_game_data_root
+from .text_utils import strip_game_markup
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,11 @@ class ItemRegistry:
             if price == 0 and "price" not in el.attrib:
                 price = None
 
+            desc_raw = attrs.get("description")
+            desc_clean = strip_game_markup(desc_raw) if desc_raw else None
+            if desc_clean == "":
+                desc_clean = None
+
             item = Item(
                 name=str(name),
                 displayname=str(displayname) if displayname is not None else None,
@@ -120,6 +126,9 @@ class ItemRegistry:
                 actiontype=str(attrs.get("actiontype")) if attrs.get("actiontype") is not None else None,
                 weapontype=str(attrs.get("weapontype")) if attrs.get("weapontype") is not None else None,
                 price=price,
+                description=desc_clean,
+                weight=(str(attrs["weight"]).strip() if attrs.get("weight") is not None else None),
+                clipname=(str(attrs["clipname"]).strip() if attrs.get("clipname") is not None else None),
                 level=int(attrs.get("level") or 0),
                 source_path=str(path),
                 raw={"xml_attrib": dict(el.attrib)},
