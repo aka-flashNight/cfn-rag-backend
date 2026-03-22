@@ -196,6 +196,69 @@ def _find_launcher_icon_path():
     return None
 
 
+def _find_loading_audio_path():
+    """scripts/loading_audio.mp3：开发目录或打包 _MEIPASS / exe 旁"""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(os.path.join(sys._MEIPASS, "scripts", "loading_audio.mp3"))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "scripts", "loading_audio.mp3"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "scripts", "loading_audio.mp3"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _play_loading_audio_mp3_windows(path: str) -> bool:
+    """
+    使用 winmm MCI 播放 MP3（无额外依赖）。在后台线程里于播放结束后 close，避免泄漏别名。
+    失败返回 False，便于调用方回退到系统提示音。
+    """
+    import ctypes
+    import threading
+    import uuid
+
+    path_abs = os.path.normpath(os.path.abspath(path))
+    if not os.path.isfile(path_abs):
+        return False
+
+    alias = "cfn_" + uuid.uuid4().hex[:16]
+    winmm = ctypes.windll.winmm
+    buf = ctypes.create_unicode_buffer(512)
+    # 路径中的引号会破坏 MCI 命令；极少见，直接失败即可
+    if '"' in path_abs:
+        return False
+    err_open = winmm.mciSendStringW(
+        f'open "{path_abs}" type mpegvideo alias {alias}', buf, 512, None
+    )
+    if err_open != 0:
+        return False
+    err_play = winmm.mciSendStringW(f"play {alias}", buf, 512, None)
+    if err_play != 0:
+        winmm.mciSendStringW(f"close {alias}", buf, 512, None)
+        return False
+
+    def _close_after_done():
+        import time
+
+        time.sleep(0.05)
+        buf2 = ctypes.create_unicode_buffer(512)
+        length_ms = 0
+        if winmm.mciSendStringW(f"status {alias} length", buf2, 512, None) == 0:
+            try:
+                length_ms = int(buf2.value)
+            except ValueError:
+                length_ms = 0
+        wait_s = max(0.001 * length_ms + 0.2, 0.4) if length_ms > 0 else 2.0
+        time.sleep(wait_s)
+        winmm.mciSendStringW(f"close {alias}", buf2, 512, None)
+
+    threading.Thread(target=_close_after_done, daemon=True).start()
+    return True
+
+
 def _apply_launcher_window_chrome(tk_root, width, height):
     """固定窗口大小、居中、任务栏图标"""
     tk_root.resizable(False, False)
@@ -222,6 +285,105 @@ def _close_pyi_splash_if_any():
         import pyi_splash  # type: ignore
 
         pyi_splash.close()
+    except Exception:
+        pass
+
+
+def _bring_packaged_status_window_forward(tk_root):
+    """
+    闪屏结束后 Windows 往往不会自动把焦点交给已创建的状态窗（窗口在任务栏需手动点）。
+    短暂置顶再取消，便于用户立刻看到状态窗；不影响长期置顶。
+    """
+    try:
+        tk_root.lift()
+        tk_root.attributes("-topmost", True)
+        tk_root.update_idletasks()
+        tk_root.update()
+
+        def _unset_topmost():
+            try:
+                tk_root.attributes("-topmost", False)
+            except Exception:
+                pass
+
+        tk_root.after(120, _unset_topmost)
+        try:
+            tk_root.focus_force()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _flash_windows_taskbar_for_hwnd(hwnd: int) -> None:
+    """让任务栏上对应窗口按钮闪烁若干次（全屏游戏时任务栏常不可见，仅作辅助）。"""
+    if os.name != "nt" or not hwnd:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwnd", wintypes.HANDLE),
+                ("dwFlags", wintypes.DWORD),
+                ("uCount", wintypes.UINT),
+                ("dwTimeout", wintypes.DWORD),
+            ]
+
+        FLASHW_ALL = 0x03
+        user32 = ctypes.windll.user32
+        info = FLASHWINFO()
+        info.cbSize = ctypes.sizeof(FLASHWINFO)
+        info.hwnd = wintypes.HANDLE(hwnd)
+        info.dwFlags = FLASHW_ALL
+        info.uCount = 6
+        info.dwTimeout = 200
+        user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass
+
+
+def _notify_browser_opened_user_attention():
+    """
+    浏览器由 webbrowser.open 打开后，系统不保证窗口到最前；全屏独占游戏时尤其如此。
+
+    补救（无法突破独占全屏，只能提高「被感知」概率）：
+    - Windows：播放 scripts/loading_audio.mp3（winmm MCI）；找不到或失败时回退系统提示音
+    - 打包模式：再次前置启动器 + 任务栏闪烁，与「另开终端打断全屏」类似但更快
+
+    若仍无感知：请退出全屏或切桌面后访问 127.0.0.1:708x。
+    """
+    if os.name == "nt":
+        played = False
+        audio_path = _find_loading_audio_path()
+        if audio_path:
+            try:
+                played = _play_loading_audio_mp3_windows(audio_path)
+            except Exception:
+                played = False
+        if not played:
+            try:
+                import winsound
+
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                pass
+
+    root = _splash_root
+    if not root:
+        return
+
+    def _on_main_thread():
+        try:
+            _bring_packaged_status_window_forward(root)
+            _flash_windows_taskbar_for_hwnd(int(root.winfo_id()))
+        except Exception:
+            pass
+
+    try:
+        root.after(0, _on_main_thread)
     except Exception:
         pass
 
@@ -689,10 +851,12 @@ def open_browser_when_ready(frontend_port):
 
     print(f"[系统] 正在打开浏览器: {url}")
     webbrowser.open(url)
+    _notify_browser_opened_user_attention()
 
     splash_update(
         "服务运行中……",
-        f"浏览器已打开页面，也可手动输入网址 127.0.0.1:{frontend_port} 访问。\n如需停止服务，可关闭本窗口。",
+        f"浏览器应已打开；全屏游戏时，请切换到浏览器查看。\n"
+        f"也可手动访问 127.0.0.1:{frontend_port}。关闭本窗口停止服务。",
     )
 
     print("\n" + "=" * 50)
@@ -829,6 +993,7 @@ def main_packaged_gui():
     root.update_idletasks()
     root.update()
     _close_pyi_splash_if_any()
+    _bring_packaged_status_window_forward(root)
 
     if not check_python_environment():
         _splash_root = None
