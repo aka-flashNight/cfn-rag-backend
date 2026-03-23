@@ -1632,7 +1632,7 @@ class GameRAGService:
         if not q:
             return matches, stage_matches, item_names_hit, stage_keys_hit
 
-        allowed_use = {"药剂", "弹夹", "材料", "食品"}
+        allowed_use = {"药剂", "弹夹", "材料", "食品", "食材"}
         allowed_type = {"武器", "防具"}
         seen_names: set[str] = set()
 

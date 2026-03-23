@@ -57,7 +57,7 @@ def parse_rag_game_entity_mentions(text: str | None) -> tuple[set[str], set[str]
 
 
 def compute_reward_tags(item: Item, equipment_mods: Any) -> list[str]:
-    """与任务奖励类型标注一致：药剂/弹夹/材料/食品/武器/防具/插件等。"""
+    """与任务奖励类型标注一致：药剂/弹夹/材料/食品/武器/防具/插件等（食材按食品标注）。"""
     allowed_use = {"药剂", "弹夹", "材料", "食品"}
     allowed_type = {"武器", "防具"}
     name = (item.name or "").strip()
@@ -69,6 +69,8 @@ def compute_reward_tags(item: Item, equipment_mods: Any) -> list[str]:
         type_tags.append(it_type)
         if it_use:
             use_tags.append(it_use)
+    elif it_use == "食材" or it_type == "食材":
+        use_tags.append("食品")
     elif it_use in allowed_use:
         use_tags.append(it_use)
     plugin = False

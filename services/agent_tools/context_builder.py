@@ -364,6 +364,7 @@ def _matches_reward_type(
     规则：name 或 type 或 use 任意一项与 reward_type 相等即可。
     特殊：\"插件\" 通过 equipment_mods_registry 判断。
     材料：reward_type「材料」同时匹配 item.use==材料 或 item.type==收集品（数据里材料多为 type 收集品 + use 材料）。
+    食品：Parser 将 消耗品_材料_食材 的 use 标为「食材」；奖励枚举仍只有「食品」，此处将食材视为食品以便入选奖励池。
     """
     if reward_type == "插件":
         return equipment_mods.is_plugin(item.name)
@@ -383,6 +384,11 @@ def _matches_reward_type(
     # 材料：数据中常为 type=收集品、use=材料；若 use 未标或归一化，用 type 收集品 兜底
     if reward_type == "材料" and item.type and item.type == "收集品":
         return True
+    if reward_type == "食品":
+        if item.use == "食材":
+            return True
+        if item.type == "食材":
+            return True
     return False
 
 

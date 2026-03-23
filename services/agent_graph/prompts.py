@@ -6,7 +6,7 @@ Layer 2 — NPC 层（同一 NPC 的多次请求相同）
 Layer 3 — 会话层（按变化频率从低到高排列）
 Layer 4 — 检索层（按请求变化）
 
-前缀越靠前越稳定，最大化 LLM API 的 prompt prefix cache 命中率。
+拼接 system 时固定层（Layer 1）置于最前，使跨 NPC 请求共享最长公共前缀，最大化 LLM API 的 prompt prefix cache 命中率。
 """
 
 from __future__ import annotations
@@ -158,6 +158,22 @@ def build_layer1() -> str:
     )
 
 
+def format_npc_role_tagline(
+    *,
+    npc_name: str,
+    sex: str = "",
+    faction: str = "",
+    titles: list[str] | None = None,
+) -> str:
+    """与 Layer 2 开头一致的角色扮演首句，供 Layer 2 与 system 末尾重申共用。"""
+    sex_desc = f"（性别：{sex}）" if sex else ""
+    faction_desc = f"（阵营：{faction}）" if faction else ""
+    titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
+    return (
+        f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Layer 2: NPC 层
 # ---------------------------------------------------------------------------
@@ -172,9 +188,6 @@ def build_layer2(
     has_shop: bool = False,
     has_challenge: bool = False,
 ) -> str:
-    sex_desc = f"（性别：{sex}）" if sex else ""
-    faction_desc = f"（阵营：{faction}）" if faction else ""
-    titles_desc = f"（身份或称呼：{'、'.join(titles)}）" if titles else ""
     emotions_list = emotions or ["普通"]
     emotions_str = "、".join(emotions_list)
 
@@ -193,7 +206,7 @@ def build_layer2(
     )
 
     return (
-        f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
+        f"{format_npc_role_tagline(npc_name=npc_name, sex=sex, faction=faction, titles=titles)}\n"
         f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。\n"
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，"
         "用简体中文回答玩家本次的发言。\n"
@@ -209,11 +222,11 @@ def build_layer2(
         "- 如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，则不要发布任务，并拒绝玩家的发布任务请求；\n"
         f"- {shop_constraint}\n"
         f"{challenge_hint}"
-        "- NPC角色定位与可发布任务类型参考（请结合你的身份灵活判断）：\n"
-        "  · 高级军事NPC → 通关、挑战、通关+收集，奖励偏向金币/经验值/武器/强化石。\n"
-        "  · 商人NPC（有商店）→ 资源收集、装备缴纳、物品持有，奖励偏向金币/商店物品/材料。\n"
-        "  · 普通成员NPC → 问候、低级资源收集、低级物品持有，奖励偏向金币/药剂/食品/弹夹。\n"
-        "  · 科技/学术NPC → 收集特殊材料/插件、装备缴纳，奖励偏向K点/技能点/插件/合成材料。\n"
+        "- NPC角色定位与推荐发布任务类型参考（请结合你的身份灵活判断，可以发布非推荐类型的任务）：\n"
+        "  · 高级军事NPC → 通关、清理、挑战、通关并收集、通关并持有，奖励偏向金币/经验值/武器/强化石/技能点。\n"
+        "  · 商人NPC（有商店）→ 装备缴纳、特殊物品获取、物品持有、资源收集，奖励偏向金币/商店物品/材料。\n"
+        "  · 普通成员NPC → 问候、传话、低级资源收集、低级物品持有，奖励偏向金币/药剂/食品/弹夹。\n"
+        "  · 科技/学术NPC → 特殊物品获取(高级材料/插件)、装备缴纳，奖励偏向K点/技能点/插件/合成材料/强化石/战宠灵石。\n"
     )
 
 
@@ -310,7 +323,7 @@ def build_system_prompt(
     mentioned_npcs_str: str = "",
     pending_draft_summary: str = "",
 ) -> str:
-    """组装 Layer 1 + Layer 2 + Layer 3 为 system prompt。"""
+    """组装 Layer 1（固定）+ Layer 2（NPC）+ Layer 3（会话）为 system prompt；固定层在前以利于前缀缓存。"""
     layer1 = build_layer1()
     layer2 = build_layer2(
         npc_name=npc_name,
@@ -331,7 +344,11 @@ def build_system_prompt(
         pending_draft_summary=pending_draft_summary,
     )
 
-    return f"{layer2}\n{layer1}\n\n{layer3}"
+    tagline = format_npc_role_tagline(
+        npc_name=npc_name, sex=sex, faction=faction, titles=titles
+    )
+    core = f"{layer1}\n\n{layer2}\n\n{layer3}"
+    return f"{core}\n\n再次强调：{tagline}"
 
 
 def build_user_prompt(
