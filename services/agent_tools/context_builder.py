@@ -783,6 +783,12 @@ def _reorder_stage_list_by_keywords(
     stage_list: list[dict[str, Any]],
     requirement_keywords: Optional[list[str]],
 ) -> None:
+    """
+    DEPRECATED:
+    旧版关卡重排逻辑（仅重排，不做分桶抽样与截断）。
+    现已由 `_pick_stage_rows_20` + `_group_stage_rows_by_area` 取代。
+    暂保留以避免潜在外部引用破坏；新逻辑请勿再调用本函数。
+    """
     kw = _normalize_kw_list(requirement_keywords)
     for block in stage_list:
         stages = block.get("stages") or []
@@ -852,6 +858,209 @@ def _stage_loot_row_matches_keywords(
     return False
 
 
+def _build_stage_access_meta(
+    *,
+    area: str,
+    stage_name: str,
+    unlock_condition: int,
+    mercs_by_stage: dict[str, list[Any]],
+    max_level: int,
+    main_task_max_id: int,
+) -> Optional[dict[str, Any]]:
+    """
+    关卡可用性与难度元信息（通关/清理/挑战/通关并收集/通关并持有共用）。
+    规则：
+    - 副本(area=副本任务)：必须存在 recommended_min_level 且 <= max_level 才可用；
+    - 非副本：按 unlock_condition <= main_task_max_id 可用。
+    """
+    is_dungeon = area == "副本任务"
+    if is_dungeon:
+        merc_tasks = mercs_by_stage.get(stage_name) or []
+        allowed_by_root = [
+            mt
+            for mt in merc_tasks
+            if mt.recommended_min_level is not None and mt.recommended_min_level <= max_level
+        ]
+        if not allowed_by_root:
+            return None
+
+        allowed_difficulties: set[str] = {"简单"}
+        challenge_modes_map: dict[str, str] = {}
+        for mt in merc_tasks:
+            if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
+                continue
+            cmin = mt.challenge_recommended_min_level
+            if cmin is None:
+                continue
+            if cmin <= max_level:
+                allowed_difficulties.add(mt.challenge_difficulty)
+                if (
+                    mt.challenge_description
+                    and mt.challenge_difficulty not in challenge_modes_map
+                ):
+                    challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+
+        difficulties = [
+            d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties
+        ]
+        challenge_modes = [
+            {"difficulty": diff, "description": desc}
+            for diff, desc in challenge_modes_map.items()
+            if diff in difficulties and diff != "简单"
+        ]
+        return {
+            "is_dungeon": True,
+            "difficulties": difficulties,
+            "recommended_level": min(
+                mt.recommended_min_level
+                for mt in merc_tasks
+                if mt.recommended_min_level is not None
+            ),
+            "challenge_modes": challenge_modes,
+        }
+
+    if unlock_condition > main_task_max_id:
+        return None
+    return {
+        "is_dungeon": False,
+        "difficulties": ["简单", "冒险", "修罗", "地狱"],
+    }
+
+
+def _stage_row_keyword_hit(
+    *,
+    area: str,
+    stage_name: str,
+    area_region_hint: str,
+    keywords: list[str],
+) -> bool:
+    if not keywords:
+        return False
+    blob = "".join([
+        area,
+        area_region_hint,
+        _STAGE_ROOT_REGION_HINT_EXTRA.get(area, ""),
+        stage_name,
+    ])
+    return _any_keyword_in_text(blob, keywords)
+
+
+def _pick_stage_rows_20(
+    rows: list[dict[str, Any]],
+    *,
+    requirement_keywords: Optional[list[str]],
+) -> list[dict[str, Any]]:
+    """
+    关卡候选分桶抽样（上限 20）：
+    - 关键词命中优先（先吃满）；
+    - 剩余名额按 当前进度 : 低于进度 = 8 : 2；
+    - 桶内随机。
+    """
+    max_n = 20
+    kw = _normalize_kw_list(requirement_keywords)
+    if not rows:
+        return []
+
+    if kw:
+        matched: list[dict[str, Any]] = [r for r in rows if r.get("_keyword_hit")]
+        unmatched_in = [
+            r for r in rows if (not r.get("_keyword_hit")) and (not r.get("below_progress"))
+        ]
+        unmatched_below = [
+            r for r in rows if (not r.get("_keyword_hit")) and r.get("below_progress")
+        ]
+        random.shuffle(matched)
+        random.shuffle(unmatched_in)
+        random.shuffle(unmatched_below)
+        picked = matched[:max_n]
+        rem = max_n - len(picked)
+        if rem > 0:
+            picked.extend(
+                _allocate_remainder_quota_pools(rem, [unmatched_in, unmatched_below], "82")
+            )
+        return picked[:max_n]
+
+    in_prog = [r for r in rows if not r.get("below_progress")]
+    below = [r for r in rows if r.get("below_progress")]
+    random.shuffle(in_prog)
+    random.shuffle(below)
+    return _allocate_remainder_quota_pools(max_n, [in_prog, below], "82")
+
+
+def _group_stage_rows_by_area(
+    rows: list[dict[str, Any]],
+    *,
+    stage: int,
+) -> list[dict[str, Any]]:
+    """将扁平关卡列表分组，并把重复字段上提到 area 级。"""
+    if not rows:
+        return []
+    cfg = get_progress_stage_config(stage)
+    current_area = cfg.stage_name if cfg else ""
+
+    area_to_rows: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        area_to_rows.setdefault(str(r.get("area") or ""), []).append(r)
+
+    others = [a for a in area_to_rows.keys() if a and a != current_area]
+    random.shuffle(others)
+    ordered_areas: list[str] = []
+    if current_area and current_area in area_to_rows:
+        ordered_areas.append(current_area)
+    ordered_areas.extend(others)
+
+    # 补充可能为空/异常的 area
+    for a in area_to_rows.keys():
+        if a not in ordered_areas:
+            ordered_areas.append(a)
+
+    # area_level_range 仅对主进度 1-7 的主区域定义；跨区为 None
+    area_level_map: dict[str, list[int] | None] = {}
+    for stage_num, sc in PROGRESS_STAGE_CONFIG.items():
+        lr = get_progress_stage_level_range(stage_num)
+        area_level_map[sc.stage_name] = list(lr) if lr else None
+
+    out: list[dict[str, Any]] = []
+    for area in ordered_areas:
+        rows_in_area = area_to_rows.get(area) or []
+        if not rows_in_area:
+            continue
+        stages: list[dict[str, Any]] = []
+        has_dungeon_mode = False
+        for r in rows_in_area:
+            item = {
+                "name": r.get("name"),
+                "unlock_id": r.get("unlock_id"),
+                "difficulties": r.get("difficulties") or [],
+                "is_dungeon": bool(r.get("is_dungeon")),
+            }
+            if r.get("recommended_level") is not None:
+                item["recommended_level"] = r.get("recommended_level")
+            if r.get("challenge_modes"):
+                item["challenge_modes"] = r.get("challenge_modes")
+                has_dungeon_mode = True
+            if r.get("below_progress"):
+                item["below_progress"] = True
+            if "loot_items" in r:
+                item["loot_items"] = r.get("loot_items") or []
+            if "total_loot_value" in r:
+                item["total_loot_value"] = r.get("total_loot_value", 0)
+            stages.append(item)
+
+        block: dict[str, Any] = {
+            "area": area,
+            "area_region_hint": stage_root_region_hint(area),
+            "area_level_range": area_level_map.get(area),
+            "stages": stages,
+        }
+        if has_dungeon_mode and area == "副本任务":
+            block["challenge_modes_hint"] = (
+                "副本任务中，若选择 challenge_modes 中的非“简单”难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
+            )
+        out.append(block)
+    return out
+
+
 def _get_all_stages_for_progress(
     game_data: GameDataRegistry,
     stage: int,
@@ -879,116 +1088,47 @@ def _get_all_stages_for_progress(
             continue
         mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
-    area_map: dict[str, list[dict[str, Any]]] = {}
-
+    rows: list[dict[str, Any]] = []
+    kw = _normalize_kw_list(requirement_keywords)
     for (area, name), si in stage_registry._stage_infos.items():
         if si.unlock_condition is None:
             continue
-
-        is_dungeon = area == "副本任务"
-
-        if is_dungeon:
-            merc_tasks = mercs_by_stage.get(name) or []
-            # 文档：没有标注推荐等级的副本一律剔除（沿用旧逻辑）
-            # 只有当至少存在一个 merc task 的 recommended_min_level <= max_level 时才放行
-            allowed_by_root = [
-                mt for mt in merc_tasks
-                if mt.recommended_min_level is not None and mt.recommended_min_level <= max_level
-            ]
-            if not allowed_by_root:
-                continue
-
-            allowed_difficulties: set[str] = {"简单"}
-            challenge_modes_map: dict[str, str] = {}
-            challenge_hint_map: dict[str, str] = {}
-
-            # 额外难度：需要满足 challenge.recommended_level 的下限
-            for mt in merc_tasks:
-                if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
-                    continue
-                cmin = mt.challenge_recommended_min_level
-                if cmin is None:
-                    continue
-                if cmin <= max_level:
-                    allowed_difficulties.add(mt.challenge_difficulty)
-                    if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
-                        challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
-                    if mt.challenge_difficulty not in challenge_hint_map:
-                        challenge_hint_map[mt.challenge_difficulty] = (
-                            mt.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
-                        )
-
-            # 保持稳定顺序：按照 difficulty 枚举顺序输出
-            difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
-
-            # 返回给 LLM 的挑战模式说明（仅当包含非简单时）
-            if len(difficulties) > 1 and challenge_modes_map:
-                entry_challenges = [
-                    {
-                        "difficulty": diff,
-                        "description": desc,
-                        "hint": challenge_hint_map.get(diff, DEFAULT_CHALLENGE_LLM_HINT),
-                    }
-                    for diff, desc in challenge_modes_map.items()
-                    if diff in difficulties and diff != "简单"
-                ]
-            else:
-                entry_challenges = []
-        else:
-            if si.unlock_condition > main_task_max_id:
-                continue
-            difficulties = ["简单", "冒险", "修罗", "地狱"]
+        meta = _build_stage_access_meta(
+            area=area,
+            stage_name=name,
+            unlock_condition=int(si.unlock_condition),
+            mercs_by_stage=mercs_by_stage,
+            max_level=int(max_level),
+            main_task_max_id=int(main_task_max_id),
+        )
+        if meta is None:
+            continue
 
         below_progress = (
-            not is_dungeon
+            not bool(meta.get("is_dungeon"))
             and si.unlock_condition < main_task_min_id
         )
-
-        entry: dict[str, Any] = {
+        row: dict[str, Any] = {
+            "area": area,
             "name": name,
             "unlock_id": si.unlock_condition,
-            "difficulties": difficulties,
-            "is_dungeon": is_dungeon,
-            "area_region_hint": stage_root_region_hint(area),
+            "difficulties": meta.get("difficulties") or [],
+            "is_dungeon": bool(meta.get("is_dungeon")),
+            "recommended_level": meta.get("recommended_level"),
+            "challenge_modes": meta.get("challenge_modes") or [],
+            "_keyword_hit": _stage_row_keyword_hit(
+                area=area,
+                stage_name=name,
+                area_region_hint=stage_root_region_hint(area),
+                keywords=kw,
+            ),
         }
-        if is_dungeon:
-            # 根 recommended_level 用于“副本可选性”提示（这里取放行集合的最小下限）
-            entry["recommended_level"] = min(
-                mt.recommended_min_level
-                for mt in merc_tasks
-                if mt.recommended_min_level is not None
-            )
-            if entry_challenges:
-                entry["challenge_modes"] = entry_challenges
         if below_progress:
-            entry["below_progress"] = True
-        # difficulties/challenge_modes/recommended_level 已在 is_dungeon 分支里处理
+            row["below_progress"] = True
+        rows.append(row)
 
-        area_map.setdefault(area, []).append(entry)
-
-    # 构建二级结构
-    result: list[dict[str, Any]] = []
-    for stage_num in sorted(PROGRESS_STAGE_CONFIG.keys()):
-        sc = PROGRESS_STAGE_CONFIG[stage_num]
-        area_name = sc.stage_name
-        if area_name and area_name in area_map:
-            lr = get_progress_stage_level_range(stage_num)
-            result.append({
-                "area": area_name,
-                "area_level_range": list(lr) if lr else None,
-                "stages": area_map[area_name],
-            })
-    # 追加跨进度区域
-    for cross_area in ("地下2层", "副本任务", "试炼场深处"):
-        if cross_area in area_map:
-            result.append({
-                "area": cross_area,
-                "area_level_range": None,
-                "stages": area_map[cross_area],
-            })
-
-    _reorder_stage_list_by_keywords(result, requirement_keywords)
-    return result
+    picked = _pick_stage_rows_20(rows, requirement_keywords=requirement_keywords)
+    return _group_stage_rows_by_area(picked, stage=stage)
 
 
 def _build_npc_list(
@@ -1091,103 +1231,62 @@ def _build_challenge_targets(
     main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)
     main_task_max_id = int(main_task_range[1]) if main_task_range and len(main_task_range) > 1 else 77
 
-    # 同名关卡可能出现在多个 area；不能只用“副本优先”的单一归属判断。
-    # 规则：无推荐等级时，若存在任一非副本 area 且其解锁id满足进度，则按关卡可用。
-    areas = {
+    areas = [
         area
         for (area, name), _si in game_data.stages._stage_infos.items()
         if name == npc_challenge
-    }
-    has_dungeon_area = "副本任务" in areas
-    non_dungeon_areas = [a for a in areas if a != "副本任务"]
+    ]
+    if not areas:
+        return {"error": "当前NPC切磋关卡不存在于可用地图数据，请选择其他任务类型"}
 
-    # 根据 mercenary_tasks.json 的 recommended_level 过滤：不展示推荐等级高于当前阶段上限的关卡
-    matched_merc_tasks = [m for m in mercenary_registry.list_all() if m.stage_name == npc_challenge]
-    if matched_merc_tasks:
-        eligible: list[Any] = []
-        unlock_ok = False
-        for area in non_dungeon_areas:
-            unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
-            if unlock_id > 0 and unlock_id <= int(main_task_max_id):
-                unlock_ok = True
-                break
-
-        for m in matched_merc_tasks:
-            rec = getattr(m, "recommended_min_level", None)
-            if rec is not None:
-                if int(rec) <= int(max_level):
-                    eligible.append(m)
-                continue
-
-            # 没有 recommended_min_level 的条目：
-            # - 存在可解锁的非副本 area：按关卡可用
-            if unlock_ok:
-                eligible.append(m)
-                continue
-
-            # - 否则若仅副本 area（或关卡 unlock 不满足）：排除
-            if has_dungeon_area:
-                continue
-
-        if not eligible:
-            return {"error": "玩家当前阶段实力/进度不满足该NPC切磋关卡条件，请选择其他任务类型"}
-
-        # 后续难度/提示等只使用可判定的有效条目
-        matched_merc_tasks = eligible
-    else:
-        # 无 mercenary 条目时：按关卡解锁条件兜底判定
-        # - 存在可解锁的非副本 area：可用
-        # - 否则不可用（例如仅副本但无推荐等级数据）
-        unlock_ok = False
-        for area in non_dungeon_areas:
-            unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
-            if unlock_id > 0 and unlock_id <= int(main_task_max_id):
-                unlock_ok = True
-                break
-        if not unlock_ok:
-            return {"error": "玩家当前阶段实力/进度不满足该NPC切磋关卡条件，请选择其他任务类型"}
-
-    # 基础：至少包含“简单”
-    allowed_difficulties: set[str] = {"简单"}
-    challenge_modes_map: dict[str, str] = {}
-    challenge_hint_map: dict[str, str] = {}
-    for m in matched_merc_tasks:
-        if not m.challenge_difficulty or m.challenge_difficulty == "简单":
+    mercs_by_stage: dict[str, list[Any]] = {}
+    for mt in mercenary_registry.list_all():
+        if not mt.stage_name:
             continue
-        cmin = m.challenge_recommended_min_level
-        if cmin is None:
-            continue
-        if int(cmin) <= int(max_level):
-            allowed_difficulties.add(m.challenge_difficulty)
-            if m.challenge_description and m.challenge_difficulty not in challenge_modes_map:
-                challenge_modes_map[m.challenge_difficulty] = m.challenge_description
-            if m.challenge_difficulty not in challenge_hint_map:
-                challenge_hint_map[m.challenge_difficulty] = m.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
+        mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
-    difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
+    metas: list[tuple[str, dict[str, Any]]] = []
+    for area in sorted(set(areas)):
+        unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
+        if unlock_id <= 0:
+            continue
+        meta = _build_stage_access_meta(
+            area=area,
+            stage_name=npc_challenge,
+            unlock_condition=unlock_id,
+            mercs_by_stage=mercs_by_stage,
+            max_level=int(max_level),
+            main_task_max_id=int(main_task_max_id),
+        )
+        if meta is not None:
+            metas.append((area, meta))
+
+    if not metas:
+        return {"error": "玩家当前阶段实力/进度不满足该NPC切磋关卡条件，请选择其他任务类型"}
+
+    # 同名关卡跨区时，优先副本（更贴近切磋语义），否则取第一个可用区。
+    picked_area, picked_meta = next(
+        ((a, m) for a, m in metas if a == "副本任务"),
+        metas[0],
+    )
+    difficulties = picked_meta.get("difficulties") or ["简单"]
 
     entry: dict[str, Any] = {
         "dungeon_name": npc_challenge,
         "target_npc": npc_name,
         "difficulties": difficulties,
     }
-    ch_area = _pick_stage_root_for_stage_name(game_data.stages, npc_challenge)
-    if ch_area:
-        entry["stage_area"] = ch_area
-        entry["area_region_hint"] = stage_root_region_hint(ch_area)
+    entry["stage_area"] = picked_area
+    entry["area_region_hint"] = stage_root_region_hint(picked_area)
 
-    if len(difficulties) > 1:
-        extra_modes = [
-            {
-                "difficulty": d,
-                "description": desc,
-                "hint": challenge_hint_map.get(d, DEFAULT_CHALLENGE_LLM_HINT),
-            }
-            for d, desc in challenge_modes_map.items()
-            if d in difficulties and d != "简单"
-        ]
-        if extra_modes:
-            entry["challenge_modes"] = extra_modes
+    extra_modes = picked_meta.get("challenge_modes") or []
+    if extra_modes:
+        entry["challenge_modes"] = extra_modes
+        entry["challenge_modes_hint"] = (
+            "若选择 challenge_modes 中的非“简单”难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
+        )
+    if picked_meta.get("recommended_level") is not None:
+        entry["recommended_level"] = picked_meta.get("recommended_level")
 
     return [entry]
 
@@ -1768,54 +1867,23 @@ def _build_stage_loot_list(
             continue
         mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
-    result: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    kw = _normalize_kw_list(requirement_keywords)
 
     for (area, name), si in stage_registry._stage_infos.items():
         if si.unlock_condition is None:
             continue
 
-        is_dungeon = area == "副本任务"
-        if is_dungeon:
-            merc_tasks = mercs_by_stage.get(name) or []
-            allowed_by_root = [
-                mt for mt in merc_tasks
-                if mt.recommended_min_level is not None and mt.recommended_min_level <= max_level
-            ]
-            if not allowed_by_root:
-                continue
-
-            allowed_difficulties: set[str] = {"简单"}
-            challenge_modes_map: dict[str, str] = {}
-            challenge_hint_map: dict[str, str] = {}
-            for mt in merc_tasks:
-                if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
-                    continue
-                cmin = mt.challenge_recommended_min_level
-                if cmin is None:
-                    continue
-                if cmin <= max_level:
-                    allowed_difficulties.add(mt.challenge_difficulty)
-                    if mt.challenge_description and mt.challenge_difficulty not in challenge_modes_map:
-                        challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
-                    if mt.challenge_difficulty not in challenge_hint_map:
-                        challenge_hint_map[mt.challenge_difficulty] = (
-                            mt.challenge_llm_hint or DEFAULT_CHALLENGE_LLM_HINT
-                        )
-
-            difficulties = [d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties]
-            entry_challenges = [
-                {
-                    "difficulty": diff,
-                    "description": desc,
-                    "hint": challenge_hint_map.get(diff, DEFAULT_CHALLENGE_LLM_HINT),
-                }
-                for diff, desc in challenge_modes_map.items()
-                if diff in difficulties and diff != "简单"
-            ]
-        else:
-            if si.unlock_condition > main_task_max_id:
-                continue
-            difficulties = ["简单", "冒险", "修罗", "地狱"]
+        meta = _build_stage_access_meta(
+            area=area,
+            stage_name=name,
+            unlock_condition=int(si.unlock_condition),
+            mercs_by_stage=mercs_by_stage,
+            max_level=int(max_level),
+            main_task_max_id=int(main_task_max_id),
+        )
+        if meta is None:
+            continue
 
         crates = stage_registry.get_stage_loot(area, name)
         if not crates:
@@ -1849,56 +1917,38 @@ def _build_stage_loot_list(
             continue
 
         below_progress = (
-            not is_dungeon
+            not bool(meta.get("is_dungeon"))
             and si.unlock_condition < main_task_min_id
         )
 
-        lr = get_progress_stage_level_range(stage)
-        entry: dict[str, Any] = {
+        row: dict[str, Any] = {
             "area": area,
-            "area_region_hint": stage_root_region_hint(area),
-            "area_level_range": list(lr) if lr else None,
-            "stage_name": name,
+            "name": name,
             "unlock_id": si.unlock_condition,
-            "is_dungeon": is_dungeon,
-            "difficulties": difficulties,
+            "is_dungeon": bool(meta.get("is_dungeon")),
+            "difficulties": meta.get("difficulties") or [],
+            "recommended_level": meta.get("recommended_level"),
+            "challenge_modes": meta.get("challenge_modes") or [],
             "loot_items": loot_items,
             "total_loot_value": total_loot_value,
+            "_keyword_hit": _stage_loot_row_matches_keywords(
+                {
+                    "area": area,
+                    "area_region_hint": stage_root_region_hint(area),
+                    "stage_name": name,
+                    "loot_items": loot_items,
+                },
+                kw,
+                item_registry,
+                equipment_mods,
+            ),
         }
         if below_progress:
-            entry["below_progress"] = True
-        if is_dungeon:
-            entry["recommended_level"] = min(
-                mt.recommended_min_level
-                for mt in merc_tasks
-                if mt.recommended_min_level is not None
-            )
-            if entry_challenges:
-                entry["challenge_modes"] = entry_challenges
+            row["below_progress"] = True
+        rows.append(row)
 
-        result.append(entry)
-
-    kw = _normalize_kw_list(requirement_keywords)
-    if not kw:
-        in_prog = [r for r in result if not r.get("below_progress")]
-        below = [r for r in result if r.get("below_progress")]
-        result = _shuffle_each_bucket_concat([in_prog, below])
-    else:
-        b0, b1, b2, b3 = [], [], [], []
-        for row in result:
-            kh = _stage_loot_row_matches_keywords(row, kw, item_registry, equipment_mods)
-            bp = bool(row.get("below_progress"))
-            if kh and not bp:
-                b0.append(row)
-            elif kh and bp:
-                b1.append(row)
-            elif not kh and not bp:
-                b2.append(row)
-            else:
-                b3.append(row)
-        result = _shuffle_each_bucket_concat([b0, b1, b2, b3])
-
-    return result[:20]
+    picked = _pick_stage_rows_20(rows, requirement_keywords=requirement_keywords)
+    return _group_stage_rows_by_area(picked, stage=stage)
 
 
 # 每种在数据侧通常唯一对应条目；若玩家勾选了该奖励类型，截断列表中优先保证出现。
