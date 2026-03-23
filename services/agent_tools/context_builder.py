@@ -1053,6 +1053,9 @@ def _group_stage_rows_by_area(
             "area_level_range": area_level_map.get(area),
             "stages": stages,
         }
+        if area == "副本任务":
+            # 副本任务跨 1-100 级，不绑定单一主线阶段区间
+            block["area_level_range"] = None
         if has_dungeon_mode and area == "副本任务":
             block["challenge_modes_hint"] = (
                 "副本任务中，若选择 challenge_modes 中的非“简单”难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
@@ -1915,6 +1918,29 @@ def _build_stage_loot_list(
 
         if not loot_items:
             continue
+
+        # 产出压缩：
+        # - 情报类全部保留（用于任务叙事/线索）
+        # - 非情报类仅保留总价值（min_qty * unit_price）最高的 3 类
+        intel_items: list[dict[str, Any]] = []
+        non_intel_items: list[dict[str, Any]] = []
+        for li in loot_items:
+            item_name = li.get("item_name") or ""
+            item = item_registry.get_by_name(item_name) if item_name else None
+            use = getattr(item, "use", None) if item is not None else None
+            typ = getattr(item, "type", None) if item is not None else None
+            if use == "情报" or typ == "情报":
+                intel_items.append(li)
+            else:
+                non_intel_items.append(li)
+
+        non_intel_items.sort(
+            key=lambda x: (
+                -int((x.get("min_qty") or 0) * (x.get("unit_price") or 0)),
+                str(x.get("item_name") or ""),
+            )
+        )
+        loot_items = intel_items + non_intel_items[:3]
 
         below_progress = (
             not bool(meta.get("is_dungeon"))

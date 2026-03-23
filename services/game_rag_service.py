@@ -1502,7 +1502,7 @@ class GameRAGService:
             # 与世界观设定使用相同检索条件的 loading 文本短句，数量较少，仅作补充参考
             parts.append("tips节选：\n" + _nodes_to_text(loading_lore_nodes, max_chars=300))
         if task_nodes:
-            parts.append("【你的参考任务对话(任务可能超过玩家当前进度，仅参考语气和设定，忽略具体剧情，避免剧透)】\n" + _nodes_to_text(task_nodes, max_chars=350))
+            parts.append("【你的参考任务对话(任务可能超过玩家当前进度，仅参考语气和设定，忽略具体剧情，避免剧透，且勿重复原文语句)】\n" + _nodes_to_text(task_nodes, max_chars=350))
         if other_npc_nodes:
             parts.append("【其他NPC相关对话参考（不是你的台词，只参考设定，忽略语气，并忽略剧情以避免剧透）】\n" + _nodes_to_other_npc_text(other_npc_nodes, max_chars=350))
         if pooled:
