@@ -86,7 +86,7 @@ class StageRegistry:
 
     def list_stages_for_progress(self, stage: int) -> list[StageInfo]:
         """
-        按玩家 progress_stage（1-6）筛选候选关卡：
+        按玩家 progress_stage（1-7）筛选候选关卡：
         - area 必须属于该阶段对应的大区（由 services/game_progress.py 提供）
         - 且必须有 unlock_condition
         """

@@ -17,8 +17,8 @@ class NPCChatRequest(BaseModel):
     progress_stage: Optional[int] = Field(
         default=None,
         ge=1,
-        le=6,
-        description="玩家当前主线进度阶段，1-6 的整数；不传时表示未知或未开始，用于后续 LLM 与后端工具根据进度做差异化响应",
+        le=7,
+        description="玩家当前主线进度阶段，1-7 的整数；不传时表示未知或未开始，用于后续 LLM 与后端工具根据进度做差异化响应",
     )
     agent_enabled: Optional[bool] = Field(
         default=None,

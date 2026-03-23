@@ -359,7 +359,7 @@ async def prepare_context_node(
             stage_num = int(progress_stage or 1)
         except Exception:
             stage_num = 1
-        stage_num = max(1, min(6, stage_num))
+        stage_num = max(1, min(7, stage_num))
         level_range = get_progress_stage_level_range(stage_num) or (1, 50)
         player_max_level = int(level_range[1]) if level_range and len(level_range) > 1 else 50
 

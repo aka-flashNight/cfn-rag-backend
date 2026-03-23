@@ -396,13 +396,13 @@ class GameRAGService:
     def _use_agent_graph(self, payload: NPCChatRequest) -> bool:
         """
         判断是否启用 LangGraph 管线。
-        条件：agent_enabled 不为 false，且 progress_stage 已传且值 1-6。
+        条件：agent_enabled 不为 false，且 progress_stage 已传且值 1-7。
         否则降级到旧的简单对话流程（单次 LLM，无工具轮）。
         """
         if not self._is_agent_enabled(payload):
             return False
         stage = getattr(payload, "progress_stage", None)
-        return stage is not None and isinstance(stage, int) and 1 <= stage <= 6
+        return stage is not None and isinstance(stage, int) and 1 <= stage <= 7
 
     def _build_graph_config(
         self,

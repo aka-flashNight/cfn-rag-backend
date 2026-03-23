@@ -18,7 +18,7 @@ class AgentState(TypedDict, total=False):
 
     # ── 上下文（prepare_context 节点填充） ──
     npc_name: str
-    player_progress: int           # 1-6
+    player_progress: int           # 1-7
     npc_affinity: int              # 0-100
     npc_relationship_level: str    # 陌生/熟悉/朋友/生死之交
     npc_faction: str

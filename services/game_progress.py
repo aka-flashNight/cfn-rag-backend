@@ -23,7 +23,7 @@ class StageConfig:
     main_task_max_id: Optional[int] = None
 
 
-# 主线阶段基础配置：1-6 阶段
+# 主线阶段基础配置：1-7 阶段
 # 注：后续如果主线扩展，可只调整对应阶段的 id 范围上限。
 PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
     # 1：废城，1-11级，stages 名：基地门口，主线 id 范围 0-21
@@ -62,23 +62,32 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
         main_task_min_id=37,
         main_task_max_id=74,
     ),
-    # 5：诺亚，29-40级，stages 名：诺亚前线基地深处，主线 id 范围 75-77（暂定）
+    # 5：诺亚，29-40级，stages 名：诺亚前线基地深处，主线 id 范围 75-120（暂定）
     5: StageConfig(
         name="诺亚",
         min_level=29,
         max_level=40,
         stage_name="诺亚前线基地深处",
         main_task_min_id=75,
-        main_task_max_id=77,
+        main_task_max_id=120,
     ),
-    # 6：雪山，40-50级，stages 名：雪山，主线 id 范围 77-77（暂定）
+    # 6：雪山，40-50级，stages 名：雪山，主线 id 范围 77-150（暂定）
     6: StageConfig(
         name="雪山",
         min_level=40,
         max_level=50,
         stage_name="雪山",
         main_task_min_id=77,
-        main_task_max_id=77,
+        main_task_max_id=150,
+    ),
+    # 7：已通关，50-100级，stages 名：已通关，主线 id 范围 77-770（暂定）
+    7: StageConfig(
+        name="已通关",
+        min_level=50,
+        max_level=100,
+        stage_name="副本任务",
+        main_task_min_id=77,
+        main_task_max_id=770,
     ),
 }
 

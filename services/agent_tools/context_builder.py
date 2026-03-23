@@ -2067,7 +2067,7 @@ def prepare_task_context(
     if game_data is None:
         game_data = get_game_data_registry()
 
-    stage = max(1, min(6, player_progress))
+    stage = max(1, min(7, player_progress))
     cfg = get_progress_stage_config(stage)
 
     level_range = get_progress_stage_level_range(stage) or (1, 50)
