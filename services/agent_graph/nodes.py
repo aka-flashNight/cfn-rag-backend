@@ -278,6 +278,7 @@ async def prepare_context_node(
     from services.game_progress import (
         get_progress_stage_name,
         get_progress_stage_level_range,
+        get_progress_stage_main_task_range,
     )
 
     npc_name = payload.npc_name.strip()
@@ -296,6 +297,7 @@ async def prepare_context_node(
     faction = current_state.faction
     titles = current_state.titles or []
     npc_challenge = getattr(current_state, "challenge", None)
+    player_can_challenge: Optional[bool] = None
     has_shop = False
     shop_reward_types: list[str] = []
     if game_data:
@@ -374,32 +376,72 @@ async def prepare_context_node(
     if stage_name:
         progress_stage_desc = f"当前玩家的主要作战区域为{stage_name}。"
 
-    # 切磋关卡的 recommended_level 过滤：不满足阶段时不要在 prompt 中提示 NPC 有切磋可选
+    # 切磋提示三态（副本/关卡混合逻辑）：
+    # - NPC确实拥有切磋关卡：has_challenge=True
+    # - 若条目有 recommended_min_level，则按推荐等级判定（副本/关卡都适用）
+    # - 若条目没有 recommended_min_level：
+    #   - 若为副本（大区为“副本任务”）则排除
+    #   - 若为关卡，则按 stages.unlock_condition（主线id上限）判定
     if game_data and npc_challenge:
         try:
             stage_num = int(progress_stage or 1)
         except Exception:
             stage_num = 1
         stage_num = max(1, min(7, stage_num))
+
         level_range = get_progress_stage_level_range(stage_num) or (1, 50)
-        player_max_level = int(level_range[1]) if level_range and len(level_range) > 1 else 50
+        player_max_level = (
+            int(level_range[1]) if level_range and len(level_range) > 1 else 50
+        )
+
+        main_task_range = get_progress_stage_main_task_range(stage_num) or (0, 77)
+        main_task_max_id = (
+            int(main_task_range[1]) if main_task_range and len(main_task_range) > 1 else 77
+        )
+
+        # 同名关卡可能出现在多个 area；不能只用“副本优先”的单一归属判断。
+        # 规则：无推荐等级时，若存在任一非副本 area 且其解锁id满足进度，则按关卡可用。
+        areas = {
+            area
+            for (area, name), _si in game_data.stages._stage_infos.items()
+            if name == npc_challenge
+        }
+        has_dungeon_area = "副本任务" in areas
+        non_dungeon_areas = [a for a in areas if a != "副本任务"]
 
         matched_merc_tasks = [
             m
             for m in game_data.mercenary_tasks.list_all()
             if m.stage_name == npc_challenge
         ]
-        if matched_merc_tasks:
-            ok = False
-            for m in matched_merc_tasks:
-                if m.recommended_min_level is None:
-                    ok = True
-                    break
-                if m.recommended_min_level <= player_max_level:
-                    ok = True
-                    break
-            if not ok:
-                npc_challenge = None
+        eligible: list[Any] = []
+        unlock_ok = False
+        for area in non_dungeon_areas:
+            unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
+            if unlock_id > 0 and unlock_id <= int(main_task_max_id):
+                unlock_ok = True
+                break
+
+        for m in matched_merc_tasks:
+            rec = getattr(m, "recommended_min_level", None)
+            if rec is not None:
+                if int(rec) <= int(player_max_level):
+                    eligible.append(m)
+                continue
+
+            if unlock_ok:
+                eligible.append(m)
+                continue
+
+            if has_dungeon_area:
+                continue
+
+        # 若没有任何 mercenary 条目，但该关卡存在可解锁的非副本 area，
+        # 仍应按关卡解锁条件判定为可挑战。
+        if not matched_merc_tasks and unlock_ok:
+            player_can_challenge = True
+        else:
+            player_can_challenge = bool(eligible)
 
     mentioned_npcs, mentioned_names = rag_service._find_mentioned_npcs(
         payload.query, npc_name, all_npc_states, faction
@@ -487,6 +529,7 @@ async def prepare_context_node(
         has_shop=has_shop,
         shop_reward_types=shop_reward_types,
         has_challenge=bool(npc_challenge),
+        player_can_challenge=player_can_challenge,
         same_faction_npcs=same_faction_str,
         player_identity=player_identity,
         progress_stage_desc=progress_stage_desc,

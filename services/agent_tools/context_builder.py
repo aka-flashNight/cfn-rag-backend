@@ -1088,17 +1088,64 @@ def _build_challenge_targets(
     mercenary_registry = game_data.mercenary_tasks
     cfg = get_progress_stage_config(stage)
     max_level = cfg.max_level if cfg else 50
+    main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)
+    main_task_max_id = int(main_task_range[1]) if main_task_range and len(main_task_range) > 1 else 77
+
+    # 同名关卡可能出现在多个 area；不能只用“副本优先”的单一归属判断。
+    # 规则：无推荐等级时，若存在任一非副本 area 且其解锁id满足进度，则按关卡可用。
+    areas = {
+        area
+        for (area, name), _si in game_data.stages._stage_infos.items()
+        if name == npc_challenge
+    }
+    has_dungeon_area = "副本任务" in areas
+    non_dungeon_areas = [a for a in areas if a != "副本任务"]
 
     # 根据 mercenary_tasks.json 的 recommended_level 过滤：不展示推荐等级高于当前阶段上限的关卡
     matched_merc_tasks = [m for m in mercenary_registry.list_all() if m.stage_name == npc_challenge]
     if matched_merc_tasks:
-        # 规则：只要存在一个条目满足 rec_min <= player_max_level（或该条目无推荐等级），则认为可用
-        ok = any(
-            (m.recommended_min_level is None) or (m.recommended_min_level <= max_level)
-            for m in matched_merc_tasks
-        )
-        if not ok:
-            return {"error": "当前阶段等级不满足该NPC切磋关卡的推荐等级，请选择其他任务类型"}
+        eligible: list[Any] = []
+        unlock_ok = False
+        for area in non_dungeon_areas:
+            unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
+            if unlock_id > 0 and unlock_id <= int(main_task_max_id):
+                unlock_ok = True
+                break
+
+        for m in matched_merc_tasks:
+            rec = getattr(m, "recommended_min_level", None)
+            if rec is not None:
+                if int(rec) <= int(max_level):
+                    eligible.append(m)
+                continue
+
+            # 没有 recommended_min_level 的条目：
+            # - 存在可解锁的非副本 area：按关卡可用
+            if unlock_ok:
+                eligible.append(m)
+                continue
+
+            # - 否则若仅副本 area（或关卡 unlock 不满足）：排除
+            if has_dungeon_area:
+                continue
+
+        if not eligible:
+            return {"error": "玩家当前阶段实力/进度不满足该NPC切磋关卡条件，请选择其他任务类型"}
+
+        # 后续难度/提示等只使用可判定的有效条目
+        matched_merc_tasks = eligible
+    else:
+        # 无 mercenary 条目时：按关卡解锁条件兜底判定
+        # - 存在可解锁的非副本 area：可用
+        # - 否则不可用（例如仅副本但无推荐等级数据）
+        unlock_ok = False
+        for area in non_dungeon_areas:
+            unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
+            if unlock_id > 0 and unlock_id <= int(main_task_max_id):
+                unlock_ok = True
+                break
+        if not unlock_ok:
+            return {"error": "玩家当前阶段实力/进度不满足该NPC切磋关卡条件，请选择其他任务类型"}
 
     # 基础：至少包含“简单”
     allowed_difficulties: set[str] = {"简单"}

@@ -188,6 +188,7 @@ def build_layer2(
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
+    player_can_challenge: Optional[bool] = None,
 ) -> str:
     emotions_list = emotions or ["普通"]
     emotions_str = "、".join(emotions_list)
@@ -202,11 +203,19 @@ def build_layer2(
         "在 reward_types 中不可选武器/防具/插件。如果玩家向你索要装备，请推荐其向售卖物品的角色提出请求，而非同意，因为你无法满足玩家的需求。"
     )
 
-    challenge_hint = (
-        "- 你拥有可用的切磋关卡，可以发布'切磋'类型的任务。\n"
-        if has_challenge
-        else "- 你没有切磋关卡，不可发布'切磋'类型的任务。\n"
-    )
+    if not has_challenge:
+        challenge_hint = "- 你没有切磋关卡，不可发布'切磋'类型的任务。\n"
+    else:
+        # 三态提示：
+        # - NPC确实有切磋关卡，但玩家暂时实力不足：不可发布'切磋'任务
+        # - NPC有切磋关卡且玩家满足挑战：可以发布'切磋'任务
+        # - player_can_challenge 未提供时：回退为“可以发布”的默认语义
+        if player_can_challenge is False:
+            challenge_hint = (
+                "- 你拥有可用的切磋关卡，但是，玩家当前的实力还暂时不能挑战你，所以你不可发布'切磋'类型的任务。\n"
+            )
+        else:
+            challenge_hint = "- 你拥有可用的切磋关卡，可以发布'切磋'类型的任务。\n"
 
     return (
         f"{format_npc_role_tagline(npc_name=npc_name, sex=sex, faction=faction, titles=titles)}\n"
@@ -319,6 +328,7 @@ def build_system_prompt(
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
+    player_can_challenge: Optional[bool] = None,
     same_faction_npcs: str = "",
     player_identity: str = "",
     progress_stage_desc: str = "",
@@ -338,6 +348,7 @@ def build_system_prompt(
         has_shop=has_shop,
         shop_reward_types=shop_reward_types,
         has_challenge=has_challenge,
+        player_can_challenge=player_can_challenge,
     )
     layer3 = build_layer3(
         same_faction_npcs=same_faction_npcs,
