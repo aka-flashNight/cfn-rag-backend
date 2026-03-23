@@ -634,6 +634,18 @@ def _build_reward_item_candidates(
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
 
+    # 当 NPC 商店的武器/防具候选在等级区间内不足 3 件时：
+    # 1) 先仅返回区间内（min_level~max_level）的商店装备；
+    # 2) 不足后再从「低于 min_level 但不超过 max_level」的商店装备中补足；
+    # 3) 补足按等级从高到低进行（尽量贴近 min_level）。
+    _SHOP_EQUIPMENT_SUPPLEMENT_TYPES: set[str] = {"武器", "防具"}
+    _shop_inrange_equipment_by_type: dict[str, list[dict[str, Any]]] = {
+        rt: [] for rt in _SHOP_EQUIPMENT_SUPPLEMENT_TYPES
+    }
+    _shop_below_equipment_by_type: dict[str, list[dict[str, Any]]] = {
+        rt: [] for rt in _SHOP_EQUIPMENT_SUPPLEMENT_TYPES
+    }
+
     # 来源 2 优先：当前NPC商店物品
     for shop_item_name in npc_shop_items:
         if shop_item_name in seen:
@@ -643,17 +655,16 @@ def _build_reward_item_candidates(
             continue
         is_weapon_or_armor = item.type in ("武器", "防具")
         is_grenade = bool(item.use) and item.use == "手雷"
-        if is_weapon_or_armor or is_grenade:
-            if item.level <= min_level or item.level > max_level:
-                continue
+
         # 所有商店物品都需匹配 reward_types（含「材料」匹配 item.use/type）
-        matched = False
+        matched_types: list[str] = []
         for rt in all_types:
             if _matches_reward_type(item, rt, equipment_mods):
-                matched = True
-                break
-        if not matched:
+                matched_types.append(rt)
+        if not matched_types:
             continue
+
+        # entry 字段统一（后续补足逻辑复用）
         entry = {
             "name": item.name,
             "type": item.type,
@@ -666,8 +677,49 @@ def _build_reward_item_candidates(
             tier = equipment_mods.get_plugin_tier(item.name)
             if tier:
                 entry["plugin_tier"] = tier
+
+        # 等级筛选只针对「武器/防具/手雷」这一类装备输入项
+        if is_weapon_or_armor or is_grenade:
+            if item.level > max_level:
+                continue
+            if item.level < min_level:
+                for rt in matched_types:
+                    if rt in _SHOP_EQUIPMENT_SUPPLEMENT_TYPES:
+                        _shop_below_equipment_by_type[rt].append(entry)
+                continue
+
+            # 区间内：立即加入候选，并在后续做“不足 3 才补”的计数
+            candidates.append(entry)
+            seen.add(shop_item_name)
+            for rt in matched_types:
+                if rt in _SHOP_EQUIPMENT_SUPPLEMENT_TYPES:
+                    _shop_inrange_equipment_by_type[rt].append(entry)
+            continue
+
+        # 非装备类：直接加入候选
         candidates.append(entry)
         seen.add(shop_item_name)
+
+    # 不足 3 件时再补：从高到低补「低于 min_level」但不超过 max_level 的商店装备
+    for rt in _SHOP_EQUIPMENT_SUPPLEMENT_TYPES:
+        if rt not in all_types:
+            continue
+        need = 3 - len(_shop_inrange_equipment_by_type.get(rt) or [])
+        if need <= 0:
+            continue
+
+        below_items = _shop_below_equipment_by_type.get(rt) or []
+        below_items.sort(key=lambda e: e.get("level") or 0, reverse=True)
+        for e in below_items:
+            nm = e.get("name") or ""
+            if not nm or nm in seen:
+                continue
+            candidates.append(e)
+            seen.add(nm)
+            _shop_inrange_equipment_by_type.setdefault(rt, []).append(e)
+            need -= 1
+            if need <= 0:
+                break
 
     # 来源 1：任务奖励池（按当前区间优先顺序：主线区间 → 前置在区间 → mercenary 等级重合 → 其他）
     for item_name in ordered_task_item_names:

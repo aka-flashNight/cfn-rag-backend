@@ -186,17 +186,20 @@ def build_layer2(
     titles: list[str] | None = None,
     emotions: list[str] | None = None,
     has_shop: bool = False,
+    shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
 ) -> str:
     emotions_list = emotions or ["普通"]
     emotions_str = "、".join(emotions_list)
+    shop_reward_types = shop_reward_types or []
 
     shop_constraint = (
         "你可以将自己商店的物品作为任务奖励（物品等级需匹配玩家进度）。"
-        "在 reward_types 中可选 武器/防具/插件。"
+        f"当前商店可覆盖的奖励类型包括：[{('、'.join(shop_reward_types) if shop_reward_types else '未知')}]。"
+        "在 reward_types 中可选这些类型；如果玩家索要的物品类型在候选列表中没有（表示你店里没有/不适配），你应回绝玩家的索要请求，而非同意，因为你没有这类物品。"
         if has_shop
-        else "你不经营商店，奖励以金币、经验值、药剂等通用物资为主。"
-        "在 reward_types 中不可选武器/防具/插件。"
+        else "你不经营商店，奖励以金币、经验值、K点、技能点、药剂、弹夹、材料等通用物资为主。"
+        "在 reward_types 中不可选武器/防具/插件。如果玩家向你索要装备，请推荐其向售卖物品的角色提出请求，而非同意，因为你无法满足玩家的需求。"
     )
 
     challenge_hint = (
@@ -314,6 +317,7 @@ def build_system_prompt(
     titles: list[str] | None = None,
     emotions: list[str] | None = None,
     has_shop: bool = False,
+    shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
     same_faction_npcs: str = "",
     player_identity: str = "",
@@ -332,6 +336,7 @@ def build_system_prompt(
         titles=titles,
         emotions=emotions,
         has_shop=has_shop,
+        shop_reward_types=shop_reward_types,
         has_challenge=has_challenge,
     )
     layer3 = build_layer3(

@@ -30,7 +30,7 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
     1: StageConfig(
         name="废城",
         min_level=1,
-        max_level=11,
+        max_level=12,
         stage_name="基地门口",
         main_task_min_id=0,
         main_task_max_id=21,
@@ -38,8 +38,8 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
     # 2：堕落城，12-15级，stages 名：基地车库，主线 id 范围 22-28
     2: StageConfig(
         name="堕落城",
-        min_level=12,
-        max_level=15,
+        min_level=11,
+        max_level=17,
         stage_name="基地车库",
         main_task_min_id=22,
         main_task_max_id=28,
@@ -47,8 +47,8 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
     # 3：荒漠军阀，16-19级，stages 名：基地房顶，主线 id 范围 29-36
     3: StageConfig(
         name="荒漠军阀",
-        min_level=16,
-        max_level=19,
+        min_level=15,
+        max_level=22,
         stage_name="基地房顶",
         main_task_min_id=29,
         main_task_max_id=36,
@@ -57,7 +57,7 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
     4: StageConfig(
         name="黑铁会总堂",
         min_level=20,
-        max_level=28,
+        max_level=31,
         stage_name="黑铁会总部",
         main_task_min_id=37,
         main_task_max_id=74,

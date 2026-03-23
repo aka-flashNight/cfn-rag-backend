@@ -297,8 +297,29 @@ async def prepare_context_node(
     titles = current_state.titles or []
     npc_challenge = getattr(current_state, "challenge", None)
     has_shop = False
+    shop_reward_types: list[str] = []
     if game_data:
         has_shop = game_data.shops.has_shop(npc_name)
+        if has_shop:
+            # 推导：当前 NPC 商店“实际覆盖”的 reward_types.optional 集合
+            #（用于 prompt 精确约束模型只选择商店确实能卖的类型。）
+            from services.agent_tools.context_builder import _matches_reward_type
+            from services.agent_tools.schemas import REWARD_OPTIONAL
+
+            equip_mods = game_data.equipment_mods
+            items = game_data.items
+            shop_item_names = game_data.shops.get_npc_shop(npc_name)
+
+            supported: set[str] = set()
+            for shop_item_name in shop_item_names:
+                item = items.get_by_name(shop_item_name)
+                if item is None:
+                    continue
+                for rt in REWARD_OPTIONAL:
+                    if _matches_reward_type(item, rt, equip_mods):
+                        supported.add(rt)
+
+            shop_reward_types = [rt for rt in REWARD_OPTIONAL if rt in supported]
 
     effective_interval = (
         payload.summarize_interval
@@ -464,6 +485,7 @@ async def prepare_context_node(
         titles=titles,
         emotions=emotions,
         has_shop=has_shop,
+        shop_reward_types=shop_reward_types,
         has_challenge=bool(npc_challenge),
         same_faction_npcs=same_faction_str,
         player_identity=player_identity,
