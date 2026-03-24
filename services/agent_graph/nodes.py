@@ -855,6 +855,7 @@ async def generate_response_node(
         "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
         "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
         "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
+        "请根据前文说明和工具执行结果，生成对话回复。"
     )
 
     decision_reply = state.get("_decision_reply", "")
@@ -998,6 +999,7 @@ async def generate_response_stream(
         "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
         "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
         "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
+        "请根据前文说明和工具执行结果，生成对话回复。"
     )
 
     decision_reply = state.get("_decision_reply", "")

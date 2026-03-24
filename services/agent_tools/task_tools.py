@@ -44,6 +44,78 @@ def _dump_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
+def _to_roman(num: int) -> str:
+    """
+    1..3999 转罗马数字；超范围时回退为十进制字符串。
+    """
+    if num <= 0 or num >= 4000:
+        return str(num)
+    vals = [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ]
+    n = num
+    out: list[str] = []
+    for v, sym in vals:
+        while n >= v:
+            out.append(sym)
+            n -= v
+    return "".join(out)
+
+
+def resolve_task_title_for_display(raw_title: Any, game_data: GameDataRegistry) -> str:
+    """
+    统一任务标题展示值：
+    - "$KEY" 且在 task_texts 有映射 -> 映射文本
+    - 其他情况 -> 原样字符串
+    """
+    s = str(raw_title or "").strip()
+    if not s:
+        return ""
+    if s.startswith("$"):
+        resolved = game_data.task_texts.resolve_str(s)
+        return str(resolved or s).strip()
+    return s
+
+
+def collect_existing_task_titles(game_data: GameDataRegistry) -> set[str]:
+    """
+    收集所有已有任务的“展示标题”（已解析文本 key），用于标题去重。
+    """
+    titles: set[str] = set()
+    for t in game_data.tasks.list_all_tasks():
+        title = resolve_task_title_for_display(getattr(t, "title", ""), game_data)
+        if title:
+            titles.add(title)
+    return titles
+
+
+def make_unique_task_title(
+    title: str,
+    *,
+    game_data: GameDataRegistry,
+) -> tuple[str, bool]:
+    """
+    若标题与已有任务重复，则自动追加简洁后缀直到不重复：
+    - 第一次冲突："{title} II"
+    - 后续："{title} III" / "{title} IV" ...
+    返回 (最终标题, 是否发生自动改名)。
+    """
+    base = (title or "").strip()
+    if not base:
+        return "", False
+    existing = collect_existing_task_titles(game_data)
+    if base not in existing:
+        return base, False
+    idx = 2
+    while True:
+        candidate = f"{base} {_to_roman(idx)}"
+        if candidate not in existing:
+            return candidate, True
+        idx += 1
+
+
 def _sync_state_path(data_root: Path) -> Path:
     """RAG 同步状态：与 npc_state_db 等并列于 <data>/rag/。"""
     return (Path(data_root).resolve() / "rag" / "sync_state.json").resolve()
@@ -289,6 +361,9 @@ def write_confirmed_agent_task_files(
             finish_npc = npc_name_fallback
 
         title = draft.get("title") if isinstance(draft.get("title"), str) else ""
+        # 最终落盘前统一做标题去重，避免与已有任务重名。
+        title, title_auto_renamed = make_unique_task_title(title, game_data=game_data)
+        draft["title"] = title
         description = (
             draft.get("description") if isinstance(draft.get("description"), str) else ""
         )
@@ -402,6 +477,12 @@ def write_confirmed_agent_task_files(
 
         _bump_task_publish_version(_sync_state_path(data_root))
 
-        msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
+        if title_auto_renamed:
+            msg = (
+                f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
+                f"标题重复，已自动调整为「{title}」。"
+            )
+        else:
+            msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
         return msg, task_id_int
 

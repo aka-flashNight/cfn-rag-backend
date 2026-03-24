@@ -89,7 +89,7 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 3. **协商修改**：`update_task_draft(draft_id, modify_fields)`  
    仅替换 `modify_fields` 中出现的顶层字段；后端对变更字段做**增量校验**（`task_type` / `get_requirements` 等不可通过此工具改类型时需重新走 1+2）。
 4. **确认发布**：`confirm_agent_task(draft_id, description, get_dialogue, finish_dialogue, ...)`  
-   合并任务说明与对话后再次校验，通过后分配任务 ID，并写入上述两个 agent 文件。
+   合并任务标题、任务说明与对话后再次校验，通过后分配任务 ID，并写入上述两个 agent 文件。
 5. **取消**：`cancel_agent_task(draft_id, ...)`
 
 辅助工具：**`search_knowledge`**（RAG 检索）、**`update_npc_mood`**（好感/情绪）。部分工具支持可选 **`ui_hint`（≤12 字）** 供前端/SSE 展示进度提示。

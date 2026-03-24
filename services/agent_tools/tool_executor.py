@@ -16,6 +16,7 @@ from services.game_progress import get_progress_stage_config
 from services.agent_tools.context_builder import prepare_task_context
 from services.agent_tools.schemas import normalize_reward_types_for_prepare_context
 from services.agent_tools.validator import validate_task_draft, DraftValidationContext
+from services.agent_tools.task_tools import collect_existing_task_titles
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,31 @@ def _build_validation_ctx(
         npc_name=npc_name or None,
         bargain_rate=bargain_rate,
     )
+
+
+def _title_duplicate_warning(title: Any, game_data: Optional[GameDataRegistry]) -> Optional[dict[str, Any]]:
+    """
+    草案阶段仅提示标题可能重复，不阻断；最终 confirm 时由后端自动去重。
+    """
+    if game_data is None:
+        return None
+    s = str(title or "").strip()
+    if not s:
+        return None
+    try:
+        existing = collect_existing_task_titles(game_data)
+    except Exception:
+        return None
+    if s not in existing:
+        return None
+    return {
+        "step": "TITLE_DUPLICATE",
+        "warning": (
+            f"当前草案标题「{s}」与已有任务重复。"
+            "建议在 confirm_agent_task 时适当调整标题内容。"
+        ),
+        "title": s,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +183,12 @@ def execute_draft_agent_task(
         "draft_summary": detailed,
         "bargain_remaining": 2,  # 讨价还价最多 2 次，提醒 LLM
     }
-    if result.validation_warnings:
-        payload["warnings"] = result.validation_warnings
+    warnings = list(result.validation_warnings or [])
+    w_title = _title_duplicate_warning(draft.get("title"), game_data)
+    if w_title:
+        warnings.append(w_title)
+    if warnings:
+        payload["warnings"] = warnings
     return json.dumps(payload, ensure_ascii=False), draft
 
 
@@ -264,8 +294,12 @@ def execute_update_task_draft(
         "draft_summary": detailed,
         "bargain_remaining": max(0, 2 - int(pending_draft.get("bargain_count", 0))),
     }
-    if result.validation_warnings:
-        payload["warnings"] = result.validation_warnings
+    warnings = list(result.validation_warnings or [])
+    w_title = _title_duplicate_warning(pending_draft.get("title"), game_data)
+    if w_title:
+        warnings.append(w_title)
+    if warnings:
+        payload["warnings"] = warnings
     return json.dumps(payload, ensure_ascii=False), pending_draft
 
 
@@ -308,8 +342,11 @@ def execute_confirm_agent_task(
         ), pending_draft, None
 
     desc = args.get("description", "")
+    title = args.get("title", "")
     if not isinstance(desc, str):
         desc = str(desc) if desc is not None else ""
+    if not isinstance(title, str):
+        title = str(title) if title is not None else ""
     get_dg = args.get("get_dialogue")
     fin_dg = args.get("finish_dialogue")
     if not isinstance(get_dg, list):
@@ -318,6 +355,7 @@ def execute_confirm_agent_task(
         fin_dg = []
 
     draft_for_commit = dict(pending_draft)
+    draft_for_commit["title"] = title
     draft_for_commit["description"] = desc
     draft_for_commit["get_dialogue"] = get_dg
     draft_for_commit["finish_dialogue"] = fin_dg

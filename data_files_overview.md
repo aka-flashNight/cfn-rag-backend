@@ -1350,7 +1350,7 @@ Step 1: LLM 调用 prepare_task_context(task_type, reward_types [, requirement_k
         → 后端根据类型筛选数据，返回该类型所需的完整上下文 + 规则说明
 Step 2: LLM 根据返回数据调用 draft_agent_task(TaskDraft)
         → 后端校验并暂存草案（不含任务说明与接取/完成对话）
-Step 3: 玩家接受后调用 confirm_agent_task，传入说明与对话，后端合并后写入
+Step 3: 玩家接受后调用 confirm_agent_task，传入最终标题、说明与对话，后端合并后写入
 ```
 
 ---
@@ -1515,7 +1515,7 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 - 格式一致性由代码保证，不依赖 LLM 的格式遵从能力。
 - 注意，"问候"、"传话"大体上是一类任务，"通关"、"清理"大体上是一类任务，"装备缴纳"、 "特殊物品获取"大体上是一类任务，这里细分只是为了让LLM能更好的对应当前情景，其返回的所需数据以及管控说明是基本一致的。
 
-`draft_agent_task` 工具的参数 JSON Schema（**权威定义以** `services/agent_tools/schemas.py` **为准**；任务说明与接取/完成对话在 `confirm_agent_task` 传入）：
+`draft_agent_task` 工具的参数 JSON Schema（**权威定义以** `services/agent_tools/schemas.py` **为准**；任务说明与接取/完成对话和最终标题在 `confirm_agent_task` 传入）：
 
 ```json
 {
@@ -1648,7 +1648,7 @@ LLM 在调用 `draft_agent_task` 工具时，必须以 **JSON 结构化参数** 
 }
 ```
 
-> **设计说明**：`update_task_draft` 采用**整字段替换**策略（而非深层合并），即 `modify_fields` 中出现的字段会完全替换草案中对应字段的值，未出现的字段保持不变。这样 LLM 只需关注要改什么，不需要重新构造整个草案，同时语义清晰、不易出错。后端收到修改后，对变更的字段执行与 `draft_agent_task` 相同的校验管线（见 6.4.2），校验不通过则返回 `validation_errors`。注意 `task_type` 和 `get_requirements` 不允许通过此工具修改——如需更改任务类型，应重新调用 `prepare_task_context` + `draft_agent_task`。任务说明与接取/完成对话**仅**在 `confirm_agent_task` 合并进草案并落库。
+> **设计说明**：`update_task_draft` 采用**整字段替换**策略（而非深层合并），即 `modify_fields` 中出现的字段会完全替换草案中对应字段的值，未出现的字段保持不变。这样 LLM 只需关注要改什么，不需要重新构造整个草案，同时语义清晰、不易出错。后端收到修改后，对变更的字段执行与 `draft_agent_task` 相同的校验管线（见 6.4.2），校验不通过则返回 `validation_errors`。注意 `task_type` 和 `get_requirements` 不允许通过此工具修改——如需更改任务类型，应重新调用 `prepare_task_context` + `draft_agent_task`。最终标题、任务说明与接取/完成对话**仅**在 `confirm_agent_task` 合并进草案并落库。
 
 ##### 6.4.2 后端校验管线（Validation Pipeline）
 

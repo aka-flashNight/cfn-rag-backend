@@ -375,6 +375,10 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "待确认的草案 ID（与 draft_summary 中一致）。",
         },
+        "title": {
+            "type": "string",
+            "description": "最终任务标题。会覆盖草案阶段标题，并以该值为准写入任务。",
+        },
         "description": {
             "type": "string",
             "description": "任务说明/描述，须与最终确定的关卡、物品与奖励一致。",
@@ -382,12 +386,12 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
         "get_dialogue": {
             "type": "array",
             "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "接取对话数组；可含 接取NPC 与玩家($PC)多条。对话发生在任务开始前， 接取NPC 向 玩家 发布任务",
+            "description": "接取对话数组；可含 接取NPC 与玩家($PC)多条。对话发生在任务开始前， 接取NPC 向 玩家 发布任务。不要和已有任务对话高度重复。",
         },
         "finish_dialogue": {
             "type": "array",
             "items": DIALOGUE_ENTRY_SCHEMA,
-            "description": "完成对话数组；可含 完成NPC 与玩家($PC)多条。对话发生在任务完成后， 玩家 向 完成NPC 交付任务。",
+            "description": "完成对话数组；可含 完成NPC 与玩家($PC)多条。对话发生在任务完成后， 玩家 向 完成NPC 交付任务。不要和已有任务对话高度重复。",
         },
         "ui_hint": {
             "type": "string",
@@ -395,7 +399,7 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。",
         },
     },
-    "required": ["draft_id", "description", "get_dialogue", "finish_dialogue"],
+    "required": ["draft_id", "title", "description", "get_dialogue", "finish_dialogue"],
     "additionalProperties": False,
 }
 
