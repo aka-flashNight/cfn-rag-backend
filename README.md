@@ -52,6 +52,8 @@ Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/C
 
 该流程由 `services/agent_graph/` 下的 LangGraph 状态图实现，并设置工具回合上限（默认 5 轮）避免无限循环。
 
+另外，`launcher.py` 内置前端静态服务器还承担了**本地反向代理层**：浏览器侧统一请求同源地址，前端服务将 `/api/*` 转发到后端 `127.0.0.1:7077`，并对 `text/event-stream` 响应做**流式转发**，以同时解决本地跨域与流式响应兼容问题。
+
 **代码入口（便于对照实现）**
 
 | 职责 | 路径 |
@@ -518,6 +520,7 @@ A: 推荐方式：
 
 - **Web**：FastAPI + Uvicorn
 - **流式**：SSE（前端对接见 `docs/STREAMING_API_FRONTEND.md`）
+- **本地网关层**：`launcher.py` 内置 Python `http.server` + `urllib` 反向代理（`/api/* -> 127.0.0.1:7077`），并支持 SSE 流式转发（`text/event-stream` 透传）
 - **RAG**：LlamaIndex（向量索引、检索；）
 - **Agent**：**LangGraph**（`langgraph`）编排状态图；**LangChain** 生态（`langchain-openai`、`langchain-core`）承载消息与工具调用结构
 - **LLM HTTP**：**OpenAI 兼容** REST（`openai` SDK，`base_url` + `model` 可指向 Gemini / ModelScope / 自建网关等）
