@@ -324,7 +324,7 @@ LLM_MODEL_NAME=moonshotai/Kimi-K2.5
 1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikey)
 2. 使用 Google 账号登录
 3. 点击 "Create API Key"
-4. 复制生成的 Key 到 `.env` 文件
+4. 复制生成的 Key 到 页面的设置之中，或 `.env` 文件中
 
 **免费额度**：gemini-3.1-flash-lite-preview 每日500次请求额度，完全满足个人使用需求。
 
