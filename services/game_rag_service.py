@@ -276,7 +276,7 @@ class GameRAGService:
         stage_name = get_progress_stage_name(getattr(payload, "progress_stage", None))
         if stage_name:
             progress_stage_desc = (
-                f"当前玩家的主要作战区域为{stage_name}。\n"
+                f"当前玩家的主要外派任务的作战区域为{stage_name}。玩家的主要居住地为A兵团的一间单人间寝室。\n"
             )
         sex_desc = f"（性别：{sex}）" if sex else ""
         faction_desc = f"（阵营：{faction}）" if faction else ""
