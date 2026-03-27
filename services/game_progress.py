@@ -62,23 +62,23 @@ PROGRESS_STAGE_CONFIG: Dict[int, StageConfig] = {
         main_task_min_id=37,
         main_task_max_id=74,
     ),
-    # 5：诺亚，29-40级，stages 名：诺亚前线基地深处，主线 id 范围 75-170（暂定）
+    # 5：诺亚，29-40级，stages 名：诺亚前线基地深处，主线 id 范围 75-175（暂定）
     5: StageConfig(
         name="诺亚",
         min_level=29,
         max_level=40,
         stage_name="诺亚前线基地深处",
         main_task_min_id=75,
-        main_task_max_id=170,
+        main_task_max_id=175,
     ),
-    # 6：雪山，40-50级，stages 名：雪山，主线 id 范围 77-250（暂定）
+    # 6：雪山，40-50级，stages 名：雪山，主线 id 范围 77-295（暂定）
     6: StageConfig(
         name="雪山",
         min_level=40,
         max_level=50,
         stage_name="雪山",
         main_task_min_id=77,
-        main_task_max_id=250,
+        main_task_max_id=295,
     ),
     # 7：已通关，50-100级，stages 名：已通关，主线 id 范围 77-300（暂定）
     7: StageConfig(
