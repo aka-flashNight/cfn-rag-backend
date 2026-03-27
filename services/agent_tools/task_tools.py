@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional
 
 from services.game_data.registry import GameDataRegistry
 
+# 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
+MAX_MAINLINE_TASK_PROGRESS: int = 77
+
 
 _WRITE_LOCK = threading.Lock()
 
@@ -424,14 +427,24 @@ def write_confirmed_agent_task_files(
         if not finish_items:
             finish_items = [{"name": finish_npc, "title": finish_npc, "char": finish_npc, "text": ""}]
 
-        get_req_list = _ensure_int_list(draft.get("get_requirements"))
-        # 若大模型没填 get_requirements，则由后端根据 finish_requirements 的关卡解锁条件补全。
-        # 该逻辑不依赖任务类型：只要 finish_requirements 中的关卡有 unlock_condition，就应写入前置主线。
-        if not get_req_list:
-            get_req_list = _stage_reqs_unlock_ids(
-                finish_requirements=draft.get("finish_requirements"),
-                game_data=game_data,
-            )
+        # get_req_list = _ensure_int_list(draft.get("get_requirements"))
+        # # 若大模型没填 get_requirements，则由后端根据 finish_requirements 的关卡解锁条件补全。
+        # # 该逻辑不依赖任务类型：只要 finish_requirements 中的关卡有 unlock_condition，就应写入前置主线。
+        # if not get_req_list:
+        #     get_req_list = _stage_reqs_unlock_ids(
+        #         finish_requirements=draft.get("finish_requirements"),
+        #         game_data=game_data,
+        #     )
+
+        # 现在大模型不再传入 finish_requirements
+        get_req_list = _stage_reqs_unlock_ids(
+            finish_requirements=draft.get("finish_requirements"),
+            game_data=game_data,
+        )
+        # 限制 get_requirements 不超过当前最大任务进度
+        get_req_list = [
+            min(req_id, MAX_MAINLINE_TASK_PROGRESS) for req_id in get_req_list
+        ]
         finish_reqs = _stage_reqs_to_strings(draft.get("finish_requirements"))
         finish_submit = _reward_items_to_expr(draft.get("finish_submit_items"))
         finish_contain = _reward_items_to_expr(draft.get("finish_contain_items"))

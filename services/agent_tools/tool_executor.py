@@ -630,9 +630,9 @@ def _detailed_draft_summary(
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
     lines.append(f"完成NPC: {draft.get('finish_npc') or npc_name_fallback}")
 
-    get_reqs = draft.get("get_requirements") or []
-    if get_reqs:
-        lines.append(f"前置主线任务ID: {get_reqs}")
+    # get_reqs = draft.get("get_requirements") or []
+    # if get_reqs:
+    #     lines.append(f"前置主线任务ID: {get_reqs}")
 
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:

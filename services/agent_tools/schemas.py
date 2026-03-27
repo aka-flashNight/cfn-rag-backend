@@ -285,11 +285,6 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
     "properties": {
         "task_type": {"type": "string", "enum": TASK_TYPES},
         "title": {"type": "string", "description": "任务标题，简洁明了"},
-        "get_requirements": {
-            "type": "array",
-            "items": {"type": "integer"},
-            "description": "前置主线任务 ID 数组，空数组表示无前置。禁止使用 -1。",
-        },
         "finish_requirements": {
             "type": "array",
             "items": STAGE_REQUIREMENT_SCHEMA,
@@ -314,7 +309,6 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
     "required": [
         "task_type",
         "title",
-        "get_requirements",
         "rewards",
     ],
     "additionalProperties": False,
