@@ -146,7 +146,7 @@ DECISION_ROUND_SUFFIX = (
     "在结束工具链、进入正式对话前须调用 update_npc_mood（可与本轮其它工具并列）；同一用户消息内重复调用时仅最后一次有效。"
 )
 
-GENERATION_ROUND_SUFFIX = "请根据以上信息，以 NPC 身份生成对话回复。"
+GENERATION_ROUND_SUFFIX = "请根据以上信息，以 NPC 身份生成对话回复。必须生成对话内容，不得输出空值。"
 
 
 def build_layer1() -> str:
