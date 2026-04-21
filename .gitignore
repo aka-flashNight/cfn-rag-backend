@@ -97,6 +97,9 @@ htmlcov/
 # tools
 tools/
 
+# reports
+evals/reports
+
 # illustration
 illustration.zip
 

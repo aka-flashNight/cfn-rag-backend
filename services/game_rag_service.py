@@ -246,10 +246,12 @@ class GameRAGService:
         effective_api_key = request_api_key or settings.llm_api_key
         effective_api_base = request_api_base or settings.llm_api_base
         effective_model = request_model or settings.llm_model_name
-        if not effective_api_key:
+        key_s = (effective_api_key or "").strip()
+        if not key_s:
             raise ValueError(
                 "未提供可用的大模型 API Key，请在设置或请求中填入 api_key 或在 .env 中配置 LLM_API_KEY。"
             )
+        effective_api_key = key_s
 
         current_state = npc_manager.state.get(npc_name)
         if current_state is None:

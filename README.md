@@ -415,6 +415,7 @@ resources/
 | **Retriever** | 给定 query，是否召回到标注相关的 chunk（`node_id`） | recall@k、precision@k、MRR@10、nDCG@10；`dense` / `bm25` / `hybrid_rrf` 对比 | 否 |
 | **RAG（Ragas）** | 检索 + 生成整体质量 | faithfulness、answer_relevancy、context_precision、context_recall | 是（Judge） |
 
+
 **准备 golden 集**（需已构建向量索引）：
 
 ```bash
@@ -423,15 +424,19 @@ python -m evals.runners.build_golden_set --tiny    # 5 条微型集 -> evals/dat
 python -m evals.runners.build_golden_set --full    # 约 80 条 -> evals/datasets/golden_v1.jsonl
 ```
 
+`build_golden_set` 会从 `resources/data/rag/npc_state_db.json` 读取阵营，**排除「彩蛋」「成员」** 阵营 NPC 的对话与任务样本，避免 golden 过多非典型台词。
+
 **运行评估**：
 
 ```bash
 # 仅检索层（无 API 费用）
 python -m evals.runners.run_all --suite retriever --dataset evals/datasets/tiny_golden.jsonl --sample 0
 
-# Ragas（需配置 LLM_API_KEY）
+# Ragas（需可用的 Judge LLM；见下方 API Key 说明）
 python -m evals.runners.run_all --suite rag --dataset evals/datasets/tiny_golden.jsonl --sample 5
 ```
+
+`run_all` 默认 `--dataset` 为 `evals/datasets/golden_v1.jsonl`（全量约 80 条）；上例显式指定 `tiny_golden.jsonl`（5 条）便于调试。
 
 报告输出到 `evals/reports/`（时间戳 + git 短 hash）。详见 [evals/README.md](evals/README.md)。
 

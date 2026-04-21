@@ -40,6 +40,18 @@ def main() -> None:
         default="dense,bm25,hybrid_rrf",
         help="仅 retriever：逗号分隔",
     )
+    parser.add_argument(
+        "--rag-timeout",
+        type=int,
+        default=600,
+        help="仅 rag：Ragas LLM 单次超时（秒）",
+    )
+    parser.add_argument(
+        "--rag-workers",
+        type=int,
+        default=1,
+        help="仅 rag：并行 worker 数（本地 Ollama 建议 1）",
+    )
     args = parser.parse_args()
 
     if args.suite in ("retriever", "all"):
@@ -68,6 +80,9 @@ def main() -> None:
         ]
         if args.sample:
             cmd.extend(["--sample", str(args.sample)])
+        cmd.extend(
+            ["--timeout", str(args.rag_timeout), "--workers", str(args.rag_workers)]
+        )
         r = subprocess.run(cmd, cwd=str(_ROOT))
         if r.returncode != 0:
             sys.exit(r.returncode)

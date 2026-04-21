@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, AsyncIterator, List, Tuple
 
+import httpx
 from openai import AsyncOpenAI
 
 from services.portrait_utils import prepare_portrait_for_ai
@@ -117,6 +118,46 @@ async def call_llm(
             })
 
     return content, tool_calls_list
+
+
+async def call_llm_eval_text_only(
+    *,
+    api_key: str,
+    api_base: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """
+    仅用于 ``evals/rag``：单次 ``chat.completions``，纯文本 system/user，**不传图像、不传 tools**。
+
+    与 ``call_llm``（多模态 / Function Calling）分离，避免评估请求误走立绘或 FC 逻辑。
+    超时仅在此路径设置（本机慢模型），不修改正式 ``call_llm`` 的默认客户端行为。
+    """
+    base = (api_base or "").rstrip("/")
+    timeout = httpx.Timeout(
+        900.0,
+        connect=120.0,
+        read=900.0,
+        write=120.0,
+        pool=60.0,
+    )
+    client = AsyncOpenAI(api_key=api_key, base_url=base, timeout=timeout)
+    completion = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    message = completion.choices[0].message
+    content = message.content or ""
+    if not isinstance(content, str):
+        try:
+            content = "".join(part.get("text", "") for part in content)  # type: ignore[arg-type]
+        except Exception:
+            content = str(content)
+    return content
 
 
 async def call_llm_stream(

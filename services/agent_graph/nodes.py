@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -43,6 +44,35 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
+_llm_debug = logging.getLogger("cfn.agent.llm_debug")
+
+
+def _agent_debug_llm_enabled() -> bool:
+    return (os.environ.get("CFN_AGENT_DEBUG_LLM") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _log_agent_llm(
+    phase: str,
+    system_prompt: str,
+    user_prompt: str,
+    assistant_reply: str | None = None,
+) -> None:
+    """环境变量 CFN_AGENT_DEBUG_LLM=1 时打印完整 prompt 与回复，便于调试 Agent 模式。"""
+    if not _agent_debug_llm_enabled():
+        return
+    _llm_debug.info("======== CFN_AGENT_DEBUG_LLM %s ========", phase)
+    if system_prompt:
+        _llm_debug.info("[system]\n%s", system_prompt)
+    if user_prompt:
+        _llm_debug.info("[user]\n%s", user_prompt)
+    if assistant_reply is not None:
+        _llm_debug.info("[assistant]\n%s", assistant_reply)
+
 
 # 同一批 tool_calls 内保证任务流水线顺序，避免模型先 confirm 后 draft 导致「无草案」失败。
 _TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
@@ -691,6 +721,8 @@ async def decision_node(
 
     has_tools = bool(other_tool_calls)
 
+    _log_agent_llm("decision", system_prompt, full_user_prompt, reply_text or "")
+
     return {
         "tool_call_round": round_num + 1,
         "has_tool_calls": has_tools,
@@ -960,6 +992,8 @@ async def generate_response_node(
     if system_prefix:
         reply_text = f"{system_prefix}{reply_text or ''}"
 
+    _log_agent_llm("generate", system_prompt, full_user_prompt, reply_text or "")
+
     return {
         "final_reply": reply_text or "",
         "_mood_tool_calls": mood_calls,
@@ -1005,6 +1039,8 @@ async def generate_response_stream(
 
     # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
     full_user_prompt += _generation_round_tool_suffix(state)
+
+    _log_agent_llm("generate_stream", system_prompt, full_user_prompt, None)
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -1084,6 +1120,8 @@ async def generate_response_stream(
         name = func.get("name") or ""
         if name == "update_npc_mood":
             mood_calls.append(tc)
+
+    _log_agent_llm("generate_stream_done", "", "", full_content or "")
 
     state["final_reply"] = full_content or ""
     state["_mood_tool_calls"] = mood_calls
