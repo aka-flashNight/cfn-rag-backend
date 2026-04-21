@@ -57,6 +57,8 @@ class _AskContext:
     favorability: int
     relationship_level: str
     payload: NPCChatRequest
+    # 供 evals/rag 使用：与 _retrieve_context 返回一致，未再经 prompt 拼装
+    retrieved_context: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,34 @@ class GameRAGService:
     def invalidate_index(self) -> None:
         """重置或重建向量库后调用，使下次请求使用最新索引。"""
         self._index = None
+
+    def retrieve_nodes_for_eval(
+        self,
+        mode: str,
+        query: str,
+        filters: MetadataFilters | None,
+        top_k: int = 20,
+    ) -> List[Any]:
+        """
+        单池检索（dense / bm25 / hybrid_rrf），用于 evals 对比与后续 search_knowledge 扩展。
+
+        不经生产环境 _retrieve_context 的多路 retriever 拼装，指标含义清晰。
+        """
+        from ai_engine.bm25_retrieval import (
+            bm25_retrieve,
+            dense_retrieve,
+            hybrid_rrf_retrieve,
+        )
+
+        index = self._get_index()
+        m = (mode or "dense").lower()
+        if m == "dense":
+            return dense_retrieve(index, query, filters, top_k=top_k)
+        if m in ("bm25", "sparse"):
+            return bm25_retrieve(index, query, filters, top_k=top_k)
+        if m in ("hybrid", "hybrid_rrf", "rrf"):
+            return hybrid_rrf_retrieve(index, query, filters, top_k=top_k)
+        raise ValueError(f"unknown retrieve mode for eval: {mode!r}")
 
     def _get_npc_image_path(self, npc_name: str, emotion: str = "普通") -> Tuple[Path | None, str | None]:
         """
@@ -379,6 +409,7 @@ class GameRAGService:
             favorability=favorability,
             relationship_level=relationship_level,
             payload=payload,
+            retrieved_context=retrieved_context or "",
         )
 
     # ==================================================================

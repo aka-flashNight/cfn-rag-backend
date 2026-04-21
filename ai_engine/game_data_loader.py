@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Set
 
 from llama_index.core import Document, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core import Settings, StorageContext, load_index_from_storage
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import BaseNode, TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from services.game_data.paths import find_resources_directory as _get_resources_dir
@@ -966,6 +966,16 @@ def get_cached_index(force_rebuild: bool = False) -> VectorStoreIndex:
 
     _index_cache = build_index(persist_dir=persist_dir)
     return _index_cache
+
+
+def iter_docstore_nodes(index: VectorStoreIndex) -> List[BaseNode]:
+    """
+    从已加载向量索引取出全部节点（与检索返回的 node_id 一致）。
+    供 evals / BM25 子集构建使用。
+    """
+    docstore = getattr(index, "docstore", None)
+    raw = getattr(docstore, "docs", None) or {}
+    return list(raw.values())
 
 
 def rebuild_vector_index() -> VectorStoreIndex:

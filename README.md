@@ -406,6 +406,38 @@ resources/
 **说明**：立绘不是必须的，没有时对话功能仍可正常使用，仅多模态体验会降级为使用头像或纯文本。
 
 
+## 评估体系（Ragas + 检索层）
+
+正式评估资产位于 `evals/`（与临时脚本用的 `test/` 区分）。两条轨道**指标含义不同，勿混用**：
+
+| 轨道 | 评什么 | 典型指标 | 是否调用 LLM |
+|------|--------|----------|----------------|
+| **Retriever** | 给定 query，是否召回到标注相关的 chunk（`node_id`） | recall@k、precision@k、MRR@10、nDCG@10；`dense` / `bm25` / `hybrid_rrf` 对比 | 否 |
+| **RAG（Ragas）** | 检索 + 生成整体质量 | faithfulness、answer_relevancy、context_precision、context_recall | 是（Judge） |
+
+**准备 golden 集**（需已构建向量索引）：
+
+```bash
+pip install -r requirements.txt
+python -m evals.runners.build_golden_set --tiny    # 5 条微型集 -> evals/datasets/tiny_golden.jsonl
+python -m evals.runners.build_golden_set --full    # 约 80 条 -> evals/datasets/golden_v1.jsonl
+```
+
+**运行评估**：
+
+```bash
+# 仅检索层（无 API 费用）
+python -m evals.runners.run_all --suite retriever --dataset evals/datasets/tiny_golden.jsonl --sample 0
+
+# Ragas（需配置 LLM_API_KEY）
+python -m evals.runners.run_all --suite rag --dataset evals/datasets/tiny_golden.jsonl --sample 5
+```
+
+报告输出到 `evals/reports/`（时间戳 + git 短 hash）。详见 [evals/README.md](evals/README.md)。
+
+**示例（`tiny_golden.jsonl`，5 条；开发机一次运行）**：检索层三种模式总体 recall@10=1.0；Ragas 需在配置 `LLM_API_KEY` 后运行 `run_all --suite rag` 生成 `evals/reports/rag_*.md` 查看 faithfulness 等分数。
+
+
 ## 项目结构
 
 ```
@@ -414,7 +446,9 @@ cfn-rag-backend/
 │   ├── assets_api.py
 │   └── game_api.py
 ├── ai_engine/
-│   └── game_data_loader.py      # 向量索引构建与缓存
+│   ├── game_data_loader.py      # 向量索引构建与缓存
+│   └── bm25_retrieval.py        # BM25 + RRF（评估 / 后续扩展）
+├── evals/                       # 正式评估（datasets / retriever / rag / reports）
 ├── core/
 │   ├── config.py
 │   └── exceptions.py

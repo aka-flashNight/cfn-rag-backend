@@ -16,3 +16,8 @@ Pillow
 langgraph
 langchain-openai
 langchain-core
+# evals: retriever + Ragas
+rank-bm25
+ragas>=0.2
+datasets
+langchain-community
