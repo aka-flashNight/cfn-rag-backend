@@ -94,7 +94,7 @@ async def ask_game_knowledge(
     基于游戏资料（剧情、人物、世界观设定等）进行 RAG 问答，
     扮演指定 NPC 与玩家对话，并驱动好感度变化。
     - stream=false（默认）：返回 JSON 体 NPCChatResponse。
-    - stream=true：返回 text/event-stream，事件类型为 content（正文片段）与 done（结尾携带 reply/emotion/favorability 等）。
+    - stream=true：返回 text/event-stream，事件类型为 content（正文片段）、可选 mood_update（流式提前下发情绪/好感变化）、done（结尾携带 reply/emotion/favorability 等）。
     """
     await ensure_embed_model_ready()
     apply_proxy_config(payload.proxy_url)
@@ -112,6 +112,9 @@ async def ask_game_knowledge(
                 if event_type == "content":
                     line = json.dumps({"delta": data}, ensure_ascii=False)
                     yield f"event: content\ndata: {line}\n\n".encode("utf-8")
+                elif event_type == "mood_update":
+                    line = json.dumps(data, ensure_ascii=False)
+                    yield f"event: mood_update\ndata: {line}\n\n".encode("utf-8")
                 elif event_type == "done":
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: done\ndata: {line}\n\n".encode("utf-8")

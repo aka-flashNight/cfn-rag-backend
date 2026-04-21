@@ -7,7 +7,7 @@
   - 响应：JSON 体，即原来的 `NPCChatResponse`。
 - **流式**：`POST /ask?stream=true`
   - 响应：`Content-Type: text/event-stream`，Server-Sent Events (SSE)。
-  - 事件类型：`content`（正文片段）、`done`（结尾元数据）、`error`（错误时）。
+  - 事件类型：`content`（正文片段）、`mood_update`（可选，提前下发情绪/好感变化）、`done`（结尾元数据）、`error`（错误时）。
 
 ## 2. 流式响应格式（SSE）
 
@@ -20,6 +20,14 @@
   ```
   - `data` 为 JSON：`{ "delta": "本次增量文本" }`，可能多次出现。
   - 前端应顺序拼接所有 `delta`，并实时渲染（如逐字/逐句显示）。
+
+- **情绪/好感提前更新**（可选，在 `done` 之前可能出现 0 次或多次）  
+  ```
+  event: mood_update
+  data: {"emotion":"高兴","favorability_change":1}
+  ```
+  - 当模型在流式阶段通过 `update_npc_mood` 工具给出可解析参数时，后端会尽早推送该事件，便于立绘/数值与打字机同步。
+  - 字段与工具约定一致，至少包含 `emotion`（字符串）与 `favorability_change`（整数，可为 0）；最终以 `done` 中的 `emotion`、`favorability_change` 为准（与存库一致）。
 
 - **结束元数据**（与 tool_calls 等价的结果）  
   ```
@@ -69,8 +77,9 @@
 
 - 解析逻辑要点：
   - 每次读到一块字符串，追加到 `buffer`，按 `\n\n` 拆成多个事件。
-  - 每个事件内按 `\n` 拆行，识别 `event: content` / `event: done` / `event: error`，再取 `data: {...}` 行做 `JSON.parse`。
+  - 每个事件内按 `\n` 拆行，识别 `event: content` / `event: mood_update` / `event: done` / `event: error`，再取 `data: {...}` 行做 `JSON.parse`。
   - `content` → 把 `data.delta` 拼到当前回复字符串并更新 UI（打字机效果）。
+  - `mood_update` → 可提前更新立绘/好感预览；收到 `done` 后应以 `done` 为准。
   - `done` → 用 `data.reply` 覆盖最终展示（后端已做末尾 JSON 剥离），并用 `data.emotion`、`data.favorability`、`data.favorability_change`、`data.relationship_level` 更新状态/立绘/好感度。
   - `error` → 展示 `data.error` 并结束。
 

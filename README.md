@@ -473,8 +473,13 @@ cfn-rag-backend/
 │   │   ├── graph.py
 │   │   ├── nodes.py
 │   │   └── prompts.py
+│   ├── skills/                  # Anthropic 风格 Skills（每 skill 一目录：SKILL.md + handler）
+│   │   ├── task/ …            # prepare_task_context / draft / update / confirm / cancel
+│   │   ├── query/ …           # search_knowledge / search_stages / search_items
+│   │   ├── mood/ …            # update_npc_mood
+│   │   └── system/ …          # list_skills
 │   ├── agent_tools/
-│   │   ├── schemas.py           # 工具 Function schema
+│   │   ├── schemas.py           # 参数 JSON Schema 常量（供 skills 与校验复用）
 │   │   ├── context_builder.py   # prepare_task_context
 │   │   ├── validator.py
 │   │   ├── task_tools.py        # draft / update / confirm / cancel 与写入

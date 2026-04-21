@@ -1,19 +1,9 @@
 """
-Agent 工具层：面向 LLM 的 Function Calling schema 与任务草案校验逻辑。
+Agent 工具层：任务草案校验与上下文构建（validator / context_builder / task_tools）。
 
-当前阶段（Phase 2）主要落地：
-- ``schemas.py``：OpenAI tools/function 的参数 schema 定义（prepare/draft/update）
-- ``validator.py``：Validation Pipeline（V1-V10）
+面向 LLM 的 **Function Calling 工具定义** 已迁移至 ``services/skills/``（SkillRegistry）。
+``schemas.py`` 仍保留参数 JSON Schema 常量与 TypedDict，供 skills 与各校验逻辑复用。
 """
-
-from .schemas import (  # noqa: F401
-    CONFIRM_AGENT_TASK_TOOL,
-    PREPARE_TASK_CONTEXT_TOOL,
-    SEARCH_KNOWLEDGE_TOOL,
-    DRAFT_AGENT_TASK_TOOL,
-    UPDATE_TASK_DRAFT_TOOL,
-    UPDATE_NPC_MOOD_TOOL,
-)
 
 # validator 依赖 game_data 的 pydantic 数据模型；为避免在缺少可选依赖时 import 失败，
 # 这里不在包初始化阶段直接导入。

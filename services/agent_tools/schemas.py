@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, TypedDict
 
-from services.npc_mood_agent import UPDATE_NPC_MOOD_TOOL
-
 # ---------------------------------------------------------------------------
 # Enums / constants（来自 data_files_overview.md 的 6.3 / 6.4 章节）
 # ---------------------------------------------------------------------------
@@ -207,35 +205,13 @@ PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-PREPARE_TASK_CONTEXT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "prepare_task_context",
-        "description": (
-            "根据意向任务类型与奖励偏好筛选数据，返回该类型的完整上下文与规则说明。"
-            "可选用 requirement_keywords / reward_keywords 优先展示与当前情境更相关的关卡与物品。"
-        ),
-        "parameters": PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA,
-    },
+
+SEARCH_KNOWLEDGE_TOOL_PARAMETERS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"keyword": {"type": "string"}},
+    "required": ["keyword"],
+    "additionalProperties": False,
 }
-
-
-SEARCH_KNOWLEDGE_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "search_knowledge",
-        "description": "复用现有 RAG 检索，获取设定/情报的摘要文本。",
-        "parameters": {
-            "type": "object",
-            "properties": {"keyword": {"type": "string"}},
-            "required": ["keyword"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
-SEARCH_KNOWLEDGE_TOOL_PARAMETERS_SCHEMA: dict[str, Any] = SEARCH_KNOWLEDGE_TOOL["function"]["parameters"]
 
 
 REWARD_ITEM_SCHEMA: dict[str, Any] = {
@@ -314,15 +290,6 @@ DRAFT_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-DRAFT_AGENT_TASK_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "draft_agent_task",
-        "description": "生成并校验任务草案，暂存到 DB。",
-        "parameters": DRAFT_AGENT_TASK_PARAMETERS_SCHEMA,
-    },
-}
-
 
 UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -350,15 +317,6 @@ UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA: dict[str, Any] = {
     },
     "required": ["draft_id", "modify_fields"],
     "additionalProperties": False,
-}
-
-UPDATE_TASK_DRAFT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "update_task_draft",
-        "description": "局部修改已有草案并触发增量校验（仅校验变更字段）。",
-        "parameters": UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA,
-    },
 }
 
 
@@ -396,16 +354,3 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
     "required": ["draft_id", "title", "description", "get_dialogue", "finish_dialogue"],
     "additionalProperties": False,
 }
-
-CONFIRM_AGENT_TASK_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "confirm_agent_task",
-        "description": (
-            "玩家认可/接受/同意任务后调用（含此前已口头答应承接、本轮内刚拟定草案的情况）："
-            "传入任务说明与接取/完成对话，与当前草案合并后校验并写入任务系统。不要和已有的任务对话高度重复。"
-        ),
-        "parameters": CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA,
-    },
-}
-

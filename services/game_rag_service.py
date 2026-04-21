@@ -26,8 +26,11 @@ from services.npc_mood_agent import (
     has_update_npc_mood_tool_call,
     parse_mood_from_text,
     parse_update_npc_mood_tool_calls,
-    strip_trailing_mood_json,
     strip_trailing_tool_call_text,
+)
+from services.skills.mood.legacy_fallback import (
+    is_mood_text_fallback_enabled,
+    strip_trailing_mood_json,
 )
 from services.game_progress import get_progress_stage_name
 from services.game_data.paths import find_resources_directory as _get_resources_dir
@@ -599,9 +602,12 @@ class GameRAGService:
             tool_calls, allowed_emotions=ctx.emotions
         )
         parsed_delta, parsed_emotion = parse_mood_from_text(reply)
-        cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
-            reply, allowed_emotions=ctx.emotions
-        )
+        if is_mood_text_fallback_enabled():
+            cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
+                reply, allowed_emotions=ctx.emotions
+            )
+        else:
+            cleaned, fallback_delta, fallback_emotion = reply, None, None
         if fallback_delta is not None and fallback_emotion is not None:
             reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
             if not has_update_npc_mood_tool_call(tool_calls):
@@ -812,6 +818,8 @@ class GameRAGService:
                         if streamed_len < len(full_content):
                             yield ("content", full_content[streamed_len:])
                         streamed_len = len(full_content)
+                elif event_type == "mood_update":
+                    yield ("mood_update", data)
                 elif event_type == "finished":
                     full_content, tool_calls_list = data
                     return
@@ -848,9 +856,12 @@ class GameRAGService:
             tool_calls_list, allowed_emotions=ctx.emotions
         )
         parsed_delta, parsed_emotion = parse_mood_from_text(reply)
-        cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
-            reply, allowed_emotions=ctx.emotions
-        )
+        if is_mood_text_fallback_enabled():
+            cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
+                reply, allowed_emotions=ctx.emotions
+            )
+        else:
+            cleaned, fallback_delta, fallback_emotion = reply, None, None
         if fallback_delta is not None and fallback_emotion is not None:
             reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
             if not has_update_npc_mood_tool_call(tool_calls_list):

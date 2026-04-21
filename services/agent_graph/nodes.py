@@ -26,18 +26,14 @@ from services.npc_mood_agent import (
     is_tools_unsupported_error,
     parse_mood_from_text,
     parse_update_npc_mood_tool_calls,
-    strip_trailing_mood_json,
     strip_trailing_tool_call_text,
 )
-from services.agent_tools.tool_executor import dispatch_tool_call
-from services.agent_tools import (
-    CONFIRM_AGENT_TASK_TOOL,
-    PREPARE_TASK_CONTEXT_TOOL,
-    SEARCH_KNOWLEDGE_TOOL,
-    DRAFT_AGENT_TASK_TOOL,
-    UPDATE_TASK_DRAFT_TOOL,
-    UPDATE_NPC_MOOD_TOOL,
+from services.skills.mood.legacy_fallback import (
+    is_mood_text_fallback_enabled,
+    strip_trailing_mood_json,
 )
+from services.agent_tools.tool_executor import dispatch_tool_call
+from services.skills import get_skill_registry
 
 from .prompts import (
     DECISION_ROUND_SUFFIX,
@@ -51,6 +47,10 @@ logger = logging.getLogger(__name__)
 # 同一批 tool_calls 内保证任务流水线顺序，避免模型先 confirm 后 draft 导致「无草案」失败。
 _TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
     "prepare_task_context": 10,
+    "search_knowledge": 15,
+    "search_stages": 16,
+    "search_items": 17,
+    "list_skills": 18,
     "draft_agent_task": 20,
     "update_task_draft": 30,
     "confirm_agent_task": 40,
@@ -77,35 +77,50 @@ def _sort_pending_tool_calls_for_task_pipeline(
     ]
 
 
-ALL_TOOLS = [
-    PREPARE_TASK_CONTEXT_TOOL,
-    SEARCH_KNOWLEDGE_TOOL,
-    DRAFT_AGENT_TASK_TOOL,
-    UPDATE_TASK_DRAFT_TOOL,
-    UPDATE_NPC_MOOD_TOOL,
-]
-
-CANCEL_AGENT_TASK_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "cancel_agent_task",
-        "description": "取消当前待确认的任务草案。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": "string"},
-                # 用于 SSE/前端显示：非常短的“正在进行中”提示
-                "ui_hint": {"type": "string", "maxLength": 12},
-            },
-            "required": ["draft_id"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
 def _get_full_tools() -> list[dict[str, Any]]:
-    return ALL_TOOLS + [CONFIRM_AGENT_TASK_TOOL, CANCEL_AGENT_TASK_TOOL]
+    """决策轮：全部 skills（含 task/query/mood/system）。"""
+    return get_skill_registry().get_openai_tools()
+
+
+def _get_mood_only_tools() -> list[dict[str, Any]]:
+    """生成轮：仅允许 update_npc_mood，避免任务/检索工具重复调用。"""
+    return get_skill_registry().get_openai_tools(categories={"mood"})
+
+
+def _decision_round_has_mood_tool(state: dict[str, Any]) -> bool:
+    """决策轮是否已出现可解析的 update_npc_mood（用于生成轮提示，避免重复调用）。"""
+    for tc in state.get("_mood_tool_calls") or []:
+        fn = tc.get("function", tc)
+        if (fn.get("name") or "") != "update_npc_mood":
+            continue
+        raw = fn.get("arguments", "{}")
+        if isinstance(raw, str):
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+        else:
+            obj = raw or {}
+        if (
+            isinstance(obj, dict)
+            and "emotion" in obj
+            and "favorability_change" in obj
+        ):
+            return True
+    return False
+
+
+def _generation_round_tool_suffix(state: dict[str, Any]) -> str:
+    """生成轮追加到 user prompt 的简短说明（替代冗长「严禁调用…」列表）。"""
+    if _decision_round_has_mood_tool(state):
+        return (
+            "\n\n【生成提示】决策阶段已通过 update_npc_mood 上报情绪与好感变化；"
+            "请直接生成自然对话正文，不要再调用任何工具。"
+        )
+    return (
+        "\n\n【生成提示】如需标注情绪与好感变化，可（可选）调用 update_npc_mood；"
+        "请勿调用任务或检索类工具。请根据前文与工具结果生成对话回复。"
+    )
 
 
 _DRAFT_SUCCESS_STATUSES = {"draft_created", "draft_updated", "confirmed"}
@@ -849,14 +864,8 @@ async def generate_response_node(
             #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             # )
 
-    # 为了与决策轮在缓存结构上保持一致，本轮依然传入完整工具 definitions，
-    # 但通过额外说明严格约束：本轮只允许（可选）调用 update_npc_mood，不得再次调用任务/检索相关工具。
-    full_user_prompt += (
-        "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
-        "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
-        "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
-        "请根据前文说明和工具执行结果，生成对话回复。"
-    )
+    # 生成轮仅传入 mood 工具定义（见 _get_mood_only_tools），与决策轮工具列表解耦。
+    full_user_prompt += _generation_round_tool_suffix(state)
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -877,7 +886,7 @@ async def generate_response_node(
             image_path=image_path,
             image_description=state.get("image_description"),
             emotion_hint=state.get("emotion_hint") or None,
-            tools=_get_full_tools(),
+            tools=_get_mood_only_tools(),
         )
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
@@ -891,7 +900,7 @@ async def generate_response_node(
                     image_path=None,
                     image_description=state.get("image_description"),
                     emotion_hint=state.get("emotion_hint") or None,
-                    tools=_get_full_tools(),
+                    tools=_get_mood_only_tools(),
                 )
             except Exception as e2:
                 if is_tools_unsupported_error(e2):
@@ -910,7 +919,7 @@ async def generate_response_node(
                     raise
         elif is_tools_unsupported_error(e):
             try:
-                    reply_text, tool_calls = await call_llm(
+                reply_text, tool_calls = await call_llm(
                     api_key=state.get("api_key"),
                     api_base=state.get("api_base"),
                     model_name=state.get("model_name"),
@@ -994,13 +1003,8 @@ async def generate_response_stream(
             #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
             # )
 
-    # 与非流式生成保持一致：传入完整工具 definitions，但通过 prompt 约束本轮仅允许（可选）调用 update_npc_mood。
-    full_user_prompt += (
-        "\n\n【本轮工具调用约束】本轮只允许（可选）调用 update_npc_mood，用于上报情绪和好感度变化；"
-        "严禁调用任何与任务或检索相关的工具（如 prepare_task_context、draft_agent_task、update_task_draft、"
-        "confirm_agent_task、cancel_agent_task、search_knowledge 等）。"
-        "请根据前文说明和工具执行结果，生成对话回复。"
-    )
+    # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
+    full_user_prompt += _generation_round_tool_suffix(state)
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -1011,35 +1015,17 @@ async def generate_response_stream(
         from pathlib import Path
         image_path = Path(image_path_str)
 
-    _TRUNCATE_PREFIXES = ["工具调用", "{", "<!---", "<!--", "update_npc_mood(", "tool_calls_list"]
     system_prefix = state.get("_system_prefix_text") or ""
     full_content = system_prefix
     streamed_len = len(system_prefix)
-    truncating = False
     tool_calls_list: list[dict] = []
-
-    def _earliest_truncate_at(text: str) -> int:
-        out = -1
-        for p in _TRUNCATE_PREFIXES:
-            if "update_npc_mood" in p.lower() or "tool_calls_list" in p.lower():
-                idx = text.lower().find(p.lower())
-            else:
-                idx = text.find(p)
-            # 避免系统前缀（以 "{" 开头）触发截断逻辑
-            if system_prefix and p == "{" and idx != -1 and idx < streamed_len:
-                continue
-            if idx != -1 and (out == -1 or idx < out):
-                out = idx
-        return out
 
     # 若有系统前缀，则先把它作为“正文增量”推给前端，保证与 done 一致
     if system_prefix:
         yield ("content", system_prefix)
 
     async def _run_stream(img_path, img_desc, use_tools):
-        nonlocal full_content, streamed_len, truncating, tool_calls_list
-        # 继续向后追加模型输出（system_prefix 已在外层 yield 并写入 full_content）
-        truncating = False
+        nonlocal full_content, streamed_len, tool_calls_list
         tool_calls_list = []
         async for event_type, data in call_llm_stream(
             api_key=state.get("api_key"),
@@ -1054,30 +1040,23 @@ async def generate_response_stream(
         ):
             if event_type == "content":
                 full_content += data
-                if truncating:
-                    continue
-                cut = _earliest_truncate_at(full_content)
-                if cut != -1:
-                    if cut > streamed_len:
-                        yield ("content", full_content[streamed_len:cut])
-                    streamed_len = len(full_content)
-                    truncating = True
-                else:
-                    if streamed_len < len(full_content):
-                        yield ("content", full_content[streamed_len:])
-                    streamed_len = len(full_content)
+                if streamed_len < len(full_content):
+                    yield ("content", full_content[streamed_len:])
+                streamed_len = len(full_content)
+            elif event_type == "mood_update":
+                yield ("mood_update", data)
             elif event_type == "finished":
                 model_full_content, tool_calls_list = data
                 full_content = system_prefix + (model_full_content or "")
                 return
 
     try:
-        async for ev, dat in _run_stream(image_path, state.get("image_description"), _get_full_tools()):
+        async for ev, dat in _run_stream(image_path, state.get("image_description"), _get_mood_only_tools()):
             yield ev, dat
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
             try:
-                async for ev, dat in _run_stream(None, state.get("image_description"), _get_full_tools()):
+                async for ev, dat in _run_stream(None, state.get("image_description"), _get_mood_only_tools()):
                     yield ev, dat
             except Exception as e2:
                 if is_tools_unsupported_error(e2):
@@ -1128,10 +1107,14 @@ def parse_mood_node(
     delta, emotion = parse_update_npc_mood_tool_calls(
         mood_tool_calls, allowed_emotions=emotions
     )
-    parsed_delta, parsed_emotion = parse_mood_from_text(reply)
-    cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
-        reply, allowed_emotions=emotions
-    )
+    if is_mood_text_fallback_enabled():
+        parsed_delta, parsed_emotion = parse_mood_from_text(reply)
+        cleaned, fallback_delta, fallback_emotion = strip_trailing_mood_json(
+            reply, allowed_emotions=emotions
+        )
+    else:
+        parsed_delta, parsed_emotion = None, None
+        cleaned, fallback_delta, fallback_emotion = reply, None, None
 
     if fallback_delta is not None and fallback_emotion is not None:
         reply = (cleaned or "").strip() or "【对方无回应，请稍后再试。】"
