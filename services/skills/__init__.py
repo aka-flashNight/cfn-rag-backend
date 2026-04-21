@@ -1,6 +1,17 @@
 """
 Skills 注册表（Anthropic 风格目录 + OpenAI Function 工具定义）。
 
+目录契约（详见 plan 路线2 §2.1）::
+
+    services/skills/
+      <category>/                # task | query | mood | system
+        <skill_name>/
+          SKILL.md                # 前两段：description + 触发/不触发
+          handler.py              # 顶层导出名为 `skill` 的 BaseSkill 实例
+
+``SkillRegistry.discover()`` 会递归扫描上述目录并自动注册，"新增文件夹即扩展"。
+task 流水线相关 skill 给予固定优先顺序，避免模型在工具列表顺序敏感时先 confirm 后 draft。
+
 使用方式::
 
     from services.skills import get_skill_registry
@@ -11,36 +22,27 @@ from __future__ import annotations
 
 from services.skills.base import BaseSkill, SkillDispatchContext, SkillRegistry
 
+# 顺序仅是"偏好"：任务流水线优先，list_skills 放最后，其余 skill 按目录顺序追加。
+# 新增文件夹会被 discover() 自动识别并追加到末尾，无需改本文件。
+_PRIORITY_ORDER: tuple[str, ...] = (
+    "prepare_task_context",
+    "search_knowledge",
+    "search_stages",
+    "search_items",
+    "draft_agent_task",
+    "update_task_draft",
+    "confirm_agent_task",
+    "cancel_agent_task",
+    "update_npc_mood",
+    "list_skills",
+)
+
 _registry: SkillRegistry | None = None
 
 
 def _build_registry() -> SkillRegistry:
     r = SkillRegistry()
-    # 顺序影响部分模型对工具列表的阅读；任务流水线优先，list_skills 放最后
-    from services.skills.task.prepare_task_context.handler import skill as sk_prepare
-    from services.skills.query.search_knowledge.handler import skill as sk_search_kn
-    from services.skills.query.search_stages.handler import skill as sk_stages
-    from services.skills.query.search_items.handler import skill as sk_items
-    from services.skills.task.draft_agent_task.handler import skill as sk_draft
-    from services.skills.task.update_task_draft.handler import skill as sk_update
-    from services.skills.task.confirm_agent_task.handler import skill as sk_confirm
-    from services.skills.task.cancel_agent_task.handler import skill as sk_cancel
-    from services.skills.mood.update_npc_mood.handler import skill as sk_mood
-    from services.skills.system.list_skills.handler import skill as sk_list
-
-    for sk in (
-        sk_prepare,
-        sk_search_kn,
-        sk_stages,
-        sk_items,
-        sk_draft,
-        sk_update,
-        sk_confirm,
-        sk_cancel,
-        sk_mood,
-        sk_list,
-    ):
-        r.register(sk)
+    r.discover(package="services.skills", priority=_PRIORITY_ORDER)
     return r
 
 

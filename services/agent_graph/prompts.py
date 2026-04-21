@@ -30,6 +30,8 @@ TOOL_USAGE_GUIDE = """\
 2. search_knowledge —— 检索游戏设定或情报
    参数: keyword（关键词）。当你不确定某个设定或信息时使用。
 
+   注：如果你对某个工具（尤其任务类工具）的用法、触发条件或参数边界不确定，可调用 list_skills(skill_name="<工具名>") 按需拉取该工具的详细文档；默认 list_skills() 只返回简表。
+
 3. 任务发布工具（两步式流程，详见下文【任务发布流程】）：
    - prepare_task_context：第一步，传入意向任务类型和奖励类型偏好，以及可选的需求/奖励关键词，获取筛选后的可选数据与规则。
    - draft_agent_task：第二步，根据 prepare_task_context 返回的数据，生成结构化的任务草案。

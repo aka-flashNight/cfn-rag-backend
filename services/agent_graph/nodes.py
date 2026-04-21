@@ -77,8 +77,14 @@ def _log_agent_llm(
     system_prompt: str,
     user_prompt: str,
     assistant_reply: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> None:
-    """每次调用模型后：完整 system / user / assistant 写入 stderr。"""
+    """
+    每次调用模型后：完整 system / user / (tools schema) / assistant 写入 stderr。
+
+    ``tools`` 独立打印一段：OpenAI function calling 走的是 API 参数而非 system prompt，
+    但它是模型"看到"的真实上下文的一部分，调试时必须一并可见。
+    """
     if not _agent_debug_llm_enabled():
         return
     parts: list[str] = []
@@ -86,6 +92,12 @@ def _log_agent_llm(
         parts.append("[system]\n" + system_prompt)
     if user_prompt:
         parts.append("[user]\n" + user_prompt)
+    if tools:
+        try:
+            tools_raw = json.dumps(tools, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            tools_raw = str(tools)
+        parts.append(f"[tools ({len(tools)} skills)]\n{tools_raw}")
     if assistant_reply is not None:
         parts.append("[assistant]\n" + assistant_reply)
     _debug_stderr_block(phase, "\n\n".join(parts))
@@ -166,39 +178,56 @@ def _get_mood_only_tools() -> list[dict[str, Any]]:
     return get_skill_registry().get_openai_tools(categories={"mood"})
 
 
-def _decision_round_has_mood_tool(state: dict[str, Any]) -> bool:
-    """决策轮是否已出现可解析的 update_npc_mood（用于生成轮提示，避免重复调用）。"""
+def _parse_update_npc_mood_args(tc: dict[str, Any]) -> dict[str, Any] | None:
+    """从单条 tool_call 解析 update_npc_mood 的 arguments；不可解析则 None。"""
+    fn = tc.get("function", tc)
+    if (fn.get("name") or "") != "update_npc_mood":
+        return None
+    raw = fn.get("arguments", "{}")
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return None
+    else:
+        obj = raw or {}
+    if not isinstance(obj, dict):
+        return None
+    if "emotion" not in obj or "favorability_change" not in obj:
+        return None
+    return obj
+
+
+def _last_mood_params_from_decision_state(state: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    决策阶段可能多轮累积 _mood_tool_calls；与解析侧一致，取**最后一次**可解析的传参，
+    供生成轮明确「你已上报的情绪 / 好感变化」。
+    """
+    last: dict[str, Any] | None = None
     for tc in state.get("_mood_tool_calls") or []:
-        fn = tc.get("function", tc)
-        if (fn.get("name") or "") != "update_npc_mood":
-            continue
-        raw = fn.get("arguments", "{}")
-        if isinstance(raw, str):
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-        else:
-            obj = raw or {}
-        if (
-            isinstance(obj, dict)
-            and "emotion" in obj
-            and "favorability_change" in obj
-        ):
-            return True
-    return False
+        p = _parse_update_npc_mood_args(tc)
+        if p is not None:
+            last = p
+    return last
 
 
 def _generation_round_tool_suffix(state: dict[str, Any]) -> str:
     """生成轮追加到 user prompt 的简短说明（替代冗长「严禁调用…」列表）。"""
-    if _decision_round_has_mood_tool(state):
+    last_mood = _last_mood_params_from_decision_state(state)
+    if last_mood is not None:
+        emo = last_mood.get("emotion", "")
+        fchg = last_mood.get("favorability_change", "")
+        emo_s = json.dumps(emo, ensure_ascii=False) if emo != "" else "（空）"
         return (
-            "\n\n【生成提示】决策阶段已通过 update_npc_mood 上报情绪与好感变化；"
-            "请直接生成自然对话正文，不要再调用任何工具。"
+            "\n\n【生成提示】决策阶段你已调用 update_npc_mood，"
+            f"参数为：emotion={emo_s}，favorability_change={fchg}。"
+            "生成 NPC 台词时请与该情绪、好感度变化保持一致；"
+            "请直接输出对话正文，不要再调用任何工具。"
         )
     return (
         "\n\n【生成提示】如需标注情绪与好感变化，可（可选）调用 update_npc_mood；"
         "请勿调用任务或检索类工具。请根据前文与工具结果生成对话回复。"
+        "无论是否调用工具，本轮必须输出对话内容，不得输出空值。"
     )
 
 
@@ -730,6 +759,8 @@ async def decision_node(
     # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
     tool_calls: list[dict] = []
+    decision_tools = _get_full_tools()
+    tools_for_debug: list[dict[str, Any]] | None = decision_tools
 
     try:
         reply_text, tool_calls = await call_llm(
@@ -741,10 +772,11 @@ async def decision_node(
             image_path=None,
             image_description=None,
             emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
-            tools=_get_full_tools(),
+            tools=decision_tools,
         )
     except Exception as e:
         if is_tools_unsupported_error(e):
+            tools_for_debug = None
             reply_text, tool_calls = await call_llm(
                 api_key=state.get("api_key"),
                 api_base=state.get("api_base"),
@@ -776,6 +808,7 @@ async def decision_node(
         system_prompt,
         full_user_prompt,
         reply_text or "",
+        tools=tools_for_debug,
     )
 
     return {
@@ -1056,7 +1089,13 @@ async def generate_response_node(
     if system_prefix:
         reply_text = f"{system_prefix}{reply_text or ''}"
 
-    _log_agent_llm("generate (final reply)", system_prompt, full_user_prompt, reply_text or "")
+    _log_agent_llm(
+        "generate (final reply)",
+        system_prompt,
+        full_user_prompt,
+        reply_text or "",
+        tools=_get_mood_only_tools(),
+    )
 
     return {
         "final_reply": reply_text or "",
@@ -1104,7 +1143,13 @@ async def generate_response_stream(
     # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
     full_user_prompt += _generation_round_tool_suffix(state)
 
-    _log_agent_llm("generate_stream (request)", system_prompt, full_user_prompt, None)
+    _log_agent_llm(
+        "generate_stream (request)",
+        system_prompt,
+        full_user_prompt,
+        None,
+        tools=_get_mood_only_tools(),
+    )
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
