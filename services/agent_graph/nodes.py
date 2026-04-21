@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -44,16 +45,31 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
-_llm_debug = logging.getLogger("cfn.agent.llm_debug")
 
 
 def _agent_debug_llm_enabled() -> bool:
-    return (os.environ.get("CFN_AGENT_DEBUG_LLM") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """
+    开启完整 Agent 调试输出（强制写入 stderr，不依赖 uvicorn 日志级别）。
+
+    优先读 ``Settings.cfn_agent_debug_llm``（来自 .env 的 ``CFN_AGENT_DEBUG_LLM``），
+    否则读进程环境变量，避免「只在 .env 写了但 os.environ 未注入」时不生效。
+    """
+    try:
+        from core.config import get_settings
+
+        if get_settings().cfn_agent_debug_llm:
+            return True
+    except Exception:
+        pass
+    v = (os.environ.get("CFN_AGENT_DEBUG_LLM") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_stderr_block(title: str, body: str) -> None:
+    if not _agent_debug_llm_enabled():
+        return
+    sep = "=" * 72
+    print(f"\n{sep}\n[CFN_AGENT_DEBUG_LLM] {title}\n{sep}\n{body}", file=sys.stderr, flush=True)
 
 
 def _log_agent_llm(
@@ -62,16 +78,49 @@ def _log_agent_llm(
     user_prompt: str,
     assistant_reply: str | None = None,
 ) -> None:
-    """环境变量 CFN_AGENT_DEBUG_LLM=1 时打印完整 prompt 与回复，便于调试 Agent 模式。"""
+    """每次调用模型后：完整 system / user / assistant 写入 stderr。"""
     if not _agent_debug_llm_enabled():
         return
-    _llm_debug.info("======== CFN_AGENT_DEBUG_LLM %s ========", phase)
+    parts: list[str] = []
     if system_prompt:
-        _llm_debug.info("[system]\n%s", system_prompt)
+        parts.append("[system]\n" + system_prompt)
     if user_prompt:
-        _llm_debug.info("[user]\n%s", user_prompt)
+        parts.append("[user]\n" + user_prompt)
     if assistant_reply is not None:
-        _llm_debug.info("[assistant]\n%s", assistant_reply)
+        parts.append("[assistant]\n" + assistant_reply)
+    _debug_stderr_block(phase, "\n\n".join(parts))
+
+
+def _log_agent_tool_round(
+    *,
+    round_label: str,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    result_str: str,
+    updated_draft: Any,
+    write_result: Any,
+) -> None:
+    """Skills 执行：参数、返回 JSON、草案是否更新、是否写入任务文件。"""
+    if not _agent_debug_llm_enabled():
+        return
+    lines = [
+        f"tool_name: {tool_name}",
+        f"arguments:\n{json.dumps(tool_args, ensure_ascii=False, indent=2)}",
+        f"result_json:\n{result_str}",
+        f"pending_draft_updated: {updated_draft is not None}",
+        f"task_write_result: {write_result!r}",
+    ]
+    _debug_stderr_block(f"tool_executor / {round_label}", "\n\n".join(lines))
+
+
+def _log_agent_decision_tool_calls(tool_calls: list[dict]) -> None:
+    if not _agent_debug_llm_enabled() or not tool_calls:
+        return
+    try:
+        raw = json.dumps(tool_calls, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        raw = str(tool_calls)
+    _debug_stderr_block("decision / model_tool_calls (raw)", raw)
 
 
 # 同一批 tool_calls 内保证任务流水线顺序，避免模型先 confirm 后 draft 导致「无草案」失败。
@@ -721,7 +770,13 @@ async def decision_node(
 
     has_tools = bool(other_tool_calls)
 
-    _log_agent_llm("decision", system_prompt, full_user_prompt, reply_text or "")
+    _log_agent_decision_tool_calls(tool_calls)
+    _log_agent_llm(
+        f"decision (round={round_num})",
+        system_prompt,
+        full_user_prompt,
+        reply_text or "",
+    )
 
     return {
         "tool_call_round": round_num + 1,
@@ -816,6 +871,15 @@ async def tool_executor_node(
             pending_draft=pending_draft,
             retrieve_fn=_make_retrieve_fn(),
             rag_context_text=state.get("retrieved_context") or "",
+        )
+
+        _log_agent_tool_round(
+            round_label=f"{tool_name} (graph_round={state.get('tool_call_round', 0)})",
+            tool_name=tool_name,
+            tool_args=tool_args if isinstance(tool_args, dict) else {},
+            result_str=result_str or "",
+            updated_draft=updated_draft,
+            write_result=write_result,
         )
 
         if updated_draft is not None:
@@ -992,7 +1056,7 @@ async def generate_response_node(
     if system_prefix:
         reply_text = f"{system_prefix}{reply_text or ''}"
 
-    _log_agent_llm("generate", system_prompt, full_user_prompt, reply_text or "")
+    _log_agent_llm("generate (final reply)", system_prompt, full_user_prompt, reply_text or "")
 
     return {
         "final_reply": reply_text or "",
@@ -1040,7 +1104,7 @@ async def generate_response_stream(
     # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
     full_user_prompt += _generation_round_tool_suffix(state)
 
-    _log_agent_llm("generate_stream", system_prompt, full_user_prompt, None)
+    _log_agent_llm("generate_stream (request)", system_prompt, full_user_prompt, None)
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -1121,7 +1185,14 @@ async def generate_response_stream(
         if name == "update_npc_mood":
             mood_calls.append(tc)
 
-    _log_agent_llm("generate_stream_done", "", "", full_content or "")
+    if _agent_debug_llm_enabled() and tool_calls_list:
+        try:
+            tc_raw = json.dumps(tool_calls_list, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            tc_raw = str(tool_calls_list)
+        _debug_stderr_block("generate_stream / model_tool_calls", tc_raw)
+
+    _log_agent_llm("generate_stream (full assistant text)", "", "", full_content or "")
 
     state["final_reply"] = full_content or ""
     state["_mood_tool_calls"] = mood_calls

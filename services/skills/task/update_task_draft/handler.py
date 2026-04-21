@@ -21,7 +21,7 @@ class UpdateTaskDraftSkill(BaseSkill):
         args: dict[str, Any],
         ctx: SkillDispatchContext,
     ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
-        return execute_update_task_draft(
+        result_str, draft = execute_update_task_draft(
             args,
             pending_draft=ctx.pending_draft,
             npc_name=ctx.npc_name,
@@ -30,6 +30,7 @@ class UpdateTaskDraftSkill(BaseSkill):
             game_data=ctx.game_data,
             rag_context_text=ctx.rag_context_text,
         )
+        return result_str, draft, None
 
 
 skill = UpdateTaskDraftSkill()

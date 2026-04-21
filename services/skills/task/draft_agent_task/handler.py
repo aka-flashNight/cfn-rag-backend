@@ -21,7 +21,7 @@ class DraftAgentTaskSkill(BaseSkill):
         args: dict[str, Any],
         ctx: SkillDispatchContext,
     ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
-        return execute_draft_agent_task(
+        result_str, draft = execute_draft_agent_task(
             args,
             pending_draft=ctx.pending_draft,
             npc_name=ctx.npc_name,
@@ -30,6 +30,8 @@ class DraftAgentTaskSkill(BaseSkill):
             game_data=ctx.game_data,
             rag_context_text=ctx.rag_context_text,
         )
+        # 第三元 task_write_result 仅 confirm/cancel 使用
+        return result_str, draft, None
 
 
 skill = DraftAgentTaskSkill()
