@@ -143,6 +143,8 @@ def build_rows(
             f"在「{ch}」的台词中，是否出现过与下列表述相近的内容？"
             f"{_text_preview(text, 80)}"
         )
+        ch_s = str(ch).strip()
+        ref_name = ch_s[:48] if len(ch_s) > 48 else ch_s
         rows.append(
             {
                 "id": f"g-dlg-{idx}",
@@ -153,7 +155,7 @@ def build_rows(
                 "question": q,
                 "retrieve_query": q,
                 "expected_doc_ids": [node.node_id],
-                "expected_answer_contains": [ch[:4], "台词"],
+                "expected_answer_contains": [ref_name or "台词", "台词"],
             }
         )
         idx += 1

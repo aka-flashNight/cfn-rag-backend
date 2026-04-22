@@ -62,6 +62,7 @@ class _AskContext:
     payload: NPCChatRequest
     # 供 evals/rag 使用：与 _retrieve_context 返回一致，未再经 prompt 拼装
     retrieved_context: str = ""
+    rag_eval_qa_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -354,37 +355,62 @@ class GameRAGService:
             ) + joined_history + "\n\n"
 
         emotions_str = "、".join(emotions)
-        system_prompt = (
-            f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
-            f"玩家的身份是：{player_identity}"
-            f"{progress_stage_desc}\n"
-            "【世界观背景概要】\n"
-            f"{WORLD_BACKGROUND}\n\n"
-            f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
-            f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。\n"
-            "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
-            "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
-            "【输出方式】\n"
-            "1. 回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
-            "2. 在回复的同时，调用工具 update_npc_mood 上报 favorability_change（-5～5，常规为 0）与 emotion（从可用情绪中选，无则用「普通」）。\n"
-            "3. 若无法调用工具而必须用正文传参时，最后一段只输出一行 JSON，不要在最后一段的 JSON 前加任何换行以外的前缀。\n"
-            "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或环境描写，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具，输出tool_calls_list。\n"
-        )
-        # agent_enabled=false：走纯对话，无任务工具；在检索与物品类型提示之后、对话历史之前提醒模型
-        task_agent_disabled_note = ""
-        if not self._is_agent_enabled(payload):
-            task_agent_disabled_note = (
-                "注：现在无法发布任务；若玩家要求任务，请推辞、拒绝，或提醒其开启终端的任务接收窗口后才能接收任务。\n\n"
+        qa_mode = bool(getattr(payload, "rag_eval_qa_mode", False))
+        if qa_mode:
+            system_prompt = (
+                "你是游戏知识库辅助问答助手。回答必须优先依据用户消息中的「检索摘录」；"
+                "与世界观冲突时以检索摘录为准，摘录不足时再参考世界观概要。\n"
+                f"当前默认关联角色：「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
+                f"玩家身份设定：{player_identity}{progress_stage_desc}\n"
+                "【世界观背景概要】\n"
+                f"{WORLD_BACKGROUND}\n\n"
+                "用简体中文、陈述语气直接作答；不要扮演 NPC 对白、不要写动作描写、不要输出 JSON、不要提及工具或情绪立绘。\n"
+                "若检索摘录不足以判断，请明确说明依据不足，不要编造具体情节或台词。\n"
             )
+            context_prompt = (
+                f"{mentioned_npcs_str}"
+                "【检索摘录】（含台词/世界观/任务/情报及物品、关卡等关键词提示；与问题无关的段落请忽略）\n"
+                f"{retrieved_context or '（当前没有检索到任何上下文。）'}\n\n"
+                f"{history_str}"
+            )
+            user_prompt = (
+                f"{context_prompt}"
+                "问题：\n"
+                f"{payload.query}\n\n"
+                "请直接作答（可先给结论，必要时一两句理由；问「是否出现过」类题目请答是/否并简要说明依据）。"
+            )
+        else:
+            system_prompt = (
+                f"你现在扮演游戏角色「{npc_name}」{sex_desc}{faction_desc}{titles_desc}。\n"
+                f"玩家的身份是：{player_identity}"
+                f"{progress_stage_desc}\n"
+                "【世界观背景概要】\n"
+                f"{WORLD_BACKGROUND}\n\n"
+                f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。\n"
+                f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。\n"
+                "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。\n\n"
+                "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。\n\n"
+                "【输出方式】\n"
+                "1. 回复内容：只输出作为该游戏角色的对话文本，不要有任何前缀，不要包含 JSON 或其它结构化数据。\n"
+                "2. 在回复的同时，调用工具 update_npc_mood 上报 favorability_change（-5～5，常规为 0）与 emotion（从可用情绪中选，无则用「普通」）。\n"
+                "3. 若无法调用工具而必须用正文传参时，最后一段只输出一行 JSON，不要在最后一段的 JSON 前加任何换行以外的前缀。\n"
+                "4. 动作与台词格式：非必要时不出现动作描写。若需表达肢体动作、神态或环境描写，必须且只能使用全角粗括号【】包裹；台词部分直接输出，不要加引号；严禁用半角括号 () 或星号 * 描述动作。你输出的动作若涉及人称，一律单独起一行，而且采用第三人称视角：用角色名指代你自己，用「你」指代玩家。玩家那边的动作可能由玩家自拟（人称不限），前端会与你的回复分开展示，你只需保证自己输出的动作符合上述格式与人称要求即可。再次强调，情绪变化和好感度变化要调用工具，输出tool_calls_list。\n"
+            )
+            # agent_enabled=false：走纯对话，无任务工具；在检索与物品类型提示之后、对话历史之前提醒模型
+            task_agent_disabled_note = ""
+            if not self._is_agent_enabled(payload):
+                task_agent_disabled_note = (
+                    "注：现在无法发布任务；若玩家要求任务，请推辞、拒绝，或提醒其开启终端的任务接收窗口后才能接收任务。\n\n"
+                )
 
-        context_prompt = (
-            f"{mentioned_npcs_str}"
-            "下面是可能与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
-            f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
-            f"{task_agent_disabled_note}"
-            f"{history_str}"
-        )
-        user_prompt = f"{context_prompt}\n玩家：{payload.query}"
+            context_prompt = (
+                f"{mentioned_npcs_str}"
+                "下面是可能与你相关的检索设定和你的过往台词片段（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
+                f"{retrieved_context or '（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）'}\n\n"
+                f"{task_agent_disabled_note}"
+                f"{history_str}"
+            )
+            user_prompt = f"{context_prompt}\n玩家：{payload.query}"
 
         raw_emotion = getattr(payload, "current_emotion", None)
         current_emotion_for_use = None
@@ -415,6 +441,7 @@ class GameRAGService:
             relationship_level=relationship_level,
             payload=payload,
             retrieved_context=retrieved_context or "",
+            rag_eval_qa_mode=qa_mode,
         )
 
     # ==================================================================

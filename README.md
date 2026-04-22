@@ -436,7 +436,7 @@ python -m evals.runners.run_all --suite retriever --dataset evals/datasets/tiny_
 python -m evals.runners.run_all --suite rag --dataset evals/datasets/tiny_golden.jsonl --sample 5
 ```
 
-`run_all` 默认 `--dataset` 为 `evals/datasets/golden_v1.jsonl`（全量约 80 条）；上例显式指定 `tiny_golden.jsonl`（5 条）便于调试。
+`run_all` 默认 `--dataset` 为 `evals/datasets/golden_v1.jsonl`（全量约 130 条）；上例显式指定 `tiny_golden.jsonl`（5 条）便于调试。
 
 报告输出到 `evals/reports/`（时间戳 + git 短 hash）。详见 [evals/README.md](evals/README.md)。
 

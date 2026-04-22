@@ -52,6 +52,10 @@ class NPCChatRequest(BaseModel):
         default=None,
         description="精确短期记忆的总结间隔/历史长度档位。取值 10/30/100/500，对应前端短/中/长/几乎无限。不传时后端使用默认值 30。",
     )
+    rag_eval_qa_mode: bool = Field(
+        default=False,
+        description="内部评估用：为 true 时使用面向问答的精简 prompt（无工具/立绘/情绪输出约定），仅 evals/rag 等脚本应开启。",
+    )
 
 
 class NPCChatResponse(BaseModel):

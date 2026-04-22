@@ -2,6 +2,10 @@
 Ragas 端到端评估：复用 ``GameRAGService`` 的检索与 prompt 拼装，但 **生成答案** 使用
 ``call_llm_eval_text_only``（仅文本），不经过 ``call_llm`` 的立绘多模态与 tools，与线路上下文隔离。
 
+生成侧使用 ``NPCChatRequest.rag_eval_qa_mode=True``：与 golden 的问答句式对齐的精简 prompt
+（保留世界观概要、角色标签、检索与关键词块；去掉扮演、工具、立绘与输出格式约束），
+避免 Ragas 的 answer_relevancy / faithfulness 与线上 NPC 对白目标互相拉扯。
+
 需要：本地 bge 嵌入模型（与主项目一致）。Judge LLM：需 ``LLM_API_KEY``；
 本脚本在检测到本地 Ollama 风格 ``LLM_API_BASE`` 且 Key 为空时，会临时使用占位符 ``ollama``
 （与正式 ``/ask`` 链路无关；正式对话请在 .env 中显式设置 ``LLM_API_KEY``，例如 ``ollama``）。
@@ -115,12 +119,17 @@ async def _run_one(
         agent_enabled=False,
         progress_stage=None,
         api_key=resolved_api_key,
+        rag_eval_qa_mode=True,
     )
     ctx = await service._prepare_ask_context(payload, npc_manager, memory)
     contexts = _contexts_from_retrieved(ctx.retrieved_context)
     # 生成：评估专用纯文本 API，不传立绘、不传 tools（与正式 call_llm 隔离）
     user_eval = ctx.user_prompt
-    if ctx.emotion_hint and str(ctx.emotion_hint).strip():
+    if (
+        not ctx.rag_eval_qa_mode
+        and ctx.emotion_hint
+        and str(ctx.emotion_hint).strip()
+    ):
         user_eval = user_eval + "\n\n" + str(ctx.emotion_hint).strip()
     ek = (ctx.effective_api_key or "").strip()
     if not ek:
