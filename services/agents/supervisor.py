@@ -53,7 +53,7 @@ _SUPERVISOR_OUTPUT_HINT = (
     '{\n'
     '  "route": "query" | "task" | "dialogue" | "end",        // 必填\n'
     '  "reason": "一句话理由（用于 debug；≤40字）",           // 必填\n'
-    '  "interim_reply": "",                                    // 可选，≤80 字 NPC 口吻短句；无话可说则留空字符串\n'
+    '  "interim_reply": "",                                    // 可选，≤80 字；仅 route=task 且本轮首次进 task 时可填；无草案/有草案规则见下方「interim_reply」\n'
     '  "mood": {                                               // route="dialogue" 或 "end" 时必填；其它情况留 null\n'
     '    "emotion": "<从可用情绪列表中选；若列表里有「普通」则未决定时填「普通」>",\n'
     '    "favorability_change": 0                              // 整数，范围 -5~5，常规为 0\n'
@@ -80,8 +80,10 @@ _SUPERVISOR_ROUTING_GUIDE = """\
 【interim_reply 生成规则】
 - 仅在 route=task **且** 本轮是首次 task 路由（agent_call_counts.task == 0）时考虑产出；
   其他情况 interim_reply=""。
-- interim_reply 用 NPC 自己的口吻（≤80 字），表示"我先想想 / 让我看看…"意味，不能剧透任务细节，
+- 尚无 pending_task_draft（尚未向玩家展示草案）时：interim_reply 用 NPC 自己的口吻（≤50 字），表示"我先想想 / 让我看看…"意味，不能剧透任务细节，
   不要涉及具体地区，不能和后续 worker 可能产出的任务内容冲突；不确定就留空。
+- 已有 pending_task_draft（已拟定草案并发送给玩家）时：interim_reply 用 NPC 自己的口吻（≤50 字），根据用户的发送内容，在转交给task_worker前给出合适的过渡短对话，
+  不必下达非常明确的任务指示（避免和后续 worker 对任务的判断冲突），不必生成最终对话文本（最终对话在后续dialogue最终进行）；实在不确定时就留空，但尽量不留空。
 
 【mood 字段规则】（等价于一次 update_npc_mood 工具调用——**本轮务必填写**，因为 dialogue_worker 一定会跑）
 - 任何 route 都必须产出 mood（包括 route=query/task/dialogue/end）。dialogue_worker 会依赖它。
@@ -180,10 +182,9 @@ def _apply_blacklist(route: str, blacklist: list[str]) -> str:
 def _default_interim_reply(route: str) -> str:
     """当 supervisor 没产出 interim_reply 时的兜底短句。
 
-    目前只对 task 路由强制兜底。这里的文案必须：
-    - 保持 NPC 口吻，但不剧透任务细节；
-    - 足够短，便于前端伪流式；
-    - 与后续 dialogue 正文不冲突。
+    **仅**在 route=task、**尚无** pending_task_draft、且本轮首次进入 task 时使用（见 supervisor_node）。
+    已有草案时再进 task（确认/改/拒）不得用本句，避免与「草案已展示」语义冲突。
+    文案必须：NPC 口吻、不剧透任务细节、足够短。
     """
     if route == "task":
         return "好，我想想手头有什么事正适合交给你。"
@@ -408,9 +409,12 @@ async def supervisor_node(
     route = _apply_blacklist(route_raw, blacklist)
     route = _soft_guard(state, route)
 
-    # 5. 首次 task 时要求 supervisor 一定先说一句；其他路由不发。
+    # 5. 仅「首次进入 task」且「尚无待确认草案」且模型未给 interim 时填默认过渡句；
+    #    已有草案时再进 task（确认/拒绝/改草案），interim 必须留空，不能套默认句。
     if route == "task" and counts.get("task", 0) == 0:
-        interim = interim or _default_interim_reply(route)
+        has_pending = bool(state.get("pending_task_draft"))
+        if not interim and not has_pending:
+            interim = _default_interim_reply(route)
     else:
         interim = ""
 

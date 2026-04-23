@@ -345,8 +345,8 @@ def _supervisor_tail() -> str:
         "- 本调用是**路由决策**：根据玩家消息选择下一跳 worker（query / task / dialogue / end）。\n"
         "- 路由到 dialogue 或 end 时，额外在同一 JSON 中给出 mood.emotion / mood.favorability_change，\n"
         "  这等价于一次 update_npc_mood 工具调用——**不要**另外产生 tool_calls。\n"
-        "- 可选给出一段不超过 80 字、NPC 口吻的 interim_reply，用于让前端先显示"
-        "「NPC 正在说一句短话」遮盖任务准备时长；仅在第一次 route=task 时考虑，否则留空。\n"
+        "- interim_reply：仅 route=task 且为本轮**首次**进入 task 时可填（≤80 字 NPC 口吻）；"
+        "无草案与有草案下的取舍见 user 中「interim_reply 生成规则」。其它情况留空。\n"
         "- 你**不**生成最终对白——最终对白由 dialogue worker 负责。你只能通过 interim_reply 发一句短话。\n"
         "- 具体 JSON schema 与字段约束见下方 user 消息。\n"
     )
