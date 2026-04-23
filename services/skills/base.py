@@ -1,221 +1,243 @@
 """
-Anthropic 风格 Skills：统一契约与 OpenAI Function 工具定义生成。
+Skill data model + YAML frontmatter parser + registry.
+
+与 Anthropic 2026 Agent Skills 规范对齐::
+
+    ---
+    name: task-publishing
+    description: NPC 发布任务给玩家的完整流程（prepare → draft → confirm）。触发：玩家索要任务……
+    ---
+
+    # 任务发布流程
+    …… markdown body ……
+
+本模块只负责**解析与索引**：
+
+- 启动时扫描所有 SKILL.md，校验 frontmatter 合法性；
+- 提供 ``index()`` 返回 Level 1 简表（name + 截断后的 description）；
+- 提供 ``get_body(name)`` / ``read_reference(name, file)`` 供渐进式披露使用。
 """
 
 from __future__ import annotations
 
-import importlib
-import json
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Optional
 
-@dataclass
-class SkillDispatchContext:
-    """工具执行期上下文（由 LangGraph tool_executor 注入）。"""
+logger = logging.getLogger(__name__)
 
-    npc_name: str = ""
-    npc_faction: str = ""
-    npc_challenge: Optional[str] = None
-    player_progress: int = 1
-    npc_affinity: int = 0
-    npc_states: Optional[dict[str, Any]] = None
-    game_data: Any = None
-    pending_draft: Optional[dict[str, Any]] = None
-    retrieve_fn: Any = None
-    rag_context_text: Optional[str] = None
+try:
+    import yaml  # PyYAML（LlamaIndex 已依赖）
+except ImportError as e:  # pragma: no cover
+    raise ImportError(
+        "需要 PyYAML 解析 SKILL.md frontmatter，请运行 pip install pyyaml"
+    ) from e
 
 
-Category = Literal["task", "query", "mood", "system"]
+_FRONTMATTER_PATTERN = re.compile(
+    r"\A---\s*\r?\n(?P<frontmatter>.*?)\r?\n---\s*\r?\n?(?P<body>.*)\Z",
+    flags=re.DOTALL,
+)
+
+_VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+
+DEFAULT_DESCRIPTION_PREVIEW_LEN = 300
 
 
-class BaseSkill(ABC):
-    """单个 skill：名称、类别、参数 JSON Schema、描述、同步执行入口。"""
+@dataclass(frozen=True)
+class Skill:
+    """一个 skill 的不可变视图（启动时一次性解析，后续只读）。"""
 
     name: str
-    category: Category
     description: str
-    parameters_schema: dict[str, Any]
+    body: str
+    md_path: Path
+    refs_dir: Optional[Path] = None
+    raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
-    def to_openai_tool(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters_schema,
-            },
-        }
 
-    @abstractmethod
-    def run(
-        self,
-        args: dict[str, Any],
-        ctx: SkillDispatchContext,
-    ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
-        """
-        返回与 tool_executor.dispatch_tool_call 一致：
-        (result_json_str, updated_pending_draft, task_write_result)
-        """
+def parse_skill_md(md_path: Path) -> Skill:
+    """
+    解析一个 SKILL.md 文件，返回 Skill。失败抛 ValueError（启动快速失败）。
+    """
+    text = md_path.read_text(encoding="utf-8")
+    m = _FRONTMATTER_PATTERN.match(text)
+    if m is None:
+        raise ValueError(
+            f"SKILL.md 缺少合法的 YAML frontmatter: {md_path}\n"
+            "正确格式：文件开头 --- 块内用 YAML 提供 name / description，然后 --- 关闭。"
+        )
+    fm_text = m.group("frontmatter") or ""
+    body_text = (m.group("body") or "").strip()
+    try:
+        fm_raw = yaml.safe_load(fm_text) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"SKILL.md frontmatter YAML 解析失败 {md_path}: {e}") from e
+
+    if not isinstance(fm_raw, dict):
+        raise ValueError(
+            f"SKILL.md frontmatter 必须是对象 {md_path}，实际为 {type(fm_raw).__name__}"
+        )
+
+    name = str(fm_raw.get("name") or "").strip()
+    description = str(fm_raw.get("description") or "").strip()
+    if not name:
+        raise ValueError(f"SKILL.md 缺少 'name' 字段: {md_path}")
+    if not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"SKILL.md name 不合法 {md_path}: {name!r}；"
+            "只允许小写字母/数字/短横，首尾不能是短横，长度 3-64。"
+        )
+    if not description:
+        raise ValueError(f"SKILL.md 缺少 'description' 字段: {md_path}")
+
+    refs_dir = md_path.parent / "references"
+    refs_dir_opt = refs_dir if refs_dir.is_dir() else None
+
+    return Skill(
+        name=name,
+        description=description,
+        body=body_text,
+        md_path=md_path,
+        refs_dir=refs_dir_opt,
+        raw_frontmatter=fm_raw,
+    )
 
 
 class SkillRegistry:
-    """Skill 注册表：按名称索引，支持按 category 过滤生成 tools 列表。"""
+    """Skill 注册表：按 name 索引。"""
 
     def __init__(self) -> None:
-        self._skills: dict[str, BaseSkill] = {}
-        # 记录 handler 模块所在目录，便于读取 SKILL.md
-        self._skill_dirs: dict[str, Path] = {}
+        self._skills: dict[str, Skill] = {}
 
-    def register(self, skill: BaseSkill, *, module_dir: Optional[Path] = None) -> None:
+    def register(self, skill: Skill) -> None:
         if skill.name in self._skills:
             raise ValueError(f"duplicate skill name: {skill.name}")
         self._skills[skill.name] = skill
-        if module_dir is not None:
-            self._skill_dirs[skill.name] = module_dir
 
-    def discover(
-        self,
-        package: str = "services.skills",
-        *,
-        priority: Optional[Iterable[str]] = None,
-    ) -> None:
+    def discover(self, root: Optional[Path] = None) -> None:
         """
-        递归扫描 ``services/skills/<category>/<skill_name>/handler.py`` 并自动注册。
-
-        每个 handler 模块必须顶层导出名为 ``skill`` 的 :class:`BaseSkill` 实例。
-        注册顺序：
-            1. ``priority`` 中列出的 skill 名称按给定顺序优先注册；
-            2. 其余 skill 按目录遍历顺序追加（对主模型影响很小，主要是一致性）。
+        扫描 ``services/skills/<skill-name>/SKILL.md`` 自动注册。
         """
-        pkg = importlib.import_module(package)
-        pkg_paths = [Path(p) for p in getattr(pkg, "__path__", [])]
-        if not pkg_paths:
+        if root is None:
+            root = Path(__file__).resolve().parent
+        if not root.is_dir():
             return
 
-        found: dict[str, tuple[BaseSkill, Path]] = {}
-        for base in pkg_paths:
-            for category_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-                if category_dir.name.startswith("_"):
-                    continue
-                for skill_dir in sorted(
-                    p for p in category_dir.iterdir() if p.is_dir()
-                ):
-                    handler_py = skill_dir / "handler.py"
-                    if not handler_py.is_file():
-                        continue
-                    mod_name = (
-                        f"{package}.{category_dir.name}.{skill_dir.name}.handler"
-                    )
-                    try:
-                        mod = importlib.import_module(mod_name)
-                    except Exception as e:  # pragma: no cover - 启动期兜底
-                        raise ImportError(
-                            f"加载 skill 模块失败: {mod_name}: {e}"
-                        ) from e
-                    skill_obj = getattr(mod, "skill", None)
-                    if not isinstance(skill_obj, BaseSkill):
-                        continue
-                    found[skill_obj.name] = (skill_obj, skill_dir)
-
-        ordered: list[str] = []
-        if priority:
-            for name in priority:
-                if name in found and name not in ordered:
-                    ordered.append(name)
-        for name in found.keys():
-            if name not in ordered:
-                ordered.append(name)
-
-        for name in ordered:
-            skill_obj, skill_dir = found[name]
-            if name in self._skills:
+        found: list[Skill] = []
+        for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+            if skill_dir.name.startswith("_"):
                 continue
-            self.register(skill_obj, module_dir=skill_dir)
+            md_path = skill_dir / "SKILL.md"
+            if not md_path.is_file():
+                continue
+            try:
+                skill = parse_skill_md(md_path)
+            except ValueError:
+                # 启动期快速失败：让使用者立刻看到 SKILL.md 写错了
+                raise
+            found.append(skill)
 
-    def get(self, name: str) -> Optional[BaseSkill]:
+        for s in found:
+            if s.name in self._skills:
+                continue
+            self._skills[s.name] = s
+
+    def get(self, name: str) -> Optional[Skill]:
         return self._skills.get(name)
 
-    def all_skills(self) -> list[BaseSkill]:
+    def all_skills(self) -> list[Skill]:
         return list(self._skills.values())
 
-    def get_openai_tools(
+    def index(
         self,
-        categories: Optional[set[Category]] = None,
-    ) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
+        *,
+        categories: Optional[Iterable[str]] = None,
+        description_preview: int = DEFAULT_DESCRIPTION_PREVIEW_LEN,
+    ) -> list[dict[str, str]]:
+        """
+        Level 1 简表：[{name, description}]。
+
+        ``categories`` 目前按 **skill name 精确匹配 OR 前缀匹配** 过滤，例如传
+        ``["task-publishing", "mood-tracking"]`` 只返回这两个；
+        传 ``["task-"]`` 返回所有 task- 前缀的 skill。
+        """
+        names_filter: Optional[set[str]] = None
+        prefixes: list[str] = []
+        if categories is not None:
+            cats = [str(c).strip() for c in categories if str(c).strip()]
+            names_filter = {c for c in cats if not c.endswith("-")}
+            prefixes = [c for c in cats if c.endswith("-")]
+
+        rows: list[dict[str, str]] = []
         for s in self._skills.values():
-            if categories is not None and s.category not in categories:
+            if names_filter is not None:
+                in_names = s.name in names_filter
+                in_prefix = any(s.name.startswith(p) for p in prefixes) if prefixes else False
+                if not (in_names or in_prefix):
+                    continue
+            desc = s.description
+            if description_preview and len(desc) > description_preview:
+                desc = desc[:description_preview].rstrip() + "…"
+            rows.append({"name": s.name, "description": desc})
+        return rows
+
+    def get_body(self, name: str) -> Optional[str]:
+        """Level 2：返回 SKILL.md 的 Markdown body。"""
+        s = self._skills.get(name)
+        if s is None:
+            return None
+        return s.body
+
+    def list_reference_files(self, name: str) -> list[str]:
+        """返回 skill 目录下 references/ 内的相对路径列表（按字典序）。"""
+        s = self._skills.get(name)
+        if s is None or s.refs_dir is None:
+            return []
+        out: list[str] = []
+        for p in sorted(s.refs_dir.rglob("*")):
+            if not p.is_file():
                 continue
-            out.append(s.to_openai_tool())
+            rel = p.relative_to(s.md_path.parent).as_posix()
+            out.append(rel)
         return out
 
-    def get_skill_doc(self, name: str) -> Optional[str]:
+    def read_reference(self, name: str, rel_path: str) -> Optional[str]:
         """
-        读取指定 skill 的 SKILL.md **完整正文**，供 agent 按需加载（渐进式披露）。
+        Level 3：读取 ``references/`` 下的附件文本。
 
-        找不到 skill 或未提供 SKILL.md 时返回 ``None``；调用方负责 fallback。
+        严格校验：路径必须以 'references/' 开头 + 禁止 ``..`` / 绝对路径 / 跳出 skill 目录。
         """
-        if name not in self._skills:
+        s = self._skills.get(name)
+        if s is None:
             return None
-        dir_path = self._skill_dirs.get(name)
-        if dir_path is None:
+        cleaned = (rel_path or "").strip().lstrip("./")
+        if not cleaned.startswith("references/"):
             return None
-        md_path = dir_path / "SKILL.md"
-        if not md_path.is_file():
+        if ".." in cleaned.split("/"):
+            return None
+        candidate = (s.md_path.parent / cleaned).resolve()
+        try:
+            candidate.relative_to(s.md_path.parent.resolve())
+        except ValueError:
+            return None
+        if not candidate.is_file():
             return None
         try:
-            return md_path.read_text(encoding="utf-8")
-        except Exception:
+            return candidate.read_text(encoding="utf-8")
+        except Exception:  # pragma: no cover
             return None
 
-    def get_system_prompt_fragment(self, names: Iterable[str]) -> str:
-        """
-        拼接指定 skill 的 SKILL.md **前两段**为 system prompt 片段。
 
-        - 第一段：一句话 description（LLM 用于选择工具）
-        - 第二段：何时触发 / 不触发
-        找不到 SKILL.md 或段落缺失时，回退使用 skill.description。
-        """
-        parts: list[str] = []
-        for name in names:
-            skill = self._skills.get(name)
-            if skill is None:
-                continue
-            fallback = (skill.description or "").strip()
-            dir_path = self._skill_dirs.get(name)
-            text = ""
-            if dir_path is not None:
-                md_path = dir_path / "SKILL.md"
-                if md_path.is_file():
-                    try:
-                        text = md_path.read_text(encoding="utf-8")
-                    except Exception:
-                        text = ""
-            if text:
-                paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-                first_two = "\n\n".join(paragraphs[:2]) if paragraphs else fallback
-            else:
-                first_two = fallback
-            if first_two:
-                parts.append(f"### {name}\n{first_two}")
-        return "\n\n".join(parts)
+_registry: Optional[SkillRegistry] = None
 
-    def dispatch(
-        self,
-        tool_name: str,
-        tool_args: dict[str, Any],
-        ctx: SkillDispatchContext,
-    ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
-        skill = self._skills.get(tool_name)
-        if skill is None:
-            return (
-                json.dumps(
-                    {"status": "error", "message": f"未知工具: {tool_name}"},
-                    ensure_ascii=False,
-                ),
-                None,
-                None,
-            )
-        return skill.run(tool_args, ctx)
+
+def get_skill_registry() -> SkillRegistry:
+    global _registry
+    if _registry is None:
+        r = SkillRegistry()
+        r.discover()
+        _registry = r
+    return _registry

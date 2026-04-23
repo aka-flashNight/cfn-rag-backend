@@ -30,12 +30,12 @@ from services.npc_mood_agent import (
     parse_update_npc_mood_tool_calls,
     strip_trailing_tool_call_text,
 )
-from services.skills.mood.legacy_fallback import (
+from services.agent_graph.mood_fallback import (
     is_mood_text_fallback_enabled,
     strip_trailing_mood_json,
 )
-from services.agent_tools.tool_executor import dispatch_tool_call
 from services.skills import get_skill_registry
+from services.tools.base import ToolContext, get_tool_registry, sort_tool_calls_for_pipeline
 
 from .prompts import (
     DECISION_ROUND_SUFFIX,
@@ -135,47 +135,14 @@ def _log_agent_decision_tool_calls(tool_calls: list[dict]) -> None:
     _debug_stderr_block("decision / model_tool_calls (raw)", raw)
 
 
-# 同一批 tool_calls 内保证任务流水线顺序，避免模型先 confirm 后 draft 导致「无草案」失败。
-_TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
-    "prepare_task_context": 10,
-    "search_knowledge": 15,
-    "search_stages": 16,
-    "search_items": 17,
-    "list_skills": 18,
-    "draft_agent_task": 20,
-    "update_task_draft": 30,
-    "confirm_agent_task": 40,
-    "cancel_agent_task": 50,
-}
-
-
-def _sort_pending_tool_calls_for_task_pipeline(
-    pending_calls: list[dict],
-) -> list[dict]:
-    if len(pending_calls) <= 1:
-        return pending_calls
-
-    def _name(tc: dict) -> str:
-        func_info = tc.get("function", tc)
-        return str(func_info.get("name", "") or "")
-
-    return [
-        tc
-        for _, tc in sorted(
-            enumerate(pending_calls),
-            key=lambda pair: (_TASK_TOOL_PIPELINE_ORDER.get(_name(pair[1]), 1000), pair[0]),
-        )
-    ]
-
-
 def _get_full_tools() -> list[dict[str, Any]]:
-    """决策轮：全部 skills（含 task/query/mood/system）。"""
-    return get_skill_registry().get_openai_tools()
+    """决策轮：全部原子工具（含 task/query/mood/system）。"""
+    return get_tool_registry().get_openai_tools()
 
 
 def _get_mood_only_tools() -> list[dict[str, Any]]:
     """生成轮：仅允许 update_npc_mood，避免任务/检索工具重复调用。"""
-    return get_skill_registry().get_openai_tools(categories={"mood"})
+    return get_tool_registry().get_openai_tools(categories=("mood",))
 
 
 def _parse_update_npc_mood_args(tc: dict[str, Any]) -> dict[str, Any] | None:
@@ -603,7 +570,7 @@ async def prepare_context_node(
 
     pending_draft_summary = ""
     if pending_draft:
-        from services.agent_tools.tool_executor import _detailed_draft_summary
+        from services.agent_tools.draft_formatting import _detailed_draft_summary
         pending_draft_summary = _detailed_draft_summary(
             pending_draft,
             game_data,
@@ -836,7 +803,7 @@ async def tool_executor_node(
     npc_manager = cfgable.get("npc_manager")
     rag_service = cfgable.get("rag_service")
 
-    pending_calls = _sort_pending_tool_calls_for_task_pipeline(
+    pending_calls = sort_tool_calls_for_pipeline(
         list(state.get("_pending_tool_calls", [])),
     )
     pending_draft = state.get("pending_task_draft")
@@ -891,9 +858,7 @@ async def tool_executor_node(
             "tool_name": tool_name,
         })
 
-        result_str, updated_draft, write_result = dispatch_tool_call(
-            tool_name,
-            tool_args,
+        tool_ctx = ToolContext(
             npc_name=npc_name,
             npc_faction=npc_faction,
             npc_challenge=npc_challenge,
@@ -904,6 +869,12 @@ async def tool_executor_node(
             pending_draft=pending_draft,
             retrieve_fn=_make_retrieve_fn(),
             rag_context_text=state.get("retrieved_context") or "",
+            skill_registry=get_skill_registry(),
+        )
+        result_str, updated_draft, write_result = get_tool_registry().dispatch(
+            tool_name,
+            tool_args,
+            tool_ctx,
         )
 
         _log_agent_tool_round(

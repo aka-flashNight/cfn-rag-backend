@@ -1,8 +1,8 @@
 """
-流式/工具不可用时的正文末尾 mood JSON 兜底（已弃用主路径）。
+Mood parsing legacy fallback（默认关闭）。
 
-仅当环境变量 ``CFN_ENABLE_MOOD_TEXT_FALLBACK`` 为 ``1`` / ``true`` / ``yes`` 时启用，
-由 ``parse_mood_node`` 与 ``_ask_stream_legacy`` 调用 ``strip_trailing_mood_json``。
+仅当环境变量 ``CFN_ENABLE_MOOD_TEXT_FALLBACK`` 为 ``1``/``true``/``yes`` 时启用。
+主路径请使用原生流式 tool_calls 协议（见 ``services/agent_graph/nodes.py`` 的 generate_response_stream）。
 """
 
 from __future__ import annotations

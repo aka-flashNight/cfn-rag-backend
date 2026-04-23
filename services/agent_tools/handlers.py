@@ -1,7 +1,8 @@
 """
-各 skill 对应的可调用实现（由 services/skills/*/handler 引用）。
+任务发布流水线的纯业务函数（无 LLM，无 state mutation）。
 
-与 ``tool_executor.dispatch_tool_call`` 解耦，避免与草案格式化函数循环依赖。
+由 ``services/tools/<category>/<name>.py`` 的 ``run()`` 方法按需调用。
+所有逻辑仅依赖入参 + ``GameDataRegistry``；返回 JSON 字符串 / 更新后的 draft / 任务写入结果三元组。
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 def _reward_field_value_changed(cur: Any, new: Any) -> bool:
-    """奖励类字段是否发生实际变化，用于讨价还价计数去重（同一轮内重复调用不重复计数）。"""
     if cur is None and (new is None or new == []):
         return False
     if (cur is None or cur == []) and new is None:
@@ -53,7 +53,10 @@ def _build_validation_ctx(
     )
 
 
-def _title_duplicate_warning(title: Any, game_data: Optional[GameDataRegistry]) -> Optional[dict[str, Any]]:
+def _title_duplicate_warning(
+    title: Any,
+    game_data: Optional[GameDataRegistry],
+) -> Optional[dict[str, Any]]:
     if game_data is None:
         return None
     s = str(title or "").strip()
@@ -433,3 +436,14 @@ def execute_search_knowledge(
             "status": "error",
             "message": f"检索失败: {str(e)}",
         }, ensure_ascii=False)
+
+
+__all__ = [
+    "execute_prepare_task_context",
+    "execute_draft_agent_task",
+    "execute_update_task_draft",
+    "execute_confirm_agent_task",
+    "execute_cancel_agent_task",
+    "execute_update_npc_mood",
+    "execute_search_knowledge",
+]

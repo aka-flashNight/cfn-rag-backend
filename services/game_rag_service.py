@@ -28,7 +28,7 @@ from services.npc_mood_agent import (
     parse_update_npc_mood_tool_calls,
     strip_trailing_tool_call_text,
 )
-from services.skills.mood.legacy_fallback import (
+from services.agent_graph.mood_fallback import (
     is_mood_text_fallback_enabled,
     strip_trailing_mood_json,
 )

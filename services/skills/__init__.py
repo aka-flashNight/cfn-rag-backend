@@ -1,61 +1,27 @@
 """
-Skills 注册表（Anthropic 风格目录 + OpenAI Function 工具定义）。
+Anthropic-style Agent Skills registry (YAML frontmatter + Markdown body).
 
-目录契约（详见 plan 路线2 §2.1）::
+参考规范：https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview（2026.04）
 
-    services/skills/
-      <category>/                # task | query | mood | system
-        <skill_name>/
-          SKILL.md                # 前两段：description + 触发/不触发
-          handler.py              # 顶层导出名为 `skill` 的 BaseSkill 实例
+每个 skill 一个目录，目录内必有 ``SKILL.md``；
+可选 ``references/`` 存放附加材料（供 ``read_skill_file`` 按需加载）。
 
-``SkillRegistry.discover()`` 会递归扫描上述目录并自动注册，"新增文件夹即扩展"。
-task 流水线相关 skill 给予固定优先顺序，避免模型在工具列表顺序敏感时先 confirm 后 draft。
+启动时 ``SkillRegistry.discover()`` 只会：
+1. 扫描 ``services/skills/<skill-name>/SKILL.md``；
+2. 解析 YAML frontmatter 得 ``name / description``；
+3. 记录 body + references 路径（body 延迟加载，不默认塞 system prompt）。
 
-使用方式::
-
-    from services.skills import get_skill_registry
-    tools = get_skill_registry().get_openai_tools()
+Level 1: ``list_skills`` 返回 {name, description} 简表进入上下文
+Level 2: ``read_skill(skill_name)`` 返回完整 body
+Level 3: ``read_skill_file(skill_name, file)`` 返回 references/xxx 附件
 """
 
 from __future__ import annotations
 
-from services.skills.base import BaseSkill, SkillDispatchContext, SkillRegistry
-
-# 顺序仅是"偏好"：任务流水线优先，list_skills 放最后，其余 skill 按目录顺序追加。
-# 新增文件夹会被 discover() 自动识别并追加到末尾，无需改本文件。
-_PRIORITY_ORDER: tuple[str, ...] = (
-    "prepare_task_context",
-    "search_knowledge",
-    "search_stages",
-    "search_items",
-    "draft_agent_task",
-    "update_task_draft",
-    "confirm_agent_task",
-    "cancel_agent_task",
-    "update_npc_mood",
-    "list_skills",
-)
-
-_registry: SkillRegistry | None = None
-
-
-def _build_registry() -> SkillRegistry:
-    r = SkillRegistry()
-    r.discover(package="services.skills", priority=_PRIORITY_ORDER)
-    return r
-
-
-def get_skill_registry() -> SkillRegistry:
-    global _registry
-    if _registry is None:
-        _registry = _build_registry()
-    return _registry
-
+from services.skills.base import Skill, SkillRegistry, get_skill_registry
 
 __all__ = [
-    "BaseSkill",
-    "SkillDispatchContext",
+    "Skill",
     "SkillRegistry",
     "get_skill_registry",
 ]
