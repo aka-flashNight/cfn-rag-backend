@@ -50,6 +50,8 @@ class AgentState(TypedDict, total=False):
     final_reply: str               # 完整的 NPC 回复文本
     emotion: str                   # 解析出的情绪标签
     favorability_change: int       # 解析出的好感度变化
+    # supervisor 的短前置对白（最终也会拼进 final_reply）
+    interim_reply: str
 
     # ── 流式回调（由调用方在 config 中注入） ──
     # streaming_callback 不放在 state 中，通过 config 的 callbacks 传递
@@ -59,11 +61,32 @@ class AgentState(TypedDict, total=False):
     effective_summarize_interval: int
 
     # ── 节点间内部传递（以下划线开头，不暴露给外部） ──
+    _prompt_base: str
     _system_prompt: str
     _user_prompt: str
     _tool_messages: list[dict[str, str]]
     _pending_tool_calls: list[dict[str, Any]]
     _mood_tool_calls: list[dict[str, Any]]
     _decision_reply: str
+    _system_prefix_text: str
+    _mood_resolved_by_supervisor: bool
+    _mood_event_emitted: bool
     # SSE: 工具调用/关键阶段的 UI 事件（由 tool_executor_node 填充）
     _ui_events: list[dict[str, Any]]
+
+    # ── 多 Agent / HITL 控制状态（主图与 worker 之间传递） ──
+    routing_decision: str
+    routing_reason: str
+    worker_hops: int
+    agent_call_counts: dict[str, int]
+    agent_consecutive_failures: dict[str, int]
+    agent_blacklist: list[str]
+    token_budget_spent: int
+    last_worker_name: str
+    last_worker_ok: bool
+    last_worker_summary: str
+    awaiting_confirmation: bool
+    confirmation_draft_id: Optional[str]
+    confirmation_payload: Optional[dict[str, Any]]
+    _active_worker: str
+    _active_worker_tool_names: list[str]

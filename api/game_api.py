@@ -2,6 +2,7 @@
 游戏知识库 RAG API，供 Web 端调用。
 """
 
+import asyncio
 import json
 import os
 
@@ -12,6 +13,7 @@ from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
     ChatMessage,
     NPCCandidate,
+    NPCChatConfirmRequest,
     NPCChatRequest,
     NPCChatResponse,
     NPCFavorabilityResponse,
@@ -112,15 +114,103 @@ async def ask_game_knowledge(
                 if event_type == "content":
                     line = json.dumps({"delta": data}, ensure_ascii=False)
                     yield f"event: content\ndata: {line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
                 elif event_type == "mood_update":
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: mood_update\ndata: {line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
                 elif event_type == "done":
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: done\ndata: {line}\n\n".encode("utf-8")
-                elif event_type == "tool_status":
+                    await asyncio.sleep(0)
+                elif event_type in (
+                    "tool_status",
+                    "agent_status",
+                ):
                     line = json.dumps(data, ensure_ascii=False)
                     yield f"event: {event_type}\ndata: {line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
+        except Exception as e:
+            err_line = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {err_line}\n\n".encode("utf-8")
+
+    return StreamingResponse(
+        sse_generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/ask/confirm",
+    summary="HITL v2：玩家对 pending 任务草案给出 accept/reject/bargain 并继续推进主图",
+)
+async def ask_confirm(
+    payload: NPCChatConfirmRequest,
+    stream: bool = Query(True, description="默认 true，以 SSE 流式返回后续主图推进事件"),
+    service: GameRAGService = Depends(get_game_rag_service),
+    memory: MemoryManager = Depends(get_memory_manager),
+    npc_manager: NPCManager = Depends(get_npc_manager),
+):
+    """
+    推进处于 awaiting_confirmation 状态的 LangGraph 主图：
+    - accept：相当于注入一条"我接受"的玩家消息，后续由 TaskAgent 调 confirm_agent_task。
+    - reject：相当于注入"我拒绝"，后续由 TaskAgent 调 cancel_agent_task。
+    - bargain：把 player_reply 作为新一轮消息再跑一次 supervisor 图（可能改 draft 或换方案）。
+    实际实现上统一做法：把 NPCChatConfirmRequest 映射为一条标准 NPCChatRequest，再走 ask_stream / ask。
+    LangGraph 通过 session_id → thread_id 复用 checkpointer 内的 state（pending_draft 仍在）。
+    """
+    await ensure_embed_model_ready()
+
+    decision = (payload.decision or "").strip().lower()
+    if decision not in ("accept", "reject", "bargain"):
+        return {"error": "decision 必须是 accept / reject / bargain"}
+
+    if decision == "accept":
+        synthetic_query = payload.player_reply or "我接受这个任务。"
+    elif decision == "reject":
+        synthetic_query = payload.player_reply or "我拒绝，算了吧。"
+    else:
+        synthetic_query = payload.player_reply or "我想再改一下。"
+
+    # 构造一条标准 NPCChatRequest，复用现有管线；session_id 保持不变 → thread_id 复用
+    chat_req = NPCChatRequest(
+        query=synthetic_query,
+        npc_name=payload.npc_name,
+        session_id=payload.session_id,
+        api_key=payload.api_key,
+        api_base=payload.api_base,
+        model_name=payload.model_name,
+        progress_stage=1,  # confirm endpoint 假定已经是进行中的对话；stage 由具体 session 状态决定
+        agent_enabled=True,
+    )
+
+    if not stream:
+        return await service.ask(chat_req, npc_manager=npc_manager, memory=memory)
+
+    async def sse_generate():
+        yield b":\n\n"
+        try:
+            async for event_type, data in service.ask_stream(
+                chat_req, npc_manager=npc_manager, memory=memory
+            ):
+                if event_type == "content":
+                    line = json.dumps({"delta": data}, ensure_ascii=False)
+                    yield f"event: content\ndata: {line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
+                elif event_type in (
+                    "tool_status",
+                    "agent_status",
+                    "mood_update",
+                    "done",
+                ):
+                    line = json.dumps(data, ensure_ascii=False)
+                    yield f"event: {event_type}\ndata: {line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
         except Exception as e:
             err_line = json.dumps({"error": str(e)}, ensure_ascii=False)
             yield f"event: error\ndata: {err_line}\n\n".encode("utf-8")

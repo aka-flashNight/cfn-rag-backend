@@ -135,13 +135,28 @@ def _log_agent_decision_tool_calls(tool_calls: list[dict]) -> None:
     _debug_stderr_block("decision / model_tool_calls (raw)", raw)
 
 
-def _get_full_tools() -> list[dict[str, Any]]:
-    """决策轮：全部原子工具（含 task/query/mood/system）。"""
-    return get_tool_registry().get_openai_tools()
+def _get_full_tools(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """决策轮：
+    - 若 state 里存在 ``_active_worker_tool_names`` 白名单（来自 Supervisor/Worker 子图），
+      则只暴露白名单内的工具 —— 支持路线三的 per-agent tools 过滤。
+    - 否则返回全部原子工具（兼容单 agent 旧流程）。
+    """
+    registry = get_tool_registry()
+    if state:
+        names = state.get("_active_worker_tool_names")
+        if names:
+            return registry.get_openai_tools(names=names)
+    return registry.get_openai_tools()
 
 
-def _get_mood_only_tools() -> list[dict[str, Any]]:
-    """生成轮：仅允许 update_npc_mood，避免任务/检索工具重复调用。"""
+def _get_mood_only_tools(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """生成轮工具策略：
+    - 多 agent 模式下（supervisor 已在路由阶段产出 mood，state[_mood_resolved_by_supervisor]=True）：
+      生成轮**完全不传工具**，避免模型被工具声明迷惑再调一次。
+    - 单 agent / legacy 降级模式（agent_enabled=false）：保留 mood 工具，允许生成轮兜底上报。
+    """
+    if state and state.get("_mood_resolved_by_supervisor"):
+        return []
     return get_tool_registry().get_openai_tools(categories=("mood",))
 
 
@@ -179,7 +194,21 @@ def _last_mood_params_from_decision_state(state: dict[str, Any]) -> dict[str, An
 
 
 def _generation_round_tool_suffix(state: dict[str, Any]) -> str:
-    """生成轮追加到 user prompt 的简短说明（替代冗长「严禁调用…」列表）。"""
+    """生成轮追加到 user prompt 的简短说明。
+
+    - 多 agent 模式（``_mood_resolved_by_supervisor=True``）：supervisor 已敲定 emotion / favorability_change，
+      本轮把这两个值回显给模型，提醒它保持一致；不允许调用任何工具。
+    - legacy / 降级兜底路径：保留旧文案（允许本轮兜底调 update_npc_mood）。
+    """
+    if state.get("_mood_resolved_by_supervisor"):
+        emo = state.get("emotion") or "普通"
+        fchg = state.get("favorability_change", 0)
+        return (
+            "\n\n【本轮已决定的情绪】"
+            f"emotion={json.dumps(emo, ensure_ascii=False)}，favorability_change={fchg}。"
+            "请与之保持一致，直接输出对话正文；本轮不提供任何工具，也不要尝试调用。"
+        )
+
     last_mood = _last_mood_params_from_decision_state(state)
     if last_mood is not None:
         emo = last_mood.get("emotion", "")
@@ -192,9 +221,9 @@ def _generation_round_tool_suffix(state: dict[str, Any]) -> str:
             "请直接输出对话正文，不要再调用任何工具。"
         )
     return (
-        "\n\n【生成提示】如需标注情绪与好感变化，可（可选）调用 update_npc_mood；"
-        "请勿调用任务或检索类工具。请根据前文与工具结果生成对话回复。"
-        "无论是否调用工具，本轮必须输出对话内容，不得输出空值。"
+        "\n\n【生成提示】仅降级兜底模式（agent_enabled=false）下允许本轮可选调用 update_npc_mood；"
+        "Agent 模式下情绪必须在 supervisor 阶段决定，本轮**不要**调用任何工具。"
+        "请根据前文与工具结果生成对话回复。无论是否调用工具，本轮必须输出对话内容，不得输出空值。"
     )
 
 
@@ -610,7 +639,9 @@ async def prepare_context_node(
     if current_emotion_for_use and current_emotion_for_use != "普通":
         emotion_hint = f"你之前的情绪是「{current_emotion_for_use}」。"
 
-    system_prompt = build_system_prompt(
+    from services.agent_graph.prompts import build_prompt_base
+    # Layer 1+2+3+tagline —— 所有 agent 共享的前缀，存入 state 供 supervisor / worker 拼各自 tail。
+    prompt_base = build_prompt_base(
         npc_name=npc_name,
         sex=sex or "",
         faction=faction or "",
@@ -627,12 +658,33 @@ async def prepare_context_node(
         relationship_level=relationship_level,
         mentioned_npcs_str=mentioned_npcs_str,
         pending_draft_summary=pending_draft_summary,
+        history_str=history_str,
+    )
+    # 默认 tail（legacy / 单 agent 路径用）；多 agent 模式下 supervisor / worker 会在运行时覆盖 _system_prompt。
+    system_prompt = build_system_prompt(
+        agent="default",
+        npc_name=npc_name,
+        sex=sex or "",
+        faction=faction or "",
+        titles=titles,
+        emotions=emotions,
+        has_shop=has_shop,
+        shop_reward_types=shop_reward_types,
+        has_challenge=bool(npc_challenge),
+        player_can_challenge=player_can_challenge,
+        same_faction_npcs=same_faction_str,
+        player_identity=player_identity,
+        progress_stage_desc=progress_stage_desc,
+        favorability=favorability,
+        relationship_level=relationship_level,
+        mentioned_npcs_str=mentioned_npcs_str,
+        pending_draft_summary=pending_draft_summary,
+        history_str=history_str,
     )
 
     # 立绘描述不写入共享 user_prompt，避免缓存变动；仅在流式/生成阶段按需拼接到 user 内容末尾
     user_prompt = build_user_prompt(
         retrieved_context=retrieved_context or "",
-        history_str=history_str,
         user_query=payload.query,
         # emotion_hint 不要写入共享 user_prompt，避免与 llm_client 末尾拼接重复。
         # 由 llm_client 统一决定：是否与 image_description 同行、或单独一行。
@@ -678,15 +730,42 @@ async def prepare_context_node(
         "pending_task_draft": pending_draft,
         "task_confirmed": False,
         "task_write_result": None,
+        "final_reply": "",
+        "interim_reply": "",
+        "routing_decision": "",
+        "routing_reason": "",
+        "worker_hops": 0,
+        "agent_call_counts": {},
+        "agent_consecutive_failures": {},
+        "agent_blacklist": [],
+        "token_budget_spent": 0,
+        "last_worker_name": "",
+        "last_worker_ok": True,
+        "last_worker_summary": "",
+        "awaiting_confirmation": False,
+        "confirmation_draft_id": None,
+        "confirmation_payload": None,
         "payload_dict": {
             "query": payload.query,
             "npc_name": npc_name,
             "session_id": payload.session_id,
         },
         "effective_summarize_interval": effective_interval,
-        # 存储构建好的 prompt（供 decision / generate 节点复用）
+        # Layer 1+2+3+tagline，所有 agent 完全一致（prefix cache 命中区）。
+        "_prompt_base": prompt_base,
+        # legacy / 单 agent 完整 system prompt；多 agent 模式下会被 agent 入口节点覆盖。
         "_system_prompt": system_prompt,
         "_user_prompt": user_prompt,
+        "_tool_messages": [],
+        "_pending_tool_calls": [],
+        "_mood_tool_calls": [],
+        "_decision_reply": "",
+        "_system_prefix_text": "",
+        "_mood_resolved_by_supervisor": False,
+        "_mood_event_emitted": False,
+        "_ui_events": [],
+        "_active_worker": "",
+        "_active_worker_tool_names": [],
     }
 
 
@@ -726,7 +805,7 @@ async def decision_node(
     # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
     tool_calls: list[dict] = []
-    decision_tools = _get_full_tools()
+    decision_tools = _get_full_tools(state)
     tools_for_debug: list[dict[str, Any]] | None = decision_tools
 
     try:
@@ -848,15 +927,18 @@ async def tool_executor_node(
             tool_args = raw_args or {}
 
         # 1) 工具开始：推送一个极短提示给前端
-        start_hint = _sanitize_ui_hint(
-            tool_args.get("ui_hint"),
-            DEFAULT_UI_HINTS.get(tool_name, "正在思考……"),
-        )
-        ui_events.append({
-            "event_type": "tool_status",
-            "text": start_hint,
-            "tool_name": tool_name,
-        })
+        #    注意：update_npc_mood 是内部工具（玩家不需要知道情绪/好感上报的时机），
+        #    它的 tool_status 不对外发；情绪/好感已经通过 mood_update 事件早推。
+        if tool_name != "update_npc_mood":
+            start_hint = _sanitize_ui_hint(
+                tool_args.get("ui_hint"),
+                DEFAULT_UI_HINTS.get(tool_name, "正在思考……"),
+            )
+            ui_events.append({
+                "event_type": "tool_status",
+                "text": start_hint,
+                "tool_name": tool_name,
+            })
 
         tool_ctx = ToolContext(
             npc_name=npc_name,
@@ -903,14 +985,8 @@ async def tool_executor_node(
             st = parsed.get("status")
             sys_text = SYSTEM_MESSAGES.get((tool_name, st))
             if sys_text:
-                payload: dict[str, Any] = {"event_type": "system", "text": sys_text}
-                if tool_name == "draft_agent_task":
-                    if isinstance(parsed.get("draft_id"), str):
-                        payload["draft_id"] = parsed.get("draft_id")
-                if tool_name == "confirm_agent_task":
-                    if isinstance(parsed.get("task_id"), (int, str)):
-                        payload["task_id"] = parsed.get("task_id")
-                ui_events.append(payload)
+                # 只追加到 _system_prefix_text（随 final_reply 入库、随 content 流式推送），
+                # 不再单独发 SSE system 事件——前端按 `{...}` 约定解析，避免刷新后丢失，也避免双渲染。
                 system_prefixes.append(sys_text)
 
         tool_messages.append({
@@ -986,7 +1062,7 @@ async def generate_response_node(
             image_path=image_path,
             image_description=state.get("image_description"),
             emotion_hint=state.get("emotion_hint") or None,
-            tools=_get_mood_only_tools(),
+            tools=_get_mood_only_tools(state),
         )
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
@@ -1000,7 +1076,7 @@ async def generate_response_node(
                     image_path=None,
                     image_description=state.get("image_description"),
                     emotion_hint=state.get("emotion_hint") or None,
-                    tools=_get_mood_only_tools(),
+                    tools=_get_mood_only_tools(state),
                 )
             except Exception as e2:
                 if is_tools_unsupported_error(e2):
@@ -1056,20 +1132,31 @@ async def generate_response_node(
         if name == "update_npc_mood":
             mood_calls.append(tc)
 
-    system_prefix = state.get("_system_prefix_text") or ""
-    if system_prefix:
-        reply_text = f"{system_prefix}{reply_text or ''}"
+    # 按顺序拼出完整 final_reply（也是最终写进 memory 的文本）：
+    #   [supervisor interim]  → [ {任务草案拟定完成} 等系统提示 ]  → [ dialogue 本体 ]
+    # 这样：
+    #   1) 前端切会话 / 刷历史都能按原样看到这三段；
+    #   2) done.reply 与 content 流累加的文本一致；
+    #   3) 前端沿用 `{...}` 约定解析系统消息，不需要单独 interim/pending 事件。
+    # 每段各自 strip 再用单个 "\n\n" 连接，避免 `_system_prefix_text` 自带 "\n\n" 后缀
+    # 和 join 里的 "\n\n" 叠加成三/四连换行。
+    interim_text = (state.get("interim_reply") or "").strip()
+    system_prefix_raw = state.get("_system_prefix_text") or ""
+    system_prefix = system_prefix_raw.strip()
+    reply_body = (reply_text or "").strip()
+    parts = [p for p in (interim_text, system_prefix, reply_body) if p]
+    composed_reply = "\n\n".join(parts)
 
     _log_agent_llm(
         "generate (final reply)",
         system_prompt,
         full_user_prompt,
-        reply_text or "",
-        tools=_get_mood_only_tools(),
+        composed_reply or "",
+        tools=_get_mood_only_tools(state),
     )
 
     return {
-        "final_reply": reply_text or "",
+        "final_reply": composed_reply,
         "_mood_tool_calls": mood_calls,
     }
 
@@ -1119,7 +1206,7 @@ async def generate_response_stream(
         system_prompt,
         full_user_prompt,
         None,
-        tools=_get_mood_only_tools(),
+                    tools=_get_mood_only_tools(state),
     )
 
     decision_reply = state.get("_decision_reply", "")
@@ -1131,17 +1218,20 @@ async def generate_response_stream(
         from pathlib import Path
         image_path = Path(image_path_str)
 
+    # `{任务发布成功}` 等系统提示作为 content 一并流式推给前端；前端按 `{...}` 解析为系统消息。
+    # 这样即便刷新 / 切回话也能在历史里看到同样内容（final_reply 会写库）。
     system_prefix = state.get("_system_prefix_text") or ""
     full_content = system_prefix
     streamed_len = len(system_prefix)
     tool_calls_list: list[dict] = []
 
-    # 若有系统前缀，则先把它作为“正文增量”推给前端，保证与 done 一致
     if system_prefix:
         yield ("content", system_prefix)
 
+    streamed_model_content = False
+
     async def _run_stream(img_path, img_desc, use_tools):
-        nonlocal full_content, streamed_len, tool_calls_list
+        nonlocal full_content, streamed_len, tool_calls_list, streamed_model_content
         tool_calls_list = []
         async for event_type, data in call_llm_stream(
             api_key=state.get("api_key"),
@@ -1155,6 +1245,8 @@ async def generate_response_stream(
             tools=use_tools,
         ):
             if event_type == "content":
+                if data:
+                    streamed_model_content = True
                 full_content += data
                 if streamed_len < len(full_content):
                     yield ("content", full_content[streamed_len:])
@@ -1167,30 +1259,40 @@ async def generate_response_stream(
                 return
 
     try:
-        async for ev, dat in _run_stream(image_path, state.get("image_description"), _get_mood_only_tools()):
+        async for ev, dat in _run_stream(image_path, state.get("image_description"), _get_mood_only_tools(state)):
             yield ev, dat
     except Exception as e:
-        if is_image_unsupported_error(e) and image_path:
+        if streamed_model_content:
+            logger.warning("generate_response_stream 在已输出部分正文后发生异常，停止重试以避免重复正文", exc_info=True)
+        # 一旦已经吐过正文，就不要再回退重试第二遍了；否则前端会看到两版对白，
+        # 而 done / 数据库只能保留最后一次，造成严重不一致。
+        if streamed_model_content:
+            pass
+        elif is_image_unsupported_error(e) and image_path:
             try:
-                async for ev, dat in _run_stream(None, state.get("image_description"), _get_mood_only_tools()):
+                async for ev, dat in _run_stream(None, state.get("image_description"), _get_mood_only_tools(state)):
                     yield ev, dat
             except Exception as e2:
-                if is_tools_unsupported_error(e2):
+                if streamed_model_content:
+                    logger.warning("generate_response_stream fallback 前已输出正文，停止二次回退", exc_info=True)
+                elif is_tools_unsupported_error(e2):
                     async for ev, dat in _run_stream(None, state.get("image_description"), None):
                         yield ev, dat
                 else:
                     raise
-        elif is_tools_unsupported_error(e):
+        elif not streamed_model_content and is_tools_unsupported_error(e):
             try:
                 async for ev, dat in _run_stream(image_path, state.get("image_description"), None):
                     yield ev, dat
             except Exception as e2:
-                if is_image_unsupported_error(e2) and image_path:
+                if streamed_model_content:
+                    logger.warning("generate_response_stream fallback 前已输出正文，停止二次回退", exc_info=True)
+                elif is_image_unsupported_error(e2) and image_path:
                     async for ev, dat in _run_stream(None, state.get("image_description"), None):
                         yield ev, dat
                 else:
                     raise
-        else:
+        elif not streamed_model_content:
             raise
 
     # 仅在本轮解析情绪工具；其他工具调用（若有）全部忽略，不执行任何副作用。
@@ -1224,10 +1326,24 @@ def parse_mood_node(
 ) -> dict[str, Any]:
     """
     从回复文本 / tool_calls 中解析情绪与好感度变化。
+
+    多 agent 模式下 supervisor 已在路由阶段通过 ``state.emotion`` / ``state.favorability_change``
+    一次性敲定结果，本节点仅做：
+      1) 尊重 supervisor 结果，不重新解析；
+      2) 仍然剥离模型可能在正文结尾多打的 JSON / 残留 tool_call 文本，保持 reply 干净。
     """
     reply = state.get("final_reply", "")
     emotions = state.get("npc_emotions", ["普通"])
     mood_tool_calls = state.get("_mood_tool_calls", [])
+
+    if state.get("_mood_resolved_by_supervisor"):
+        _cleaned, _d, _e = strip_trailing_mood_json(reply, allowed_emotions=emotions)
+        cleaned_reply = strip_trailing_tool_call_text(_cleaned or reply)
+        return {
+            "final_reply": (cleaned_reply or "").strip() or "【对方无回应，请稍后再试。】",
+            "emotion": state.get("emotion"),
+            "favorability_change": state.get("favorability_change", 0),
+        }
 
     delta, emotion = parse_update_npc_mood_tool_calls(
         mood_tool_calls, allowed_emotions=emotions

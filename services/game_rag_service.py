@@ -130,6 +130,33 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# 伪流式 chunk 工具
+# ---------------------------------------------------------------------------
+
+
+async def _simulated_content_chunks(
+    text: str,
+    *,
+    chunk_size: int = 6,
+    sleep_ms: int = 30,
+) -> AsyncIterator[str]:
+    """
+    把一段完整文本切成若干 char chunk（带轻微 sleep）作为"伪流式"推给前端。
+
+    用在 supervisor 的 interim reply 上：supervisor 是非流式调用，一次性拿到整段，
+    直接 yield 会让前端看到"瞬移"的大段文本；切成 ~6 字/40ms 的 chunk 更接近
+    NPC 说话节奏，同时依然比 dialogue_worker 先到。
+    """
+    if not text:
+        return
+    for i in range(0, len(text), chunk_size):
+        piece = text[i: i + chunk_size]
+        yield piece
+        if sleep_ms > 0 and i + chunk_size < len(text):
+            await asyncio.sleep(sleep_ms / 1000)
+
+
 class GameRAGService:
     """
     游戏世界观 / NPC 知识库 RAG 服务 + 好感度 Agent。
@@ -486,6 +513,8 @@ class GameRAGService:
                 "memory": memory,
                 "payload": payload,
                 "game_data": game_data,
+                # Checkpointer 用；每个 session 有独立的 LangGraph 线程
+                "thread_id": payload.session_id,
             }
         }
 
@@ -519,12 +548,12 @@ class GameRAGService:
         npc_manager: NPCManager,
         memory: "MemoryManager",
     ) -> NPCChatResponse:
-        """使用 LangGraph 完整图执行 ask。"""
-        from services.agent_graph.graph import get_full_graph
+        """使用 LangGraph Supervisor 主图执行 ask（路线三多 Agent 编排）。"""
+        from services.agents.graph import get_supervisor_graph
 
-        graph = get_full_graph()
+        graph = await get_supervisor_graph()
         config = self._build_graph_config(payload, npc_manager, memory)
-        initial_state = {}
+        initial_state: dict[str, Any] = {}
 
         result = await graph.ainvoke(initial_state, config)
 
@@ -706,89 +735,214 @@ class GameRAGService:
         memory: "MemoryManager",
     ) -> AsyncIterator[Tuple[str, Any]]:
         """
-        使用 LangGraph 决策循环 + 流式生成的 ask_stream。
+        多 Agent 流式 ask_stream（手动编排版）。
 
-        流程：
-        1. 运行决策循环子图（prepare_context -> decision <-> tool_executor）
-        2. 子图结束后，用流式 LLM 调用生成最终回复
-        3. 解析情绪 + 好感度
-        4. 保存记忆 + 更新 NPC 状态
+        为什么不用整张 supervisor 主图直接 `astream(..., stream_mode="values")`：
+        - 那样 query/task 作为“已编译子图节点”时，内部多次更新会在主图侧聚合后才可见，
+          导致多个 tool_status / `{系统提示}` / content 挤成一坨才到前端；
+        - dialogue_worker 走的是非流式 generate_response_node，最后一轮对白会整段一次性返回。
+
+        这里改为“按阶段手动编排”：
+        1. `prepare_context_node`
+        2. `supervisor_node`
+        3. `query_worker` / `task_worker` 子图（单独 `astream`，拿到内部每一步）
+        4. `dialogue` 入口态组装后，直接调用 `generate_response_stream`
+        5. `parse_mood_node` + `post_process_node`
+
+        这样能保证：
+        - 每个 event 按真实发生顺序尽快送到前端；
+        - agent 交接点都可以插一条 `tool_status: 正在思考……`；
+        - 最后一轮 dialogue 恢复真正的 token 流式输出。
         """
-        from services.agent_graph.graph import MAX_TOOL_ROUNDS
         from services.agent_graph.nodes import (
-            prepare_context_node,
-            decision_node,
-            tool_executor_node,
             generate_response_stream,
             parse_mood_node,
             post_process_node,
+            prepare_context_node,
         )
+        from services.agent_graph.prompts import build_agent_tail, build_in_turn_history_appendix
+        from services.agents.supervisor import supervisor_node
+        from services.agents.tool_scopes import tools_for_worker
+        from services.agents.workers import build_query_worker, build_task_worker
 
         config = self._build_graph_config(payload, npc_manager, memory)
+        state: dict[str, Any] = await prepare_context_node({}, config)
 
-        # 关键拆分：
-        # 1) 工具阶段：只 yield tool_status/system（不 yield content），不写入数据库（post_process 在最后才执行）
-        # 2) 生成阶段：仅最后一次 generate_response_stream 才 yield content/done
-        state: dict[str, Any] = {}
-        state.update(await prepare_context_node(state, config))
+        emitted_idx = 0
+        prefix_yielded_len = 0
+        has_visible_content = False
+        reply_fragments: list[str] = []
 
-        # 进入第一轮决策前先提示一次，避免“工具状态在前，正在思考在后”的观感
-        yield ("tool_status", {"text": "正在思考……", "tool_name": "decision"})
+        async def _emit_handoff_status() -> AsyncIterator[Tuple[str, Any]]:
+            yield ("tool_status", {"text": "正在思考……", "tool_name": "supervisor"})
+            await asyncio.sleep(0)
 
-        for _round in range(MAX_TOOL_ROUNDS):
-            # 决策轮：模型只负责判断 tool_calls，不负责对话文本（如有 decision_reply 也会丢弃）
-            state.update(await decision_node(state, config))
-
-            if not state.get("has_tool_calls", False):
-                break
-
-            # 工具执行轮：立即把 tool_status/system 给前端，且不输出对话 content
-            tool_update = await tool_executor_node(state, config)
-            state.update(tool_update)
-
-            ui_events = tool_update.get("_ui_events") or []
-            for ev in ui_events:
+        async def _emit_new_ui_events(cur_state: dict[str, Any]) -> AsyncIterator[Tuple[str, Any]]:
+            nonlocal emitted_idx
+            events = cur_state.get("_ui_events") or []
+            for ev in events[emitted_idx:]:
                 if not isinstance(ev, dict):
                     continue
-                event_type = ev.get("event_type") or ""
-                # 仅输出 tool_status；system 通知只拼到最终 reply 前缀，不作为 SSE 独立事件
-                if event_type == "tool_status":
-                    payload2 = {k: v for k, v in ev.items() if k != "event_type"}
-                    yield (event_type, payload2)
+                et = ev.get("event_type") or ""
+                if et in ("tool_status", "agent_status", "mood_update"):
+                    body = {k: v for k, v in ev.items() if k != "event_type"}
+                    yield (et, body)
+                    await asyncio.sleep(0)
+            emitted_idx = len(events)
 
-            # 防止同一轮 ui_events 在 state 中被二次消费
-            state["_ui_events"] = []
+        async def _emit_new_system_prefix(cur_state: dict[str, Any]) -> AsyncIterator[Tuple[str, Any]]:
+            nonlocal prefix_yielded_len, has_visible_content
+            sysp_raw = cur_state.get("_system_prefix_text") or ""
+            sysp_stripped = sysp_raw.strip()
+            if len(sysp_stripped) <= prefix_yielded_len:
+                return
+            new_segment = sysp_stripped[prefix_yielded_len:].lstrip("\n").rstrip()
+            if not new_segment:
+                prefix_yielded_len = len(sysp_stripped)
+                return
+            if has_visible_content:
+                reply_fragments.append("\n\n")
+                yield ("content", "\n\n")
+                await asyncio.sleep(0)
+            reply_fragments.append(new_segment)
+            yield ("content", new_segment)
+            await asyncio.sleep(0)
+            has_visible_content = True
+            prefix_yielded_len = len(sysp_stripped)
 
-        # 工具阶段结束 -> 正式生成正文前：再给前端一个短提示，避免空窗
-        yield ("tool_status", {"text": "正在思考……", "tool_name": "generate_response"})
+        # 1) supervisor
+        state.update(await supervisor_node(state, config))
+        async for ev in _emit_new_ui_events(state):
+            yield ev
 
-        async for ev, dat in generate_response_stream(state, config):
-            yield (ev, dat)
+        interim_text = (state.get("interim_reply") or "").strip()
+        if interim_text:
+            async for piece in _simulated_content_chunks(interim_text):
+                reply_fragments.append(piece)
+                yield ("content", piece)
+            has_visible_content = True
 
-        mood_result = parse_mood_node(state, config)
-        state.update(mood_result)
+        route = (state.get("routing_decision") or "").strip().lower()
 
-        pp_result = await post_process_node(state, config)
-        state.update(pp_result)
+        # 2) supervisor -> worker / dialogue 交接：在上一段 content 之后发“正在思考……”
+        if route in ("query", "task", "dialogue"):
+            async for ev in _emit_handoff_status():
+                yield ev
+
+        # 3) query / task worker（如果有）
+        if route in ("query", "task"):
+            if route == "query":
+                worker = build_query_worker().compile()
+            else:
+                worker = build_task_worker().compile()
+            async for chunk in worker.astream(state, config, stream_mode="values"):
+                if not isinstance(chunk, dict):
+                    continue
+                state = chunk
+                async for ev in _emit_new_ui_events(state):
+                    yield ev
+                async for ev in _emit_new_system_prefix(state):
+                    yield ev
+
+            # worker -> dialogue 交接：如果下一步还要生成对白，再给前端一条“正在思考……”
+            async for ev in _emit_handoff_status():
+                yield ev
+
+        # 4) 进入 dialogue：真正的 token 流式
+        if route in ("query", "task", "dialogue"):
+            base = state.get("_prompt_base") or state.get("_system_prompt") or ""
+            dialogue_tail = build_agent_tail("dialogue")
+            appendix = build_in_turn_history_appendix(
+                npc_name=state.get("npc_name", ""),
+                interim_reply=state.get("interim_reply") or "",
+            )
+            if base and appendix:
+                dialogue_system_prompt = f"{base}\n\n{appendix}\n\n{dialogue_tail}"
+            elif base:
+                dialogue_system_prompt = f"{base}\n\n{dialogue_tail}"
+            elif appendix:
+                dialogue_system_prompt = f"{appendix}\n\n{dialogue_tail}"
+            else:
+                dialogue_system_prompt = dialogue_tail
+            state.update({
+                "_active_worker": "dialogue",
+                "_active_worker_tool_names": list(tools_for_worker("dialogue")),
+                "_system_prompt": dialogue_system_prompt,
+                "tool_call_round": 0,
+                "has_tool_calls": False,
+                "_pending_tool_calls": [],
+                "_tool_messages": [],
+                "last_worker_name": "dialogue",
+            })
+
+            prefix_for_reply = (state.get("_system_prefix_text") or "").strip()
+            interim_for_reply = (state.get("interim_reply") or "").strip()
+
+            # prefix 已经在前面作为独立 content 段发过，这里清空，避免 generate_response_stream 重复前缀。
+            dialogue_stream_state = dict(state)
+            dialogue_stream_state["_system_prefix_text"] = ""
+
+            async for event_type, data in generate_response_stream(dialogue_stream_state, config):
+                if event_type == "content":
+                    if data:
+                        if has_visible_content:
+                            # 前面已经发过 supervisor interim 或 {系统提示}，对白正文前补一个空行。
+                            reply_fragments.append("\n\n")
+                            yield ("content", "\n\n")
+                            await asyncio.sleep(0)
+                            has_visible_content = False
+                        reply_fragments.append(data)
+                        yield ("content", data)
+                        await asyncio.sleep(0)
+                elif event_type == "mood_update":
+                    # 多 Agent 模式下 mood 早已由 supervisor 产出；这里忽略重复的 mood_update。
+                    if not state.get("_mood_event_emitted"):
+                        yield ("mood_update", data)
+                        await asyncio.sleep(0)
+
+            state.update({
+                "final_reply": dialogue_stream_state.get("final_reply", ""),
+                "_mood_tool_calls": dialogue_stream_state.get("_mood_tool_calls", []),
+            })
+
+            # 以“实际已经发给前端的 content 流”为唯一事实来源，保证 done.reply / 入库文本
+            # 与前端看到的内容完全一致；不要再用后置重拼覆盖掉前面已经发出的段落。
+            emitted_reply = "".join(reply_fragments).strip()
+            if emitted_reply:
+                state["final_reply"] = emitted_reply
+            else:
+                dialogue_body = (state.get("final_reply") or "").strip()
+                parts = [p for p in (interim_for_reply, prefix_for_reply, dialogue_body) if p]
+                state["final_reply"] = "\n\n".join(parts)
+
+            state.update(await parse_mood_node(state, config))
+            await post_process_node(state, config)
+
+        elif route == "end":
+            fallback_reply = interim_text or "【对方无回应，请稍后再试。】"
+            state["final_reply"] = fallback_reply
+            await post_process_node(state, config)
 
         npc_name = state.get("npc_name", payload.npc_name)
-        reply = state.get("final_reply", "【对方无回应，请稍后再试。】")
+        reply = state.get("final_reply", "") or "【对方无回应，请稍后再试。】"
         emotion = state.get("emotion", "普通")
         delta = state.get("favorability_change", 0)
         favorability = state.get("npc_affinity", 0)
         relationship_level = state.get("npc_relationship_level", "陌生")
 
-        yield (
-            "done",
-            {
-                "reply": reply,
-                "npc_name": npc_name,
-                "favorability": favorability,
-                "relationship_level": relationship_level,
-                "favorability_change": delta,
-                "emotion": emotion,
-            },
-        )
+        done_body: dict[str, Any] = {
+            "reply": reply,
+            "npc_name": npc_name,
+            "favorability": favorability,
+            "relationship_level": relationship_level,
+            "favorability_change": delta,
+            "emotion": emotion,
+        }
+        if state.get("awaiting_confirmation"):
+            done_body["awaiting_confirmation"] = True
+            done_body["confirmation_draft_id"] = state.get("confirmation_draft_id") or ""
+
+        yield ("done", done_body)
 
     async def _ask_stream_legacy(
         self,

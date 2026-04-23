@@ -74,6 +74,28 @@ class NPCChatResponse(BaseModel):
     emotion: str = Field(..., description="本次对话后 NPC 的情绪，用于选择立绘")
 
 
+class NPCChatConfirmRequest(BaseModel):
+    """
+    HITL v2：玩家对 pending 任务草案的确认/拒绝/修改请求。
+    调用 /api/ask/confirm 时使用；后端通过 session_id → thread_id 恢复 LangGraph 主图。
+    """
+
+    session_id: str = Field(..., description="会话 ID（= LangGraph thread_id）")
+    npc_name: str = Field(..., description="草案所属 NPC 名字")
+    draft_id: str = Field(..., description="待确认的 draft_id（与 pending_confirmation 事件一致）")
+    decision: str = Field(
+        ...,
+        description="玩家决定：accept / reject / bargain；accept 会立即调 confirm_agent_task，reject 会 cancel_agent_task，bargain 会把 reply 作为新一轮玩家消息再跑一次主图",
+    )
+    player_reply: Optional[str] = Field(
+        default=None,
+        description="玩家回复文本（bargain / reject 时用于驱动下一轮；accept 时可省略）",
+    )
+    api_key: Optional[str] = Field(default=None)
+    api_base: Optional[str] = Field(default=None)
+    model_name: Optional[str] = Field(default=None)
+
+
 class ChatMessage(BaseModel):
     """
     单条会话消息。
