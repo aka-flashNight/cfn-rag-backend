@@ -1,30 +1,29 @@
 """
-分层 Prompt 模板（对应文档 6.5.3，2026.04 路线三修订版）。
+分层 Prompt 模板（2026.04 路线三 · 与 OpenAI/Anthropic 常见实践对齐的修订版）。
 
-## 分层策略（最大化前缀缓存）
+## 总原则
 
-```
-[Layer 1] 世界观骨架（所有 agent 完全一致）
-[Layer 2] NPC 扮演层（所有 agent 完全一致；内含任务发布硬约束与 skills 索引指引）
-[Layer 3] 会话状态层（所有 agent 完全一致）
-[tagline] 再次强调"你是 <NPC>"（所有 agent 完全一致）
---------------------- ↑ prefix cache 命中区 ↑ ---------------------
-[agent tail] 专属指令（每个 agent 各自不同）
-    - supervisor: 路由规则 + interim_reply 规则 + mood 规则 + JSON schema
-    - query:      知识检索 skills 索引 + 工具使用纲领 + 决策轮后缀
-    - task:       任务流水线 skills 索引 + 工具使用纲领 + 决策轮后缀
-    - dialogue:   对话格式规则 + 生成轮后缀（无工具）
-```
+1. **system** 里只放**跨轮长期稳定**、且**与「当前这一局对话内容」无强绑定**的约束：
+   - 全局固定世界观/规则骨架（尽量少）
+   - 单个 NPC 的静态设定（同 NPC 在任意会话里不变的部分）
+2. **user** 里放**每轮或同一轮多 Agent 会共享、或会随工具调用递增**的上下文：
+   - RAG + 关键词/实体检索块（每轮变；同一轮内多 Agent 共享）
+   - 聊天历史 + 早期摘要（每轮变；**放在 user 侧**，避免被误认为「系统级永久设定」）
+   - 会话态（好感、进度、待确认草案摘要等）；**同阵营 NPC 列表**对固定 NPC 为确定性结果，放在 **system（Layer2）**
+   - 工具执行结果（同轮内递增追加）
+   - 各 Agent 的职能说明、skills 索引、工具使用方式（放在 user 的靠前或靠后由你们产品决定，但**不应冒充 system 永久设定**）
+3. **tools** 在 API 层仍是 `tools=...` 独立参数，不塞进 `system` 字符串；如某模型/兼容层
+   只支持单条 user，可把 tools schema 的**文字摘要**复制进 user 作为兼容（本仓库仍以 API tools 为主）。
 
-关键要点：
-- `DIALOGUE_FORMAT_RULES` **只在 dialogue agent 的 tail** 出现——其他 agent 不需要。
-- `update_npc_mood` **不暴露**给任何 worker。情绪 / 好感度变化在 supervisor 路由时以 JSON 字段
-  （`mood.emotion` / `mood.favorability_change`）一次性决定，等价于调用 `update_npc_mood`。
-- 复杂流程（task-publishing / task-bargaining / knowledge-search / skill-discovery）的 **YAML frontmatter
-  简介** 作为"索引"**静态**拼进对应 agent 的 tail；详细 body / references 由 `read_skill` / `read_skill_file`
-  按需拉取，避免把完整 body 挤进每次 prompt。
-- `build_prompt_base(...)` 返回的 Layer 1+2+3+tagline 字符串会写入 state 的 `_prompt_base`，
-  每个 agent 只在此基础上拼自己的 tail，便于 LLM API 的 prefix cache 命中。
+> 与「最大前缀缓存」不冲突：缓存命中主要看**字节级前缀是否一致**。
+> 将「多轮才变一次」的块放在前，「每轮都变」的块放后，依然能整段命中静态前缀。
+
+## 本文件对外主入口
+
+- `build_static_system(...)`：写入 `state["_prompt_base"]`（L1 + L2（含同阵营角色表）+ tagline）
+- `build_user_shared_core(...)`：写入 `state["_user_shared"]`（RAG → 对话中提到的其他角色设定 → 会话态 + 历史 + 草案摘要）
+  立绘文描与上一轮情绪提示仍由 `call_llm*(..., image_description=, emotion_hint=)` **追加在 user 文本末尾**，避免重复、也与「仅传图像」解耦
+- `compose_agent_user_prompt(...)`：在 worker 入口用「shared + agent tail + 当前玩家话」拼出本轮完整 user
 """
 
 from __future__ import annotations
@@ -73,6 +72,7 @@ def build_layer2(
     shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
     player_can_challenge: Optional[bool] = None,
+    same_faction_npcs: str = "",
 ) -> str:
     """Layer 2：NPC 扮演。对所有 agent 一致——因为 supervisor 也要以 NPC 口吻做 interim_reply
     和 mood 判断，worker 也要用 NPC 身份调用工具。"""
@@ -99,12 +99,17 @@ def build_layer2(
         else:
             challenge_hint = "- 你拥有可用的切磋关卡，可以发布'切磋'类型的任务。\n"
 
+    same_faction_block = (same_faction_npcs or "").strip()
+    if same_faction_block:
+        same_faction_block = same_faction_block + "\n\n"
+
     return (
         f"{format_npc_role_tagline(npc_name=npc_name, sex=sex, faction=faction, titles=titles)}\n"
         f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。\n"
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，"
         "用简体中文回答玩家本次的发言。\n"
         "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定。\n\n"
+        f"{same_faction_block}"
         "【任务发布硬约束（详细流程见 skill: task-publishing / task-bargaining，通过 read_skill 按需加载）】\n"
         f"你作为「{npc_name}」（{faction or '未知阵营'}）："
         "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
@@ -115,21 +120,16 @@ def build_layer2(
     )
 
 
-def build_layer3(
+def build_user_session_state_block(
     *,
-    same_faction_npcs: str = "",
     player_identity: str = "",
     progress_stage_desc: str = "",
     favorability: int = 0,
     relationship_level: str = "陌生",
-    mentioned_npcs_str: str = "",
     pending_draft_summary: str = "",
-    history_str: str = "",
 ) -> str:
+    """会话内可变状态 + 待确认草案摘要（不含同阵营表——同阵营在 static Layer2）。"""
     parts: list[str] = []
-
-    if same_faction_npcs:
-        parts.append(same_faction_npcs)
 
     if player_identity:
         parts.append(f"玩家的身份是：{player_identity}")
@@ -141,9 +141,6 @@ def build_layer3(
         f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。"
     )
 
-    if mentioned_npcs_str:
-        parts.append(mentioned_npcs_str)
-
     if pending_draft_summary:
         parts.append(
             "【待确认的任务草案】\n"
@@ -152,37 +149,94 @@ def build_layer3(
             "具体分支处理见 skill: task-bargaining。"
         )
 
-    # 历史聊天记录对同一轮内的所有 agent 都是共用且基本不变的上下文，
-    # 因此放入共享 prompt base 的靠下位置；这样 supervisor / task / query / dialogue
-    # 都能看到同一份历史，同时最大化同轮内多次调用的前缀缓存命中。
-    if history_str:
-        parts.append(history_str.strip())
-
     return "\n".join(parts)
 
 
-def build_layer4(
+def _rag_block(*, retrieved_context: str) -> str:
+    if not (retrieved_context or "").strip():
+        return ""
+    return (
+        "下面是可能与你相关的检索设定和你的过往台词片段"
+        "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
+        f"{retrieved_context}"
+    )
+
+
+def _history_block(*, history_str: str) -> str:
+    return (history_str or "").strip()
+
+
+def build_user_shared_core(
     *,
     retrieved_context: str = "",
     history_str: str = "",
-    user_query: str = "",
+    player_identity: str = "",
+    progress_stage_desc: str = "",
+    favorability: int = 0,
+    relationship_level: str = "陌生",
+    mentioned_npcs_str: str = "",
+    pending_draft_summary: str = "",
 ) -> str:
+    """同一轮内所有 Agent 共享的 user 侧上下文（**不含**玩家当轮发言句）。
+
+    典型顺序：RAG →（对话触发的）其他角色设定摘录 → 会话态 → 历史。
+    """
+    session_block = build_user_session_state_block(
+        player_identity=player_identity,
+        progress_stage_desc=progress_stage_desc,
+        favorability=favorability,
+        relationship_level=relationship_level,
+        pending_draft_summary=pending_draft_summary,
+    )
     parts: list[str] = []
-
-    if retrieved_context:
-        parts.append(
-            "下面是可能与你相关的检索设定和你的过往台词片段"
-            "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
-            f"{retrieved_context}"
-        )
-
-    if history_str:
-        parts.append(history_str)
-
-    if user_query:
-        parts.append(f"玩家：{user_query}")
-
+    rag = _rag_block(retrieved_context=retrieved_context)
+    if rag:
+        parts.append(rag)
+    men = (mentioned_npcs_str or "").strip()
+    if men:
+        parts.append(men)
+    if session_block:
+        parts.append(session_block)
+    hist = _history_block(history_str=history_str)
+    if hist:
+        parts.append(hist)
     return "\n\n".join(parts)
+
+
+build_user_shared_prefix = build_user_shared_core
+
+
+def build_static_system(
+    *,
+    npc_name: str,
+    sex: str = "",
+    faction: str = "",
+    titles: list[str] | None = None,
+    emotions: list[str] | None = None,
+    has_shop: bool = False,
+    shop_reward_types: Optional[list[str]] = None,
+    has_challenge: bool = False,
+    player_can_challenge: Optional[bool] = None,
+    same_faction_npcs: str = "",
+) -> str:
+    """Layer1 + Layer2（含同阵营角色表）+ tagline。写入 ``state['_prompt_base']``。"""
+    layer1 = build_layer1()
+    layer2 = build_layer2(
+        npc_name=npc_name,
+        sex=sex,
+        faction=faction,
+        titles=titles,
+        emotions=emotions,
+        has_shop=has_shop,
+        shop_reward_types=shop_reward_types,
+        has_challenge=has_challenge,
+        player_can_challenge=player_can_challenge,
+        same_faction_npcs=same_faction_npcs,
+    )
+    tagline = format_npc_role_tagline(
+        npc_name=npc_name, sex=sex, faction=faction, titles=titles
+    )
+    return f"{layer1}\n\n{layer2}\n\n再次强调：{tagline}"
 
 
 def build_prompt_base(
@@ -196,6 +250,7 @@ def build_prompt_base(
     shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
     player_can_challenge: Optional[bool] = None,
+    # 以下历史参数为兼容旧调用保留，**不再进入 system**（请改用 build_user_shared_core）
     same_faction_npcs: str = "",
     player_identity: str = "",
     progress_stage_desc: str = "",
@@ -205,9 +260,17 @@ def build_prompt_base(
     pending_draft_summary: str = "",
     history_str: str = "",
 ) -> str:
-    """拼装 Layer 1+2+3+tagline——所有 agent 的 **共同前缀**，可被 LLM API 完整缓存。"""
-    layer1 = build_layer1()
-    layer2 = build_layer2(
+    """兼容名：≈ ``build_static_system``；其中 **同阵营表** 会进入 system，其余旧参数仍忽略。"""
+    _ = (
+        player_identity,
+        progress_stage_desc,
+        favorability,
+        relationship_level,
+        mentioned_npcs_str,
+        pending_draft_summary,
+        history_str,
+    )
+    return build_static_system(
         npc_name=npc_name,
         sex=sex,
         faction=faction,
@@ -217,25 +280,12 @@ def build_prompt_base(
         shop_reward_types=shop_reward_types,
         has_challenge=has_challenge,
         player_can_challenge=player_can_challenge,
-    )
-    layer3 = build_layer3(
         same_faction_npcs=same_faction_npcs,
-        player_identity=player_identity,
-        progress_stage_desc=progress_stage_desc,
-        favorability=favorability,
-        relationship_level=relationship_level,
-        mentioned_npcs_str=mentioned_npcs_str,
-        pending_draft_summary=pending_draft_summary,
-        history_str=history_str,
     )
-    tagline = format_npc_role_tagline(
-        npc_name=npc_name, sex=sex, faction=faction, titles=titles
-    )
-    return f"{layer1}\n\n{layer2}\n\n{layer3}\n\n再次强调：{tagline}"
 
 
 # ---------------------------------------------------------------------------
-# Per-agent tails（prefix cache 命中区之外的部分）
+# Per-agent tails（放在 **user 侧**；多 agent 下 static system 可最大化缓存）
 # ---------------------------------------------------------------------------
 
 # 每个 agent 应看到的 skill 白名单——用来过滤 skills 索引。
@@ -307,25 +357,21 @@ def _worker_decision_tail(agent: AgentName) -> str:
     skills_block = _skills_index_block(agent)
     focus = {
         "query": "你当前是 QueryAgent：仅负责知识检索（search_knowledge / search_stages / search_items）。不要发布任务、不要生成最终对白。",
-        "task": "你当前是 TaskAgent：负责任务流水线（prepare_task_context / draft_agent_task / update_task_draft / confirm_agent_task / cancel_agent_task），可辅助查关卡/物品。不要自己写最终对白——对白交给 dialogue agent。",
+        "task": "你当前是 TaskAgent：负责任务流水线（prepare_task_context / draft_agent_task / update_task_draft / confirm_agent_task / cancel_agent_task），可辅助查关卡/物品。你只负责调用工具，不要写对白。",
     }[agent]
     return (
         f"【Agent 角色】{focus}\n\n"
         "【工具使用纲领】\n"
-        "- 原子工具的参数 schema 由后端 tools 字段提供。**只使用 schema 里声明的字段**——严禁自行添加 `reason` / `title` / `favorability_delta` 等 schema 之外的字段。\n"
+        "- 原子工具的参数 schema 由 tools 字段提供。**只使用 schema 里声明的字段**。\n"
         "- 遇到不熟悉场景时，先 list_skills 看索引，再 read_skill(name) 拉具体流程，必要时 read_skill_file 读 references。\n"
         "- 需要 `ui_hint` 的工具：填一句 ≤12 字的极短『正在……』提示；不确定则留空。\n"
-        "- 情绪与好感度由 supervisor 处理，本 agent 不应调用 update_npc_mood；本 agent 的 tools 中也不会出现它。\n\n"
-        f"{skills_block}\n\n"
-        "本轮请仅判断是否需要调用工具并生成 tool_calls；可调用工具，不要输出对话文本。若不需要任何工具，返回空内容即可。"
+        f"{skills_block}\n"
     )
 
 
 def _dialogue_tail() -> str:
-    return (
-        f"{DIALOGUE_FORMAT_RULES}\n\n"
-        "请根据以上信息，以 NPC 身份生成对话回复。必须生成对话内容，不得输出空值。"
-    )
+    # 生成约束句只保留在 ``GENERATION_ROUND_SUFFIX``（nodes 里拼接），避免与生成轮后缀重复。
+    return f"{DIALOGUE_FORMAT_RULES}\n"
 
 
 def build_agent_tail(agent: AgentName) -> str:
@@ -386,8 +432,18 @@ def build_system_prompt(
     pending_draft_summary: str = "",
     history_str: str = "",
 ) -> str:
-    """组装完整 system prompt = 共享 prefix + agent tail。"""
-    base = build_prompt_base(
+    """兼容旧名：现仅返回 **static system**（= ``build_static_system``）。agent 与各 tail 在 user 侧拼接。"""
+    _ = (
+        agent,
+        player_identity,
+        progress_stage_desc,
+        favorability,
+        relationship_level,
+        mentioned_npcs_str,
+        pending_draft_summary,
+        history_str,
+    )
+    return build_static_system(
         npc_name=npc_name,
         sex=sex,
         faction=faction,
@@ -398,59 +454,94 @@ def build_system_prompt(
         has_challenge=has_challenge,
         player_can_challenge=player_can_challenge,
         same_faction_npcs=same_faction_npcs,
-        player_identity=player_identity,
-        progress_stage_desc=progress_stage_desc,
-        favorability=favorability,
-        relationship_level=relationship_level,
-        mentioned_npcs_str=mentioned_npcs_str,
-        pending_draft_summary=pending_draft_summary,
-        history_str=history_str,
     )
-    tail = build_agent_tail(agent)
-    return f"{base}\n\n{tail}"
 
 
-def build_in_turn_history_appendix(*, npc_name: str, interim_reply: str = "") -> str:
-    """构造“本轮新增对话”附加块。
+def build_in_turn_history_appendix(
+    *,
+    npc_name: str,
+    interim_reply: str = "",
+    streamed_content_suffix: str = "",
+) -> str:
+    """构造「本轮已推送给玩家的可见正文」附加块。
 
-    用途：
-    - 历史记录本体已经进入共享 `_prompt_base`；
-    - supervisor 在本轮先说出的 interim_reply 属于“同一轮新增的一条 NPC 发言”，
-      后续 task/query/dialogue agent 需要把它视为已经发生的上下文；
-    - 这条附加块放在共享 base 之后、agent tail 之前，满足“绝大部分不变、底部只加一条”的结构。
+    - **interim_reply**：supervisor 短句，形如「{speaker}：…」之上文。
+    - **streamed_content_suffix**：与前端已推送 content 一致的片段（如 ``{任务发布成功}``、
+      ``{任务草案拟定完成}`` 等，来自 ``_system_prefix_text`` 的快照），拼在 interim **之后**，
+      便于模型与玩家所见同步。
+
+    应放在 **「玩家：…」当轮原话之后**；二者皆空时返回空串。
     """
     s = (interim_reply or "").strip()
-    if not s:
+    extra = (streamed_content_suffix or "").strip()
+    if not s and not extra:
         return ""
     speaker = (npc_name or "该角色").strip() or "该角色"
+    parts: list[str] = []
+    if s:
+        parts.append(
+            "【本轮新增对话（已发送给玩家，不要重复发送）】\n"
+            f"{speaker}：{s}"
+        )
+    if extra:
+        if s:
+            parts.append(
+                # "以下片段已作为正文推送给玩家（与前端 content 流一致，含花括号系统提示）：\n"
+                f"{extra}"
+            )
+        else:
+            parts.append(
+                # "【已推送给玩家的正文片段（与前端 content 流一致）】\n"
+                f"{extra}"
+            )
+    body = "\n\n".join(parts)
     return (
-        "【本轮新增对话（发生在当前用户消息之后，后续处理时必须视为既成事实）】\n"
-        f"{speaker}：{s}"
+        body
+        + "\n\n请在此之后继续生成「"
+        + speaker
+        + "」的回复。"
     )
 
 
 def build_user_prompt(
     *,
     retrieved_context: str = "",
+    history_str: str = "",
     user_query: str = "",
-    emotion_hint: str = "",
-    image_description: str = "",
+    same_faction_npcs: str = "",
+    player_identity: str = "",
+    progress_stage_desc: str = "",
+    favorability: int = 0,
+    relationship_level: str = "陌生",
+    mentioned_npcs_str: str = "",
+    pending_draft_summary: str = "",
 ) -> str:
-    prefix_parts: list[str] = []
-    if image_description:
-        prefix_parts.append(image_description + "。")
-    if emotion_hint:
-        prefix_parts.append(emotion_hint)
-    prefix = "".join(prefix_parts)
-
-    layer4 = build_layer4(
+    """兼容单 agent 路径：拼出 ``_user_shared``（**不含**玩家当轮原话，避免重复）。"""
+    _ = (user_query, same_faction_npcs)
+    return build_user_shared_core(
         retrieved_context=retrieved_context,
-        history_str="",
-        user_query=user_query,
+        history_str=history_str,
+        player_identity=player_identity,
+        progress_stage_desc=progress_stage_desc,
+        favorability=favorability,
+        relationship_level=relationship_level,
+        mentioned_npcs_str=mentioned_npcs_str,
+        pending_draft_summary=pending_draft_summary,
     )
-    if prefix:
-        return f"{prefix}\n\n{layer4}"
-    return layer4
+
+
+def format_player_utterance(*, user_query: str) -> str:
+    q = (user_query or "").strip()
+    if not q:
+        return ""
+    return f"玩家：{q}"
+
+
+def compose_agent_user(
+    *blocks: str,
+) -> str:
+    """将若干 prompt 段用空行拼合，自动跳过空段。"""
+    return "\n\n".join((b or "").strip() for b in blocks if (b or "").strip())
 
 
 # 兼容旧 import（已废弃）：保留名字但内容空壳化，避免外部误用。

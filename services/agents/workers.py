@@ -26,7 +26,10 @@ from services.agent_graph.nodes import (
     parse_mood_node,
     tool_executor_node,
 )
-from services.agent_graph.prompts import build_agent_tail, build_in_turn_history_appendix
+from services.agent_graph.prompts import (
+    build_agent_tail,
+    compose_agent_user,
+)
 from services.agent_graph.state import AgentState
 from services.agents.tool_scopes import tools_for_worker
 
@@ -50,31 +53,20 @@ _TASK_TERMINAL_STATUSES: dict[str, frozenset[str]] = {
 
 def _make_entry_node(worker_name: str):
     tool_names = list(tools_for_worker(worker_name))
-    # agent tail 在进程启动时预构建（不含 NPC 可变内容），与 _prompt_base 拼接后得到最终 system。
+    # agent tail 在进程启动时预构建，与 static system 解耦，放入 **user 侧**。
     agent_tail = build_agent_tail(worker_name)  # type: ignore[arg-type]
 
     async def _entry(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-        # 组装本 worker 的 system prompt：
-        #   prefix = state["_prompt_base"]（所有 agent 一致，prefix cache 命中）
-        #   appendix = 本轮 supervisor 已说出的新增对白（若有）
-        #   tail   = 本 worker 专属指令（工具使用纲领 / 对话规则 等）
+        # static system：仅 L1+L2+tagline
+        # user：共享上下文 + 本 worker 专属说明（玩家原话与 interim 块由 decision / generate 节点统一拼在末尾）
         base = state.get("_prompt_base") or state.get("_system_prompt") or ""
-        appendix = build_in_turn_history_appendix(
-            npc_name=state.get("npc_name", ""),
-            interim_reply=state.get("interim_reply") or "",
-        )
-        if base and appendix:
-            system_prompt = f"{base}\n\n{appendix}\n\n{agent_tail}"
-        elif base:
-            system_prompt = f"{base}\n\n{agent_tail}"
-        elif appendix:
-            system_prompt = f"{appendix}\n\n{agent_tail}"
-        else:
-            system_prompt = agent_tail
+        user_shared = (state.get("_user_shared") or state.get("_user_prompt") or "").strip()
+        user_prompt = compose_agent_user(user_shared, agent_tail)
         return {
             "_active_worker": worker_name,
             "_active_worker_tool_names": tool_names,
-            "_system_prompt": system_prompt,
+            "_system_prompt": base,
+            "_user_prompt": user_prompt,
             # 进入 worker 时本 worker 的本地循环计数归零，避免跨 supervisor 跳累加
             "tool_call_round": 0,
             "has_tool_calls": False,

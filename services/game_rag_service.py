@@ -760,7 +760,10 @@ class GameRAGService:
             post_process_node,
             prepare_context_node,
         )
-        from services.agent_graph.prompts import build_agent_tail, build_in_turn_history_appendix
+        from services.agent_graph.prompts import (
+            build_agent_tail,
+            compose_agent_user,
+        )
         from services.agents.supervisor import supervisor_node
         from services.agents.tool_scopes import tools_for_worker
         from services.agents.workers import build_query_worker, build_task_worker
@@ -852,22 +855,14 @@ class GameRAGService:
         if route in ("query", "task", "dialogue"):
             base = state.get("_prompt_base") or state.get("_system_prompt") or ""
             dialogue_tail = build_agent_tail("dialogue")
-            appendix = build_in_turn_history_appendix(
-                npc_name=state.get("npc_name", ""),
-                interim_reply=state.get("interim_reply") or "",
-            )
-            if base and appendix:
-                dialogue_system_prompt = f"{base}\n\n{appendix}\n\n{dialogue_tail}"
-            elif base:
-                dialogue_system_prompt = f"{base}\n\n{dialogue_tail}"
-            elif appendix:
-                dialogue_system_prompt = f"{appendix}\n\n{dialogue_tail}"
-            else:
-                dialogue_system_prompt = dialogue_tail
+            user_core = (state.get("_user_shared") or state.get("_user_prompt") or "").strip()
+            # interim 块由 generate_response_stream 在「玩家：」之后拼接，避免顺序错乱
+            dialogue_user_prompt = compose_agent_user(user_core, dialogue_tail)
             state.update({
                 "_active_worker": "dialogue",
                 "_active_worker_tool_names": list(tools_for_worker("dialogue")),
-                "_system_prompt": dialogue_system_prompt,
+                "_system_prompt": base,
+                "_user_prompt": dialogue_user_prompt,
                 "tool_call_round": 0,
                 "has_tool_calls": False,
                 "_pending_tool_calls": [],
@@ -878,8 +873,10 @@ class GameRAGService:
             prefix_for_reply = (state.get("_system_prefix_text") or "").strip()
             interim_for_reply = (state.get("interim_reply") or "").strip()
 
-            # prefix 已经在前面作为独立 content 段发过，这里清空，避免 generate_response_stream 重复前缀。
+            # prefix 已经在前面作为独立 content 段发过，这里清空，避免 generate_response_stream 重复前缀；
+            # 同时把快照写入 _streamed_prefix_for_llm，供 user 里「本轮已推送」块与玩家所见对齐。
             dialogue_stream_state = dict(state)
+            dialogue_stream_state["_streamed_prefix_for_llm"] = prefix_for_reply
             dialogue_stream_state["_system_prefix_text"] = ""
 
             async for event_type, data in generate_response_stream(dialogue_stream_state, config):
@@ -915,7 +912,8 @@ class GameRAGService:
                 parts = [p for p in (interim_for_reply, prefix_for_reply, dialogue_body) if p]
                 state["final_reply"] = "\n\n".join(parts)
 
-            state.update(await parse_mood_node(state, config))
+            # parse_mood_node 为同步函数，误 await 会抛 TypeError，导致整条图式流式失败并降级 legacy（done 与已推流不一致）
+            state.update(parse_mood_node(state, config))
             await post_process_node(state, config)
 
         elif route == "end":

@@ -62,6 +62,8 @@ class AgentState(TypedDict, total=False):
 
     # ── 节点间内部传递（以下划线开头，不暴露给外部） ──
     _prompt_base: str
+    _user_shared: str
+    _user_query: str
     _system_prompt: str
     _user_prompt: str
     _tool_messages: list[dict[str, str]]
@@ -69,6 +71,8 @@ class AgentState(TypedDict, total=False):
     _mood_tool_calls: list[dict[str, Any]]
     _decision_reply: str
     _system_prefix_text: str
+    # 流式 dialogue 前清空 _system_prefix_text 时，把已推送给前端的 `{…}` 等快照留给 LLM user 拼接
+    _streamed_prefix_for_llm: str
     _mood_resolved_by_supervisor: bool
     _mood_event_emitted: bool
     # SSE: 工具调用/关键阶段的 UI 事件（由 tool_executor_node 填充）

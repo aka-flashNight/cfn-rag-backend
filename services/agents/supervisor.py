@@ -23,7 +23,12 @@ from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 
-from services.agent_graph.prompts import build_prompt_base
+from services.agent_graph.prompts import (
+    build_prompt_base,
+    build_agent_tail,
+    compose_agent_user,
+    format_player_utterance,
+)
 from services.llm_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -273,11 +278,8 @@ def _soft_guard(state: dict[str, Any], proposed_route: str) -> str:
 def _build_supervisor_prompt(state: dict[str, Any]) -> tuple[str, str]:
     """构造 supervisor 的 system + user prompt。
 
-    prefix cache 策略：
-        ``state["_prompt_base"]``（Layer 1+2+3+tagline）对所有 agent **完全一致**，
-        supervisor 直接复用，获得完整 NPC 扮演能力（用于 interim_reply 的角色口吻，
-        和 mood 判断时参考 NPC 性格 / 当前好感度）；本函数只在此基础上追加 supervisor
-        专属 tail（路由规则 + mood 规则 + JSON schema）。
+    - system：仅 static L1+L2+tagline（= ``state['_prompt_base']``）
+    - user：共享当轮上下文 + supervisor 路由/JSON 规范 + 状态摘要 +（最后）玩家原话
     """
     prompt_base = state.get("_prompt_base") or ""
     if not prompt_base:
@@ -288,8 +290,6 @@ def _build_supervisor_prompt(state: dict[str, Any]) -> tuple[str, str]:
             faction=state.get("npc_faction", "") or "",
             titles=state.get("npc_titles") or [],
             emotions=state.get("npc_emotions") or [],
-            favorability=state.get("npc_affinity", 0),
-            relationship_level=state.get("npc_relationship_level", "陌生"),
         )
 
     allowed_emotions = state.get("npc_emotions") or []
@@ -299,13 +299,8 @@ def _build_supervisor_prompt(state: dict[str, Any]) -> tuple[str, str]:
         else "可用情绪：[普通]"
     )
 
-    # supervisor 专属 tail：保持"静态内容在前、动态内容在后"，让静态部分也能被前缀缓存命中。
-    system_prompt = (
-        f"{prompt_base}\n\n"
-        f"{_SUPERVISOR_ROUTING_GUIDE}\n\n"
-        f"{_SUPERVISOR_OUTPUT_HINT}\n\n"
-        f"{emotions_line}"
-    )
+    sup_tail = build_agent_tail("supervisor")
+    system_prompt = prompt_base
 
     pending_draft = state.get("pending_task_draft")
     has_pending = bool(pending_draft)
@@ -323,10 +318,18 @@ def _build_supervisor_prompt(state: dict[str, Any]) -> tuple[str, str]:
     if last_worker:
         status_parts.append(f"上一跳 worker: {last_worker}；摘要: {last_summary[:180]}")
 
-    user_prompt = (
-        f"玩家本轮消息：{state.get('payload_dict', {}).get('query') or ''}\n\n"
-        + "\n".join(status_parts)
-        + "\n\n请按约束输出 JSON。"
+    user_shared = (state.get("_user_shared") or state.get("_user_prompt") or "").strip()
+    pline = format_player_utterance(
+        user_query=(state.get("_user_query") or (state.get("payload_dict") or {}).get("query") or ""),
+    )
+    user_prompt = compose_agent_user(
+        user_shared,
+        _SUPERVISOR_ROUTING_GUIDE,
+        sup_tail,
+        _SUPERVISOR_OUTPUT_HINT,
+        emotions_line,
+        "\n".join(status_parts) + "\n\n请按约束输出 JSON。",
+        pline,
     )
     return system_prompt, user_prompt
 

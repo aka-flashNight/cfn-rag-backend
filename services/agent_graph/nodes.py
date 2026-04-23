@@ -40,8 +40,12 @@ from services.tools.base import ToolContext, get_tool_registry, sort_tool_calls_
 from .prompts import (
     DECISION_ROUND_SUFFIX,
     GENERATION_ROUND_SUFFIX,
-    build_system_prompt,
-    build_user_prompt,
+    build_agent_tail,
+    build_in_turn_history_appendix,
+    build_static_system,
+    build_user_shared_core,
+    compose_agent_user,
+    format_player_utterance,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,12 +96,12 @@ def _log_agent_llm(
         parts.append("[system]\n" + system_prompt)
     if user_prompt:
         parts.append("[user]\n" + user_prompt)
-    if tools:
-        try:
-            tools_raw = json.dumps(tools, ensure_ascii=False, indent=2, default=str)
-        except Exception:
-            tools_raw = str(tools)
-        parts.append(f"[tools ({len(tools)} skills)]\n{tools_raw}")
+    # if tools:
+    #     try:
+    #         tools_raw = json.dumps(tools, ensure_ascii=False, indent=2, default=str)
+    #     except Exception:
+    #         tools_raw = str(tools)
+    #     parts.append(f"[tools ({len(tools)} skills)]\n{tools_raw}")
     if assistant_reply is not None:
         parts.append("[assistant]\n" + assistant_reply)
     _debug_stderr_block(phase, "\n\n".join(parts))
@@ -639,9 +643,8 @@ async def prepare_context_node(
     if current_emotion_for_use and current_emotion_for_use != "普通":
         emotion_hint = f"你之前的情绪是「{current_emotion_for_use}」。"
 
-    from services.agent_graph.prompts import build_prompt_base
-    # Layer 1+2+3+tagline —— 所有 agent 共享的前缀，存入 state 供 supervisor / worker 拼各自 tail。
-    prompt_base = build_prompt_base(
+    # Layer1+2+tagline —— 仅静态 system，供全图共享；当轮可变上下文放 user 侧。
+    prompt_base = build_static_system(
         npc_name=npc_name,
         sex=sex or "",
         faction=faction or "",
@@ -652,45 +655,20 @@ async def prepare_context_node(
         has_challenge=bool(npc_challenge),
         player_can_challenge=player_can_challenge,
         same_faction_npcs=same_faction_str,
-        player_identity=player_identity,
-        progress_stage_desc=progress_stage_desc,
-        favorability=favorability,
-        relationship_level=relationship_level,
-        mentioned_npcs_str=mentioned_npcs_str,
-        pending_draft_summary=pending_draft_summary,
-        history_str=history_str,
     )
-    # 默认 tail（legacy / 单 agent 路径用）；多 agent 模式下 supervisor / worker 会在运行时覆盖 _system_prompt。
-    system_prompt = build_system_prompt(
-        agent="default",
-        npc_name=npc_name,
-        sex=sex or "",
-        faction=faction or "",
-        titles=titles,
-        emotions=emotions,
-        has_shop=has_shop,
-        shop_reward_types=shop_reward_types,
-        has_challenge=bool(npc_challenge),
-        player_can_challenge=player_can_challenge,
-        same_faction_npcs=same_faction_str,
-        player_identity=player_identity,
-        progress_stage_desc=progress_stage_desc,
-        favorability=favorability,
-        relationship_level=relationship_level,
-        mentioned_npcs_str=mentioned_npcs_str,
-        pending_draft_summary=pending_draft_summary,
-        history_str=history_str,
-    )
+    system_prompt = prompt_base
 
-    # 立绘描述不写入共享 user_prompt，避免缓存变动；仅在流式/生成阶段按需拼接到 user 内容末尾
-    user_prompt = build_user_prompt(
+    user_shared = build_user_shared_core(
         retrieved_context=retrieved_context or "",
-        user_query=payload.query,
-        # emotion_hint 不要写入共享 user_prompt，避免与 llm_client 末尾拼接重复。
-        # 由 llm_client 统一决定：是否与 image_description 同行、或单独一行。
-        emotion_hint="",
-        image_description="",
+        history_str=history_str,
+        player_identity=player_identity,
+        progress_stage_desc=progress_stage_desc,
+        favorability=favorability,
+        relationship_level=relationship_level,
+        mentioned_npcs_str=mentioned_npcs_str,
+        pending_draft_summary=pending_draft_summary,
     )
+    user_prompt = user_shared
 
     from core.config import get_settings
     settings = get_settings()
@@ -751,9 +729,11 @@ async def prepare_context_node(
             "session_id": payload.session_id,
         },
         "effective_summarize_interval": effective_interval,
-        # Layer 1+2+3+tagline，所有 agent 完全一致（prefix cache 命中区）。
+        # 静态 system（L1+L2+tagline），全图一致。
         "_prompt_base": prompt_base,
-        # legacy / 单 agent 完整 system prompt；多 agent 模式下会被 agent 入口节点覆盖。
+        "_user_shared": user_shared,
+        "_user_query": (payload.query or "").strip(),
+        # 默认 user 段：同 _user_shared；worker 入口会扩写为「shared + 玩家原话 + interim + agent tail…」
         "_system_prompt": system_prompt,
         "_user_prompt": user_prompt,
         "_tool_messages": [],
@@ -773,6 +753,17 @@ async def prepare_context_node(
 # Node: decision
 # ---------------------------------------------------------------------------
 
+def _player_query_text(state: dict[str, Any]) -> str:
+    q = (state.get("_user_query") or "").strip()
+    if q:
+        return q
+    return (state.get("payload_dict") or {}).get("query") or ""
+
+
+def _effective_user_shared(state: dict[str, Any]) -> str:
+    return (state.get("_user_shared") or state.get("_user_prompt") or "").strip()
+
+
 async def decision_node(
     state: dict[str, Any],
     config: RunnableConfig,
@@ -780,27 +771,33 @@ async def decision_node(
     """
     非流式 LLM 调用（带全部工具），判断是否需要使用工具。
     """
-    system_prompt = state.get("_system_prompt", "")
-    user_prompt = state.get("_user_prompt", "")
+    system_prompt = (state.get("_prompt_base") or state.get("_system_prompt") or "").strip()
+    user_shared = _effective_user_shared(state)
+    worker = (state.get("_active_worker") or "").strip()
+    agent_tail = build_agent_tail(worker if worker in ("query", "task", "supervisor", "dialogue") else "default")
+    pline = format_player_utterance(user_query=_player_query_text(state))
     round_num = state.get("tool_call_round", 0)
 
-    decision_suffix = f"\n\n{DECISION_ROUND_SUFFIX}"
-    full_user_prompt = user_prompt + decision_suffix
-
+    mid = compose_agent_user(user_shared, agent_tail, DECISION_ROUND_SUFFIX)
     tool_messages = state.get("_tool_messages", [])
+    tool_block = ""
     if tool_messages:
-        full_user_prompt += "\n\n【工具执行结果】\n"
+        lines = ["【工具执行结果】"]
         for tm in tool_messages:
-            full_user_prompt += (
+            lines.append(
                 f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}"
             )
-            # Debug
-            # print('——————【工具执行结果】decision_node——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+        tool_block = "\n".join(lines)
+    appendix = build_in_turn_history_appendix(
+        npc_name=state.get("npc_name", ""),
+        interim_reply=state.get("interim_reply") or "",
+        streamed_content_suffix=(
+            (state.get("_streamed_prefix_for_llm") or state.get("_system_prefix_text") or "").strip()
+        ),
+    )
+    # 顺序：共享上下文 / agent 说明 → 工具结果 → 玩家当轮原话 →（若有）已发送的 interim
+    full_user_prompt = compose_agent_user(mid, tool_block, pline, appendix)
 
     # 非流式决策轮不传立绘，仅流式/生成阶段再传，减少 token 与缓存变动
     reply_text = ""
@@ -817,7 +814,7 @@ async def decision_node(
             user_prompt=full_user_prompt,
             image_path=None,
             image_description=None,
-            emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+            emotion_hint=None,
             tools=decision_tools,
         )
     except Exception as e:
@@ -831,7 +828,7 @@ async def decision_node(
                 user_prompt=full_user_prompt,
                 image_path=None,
                 image_description=None,
-                emotion_hint=state.get("emotion_hint") if round_num == 0 else None,
+                emotion_hint=None,
                 tools=None,
             )
         else:
@@ -1018,30 +1015,39 @@ async def generate_response_node(
     """
     生成最终 NPC 对话回复（非流式，用于 ask 接口）。
     """
-    system_prompt = state.get("_system_prompt", "")
-    user_prompt = state.get("_user_prompt", "")
+    system_prompt = (state.get("_prompt_base") or state.get("_system_prompt") or "").strip()
+    user_block = (state.get("_user_prompt") or _effective_user_shared(state) or "").strip()
+    worker = (state.get("_active_worker") or "").strip()
+    if worker not in ("dialogue",) and "【对话输出规则" not in user_block:
+        # 单 agent 路径：在 user 侧补 default tail（多 agent 的 dialogue 入口已拼过 dialogue_tail）
+        user_block = compose_agent_user(user_block, build_agent_tail("default"))
 
     gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
-    full_user_prompt = user_prompt + gen_suffix
+    mid = user_block + gen_suffix
+    # 生成轮仅传入 mood 工具定义（见 _get_mood_only_tools），与决策轮工具列表解耦。
+    mid += _generation_round_tool_suffix(state)
 
     raw_tool_messages = state.get("_tool_messages", [])
     gen_messages = _build_gen_tool_messages(raw_tool_messages)
+    tool_block = ""
     if gen_messages:
-        full_user_prompt += "\n\n【工具执行结果】\n"
+        lines = ["【工具执行结果】"]
         for tm in gen_messages:
-            full_user_prompt += (
+            lines.append(
                 f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}"
             )
-            # Debug
-            # print('——————【工具执行结果】generate_response_node——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+        tool_block = "\n".join(lines)
 
-    # 生成轮仅传入 mood 工具定义（见 _get_mood_only_tools），与决策轮工具列表解耦。
-    full_user_prompt += _generation_round_tool_suffix(state)
+    pline = format_player_utterance(user_query=_player_query_text(state))
+    appendix = build_in_turn_history_appendix(
+        npc_name=state.get("npc_name", ""),
+        interim_reply=state.get("interim_reply") or "",
+        streamed_content_suffix=(
+            (state.get("_streamed_prefix_for_llm") or state.get("_system_prefix_text") or "").strip()
+        ),
+    )
+    full_user_prompt = compose_agent_user(mid, tool_block, pline, appendix)
 
     decision_reply = state.get("_decision_reply", "")
     # 决策阶段返回的文本（如果有）不参与后续生成，避免“决策轮自述”污染正文。
@@ -1176,37 +1182,45 @@ async def generate_response_stream(
     Yields: ("content", delta_text)
     Returns: (full_reply, mood_tool_calls) 更新到 state
     """
-    system_prompt = state.get("_system_prompt", "")
-    user_prompt = state.get("_user_prompt", "")
+    system_prompt = (state.get("_prompt_base") or state.get("_system_prompt") or "").strip()
+    user_block = (state.get("_user_prompt") or _effective_user_shared(state) or "").strip()
+    worker = (state.get("_active_worker") or "").strip()
+    if worker not in ("dialogue",) and "【对话输出规则" not in user_block:
+        user_block = compose_agent_user(user_block, build_agent_tail("default"))
 
     gen_suffix = f"\n\n{GENERATION_ROUND_SUFFIX}"
-    full_user_prompt = user_prompt + gen_suffix
+    mid = user_block + gen_suffix
+    # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
+    mid += _generation_round_tool_suffix(state)
 
     raw_tool_messages = state.get("_tool_messages", [])
     gen_messages = _build_gen_tool_messages(raw_tool_messages)
+    tool_block = ""
     if gen_messages:
-        full_user_prompt += "\n\n【工具执行结果】\n"
+        lines = ["【工具执行结果】"]
         for tm in gen_messages:
-            full_user_prompt += (
+            lines.append(
                 f"[{tm['tool_name']}]: "
-                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
+                f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}"
             )
-            # Debug
-            # print('——————【工具执行结果】generate_response_stream——————')
-            # print(
-            #     f"[{tm['tool_name']}]: "
-            #     f"{_format_tool_result_for_prompt(tm['tool_name'], tm['result'])}\n"
-            # )
+        tool_block = "\n".join(lines)
 
-    # 流式生成轮仅传入 mood 工具（_get_mood_only_tools），prompt 约束同非流式。
-    full_user_prompt += _generation_round_tool_suffix(state)
+    pline = format_player_utterance(user_query=_player_query_text(state))
+    appendix = build_in_turn_history_appendix(
+        npc_name=state.get("npc_name", ""),
+        interim_reply=state.get("interim_reply") or "",
+        streamed_content_suffix=(
+            (state.get("_streamed_prefix_for_llm") or state.get("_system_prefix_text") or "").strip()
+        ),
+    )
+    full_user_prompt = compose_agent_user(mid, tool_block, pline, appendix)
 
     _log_agent_llm(
         "generate_stream (request)",
         system_prompt,
         full_user_prompt,
         None,
-                    tools=_get_mood_only_tools(state),
+        tools=_get_mood_only_tools(state),
     )
 
     decision_reply = state.get("_decision_reply", "")
