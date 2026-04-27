@@ -12,18 +12,21 @@ CFN-RAG 后端是一个面向 [Crazy Flash Night (CFN)](https://github.com/Flash
 
 ## 功能特点
 
-- **RAG 检索智能对话**：基于游戏数据进行全面深度检索，进行关于角色、任务、物品等各类话题的对话
-- **流式回复（SSE）**：支持流式输出，前端可做打字机效果
-- **NPC 分层记忆系统**：按会话保存对话历史与摘要，保持上下文连贯
+- **RAG 检索智能对话**：基于游戏数据进行多路 Dense + BM25 + Hybrid RRF 检索，覆盖角色、任务、物品、世界观等各类话题
+- **Supervisor 多 Agent 系统**：LangGraph Supervisor 智能路由到 QueryAgent（查资料）/ TaskAgent（发任务）/ DialogueAgent（闲聊），每种 Agent 只持有自己需要的工具
+- **Skills 渐进式披露**：Skills（流程知识包）与 Tools（原子函数）解耦，三级按需加载（简表 → 正文 → 附件），大幅降低 prompt token 消耗
+- **流式回复（SSE）**：支持流式输出，前端可做打字机效果；多 Agent 场景下 Supervisor 可选 `interim_reply` 中途过渡对话
+- **NPC 分层记忆系统**：按会话保存对话历史与摘要，保持上下文连贯；LLM prompt 分层设计最大化前缀缓存命中率
 - **好感度 / 关系 / 情绪**：维护 NPC 独立状态，并支持工具化更新
 - **多模态对话**：可注入 NPC 立绘/头像（WebP/PNG），增强角色扮演一致性
-- **对话管理**：支持删除、重命名对话会话，分页加载历史记录
-- **向量索引持久化**：本地持久化向量索引，二次启动可直接加载
+- **对话管理**：支持删除、重命名会话，分页加载历史记录；HITL 任务确认/取消/讨价还价
+- **向量索引持久化**：本地和 Qdrant 两种向量后端可选，启动无需重建
 - **Agent 任务生成系统（端到端）**：
   - 在对话中先生成 **任务草案（draft）**，并可多轮 **讨价还价/局部修改/重新发布或取消**
   - 用户确认后 **原子写入** CFN 任务文件（`agent_tasks.json` 与 `agent_text.json`）
   - 全流程带 **后端校验管线**（物品/关卡/进度/价值预算/等级匹配等）
-- **离线/本地部署**：可本地运行，数据在本机处理
+- **RAG 评估体系**：Ragas 端到端评估（faithfulness / answer_relevancy / context_precision / context_recall）+ 检索层独立评估（recall@k / MRR / nDCG），dense / BM25 / hybrid RRF 三轨对比
+- **双 Profile 云原生**：**Local**（双击 exe，零外部依赖）/ **Server**（Docker + K8s + Redis + Qdrant + Postgres + arq Worker）
 - **可执行文件打包发布**：提供 PyInstaller 打包的单文件版与完整独立版
 
 ## 前置要求
@@ -42,32 +45,59 @@ CFN-RAG 后端需要配合 **Crazy Flash Night 游戏资源** 使用。请将游
 
 Crazy Flash Night 游戏项目地址：`https://github.com/FlashNightModReborn/CrazyFlashNight`
 
-## 架构概览（Decision → Execute → Generate）
+## 架构概览
 
-为兼容部分 OpenAI-兼容模型在“工具调用 + 流式输出”上的限制，同时便于扩展更多工具，本项目的对话接口采用 **三阶段管线**：
+### Supervisor 多 Agent 编排
 
-- **Decision（非流式）**：LLM 仅负责判断是否需要工具，并产生 `tool_calls`
-- **Execute（后端执行）**：后端分发工具调用，执行并把 `tool results` 注入消息
-- **Generate（流式）**：LLM 生成最终 NPC 对话回复（SSE 流式输出）
+```
+UserMsg → Supervisor → QueryAgent（查资料 / 知识检索）
+                     → TaskAgent（发任务 / 协商 / 确认写入）
+                     → DialogueAgent（流式闲聊 / 最终回复）
+                     → finalize → END
+```
 
-该流程由 `services/agent_graph/` 下的 LangGraph 状态图实现，并设置工具回合上限（默认 5 轮）避免无限循环。
+- **Supervisor**：轻量路由节点（非流式），输出 `next_agent ∈ {query, task, dialogue, end}` + 可选 `interim_reply`（≤40 字中途过渡对话），不携带非必要工具 schema
+- **QueryAgent**：持有 `search_knowledge / search_items / search_stages` + Skills 元工具，上限 3 轮决策，输出检索结果供下游复用
+- **TaskAgent**：持有 `prepare_task_context → draft_agent_task → update_task_draft → confirm_agent_task / cancel_agent_task` 状态机，上限 4 轮；确认写入前触发 HITL 中断
+- **DialogueAgent**：携带 `update_npc_mood` 单一工具 + `stream=True`，单次流式调用产出最终 NPC 对话
+- **防护机制**：per-agent 调用上限、连续失败黑名单、token 预算熔断器（circuit breaker）、全局 6 轮强制出口——全部硬编码在 `route` 工具 schema 中，不依赖 prompt 自觉
 
-另外，`launcher.py` 内置前端静态服务器还承担了**本地反向代理层**：浏览器侧统一请求同源地址，前端服务将 `/api/*` 转发到后端 `127.0.0.1:7077`，并对 `text/event-stream` 响应做**流式转发**，以同时解决本地跨域与流式响应兼容问题。
+### Tools / Skills 分离 + 渐进式披露
 
-**代码入口（便于对照实现）**
+遵循 Anthropic 2026 Agent Skills 规范：
+
+- **Tools**：原子函数（OpenAI function calling），每个 tool 一个文件，位于 `services/tools/{category}/{name}.py`
+- **Skills**：人类可读的流程知识包，YAML frontmatter + Markdown body，位于 `services/skills/{name}/SKILL.md`
+- **三级加载**：Level 1 `list_skills` 只返回所有 skill 的 name + description 简表；Level 2 `read_skill(name)` 加载完整正文；Level 3 `read_skill_file(name, file)` 加载 references/ 附件
+- 各 Worker Agent 按职责持有 skill 子集（如 TaskAgent 加载 `task-publishing` + `task-bargaining`，DialogueAgent 不加载），实现 prompt 最小化
+
+### 双 Profile 部署模式
+
+| | Local Profile | Server Profile |
+|------|------|------|
+| 启动方式 | `python main.py` / 双击 exe | Docker / K8s |
+| 缓存 | In-Memory dict | Redis |
+| 数据库 | SQLite | PostgreSQL |
+| 向量库 | LlamaIndex 本地索引 | Qdrant |
+| Checkpointer | AsyncSqliteSaver | AsyncPostgresSaver |
+| 后台任务 | — | arq Worker |
+| 观测性 | 控制台日志 | Prometheus /metrics + JSON 日志 |
+| 外部依赖 | 零 | Redis + Qdrant + Postgres |
+
+`launcher.py` 内置前端静态服务器还承担了**本地反向代理层**：浏览器侧统一请求同源地址，前端服务将 `/api/*` 转发到后端 `127.0.0.1:7077`，并对 `text/event-stream` 响应做**流式转发**，以同时解决本地跨域与流式响应兼容问题。
+
+**核心代码入口**
 
 | 职责 | 路径 |
 |------|------|
-| 图状态与编译 | `services/agent_graph/state.py`、`graph.py` |
-| 各节点（准备 prompt、决策、工具、流式生成、后处理） | `services/agent_graph/nodes.py` |
-| 分层 system/user prompt | `services/agent_graph/prompts.py` |
-| OpenAI Function 工具 schema | `services/agent_tools/schemas.py` |
-| `prepare_task_context` 数据筛选与组装 | `services/agent_tools/context_builder.py` |
-| 全量/增量校验管线 | `services/agent_tools/validator.py` |
-| 草案/确认/取消等工具逻辑与写入拼装 | `services/agent_tools/task_tools.py` |
-| `tool_calls` 分发到上述实现 | `services/agent_tools/tool_executor.py` |
-| 游戏数据内存 Registry | `services/game_data/registry.py` 及各 `*_registry.py` |
-| 任务草案 SQLite（按 session） | `services/task_draft_store.py`（表 `session_task_drafts` 等） |
+| Supervisor 主图 + Checkpointer | `services/agents/graph.py`、`checkpointer.py` |
+| 三个 Worker Agent 子图 | `services/agents/workers.py` |
+| 多 Agent 共享状态 | `services/agents/state.py` |
+| 原子工具（BaseTool + ToolRegistry） | `services/tools/base.py` |
+| Skills 注册表 + SKILL.md 解析 | `services/skills/base.py` |
+| Profile 配置 + 后端自动推导 | `core/config.py` |
+| 存储抽象（Cache / DB / Vector） | `services/storage/` |
+| 任务草案 SQLite / PG | `services/task_draft_store.py`、`services/storage/postgres_db.py` |
 
 ## 任务生成系统（草案 → 协商 → 写入）
 
@@ -451,59 +481,87 @@ cfn-rag-backend/
 │   ├── assets_api.py
 │   └── game_api.py
 ├── ai_engine/
-│   ├── game_data_loader.py      # 向量索引构建与缓存
-│   └── bm25_retrieval.py        # BM25 + RRF（评估 / 后续扩展）
-├── evals/                       # 正式评估（datasets / retriever / rag / reports）
+│   ├── game_data_loader.py      # 向量索引构建与缓存（Dense）
+│   └── bm25_retrieval.py        # BM25 + Hybrid RRF（稀疏 + 融合检索）
+├── evals/                       # 正式评估体系
+│   ├── datasets/                # golden 测试集（tiny / full）
+│   ├── retriever/               # 检索层评估（recall@k / MRR / nDCG）
+│   ├── rag/                     # Ragas 端到端评估（faithfulness / relevancy）
+│   ├── runners/                 # 评估入口（build_golden_set / run_all）
+│   └── reports/                 # 评估报告（时间戳 + git hash 命名）
 ├── core/
-│   ├── config.py
-│   └── exceptions.py
+│   ├── config.py                # Profile 系统 + 后端自动推导（CFN_PROFILE）
+│   ├── exceptions.py
+│   └── startup.py               # 启动初始化（模型/索引/数据预加载）
+├── deploy/                      # 云原生部署（路线四）
+│   ├── README.md                # 部署指南（Docker / minikube / Helm）
+│   ├── Dockerfile               # 多阶段构建（CPU-only）
+│   ├── docker-compose.yml       # 全栈 Compose（backend + worker + Redis + Qdrant + PG）
+│   ├── k8s/base/                # K8s 清单（Deployment / HPA / Ingress / ConfigMap / Secret）
+│   └── helm/cfn-rag/            # Helm Chart（values.yaml 分环境）
+├── worker/                      # 后台 Worker（arq）
+│   ├── main.py                  # Worker 启动入口
+│   ├── tasks.py                 # 任务定义（重建索引 / 评估触发 / 健康检查）
+│   └── settings.py              # Redis broker 配置
+├── loadtest/                    # 压测（Locust）
+│   └── locustfile.py            # 50 并发 SSE 流式 + 非流式压测脚本
+├── alembic/                     # Postgres 数据库迁移
+│   ├── env.py
+│   └── versions/001_initial.py
 ├── dist/                        # 前端构建产物（静态）
-├── models/                      # 嵌入模型落盘目录（可选：首次运行或脚本下载后才有）
-│   └── bge-small-zh-v1.5/       # 默认 BGE 中文嵌入
+├── models/                      # 嵌入模型落盘目录
+│   └── bge-small-zh-v1.5/       # 默认 BGE 中文嵌入（384 维）
 ├── schemas/                     # Pydantic 请求/响应模型
-├── docs/                        # 如 STREAMING_API_FRONTEND.md
 ├── scripts/
 │   ├── build_exe.py
-│   ├── download_model.py        # 模型下载（ModelScope / 镜像 / 代理）
-│   └── extract_portraits_from_swf.py
+│   ├── download_model.py
+│   ├── extract_portraits_from_swf.py
+│   ├── migrate_sqlite_to_pg.py         # SQLite → Postgres 迁移
+│   └── migrate_vector_to_qdrant.py     # LlamaIndex 本地索引 → Qdrant 迁移
 ├── services/
-│   ├── game_rag_service.py      # RAG、资源路径、与 ask 相关公共逻辑
-│   ├── llm_client.py            # LLM 调用（含流式）
-│   ├── memory_manager.py        # SQLite 会话记忆
-│   ├── npc_manager.py           # NPC 状态（好感度、情绪、阵营等）
-│   ├── task_draft_store.py      # session_task_drafts / 草案轮次计数（SQLite）
-│   ├── game_progress.py         # 玩家阶段与等级/主线区间工具
-│   ├── agent_graph/             # LangGraph：prepare → decision ⇄ tool → generate → post
-│   │   ├── state.py
-│   │   ├── graph.py
-│   │   ├── nodes.py
-│   │   └── prompts.py
-│   ├── skills/                  # Anthropic 风格 Skills（每 skill 一目录：SKILL.md + handler）
-│   │   ├── task/ …            # prepare_task_context / draft / update / confirm / cancel
-│   │   ├── query/ …           # search_knowledge / search_stages / search_items
-│   │   ├── mood/ …            # update_npc_mood
-│   │   └── system/ …          # list_skills
-│   ├── agent_tools/
-│   │   ├── schemas.py           # 参数 JSON Schema 常量（供 skills 与校验复用）
-│   │   ├── context_builder.py   # prepare_task_context
-│   │   ├── validator.py
-│   │   ├── task_tools.py        # draft / update / confirm / cancel 与写入
-│   │   └── tool_executor.py
-│   └── game_data/               # 启动加载：items / tasks / stages / shops / crafting 等
-│       ├── registry.py          # GameDataRegistry
-│       ├── parsers.py
-│       ├── item_registry.py
-│       ├── task_registry.py
-│       ├── task_text_registry.py
-│       ├── stage_registry.py
-│       ├── shop_registry.py
-│       ├── kshop_registry.py
-│       ├── crafting_registry.py
-│       ├── mercenary_registry.py
-│       └── equipment_mods_registry.py
-├── data_files_overview.md       # 数据格式与 Agent 设计说明（权威参考）
+│   ├── game_rag_service.py      # RAG 编排（多路检索 + Agent/非Agent 对话入口）
+│   ├── llm_client.py            # LLM 调用（OpenAI 兼容，含流式）
+│   ├── memory_manager.py        # SQLite 会话记忆 + 摘要
+│   ├── npc_manager.py           # NPC 状态（好感度/情绪/阵营）
+│   ├── task_draft_store.py      # 任务草案 SQLite 存储（local profile）
+│   ├── session_heartbeat.py     # SSE 连接 Redis 心跳续期（server profile）
+│   ├── latency_tracker.py       # 首字延迟分步检测
+│   ├── agents/                  # 多 Agent Supervisor（路线三）
+│   │   ├── graph.py             # 主图编译 + Checkpointer 集成
+│   │   ├── checkpointer.py      # Checkpointer Profile 工厂（Local→Sqlite / Server→PG）
+│   │   ├── supervisor.py        # Supervisor 路由节点
+│   │   ├── workers.py           # Query / Task / Dialogue 三个 Worker 子图
+│   │   ├── state.py             # SupervisorState 定义
+│   │   └── tool_scopes.py       # 各 Worker 工具白名单
+│   ├── agent_graph/             # 单 Agent 图（保留为回退路径）
+│   ├── tools/                   # 原子工具（OpenAI function calling）
+│   │   ├── base.py              # BaseTool / ToolRegistry / ToolContext
+│   │   ├── query/               # search_knowledge / search_items / search_stages
+│   │   ├── task/                # prepare / draft / update / confirm / cancel
+│   │   ├── mood/                # update_npc_mood
+│   │   └── system/              # list_skills / read_skill / read_skill_file
+│   ├── skills/                  # Anthropic 2026 规范 Skills（YAML frontmatter + Markdown body）
+│   │   ├── base.py              # Skill / SkillRegistry
+│   │   ├── task-publishing/     # 任务发布完整流程 + references/（奖励规则 / 任务类型）
+│   │   ├── task-bargaining/     # 讨价还价协商流程
+│   │   ├── knowledge-search/    # 知识检索工具协同用法
+│   │   ├── mood-tracking/       # 情绪追踪调用时机
+│   │   └── skill-discovery/     # 元工具用法
+│   ├── storage/                 # 存储抽象层（路线四）
+│   │   ├── cache.py             # CacheBackend Protocol + MemoryCache / RedisCache
+│   │   ├── db.py                # SessionStore / MessageStore / DraftStore Protocol + SqliteBackend
+│   │   ├── vector.py            # VectorBackend Protocol + LlamaIndexLocalBackend
+│   │   ├── qdrant_vector.py     # QdrantBackend（server profile）
+│   │   └── postgres_db.py       # PostgresBackend（server profile）
+│   ├── agent_tools/             # 业务纯函数（供 tools/ 调用）
+│   │   ├── schemas.py           # 参数 Schema / 任务类型 / 难度 / 奖励常量
+│   │   ├── context_builder.py   # prepare_task_context 数据筛选
+│   │   ├── validator.py         # 全量/增量校验管线
+│   │   ├── task_tools.py        # 草案/确认/取消业务逻辑
+│   │   └── draft_formatting.py  # 草案格式化
+│   └── game_data/               # 游戏静态数据 Registry
 ├── launcher.py
-├── main.py
+├── main.py                      # FastAPI 入口 + Prometheus /metrics + structlog
 └── requirements.txt
 ```
 
@@ -562,17 +620,25 @@ A: 推荐方式：
 
 ## 技术栈
 
-- **Web**：FastAPI + Uvicorn
-- **流式**：SSE（前端对接见 `docs/STREAMING_API_FRONTEND.md`）
-- **本地网关层**：`launcher.py` 内置 Python `http.server` + `urllib` 反向代理（`/api/* -> 127.0.0.1:7077`），并支持 SSE 流式转发（`text/event-stream` 透传）
-- **RAG**：LlamaIndex（向量索引、检索；）
-- **Agent**：**LangGraph**（`langgraph`）编排状态图；**LangChain** 生态（`langchain-openai`、`langchain-core`）承载消息与工具调用结构
-- **LLM HTTP**：**OpenAI 兼容** REST（`openai` SDK，`base_url` + `model` 可指向 Gemini / ModelScope / 自建网关等）
-- **工具**：OpenAI **Function Calling** 风格 schema（`services/agent_tools/schemas.py`），运行时由 `tool_executor` 分发  
-  `prepare_task_context` · `draft_agent_task` · `update_task_draft` · `confirm_agent_task` · `cancel_agent_task` · `search_knowledge` · `update_npc_mood`
-- **嵌入**：默认 **BAAI/bge-small-zh-v1.5**（HuggingFace/本地 `models/` 。可用 `scripts/download_model.py` 或首次运行拉取至本地）
-- **持久化**：SQLite（`memory_manager` 会话记忆 + `task_draft_store` 任务草案）；游戏静态数据来自 `resources/data`，启动时载入 `GameDataRegistry`
-- **打包**：PyInstaller
+| 层级 | 技术 | 说明 |
+|------|------|------|
+| **Web 框架** | FastAPI + Uvicorn | 异步 HTTP 服务；SSE（Server-Sent Events）流式回复；`/metrics` 端点 |
+| **Agent 编排** | **LangGraph** | Supervisor + Query/Task/Dialogue 三个 Worker Agent 子图；`AsyncSqliteSaver` / `AsyncPostgresSaver` Checkpointer；HITL v2（`interrupt_before` 草案确认中断） |
+| **Agent Skills** | Anthropic 2026 规范 | Skills（YAML frontmatter + Markdown body）与 Tools（OpenAI function calling）彻底解耦；三级渐进式披露（`list_skills` → `read_skill` → `read_skill_file`） |
+| **RAG 检索** | **LlamaIndex** | 多路向量检索（Dense + BM25 + Hybrid RRF 融合）；Qdrant 向量数据库（server profile）；CJK 字符级分词器 |
+| **LLM 调用** | OpenAI 兼容 REST | `openai` SDK，`base_url` + `model` 可指向 Gemini / Kimi / Qwen / DeepSeek / GLM 等 |
+| **嵌入模型** | BAAI/**bge-small-zh-v1.5** | 本地离线 CPU 推理（HuggingFace / ModelScope），384 维 |
+| **评估体系** | **Ragas** + 自定义 Retriever Eval | Ragas：faithfulness / answer_relevancy / context_precision / context_recall；Retriever：recall@k / precision@k / MRR / nDCG；dense / bm25 / hybrid RRF 三轨对比 |
+| **Prompt 优化** | Prompt Caching | 分层 prompt 设计（L1 世界观 → L5 Agent 专属指令），最大化 API Cache 命中率（实测 85%-95%+） |
+| **存储 — Local** | SQLite + LlamaIndex 本地索引 | `memory.db`（会话记忆 + 任务草案）；`vector_index/` 目录（向量索引持久化）；In-Memory dict 缓存 |
+| **存储 — Server** | **PostgreSQL** + **Qdrant** + **Redis** | `PostgresBackend`（SQLAlchemy 2.0 async + asyncpg）；`QdrantBackend`（Cosine 384 维，metadata filter 转换）；`RedisCache`（热会话缓存 / SSE 心跳 / 幂等 / Pub-Sub 预留） |
+| **后台任务** | **arq** | Redis-based 异步任务队列（索引重建 / 评估触发 / 立绘提取） |
+| **容器化** | Docker + docker-compose | 多阶段构建（CPU-only 镜像 ~1.2GB）；全栈 Compose（backend + worker + Redis + Qdrant + PG + Jaeger） |
+| **编排** | **Kubernetes** + **Helm** | Deployment / HPA（CPU 70% 自动扩缩 1→3）/ Ingress（nginx sticky session for SSE）/ ConfigMap / Secret；Helm Chart 分环境 values |
+| **观测性** | **Prometheus** + **structlog** | `/metrics`（请求计数/延迟分布/SSE 活跃连接数）；JSON 结构化日志（server profile）；Jaeger 追踪（可选） |
+| **压测** | **Locust** | 50 并发 SSE 流式 + 非流式混合场景，TTFB / 完整延迟 / 失败率 |
+| **打包发布** | PyInstaller | 单文件版 exe + 完整独立版 zip；`launcher.py` 内置反向代理（本地跨域 + SSE 流式转发） |
+| **本地开发** | minikube + kubectl | Windows + WSL2 + Docker Desktop 驱动，一键部署全栈 K8s 集群 |
 
 ## 许可证
 
@@ -584,6 +650,11 @@ A: 推荐方式：
 - [cfn-terminal-web](https://github.com/aka-flashNight/cfn-terminal-web) - 前端终端界面（Vue 3）
 - [LlamaIndex](https://www.llamaindex.ai/) - RAG 框架
 - [BAAI](https://github.com/FlagOpen/FlagEmbedding) - BGE 嵌入模型
+- [LangGraph](https://github.com/langchain-ai/langgraph) - Agent 编排 + Checkpointer
+- [Qdrant](https://qdrant.tech/) - 向量数据库（server profile）
+- [Redis](https://redis.io/) - 缓存 / 消息队列（server profile）
+- [Prometheus](https://prometheus.io/) - 监控指标采集
+- [Locust](https://locust.io/) - 负载测试框架
 
 ## 联系方式
 
