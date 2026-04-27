@@ -95,7 +95,7 @@ htmlcov/
 .pytest_cache/
 
 # tools
-tools/
+/tools/
 
 # reports
 evals/reports
