@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cfn-rag-worker
+  labels:
+    app: cfn-rag-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cfn-rag-worker
+  template:
+    metadata:
+      labels:
+        app: cfn-rag-worker
+    spec:
+      containers:
+        - name: worker
+          image: cfn-rag-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "worker/main.py"]
+          envFrom:
+            - configMapRef:
+                name: cfn-rag-config
+            - secretRef:
+                name: cfn-rag-secret
+          env:
+            - name: CFN_PROFILE
+              value: "server"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: resources
+              mountPath: /app/resources
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: cfn-rag-models-pvc
+        - name: resources
+          persistentVolumeClaim:
+            claimName: cfn-rag-resources-pvc

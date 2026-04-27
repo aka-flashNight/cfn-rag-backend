@@ -1,0 +1,52 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+
+# 模型（不进镜像，运行时挂载）
+models/
+
+# 游戏数据（不进镜像，运行时挂载）
+resources/
+
+# 前端 SPA（launcher 用，容器仅后端）
+dist/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+.claude/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# 测试 & 评估
+test/
+evals/reports/
+loadtest/
+
+# 打包
+*.spec
+build/
+release/
+backup_resources/
+
+# 文档
+*.md
+data_files_overview.md
+
+# 环境
+.env
+.env.local
+.env.production
+
+# OS
+.DS_Store
+Thumbs.db

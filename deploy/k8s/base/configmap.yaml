@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfn-rag-config
+data:
+  CFN_DB_BACKEND: "postgres"
+  CFN_CACHE_BACKEND: "redis"
+  CFN_VECTOR_BACKEND: "qdrant"
+  CFN_CHECKPOINT_BACKEND: "postgres"
+  CFN_REDIS_URL: "redis://redis:6379/0"
+  CFN_POSTGRES_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/cfn_rag"
+  CFN_QDRANT_URL: "http://qdrant:6333"
+  CFN_QDRANT_COLLECTION: "cfn_game"
+  CFN_WORKER_BROKER_URL: "redis://redis:6379/1"
+  CFN_LANGGRAPH_CHECKPOINT_DB: "/app/resources/tools/langgraph_checkpoint.sqlite"

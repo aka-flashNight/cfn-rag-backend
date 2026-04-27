@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cfn-rag-backend
+  labels:
+    app: cfn-rag-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cfn-rag-backend
+  template:
+    metadata:
+      labels:
+        app: cfn-rag-backend
+    spec:
+      # SSE 需要较长的优雅终止时间
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: backend
+          image: cfn-rag-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 7077
+              name: http
+          envFrom:
+            - configMapRef:
+                name: cfn-rag-config
+            - secretRef:
+                name: cfn-rag-secret
+          env:
+            - name: CFN_PROFILE
+              value: "server"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 7077
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 7077
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: resources
+              mountPath: /app/resources
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: cfn-rag-models-pvc
+        - name: resources
+          persistentVolumeClaim:
+            claimName: cfn-rag-resources-pvc
