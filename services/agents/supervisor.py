@@ -29,6 +29,7 @@ from services.agent_graph.prompts import (
     compose_agent_user,
     format_player_utterance,
 )
+from services.latency_tracker import LatencyTracker
 from services.llm_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -387,14 +388,15 @@ async def supervisor_node(
         # 3. 其余情况交给 LLM 决策
         system_prompt, user_prompt = _build_supervisor_prompt(state)
         try:
-            reply_text, _tcs = await call_llm(
-                api_key=state.get("api_key"),
-                api_base=state.get("api_base"),
-                model_name=state.get("model_name"),
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                tools=None,  # supervisor 自己不用 function calling；纯文本 JSON 输出
-            )
+            async with LatencyTracker("supervisor — 路由决策 (LLM)") as _lt:
+                reply_text, _tcs = await call_llm(
+                    api_key=state.get("api_key"),
+                    api_base=state.get("api_base"),
+                    model_name=state.get("model_name"),
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    tools=None,  # supervisor 自己不用 function calling；纯文本 JSON 输出
+                )
         except Exception as e:
             logger.warning("supervisor LLM 失败，回退 dialogue: %s", e)
             reply_text = ""

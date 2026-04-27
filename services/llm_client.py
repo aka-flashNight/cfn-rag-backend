@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, List, Tuple
 import httpx
 from openai import AsyncOpenAI
 
+from services.latency_tracker import LatencyTracker
 from services.portrait_utils import prepare_portrait_for_ai
 
 
@@ -88,7 +89,8 @@ async def call_llm(
     if tools:
         kwargs["tools"] = tools
 
-    completion = await client.chat.completions.create(**kwargs)
+    async with LatencyTracker("LLM 调用 (非流式)") as _lt:
+        completion = await client.chat.completions.create(**kwargs)
 
     message = completion.choices[0].message
     content = message.content or ""
@@ -220,7 +222,8 @@ async def call_llm_stream(
     if tools:
         kwargs["tools"] = tools
 
-    stream = await client.chat.completions.create(**kwargs)
+    async with LatencyTracker("LLM 调用 (流式)") as _lt:
+        stream = await client.chat.completions.create(**kwargs)
     content_parts: List[str] = []
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     mood_update_emitted: set[int] = set()

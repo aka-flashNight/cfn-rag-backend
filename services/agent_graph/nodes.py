@@ -22,6 +22,7 @@ from typing import Any, Optional
 from langchain_core.runnables import RunnableConfig
 
 from services.llm_client import call_llm, call_llm_stream
+from services.latency_tracker import LatencyTracker
 from services.npc_mood_agent import (
     has_update_npc_mood_tool_call,
     is_image_unsupported_error,
@@ -386,6 +387,7 @@ async def prepare_context_node(
     - memory: MemoryManager 实例
     - payload: NPCChatRequest 对象
     """
+    _prepare_tracker = LatencyTracker.start("prepare_context — 构建上下文与 Prompt")
     cfgable = config.get("configurable", {})
     rag_service = cfgable["rag_service"]
     npc_manager = cfgable["npc_manager"]
@@ -685,7 +687,7 @@ async def prepare_context_node(
         or settings.llm_model_name
     )
 
-    return {
+    _prepare_result = {
         "npc_name": npc_name,
         "player_progress": progress_stage or 0,
         "npc_affinity": favorability,
@@ -748,6 +750,9 @@ async def prepare_context_node(
         "_active_worker_tool_names": [],
     }
 
+    _prepare_tracker.end()
+    return _prepare_result
+
 
 # ---------------------------------------------------------------------------
 # Node: decision
@@ -806,20 +811,7 @@ async def decision_node(
     tools_for_debug: list[dict[str, Any]] | None = decision_tools
 
     try:
-        reply_text, tool_calls = await call_llm(
-            api_key=state.get("api_key"),
-            api_base=state.get("api_base"),
-            model_name=state.get("model_name"),
-            system_prompt=system_prompt,
-            user_prompt=full_user_prompt,
-            image_path=None,
-            image_description=None,
-            emotion_hint=None,
-            tools=decision_tools,
-        )
-    except Exception as e:
-        if is_tools_unsupported_error(e):
-            tools_for_debug = None
+        async with LatencyTracker(f"decision_node — LLM 决策") as _lt:
             reply_text, tool_calls = await call_llm(
                 api_key=state.get("api_key"),
                 api_base=state.get("api_base"),
@@ -829,8 +821,23 @@ async def decision_node(
                 image_path=None,
                 image_description=None,
                 emotion_hint=None,
-                tools=None,
+                tools=decision_tools,
             )
+    except Exception as e:
+        if is_tools_unsupported_error(e):
+            tools_for_debug = None
+            async with LatencyTracker(f"decision_node — LLM 决策 (降级无工具)") as _lt2:
+                reply_text, tool_calls = await call_llm(
+                    api_key=state.get("api_key"),
+                    api_base=state.get("api_base"),
+                    model_name=state.get("model_name"),
+                    system_prompt=system_prompt,
+                    user_prompt=full_user_prompt,
+                    image_path=None,
+                    image_description=None,
+                    emotion_hint=None,
+                    tools=None,
+                )
         else:
             raise
 
@@ -1059,17 +1066,18 @@ async def generate_response_node(
         image_path = Path(image_path_str)
 
     try:
-        reply_text, tool_calls = await call_llm(
-            api_key=state.get("api_key"),
-            api_base=state.get("api_base"),
-            model_name=state.get("model_name"),
-            system_prompt=system_prompt,
-            user_prompt=full_user_prompt,
-            image_path=image_path,
-            image_description=state.get("image_description"),
-            emotion_hint=state.get("emotion_hint") or None,
-            tools=_get_mood_only_tools(state),
-        )
+        async with LatencyTracker("generate_response — 生成对话 (非流式)") as _lt:
+            reply_text, tool_calls = await call_llm(
+                api_key=state.get("api_key"),
+                api_base=state.get("api_base"),
+                model_name=state.get("model_name"),
+                system_prompt=system_prompt,
+                user_prompt=full_user_prompt,
+                image_path=image_path,
+                image_description=state.get("image_description"),
+                emotion_hint=state.get("emotion_hint") or None,
+                tools=_get_mood_only_tools(state),
+            )
     except Exception as e:
         if is_image_unsupported_error(e) and image_path:
             try:
@@ -1410,6 +1418,7 @@ async def post_process_node(
     """
     保存对话记录、更新好感度、持久化任务草案状态。
     """
+    _post_tracker = LatencyTracker.start("post_process — 后处理与持久化")
     cfgable = config.get("configurable", {})
     memory = cfgable["memory"]
     npc_manager = cfgable["npc_manager"]
@@ -1468,7 +1477,9 @@ async def post_process_node(
     except Exception:
         logger.warning("持久化任务草案失败", exc_info=True)
 
-    return {
+    _post_result = {
         "npc_affinity": updated_state.favorability,
         "npc_relationship_level": updated_state.relationship_level,
     }
+    _post_tracker.end()
+    return _post_result

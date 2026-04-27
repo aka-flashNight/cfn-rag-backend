@@ -29,6 +29,12 @@ class Settings(BaseSettings):
         validation_alias="CFN_AGENT_DEBUG_LLM",
     )
 
+    # 首字延迟分步检测：开启后在 stderr 输出每一步动作描述与耗时
+    cfn_agent_debug_latency: bool = Field(
+        default=False,
+        validation_alias="CFN_AGENT_DEBUG_LATENCY",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

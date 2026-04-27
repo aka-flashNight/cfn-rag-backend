@@ -19,6 +19,7 @@ from schemas.knowledge_schema import NPCChatRequest, NPCChatResponse
 from services.npc_manager import NPCManager, NPCState
 from services.memory_manager import MemoryManager
 from services.llm_client import call_llm, call_llm_stream
+from services.latency_tracker import LatencyTracker
 from services.npc_mood_agent import (
     UPDATE_NPC_MOOD_TOOL,
     is_image_unsupported_error,
@@ -322,14 +323,15 @@ class GameRAGService:
                 if (st.faction or "").strip() in skip_factions_for_other
             }
 
-        retrieved_context = await asyncio.to_thread(
-            self._retrieve_context,
-            npc_name,
-            payload.query,
-            retrieve_query,
-            npc_last_message=last_npc_message,
-            forbidden_other_chars=forbidden_other_chars,
-        )
+        async with LatencyTracker("RAG 多路检索") as _lt:
+            retrieved_context = await asyncio.to_thread(
+                self._retrieve_context,
+                npc_name,
+                payload.query,
+                retrieve_query,
+                npc_last_message=last_npc_message,
+                forbidden_other_chars=forbidden_other_chars,
+            )
         player_identity = (
             payload.player_identity.strip()
             if payload.player_identity and payload.player_identity.strip()
@@ -551,6 +553,7 @@ class GameRAGService:
         """使用 LangGraph Supervisor 主图执行 ask（路线三多 Agent 编排）。"""
         from services.agents.graph import get_supervisor_graph
 
+        pipeline_tracker = LatencyTracker.start("多 Agent 管线总耗时 (非流式)")
         graph = await get_supervisor_graph()
         config = self._build_graph_config(payload, npc_manager, memory)
         initial_state: dict[str, Any] = {}
@@ -563,6 +566,8 @@ class GameRAGService:
         delta = result.get("favorability_change", 0)
         favorability = result.get("npc_affinity", 0)
         relationship_level = result.get("npc_relationship_level", "陌生")
+
+        pipeline_tracker.end()
 
         return NPCChatResponse(
             reply=reply,
@@ -769,6 +774,7 @@ class GameRAGService:
         from services.agents.workers import build_query_worker, build_task_worker
 
         config = self._build_graph_config(payload, npc_manager, memory)
+        pipeline_tracker = LatencyTracker.start("多 Agent 管线总耗时 (流式)")
         state: dict[str, Any] = await prepare_context_node({}, config)
 
         emitted_idx = 0
@@ -940,6 +946,7 @@ class GameRAGService:
             done_body["awaiting_confirmation"] = True
             done_body["confirmation_draft_id"] = state.get("confirmation_draft_id") or ""
 
+        pipeline_tracker.end()
         yield ("done", done_body)
 
     async def _ask_stream_legacy(
