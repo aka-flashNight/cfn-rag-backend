@@ -409,6 +409,16 @@ class PostgresBackend:
                 return True
             return False
 
+    # ---- 兼容 MemoryManager API 的方法别名 ----
+
+    async def update_session_title(self, session_id: str, title: str) -> dict:
+        """MemoryManager 兼容方法（等同于 update_title）。"""
+        result = await self.update_title(session_id, title)
+        return {
+            "session_id": result.session_id,
+            "title": result.title,
+        }
+
     async def close(self) -> None:
         if self._engine is not None:
             await self._engine.dispose()

@@ -161,11 +161,14 @@ async def _simulated_content_chunks(
 class GameRAGService:
     """
     游戏世界观 / NPC 知识库 RAG 服务 + 好感度 Agent。
+
+    路线四：支持通过 ``vector_backend`` 参数注入 Qdrant 等外部向量后端。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, vector_backend: Any | None = None) -> None:
         self._index: VectorStoreIndex | None = None
         self._resources_dir: Path = _get_resources_dir()
+        self._vector_backend = vector_backend
 
     def _get_index(self) -> VectorStoreIndex:
         if self._index is None:
@@ -175,6 +178,11 @@ class GameRAGService:
     def invalidate_index(self) -> None:
         """重置或重建向量库后调用，使下次请求使用最新索引。"""
         self._index = None
+
+    @property
+    def vector_backend(self) -> Any | None:
+        """Server profile 下的 QdrantBackend，local 为 None。"""
+        return self._vector_backend
 
     def retrieve_nodes_for_eval(
         self,

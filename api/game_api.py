@@ -1,14 +1,19 @@
 """
 游戏知识库 RAG API，供 Web 端调用。
+
+路线四：Server profile 下自动切换 Postgres / Qdrant / Redis 后端。
 """
 
 import asyncio
 import json
+import logging
 import os
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
+from core.config import get_settings
 from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
     ChatMessage,
@@ -31,6 +36,7 @@ from services.game_rag_service import GameRAGService
 from services.memory_manager import MemoryManager
 from services.npc_manager import NPCManager
 
+logger = logging.getLogger(__name__)
 router: APIRouter = APIRouter()
 
 
@@ -41,14 +47,12 @@ def apply_proxy_config(proxy_url: str | None) -> None:
     - proxy_url 为空或空字符串：清除代理
     """
     if not proxy_url or not proxy_url.strip():
-        # 清除代理配置
         os.environ.pop("HTTP_PROXY", None)
         os.environ.pop("HTTPS_PROXY", None)
         print("[代理] 已清除代理配置")
         return
 
     proxy = proxy_url.strip()
-    # 确保代理地址有 http:// 前缀
     if not proxy.startswith("http://") and not proxy.startswith("https://"):
         proxy = "http://" + proxy
 
@@ -56,29 +60,101 @@ def apply_proxy_config(proxy_url: str | None) -> None:
     os.environ["HTTPS_PROXY"] = proxy
     print(f"[代理] 已设置代理: {proxy}")
 
+
+# ---------------------------------------------------------------------------
+# 单例 + 依赖注入（路线四：profile 感知）
+# ---------------------------------------------------------------------------
+
 _game_rag_service: GameRAGService | None = None
-_memory_manager: MemoryManager | None = None
+_memory_manager: Any = None  # MemoryManager (local) or PostgresBackend (server)
+_server_cache: Any = None    # RedisCache (server), None (local)
 
 
 def get_game_rag_service() -> GameRAGService:
-    """GameRAGService 单例依赖注入。"""
+    """GameRAGService 单例依赖注入（profile 感知向量后端）。"""
     global _game_rag_service
     if _game_rag_service is None:
-        _game_rag_service = GameRAGService()
+        settings = get_settings()
+        if settings.is_server_profile and settings.effective("vector_backend") == "qdrant":
+            from services.storage.qdrant_vector import QdrantBackend
+            vector_backend = QdrantBackend(url=settings.qdrant_url, collection=settings.qdrant_collection)
+            _game_rag_service = GameRAGService(vector_backend=vector_backend)
+        else:
+            _game_rag_service = GameRAGService()
     return _game_rag_service
 
 
-async def get_memory_manager() -> MemoryManager:
-    """MemoryManager 单例依赖注入。"""
+async def get_memory_manager() -> Any:
+    """
+    会话/消息持久化依赖注入（profile 感知）。
+
+    Local  → MemoryManager (SQLite)
+    Server → PostgresBackend (PostgreSQL via asyncpg)
+    """
     global _memory_manager
-    if _memory_manager is None:
+    if _memory_manager is not None:
+        return _memory_manager
+
+    settings = get_settings()
+    if settings.is_server_profile and settings.effective("db_backend") == "postgres":
+        from services.storage.postgres_db import PostgresBackend
+
+        backend = PostgresBackend(url=settings.postgres_url)
+        await backend.init()
+        _memory_manager = backend
+        logger.info("[profile] 使用 PostgresBackend (server)")
+    else:
         _memory_manager = await MemoryManager.create()
+        logger.info("[profile] 使用 MemoryManager (local)")
     return _memory_manager
+
+
+async def get_server_cache() -> Any | None:
+    """Server profile 下返回 RedisCache 实例，local 返回 None。"""
+    global _server_cache
+    if _server_cache is not None:
+        return _server_cache
+
+    settings = get_settings()
+    if settings.use_redis:
+        from services.storage.cache import RedisCache
+        _server_cache = RedisCache(url=settings.redis_url)
+        logger.info("[profile] Redis 缓存已启用")
+    return _server_cache
 
 
 async def get_npc_manager() -> NPCManager:
     """NPCManager 依赖注入。"""
     return await NPCManager.load()
+
+
+# ---------------------------------------------------------------------------
+# 幂等性检查（server profile）
+# ---------------------------------------------------------------------------
+
+async def check_idempotent(request: Request) -> None:
+    """
+    检查 X-Request-Id header 幂等性（仅 server profile）。
+
+    如果请求带有 X-Request-Id，则用 Redis SETNX 防止重复处理。
+    """
+    settings = get_settings()
+    if not settings.use_redis:
+        return
+
+    request_id = request.headers.get("X-Request-Id")
+    if not request_id:
+        return
+
+    cache = await get_server_cache()
+    if cache is None:
+        return
+
+    key = f"req:{request_id}"
+    is_new = await cache.setnx(key, "1", ttl=60)
+    if not is_new:
+        logger.warning("重复请求被拦截: %s", request_id)
+        # 不抛异常，仅记录——幂等由上层业务决定是否拒绝
 
 
 @router.post(
