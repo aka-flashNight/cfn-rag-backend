@@ -316,8 +316,8 @@ class GameRAGService:
         )
         last_npc_message: str | None = None
         for msg in reversed(history_records):
-            if msg.get("role") != "user":
-                last_npc_message = (msg.get("content") or "").strip()
+            if msg.role != "user":
+                last_npc_message = (msg.content or "").strip()
                 break
         # 为「其他 NPC 相关对话参考」准备需要排除的阵营角色（如「彩蛋」「成员」）：
         # 若当前 NPC 自身不属于这些阵营，则从其他 NPC 中筛出这些阵营角色，在后续检索中一律跳过。
@@ -375,7 +375,7 @@ class GameRAGService:
         summary_text = await memory.get_summary(payload.session_id)
         history_lines = []
         for msg in history_records:
-            role, content = msg["role"], msg["content"]
+            role, content = msg.role, msg.content
             prefix = "玩家" if role == "user" else npc_name
             history_lines.append(f"{prefix}: {content}")
         history_str = ""

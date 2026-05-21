@@ -86,10 +86,10 @@ def get_game_rag_service() -> GameRAGService:
 
 async def get_memory_manager() -> Any:
     """
-    会话/消息持久化依赖注入（profile 感知）。
+    会话/消息持久化依赖注入（profile 感知），统一返回 dataclass 接口。
 
-    Local  → MemoryManager (SQLite)
-    Server → PostgresBackend (PostgreSQL via asyncpg)
+    Local  → SqliteBackend（封装 MemoryManager，返回 SessionInfo / ChatMessage）
+    Server → PostgresBackend（返回 SessionInfo / ChatMessage）
     """
     global _memory_manager
     if _memory_manager is not None:
@@ -104,8 +104,11 @@ async def get_memory_manager() -> Any:
         _memory_manager = backend
         logger.info("[profile] 使用 PostgresBackend (server)")
     else:
-        _memory_manager = await MemoryManager.create()
-        logger.info("[profile] 使用 MemoryManager (local)")
+        from services.storage.db import SqliteBackend
+
+        backend = SqliteBackend()
+        _memory_manager = backend
+        logger.info("[profile] 使用 SqliteBackend (local)")
     return _memory_manager
 
 
@@ -316,10 +319,10 @@ async def get_session_history(
     records = await memory.get_history(session_id, limit=limit, offset=offset, order="desc")
     messages: list[ChatMessage] = [
         ChatMessage(
-            id=rec["id"],
-            role=rec["role"],
-            content=rec["content"],
-            timestamp=rec["timestamp"],
+            id=rec.id,
+            role=rec.role,
+            content=rec.content,
+            timestamp=rec.timestamp,
         )
         for rec in records
     ]
@@ -341,10 +344,10 @@ async def list_sessions(
     sessions_raw = await memory.list_sessions()
     sessions: list[SessionInfo] = [
         SessionInfo(
-            session_id=item["session_id"],
-            npc_name=item["npc_name"],
-            title=item["title"],
-            created_at=item["created_at"],
+            session_id=item.session_id,
+            npc_name=item.npc_name,
+            title=item.title,
+            created_at=item.created_at,
         )
         for item in sessions_raw
     ]
@@ -378,10 +381,10 @@ async def create_session(
 
     info = await memory.create_session(npc_name=payload.npc_name, title=payload.title)
     return SessionCreateResponse(
-        session_id=info["session_id"],
-        npc_name=info["npc_name"],
-        title=info["title"],
-        created_at=info["created_at"],
+        session_id=info.session_id,
+        npc_name=info.npc_name,
+        title=info.title,
+        created_at=info.created_at,
     )
 
 
@@ -434,10 +437,10 @@ async def update_session_title(
     from fastapi import HTTPException
 
     try:
-        result = await memory.update_session_title(session_id, payload.title)
+        result = await memory.update_title(session_id, payload.title)
         return SessionTitleUpdateResponse(
-            session_id=result["session_id"],
-            title=result["title"],
+            session_id=result.session_id,
+            title=result.title,
         )
     except ValueError as e:
         if "不存在" in str(e):

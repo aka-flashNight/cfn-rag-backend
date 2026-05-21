@@ -461,8 +461,8 @@ async def prepare_context_node(
 
     last_npc_message: str | None = None
     for msg in reversed(history_records):
-        if msg.get("role") != "user":
-            last_npc_message = (msg.get("content") or "").strip()
+        if msg.role != "user":
+            last_npc_message = (msg.content or "").strip()
             break
 
     all_npc_states = npc_manager.state
@@ -615,7 +615,7 @@ async def prepare_context_node(
     summary_text = await memory.get_summary(payload.session_id)
     history_lines = []
     for msg in history_records:
-        role, content = msg["role"], msg["content"]
+        role, content = msg.role, msg.content
         prefix = "玩家" if role == "user" else npc_name
         history_lines.append(f"{prefix}: {content}")
     history_str = ""

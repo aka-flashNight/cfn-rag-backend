@@ -66,6 +66,16 @@ class LatencyTracker:
         if self._enabled and self._start is not None:
             _emit_latency(self.step_name, time.perf_counter() - self._start)
 
+    def __enter__(self):
+        if self._enabled:
+            self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        if self._enabled and self._start is not None:
+            _emit_latency(self.step_name, time.perf_counter() - self._start)
+        return False
+
     @staticmethod
     def start(step_name: str) -> "LatencyTracker":
         """手动开始计时（返回 tracker，用 .end() 结束）。"""
