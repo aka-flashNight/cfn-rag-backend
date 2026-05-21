@@ -34,3 +34,5 @@ prometheus-fastapi-instrumentator>=7.0
 structlog>=24.1
 # route4: 压测（可选）
 locust>=2.31
+# route5: MCP Server（游戏数据查询与创作辅助）
+fastmcp>=3.0

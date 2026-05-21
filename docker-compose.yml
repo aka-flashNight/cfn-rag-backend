@@ -86,7 +86,7 @@ services:
 
   # ---- Qdrant（向量数据库） ----
   qdrant:
-    image: qdrant/qdrant:v1.9
+    image: qdrant/qdrant:v1.9.0
     container_name: cfn-rag-qdrant
     ports:
       - "6333:6333"

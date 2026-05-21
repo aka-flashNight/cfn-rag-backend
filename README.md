@@ -60,7 +60,7 @@ UserMsg → Supervisor → QueryAgent（查资料 / 知识检索）
 - **QueryAgent**：持有 `search_knowledge / search_items / search_stages` + Skills 元工具，上限 3 轮决策，输出检索结果供下游复用
 - **TaskAgent**：持有 `prepare_task_context → draft_agent_task → update_task_draft → confirm_agent_task / cancel_agent_task` 状态机，上限 4 轮；确认写入前触发 HITL 中断
 - **DialogueAgent**：携带 `update_npc_mood` 单一工具 + `stream=True`，单次流式调用产出最终 NPC 对话
-- **防护机制**：per-agent 调用上限、连续失败黑名单、token 预算熔断器（circuit breaker）、全局 6 轮强制出口——全部硬编码在 `route` 工具 schema 中，不依赖 prompt 自觉
+- **防护机制**：per-agent 调用上限、连续失败黑名单、token 预算熔断器（circuit breaker）、全局 6 轮强制出口——配置在 `route` 工具 schema 中，不依赖 prompt 自觉
 
 ### Tools / Skills 分离 + 渐进式披露
 
@@ -307,7 +307,7 @@ python launcher.py
 
 ### 获取 API Key
 
-本项目需要配置 LLM API Key 才能使用。以下是几种获取免费 API Key 的方式：
+本项目需要配置 LLM API Key 才能使用。如需临时体验，以下是几种获取免费 API Key 的方式：
 
 #### ModelScope 魔搭社区（国内访问稳定，可试用）
 
@@ -563,6 +563,22 @@ cfn-rag-backend/
 ├── launcher.py
 ├── main.py                      # FastAPI 入口 + Prometheus /metrics + structlog
 └── requirements.txt
+```
+
+## MCP Server（游戏数据查询）
+
+项目附带一个 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server（`mcp_server/`），将游戏数据的查询能力以标准协议暴露给 Claude Desktop、Cursor 等 AI 工具。
+
+**提供的功能**：
+- **13 个查询工具**：物品搜索与详情、关卡搜索与掉落查询、合成配方搜索、NPC 商店、任务查询等
+- **9 个数据资源**：以 `game://items/{name}`、`game://stages/{area}` 等 URI 暴露结构化游戏数据
+- **3 个 Prompt 模板**：辅助任务设计和 NPC 对话创作
+
+**使用方式**：
+```bash
+pip install fastmcp
+fastmcp install mcp_server/server.py    # 安装到 Claude Desktop
+fastmcp dev mcp_server/server.py        # MCP Inspector 调试
 ```
 
 ## 打包可执行文件
