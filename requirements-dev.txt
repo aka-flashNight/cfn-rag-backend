@@ -3,9 +3,12 @@
 # 注意：torch 请装 CPU 版，别污染运行时 venv 的体积口径
 
 # 模型导出（scripts/export_onnx_int8.py，一次性执行）
-optimum[onnxruntime]
+# 注：手册建议 optimum 导出，但 optimum 2.x 已拆包且与 transformers 5.x 不兼容，
+# 实际改用 torch.onnx.export 直接导出，无需 optimum
 torch --index-url https://download.pytorch.org/whl/cpu
 transformers
+onnx
+onnxruntime
 
 # 评估（evals/，golden 集与 Ragas 流程）
 ragas>=0.2
