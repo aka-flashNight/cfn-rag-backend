@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import gzip
 import logging
 import pickle
 import re
@@ -46,7 +47,7 @@ def cjk_tokenizer(text: str) -> list[str]:
     return tokens if tokens else [""]
 
 
-BM25_FILE = "bm25.pkl"
+BM25_FILE = "bm25.pkl.gz"
 
 
 class BM25Index:
@@ -214,10 +215,11 @@ class RetrievalEngine:
         )
 
     def _load_or_build_bm25(self, store: VectorStore) -> BM25Index | None:
+        """优先反序列化 gzip 压缩的 bm25.pkl.gz（省 ~4MB 落盘体积），失败则重建并落盘。"""
         bm25_path = self._dir() / BM25_FILE
         if bm25_path.exists():
             try:
-                with bm25_path.open("rb") as f:
+                with gzip.open(bm25_path, "rb") as f:
                     payload = pickle.load(f)
                 if payload.get("fingerprint") == store.fingerprint and payload.get("count") == len(store.nodes):
                     index = payload["bm25"]
@@ -229,10 +231,10 @@ class RetrievalEngine:
             return None
         index = BM25Index(store.nodes)
         try:
-            with bm25_path.open("wb") as f:
+            with gzip.open(bm25_path, "wb") as f:
                 pickle.dump({"fingerprint": store.fingerprint, "count": len(store.nodes), "bm25": index}, f)
         except Exception as exc:
-            logger.warning("bm25.pkl 写盘失败（不影响检索）: %s", exc)
+            logger.warning("bm25.pkl.gz 写盘失败（不影响检索）: %s", exc)
         return index
 
     def _resolve_embedder(self):
@@ -289,7 +291,7 @@ class RetrievalEngine:
 
             picked = [s for s in picked if s.node.id not in picked_ids]
             picked_ids.update(s.node.id for s in picked)
-            setattr(bundle, pool.name, picked)
+            setattr(bundle, _BUNDLE_FIELD_BY_POOL.get(pool.name, pool.name), picked)
 
         return bundle
 
@@ -402,6 +404,13 @@ class RetrievalEngine:
 
 def queries_key_index(queries: dict[str, str], key: str) -> int:
     return list(queries.keys()).index(key)
+
+
+# 池名 → RetrievalBundle 字段名（实体池不进 section，单独承载给实体提示拼装）
+_BUNDLE_FIELD_BY_POOL = {
+    "game_item": "entity_items",
+    "game_stage": "entity_stages",
+}
 
 
 # ---------------------------------------------------------------------------

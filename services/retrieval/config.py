@@ -9,8 +9,8 @@
 
 from __future__ import annotations
 
-# 嵌入批量大小（构建索引与查询共用）
-EMBED_BATCH_SIZE = 64
+# 嵌入批量大小（构建索引与查询共用；本机实测 32 最快 216 条/s vs 64 的 198）
+EMBED_BATCH_SIZE = 32
 
 # RRF 融合常数 k（调研 §4.2 社区共识 k=60；语料 4426 条不在「极小语料 RRF 反噬」区间）
 RRF_K = 60

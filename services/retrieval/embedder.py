@@ -53,7 +53,7 @@ class OnnxEmbedder:
 
         self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
         self._tokenizer.enable_truncation(max_length=MAX_SEQ_LENGTH)
-        self._tokenizer.enable_padding()  # 每批 pad 到最长序列
+        self._tokenizer.no_padding()  # padding 在 _forward 前手工按批内最长做，避免整批被长文档拖到 512
 
         self._session = ort.InferenceSession(
             str(model_path), providers=["CPUExecutionProvider"]
@@ -70,7 +70,11 @@ class OnnxEmbedder:
     # ------------------------------------------------------------------
 
     def encode(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
-        """批量编码 → float32[N, dim]，L2 归一化。顺序与输入严格一致。"""
+        """批量编码 → float32[N, dim]，L2 归一化。顺序与输入严格一致。
+
+        缺失项按 token 长度降序分批（长度相近的文本同批，padding 浪费最小化），
+        结果按原顺序回填；顺序稳定性由 pytest 保证。
+        """
         vecs = np.zeros((len(texts), self.dim), dtype=np.float32)
         cache_hits: dict[int, np.ndarray] = {}
         misses: list[int] = []
@@ -87,14 +91,27 @@ class OnnxEmbedder:
         for i, v in cache_hits.items():
             vecs[i] = v
 
-        for start in range(0, len(misses), batch_size):
-            chunk_idx = misses[start : start + batch_size]
-            chunk_texts = [texts[i] for i in chunk_idx]
-            encoded = self._run_model(chunk_texts)
-            for i, v in zip(chunk_idx, encoded):
-                vecs[i] = v
+        if not misses:
+            return vecs
+
+        encodings = self._tokenizer.encode_batch([texts[i] for i in misses])
+        order = sorted(range(len(misses)), key=lambda k: len(encodings[k].ids), reverse=True)
+        for start in range(0, len(order), batch_size):
+            batch = order[start : start + batch_size]
+            batch_enc = [encodings[k] for k in batch]
+            max_len = max(len(e.ids) for e in batch_enc)
+            n = len(batch_enc)
+            input_ids = np.zeros((n, max_len), dtype=np.int64)
+            attention_mask = np.zeros((n, max_len), dtype=np.int64)
+            for r, e in enumerate(batch_enc):
+                ids = e.ids
+                input_ids[r, : len(ids)] = ids
+                attention_mask[r, : len(ids)] = e.attention_mask
+            result = self._forward(input_ids, attention_mask)
+            for r, k in enumerate(batch):
+                vecs[misses[k]] = result[r]
                 with self._cache_lock:
-                    self._cache[texts[i]] = v
+                    self._cache[texts[misses[k]]] = result[r]
         return vecs
 
     def encode_query(self, text: str) -> np.ndarray:
@@ -106,21 +123,8 @@ class OnnxEmbedder:
         with self._cache_lock:
             self._cache.clear()
 
-    def warmup(self) -> None:
-        """预热一句空文本，触发权重/DLL 加载。"""
-        self.encode([""])
-
-    # ------------------------------------------------------------------
-    # ONNX 前向
-    # ------------------------------------------------------------------
-
-    def _run_model(self, texts: list[str]) -> np.ndarray:
-        encodings = self._tokenizer.encode_batch(texts)
-        import numpy as np
-
-        input_ids = np.asarray([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.asarray([e.attention_mask for e in encodings], dtype=np.int64)
-
+    def _forward(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+        """ONNX 前向 → CLS pooling + L2 归一化（与模型 1_Pooling 配置一致）。"""
         feed: dict[str, np.ndarray] = {}
         for name in self._input_names:
             if name == "input_ids":
@@ -132,14 +136,13 @@ class OnnxEmbedder:
 
         output_name = self._session.get_outputs()[0].name
         result = self._session.run([output_name], feed)[0]
-        return self._cls_pool(result, attention_mask)
-
-    @staticmethod
-    def _cls_pool(last_hidden_state: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-        """CLS pooling + L2 归一化（与模型 1_Pooling 配置一致）。"""
-        vecs = np.asarray(last_hidden_state, dtype=np.float32)[:, 0, :]
+        vecs = np.asarray(result, dtype=np.float32)[:, 0, :]
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         return vecs / np.clip(norms, 1e-12, None)
+
+    def warmup(self) -> None:
+        """预热一句空文本，触发权重/DLL 加载。"""
+        self.encode([""])
 
 
 _DEFAULT_EMBEDDER: OnnxEmbedder | None = None

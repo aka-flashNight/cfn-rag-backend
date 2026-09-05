@@ -144,7 +144,7 @@ class VectorStore:
         nodes: list[Node],
         embedder,  # services.retrieval.embedder.OnnxEmbedder（鸭子类型，便于测试注入）
         expected_fingerprint: str,
-        batch_size: int = 64,
+        batch_size: int = 32,
     ) -> "VectorStore":
         """全量构建（4426 条 ONNX int8 预计 ≤25s）。"""
         if not nodes:
