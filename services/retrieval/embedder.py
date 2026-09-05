@@ -30,7 +30,8 @@ def get_model_dir() -> Path:
     if getattr(sys, "frozen", False):
         base_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     else:
-        base_dir = Path(__file__).resolve().parent.parent
+        # services/retrieval/embedder.py → 项目根
+        base_dir = Path(__file__).resolve().parent.parent.parent
     return base_dir / DEFAULT_MODEL_SUBDIR
 
 

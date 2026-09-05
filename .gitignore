@@ -107,3 +107,6 @@ illustration.zip
 release_notes_*.md
 
 .cursor
+# v3: ONNX 导出产物（由 scripts/export_onnx_int8.py 本地生成）
+models/*/model.onnx
+models/_export_onnx_tmp/

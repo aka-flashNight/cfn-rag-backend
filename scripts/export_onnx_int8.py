@@ -1,7 +1,9 @@
 """把 models/bge-small-zh-v1.5 导出为 ONNX 并动态 int8 量化（开发机一次性执行）。
 
 流程（对应 docs/v3-developer/04-检索与向量模型.md §1.2）：
- 1. optimum 导出 fp32 ONNX（task=feature-extraction，输出 last_hidden_state）
+ 1. torch.onnx.export 导出 fp32 ONNX（BERT 特征提取，输出 last_hidden_state）
+    （手册建议 optimum 导出，但 optimum 2.x 已拆包且与 transformers 5.x 兼容性差，
+     改用 torch.onnx.export 直接导出，产物等价、少一个重依赖）
  2. onnxruntime.quantization.quant_dynamic（weight_type=QInt8）→ model.onnx（int8）
  3. 拷贝 tokenizer 文件（运行时只需要 tokenizers 库可读的文件）
  4. 校验：随机 50 句，int8 与 fp32 输出（CLS pooling + L2 归一化）余弦相似度均值 ≥ 0.99
@@ -11,7 +13,7 @@
     .\\venv\\Scripts\\Activate.ps1
     python scripts/export_onnx_int8.py
 
-依赖（仅 requirements-dev.txt，不进运行时）：torch(cpu)、transformers、optimum[onnxruntime]、onnxruntime。
+依赖（仅 requirements-dev.txt，不进运行时）：torch(cpu)、transformers、onnx、onnxruntime。
 """
 
 from __future__ import annotations
@@ -114,30 +116,68 @@ def main() -> int:
 
     import numpy as np
     import onnxruntime as ort
+    import torch
     from onnxruntime.quantization import QuantType, quantize_dynamic
-    from optimum.onnxruntime import ORTModelForFeatureExtraction
-    from transformers import AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
 
     print(f"[导出] 源模型: {SRC_MODEL_DIR}")
     if WORK_DIR.exists():
         shutil.rmtree(WORK_DIR)
     WORK_DIR.mkdir(parents=True)
 
-    # 1. optimum 导出 fp32 ONNX
-    print("[导出] 步骤 1/4: 导出 fp32 ONNX（optimum, task=feature-extraction）...")
-    fp32_model = ORTModelForFeatureExtraction.from_pretrained(
-        str(SRC_MODEL_DIR), export=True
-    )
+    # 1. torch.onnx.export 导出 fp32 ONNX（BERT 特征提取）
+    print("[导出] 步骤 1/4: 导出 fp32 ONNX（torch.onnx.export, opset 17）...")
+    torch_model = AutoModel.from_pretrained(str(SRC_MODEL_DIR))
+    torch_model.eval()
+
+    class _FeatureExtractor(torch.nn.Module):
+        """关键字传参包装（transformers 5.x forward 不接受位置实参），只输出 last_hidden_state。"""
+
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, input_ids, attention_mask, token_type_ids):
+            out = self.model(
+                input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids
+            )
+            return out.last_hidden_state,
+
+    wrapper = _FeatureExtractor(torch_model)
     fp32_dir = WORK_DIR / "fp32"
-    fp32_model.save_pretrained(str(fp32_dir))
+    fp32_dir.mkdir(parents=True)
     fp32_onnx = fp32_dir / "model.onnx"
+
+    dummy_ids = torch.ones(1, 8, dtype=torch.int64)
+    dummy_mask = torch.ones(1, 8, dtype=torch.int64)
+    dummy_types = torch.zeros(1, 8, dtype=torch.int64)
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (dummy_ids, dummy_mask, dummy_types),
+            str(fp32_onnx),
+            input_names=["input_ids", "attention_mask", "token_type_ids"],
+            output_names=["last_hidden_state"],
+            dynamic_axes={
+                "input_ids": {0: "batch", 1: "seq"},
+                "attention_mask": {0: "batch", 1: "seq"},
+                "token_type_ids": {0: "batch", 1: "seq"},
+                "last_hidden_state": {0: "batch", 1: "seq"},
+            },
+            opset_version=17,
+            do_constant_folding=True,
+            dynamo=False,  # torch 2.10 默认 dynamo 导出器会把权重写外部文件，改用自包含的 TorchScript 导出器
+        )
     if not fp32_onnx.exists():
         print(f"[导出] 失败：未找到导出的 fp32 ONNX: {fp32_onnx}")
         return 1
     print(f"[导出] fp32 ONNX 大小: {fp32_onnx.stat().st_size / 1024 / 1024:.1f} MB")
 
     # 2. 动态 int8 量化
-    print("[导出] 步骤 2/4: 动态 int8 量化（quantize_dynamic, QInt8）...")
+    # 注意：默认会把 Embedding(Gather) 的词嵌入表一并量化，实测余弦掉到 ~0.964；
+    # 只量化 MatMul/Gemm（Linear 层，即 torch 动态量化同款范围），词嵌入表保持 fp32，
+    # 余弦 ≥0.99 达标（调研 02 §7.3：嵌入表 int8 是 bge 质量损失的主因）。
+    print("[导出] 步骤 2/4: 动态 int8 量化（quantize_dynamic, QInt8, MatMul/Gemm, per_channel）...")
     int8_dir = WORK_DIR / "int8"
     int8_dir.mkdir(parents=True)
     int8_onnx = int8_dir / "model.onnx"
@@ -145,6 +185,8 @@ def main() -> int:
         model_input=str(fp32_onnx),
         model_output=str(int8_onnx),
         weight_type=QuantType.QInt8,
+        op_types_to_quantize=["MatMul", "Gemm"],
+        per_channel=True,
     )
     print(f"[导出] int8 ONNX 大小: {int8_onnx.stat().st_size / 1024 / 1024:.1f} MB")
 
