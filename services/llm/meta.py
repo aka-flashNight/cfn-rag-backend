@@ -184,7 +184,8 @@ async def split_meta_events(
         obj = _try_parse_first_line(buffer)
         if obj is not None and _passes_meta_schema(obj, npc_emotions):
             return _finish(held_events, parse_meta_obj(obj, npc_emotions) or Meta())
-        return _finish([*held_events, StreamEvent(kind="content", text=buffer)], Meta())
+        # 缓冲正文必须排在 held usage/finish 之前，否则下游「finish 即终止」的转发会丢正文
+        return _finish([StreamEvent(kind="content", text=buffer), *held_events], Meta())
     return _finish(held_events, Meta())
 
 
