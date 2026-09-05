@@ -1,147 +1,118 @@
-"""
-后端启动初始化模块
+"""后端启动初始化（core/startup.py 重写，对应 docs/v3-developer/06 §2）。
 
-统一管理所有需要在后端启动时执行的初始化任务：
-1. 加载嵌入模型（异步后台加载）
-2. 检查并生成 NPC 状态数据库
-3. 初始化数据库
+启动序列（重型任务全部并行 gather，print 改 logging，local 也输出到控制台 + cfn-rag.log）：
+├─ OnnxEmbedder 预载 + 预热              (~0.5s)
+├─ VectorStore.load（指纹匹配则 <1s）     │ 不匹配 → 后台构建 ≤25s，期间检索降级（空 bundle）
+├─ GameDataRegistry 加载
+├─ NPCManager 加载
+├─ 任务文件 ensure（agent_tasks/agent_text/list.xml 注册，沿用现逻辑）
+└─ 摘要 worker 启动
+
+目标：索引已建时从进程启动到 /api/ask 可服务 ≤ 5s（不含 exe 自解压）。
+已删除：立绘包解压任务、SWF/FFDec 预处理、npc_state_db 脚本生成链
+（保留 backup 复制；缺失时由 NPCManager 从对话数据兜底生成）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
+import logging
 import re
 import shutil
 import sys
-import zipfile
+import time
 from pathlib import Path
 from typing import Any
 
 from services.game_data.paths import find_resources_directory
 
-# 模型加载状态
-_EMBED_MODEL_LOADING = False
-_EMBED_MODEL_LOADED = False
-_EMBED_MODEL_LOAD_TASK: asyncio.Task | None = None
+logger = logging.getLogger(__name__)
 
-# 索引构建状态
-_INDEX_BUILT = False
-_INDEX_BUILDING = False
-
-# 立绘预处理状态
-_PORTRAITS_CHECKED = False
+_LOG_FILE_NAME = "cfn-rag.log"
 
 
-def get_npc_state_db_path() -> Path:
-    """
-    获取 npc_state_db.json 的路径
-    """
-    # 获取 resources 目录
-    resources_dir = _get_resources_dir()
-    return resources_dir / "data" / "rag" / "npc_state_db.json"
+def setup_logging() -> None:
+    """本地路线日志：控制台 + 项目根 cfn-rag.log（幂等，重复调用不叠加 handler）。"""
+    root = logging.getLogger()
+    if getattr(root, "_cfn_logging_configured", False):
+        return
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    log_path = Path(__file__).resolve().parent.parent / _LOG_FILE_NAME
+    try:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError:
+        root.warning("日志文件不可写，仅输出到控制台: %s", log_path)
+
+    root._cfn_logging_configured = True  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# 任务文件 ensure（agent_tasks / agent_text / list.xml 注册，沿用现逻辑）
+# ---------------------------------------------------------------------------
 
 def _get_backup_resources_dir() -> Path:
-    """
-    获取内置备份目录 `backup_resources` 的位置（与 `backup_resources/data/...` 下三份 JSON 对应）。
-
-    - PyInstaller：datas 解压到 sys._MEIPASS，优先使用 `_MEIPASS/backup_resources`
-    - 其次：exe 同目录下的 `backup_resources`（便于你手动放置覆盖）
-    - 开发环境：项目根目录 `cfn-rag-backend/backup_resources`
-    """
+    """内置备份目录 backup_resources（PyInstaller / exe 同级 / 开发项目根）。"""
     if getattr(sys, "frozen", False):
         if hasattr(sys, "_MEIPASS"):
             meipass_backup = Path(sys._MEIPASS) / "backup_resources"
             if meipass_backup.is_dir():
                 return meipass_backup
-        exe_side = Path(sys.executable).parent / "backup_resources"
-        if exe_side.is_dir():
-            return exe_side
-        # 仍返回 exe 侧路径，便于 _copy_backup_file_if_missing 统一判断 .exists()
         return Path(sys.executable).parent / "backup_resources"
     return Path(__file__).resolve().parent.parent / "backup_resources"
 
 
-def _copy_backup_file_if_missing(
-    *,
-    target_path: Path,
-    backup_rel_path: Path,
-) -> bool:
-    """
-    若 target_path 不存在，则尝试从 backup_rel_path 复制到 target_path。
-    """
+def _copy_backup_file_if_missing(*, target_path: Path, backup_rel_path: Path) -> bool:
+    """若 target 不存在则从 backup 复制（保留 backup 复制本身，逻辑简化）。"""
     if target_path.exists():
         return False
-
     backup_path = _get_backup_resources_dir() / backup_rel_path
     if not backup_path.exists():
         return False
-
     target_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(backup_path), str(target_path))
-    print(f"[初始化] 已从备份复制: {backup_path} -> {target_path}")
+    logger.info("已从备份复制: %s -> %s", backup_path, target_path)
     return True
 
 
-def _ensure_json_file(
-    *,
-    target_path: Path,
-    default_obj: Any,
-    backup_rel_path: Path,
-) -> None:
-    """
-    确保某 JSON 文件存在：
-    1) 目标存在则跳过
-    2) 目标不存在则优先从备份复制
-    3) 备份也不存在则写入最小骨架
-    """
+def _ensure_json_file(*, target_path: Path, default_obj: Any, backup_rel_path: Path) -> None:
+    """确保 JSON 文件存在：目标优先 → 备份 → 最小骨架。"""
     if target_path.exists():
         return
-
     if _copy_backup_file_if_missing(target_path=target_path, backup_rel_path=backup_rel_path):
         return
-
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(
-        json.dumps(default_obj, ensure_ascii=False, indent=1),
-        encoding="utf-8",
-    )
-    print(f"[初始化] 已创建默认 JSON 文件: {target_path}")
+    target_path.write_text(json.dumps(default_obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    logger.info("已创建默认 JSON 文件: %s", target_path)
 
 
-def _ensure_xml_entry(
-    *,
-    list_xml_path: Path,
-    tag: str,
-    value: str,
-) -> None:
-    """
-    若 list.xml 中缺失 `<tag>value</tag>`，只在文件末尾的 `</root>` 前插入一行，避免改动其它内容。
-    """
+def _ensure_xml_entry(*, list_xml_path: Path, tag: str, value: str) -> None:
+    """若 list.xml 缺失 `<tag>value</tag>`，只在 `</root>` 前插入一行。"""
     if not list_xml_path.exists():
-        print(f"[初始化] 未找到 XML 列表文件，跳过修复: {list_xml_path}")
+        logger.warning("未找到 XML 列表文件，跳过修复: %s", list_xml_path)
         return
-
     try:
         raw = list_xml_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        print(f"[初始化] 读取 XML 失败，跳过修复: {list_xml_path}, err={e}")
+    except OSError as exc:
+        logger.warning("读取 XML 失败，跳过修复: %s, err=%s", list_xml_path, exc)
         return
 
-    # 允许 `<tag> value </tag>` 中间有空白
     if re.search(rf"<{re.escape(tag)}>\s*{re.escape(value)}\s*</{re.escape(tag)}>", raw):
         return
 
     newline = "\r\n" if "\r\n" in raw else "\n"
-
-    # 尽量复用已有条目的缩进
     indent = "  "
     m = re.search(rf"^(?P<indent>\s*)<{re.escape(tag)}>\s*.+?\s*</{re.escape(tag)}>\s*$", raw, flags=re.M)
     if m:
         indent = m.group("indent") or indent
-
     insertion_line = f"{indent}<{tag}>{value}</{tag}>"
     close_idx = raw.rfind("</root>")
     if close_idx != -1:
@@ -150,458 +121,143 @@ def _ensure_xml_entry(
         raw_new = before + newline + insertion_line + newline + after
     else:
         raw_new = raw.rstrip("\r\n") + newline + insertion_line + newline
-
     try:
         list_xml_path.write_text(raw_new, encoding="utf-8")
-        print(f"[初始化] 已修复 XML 列表条目: {list_xml_path} -> {insertion_line}")
-    except Exception as e:
-        print(f"[初始化] 写入 XML 修复失败，跳过: {list_xml_path}, err={e}")
+        logger.info("已修复 XML 列表条目: %s -> %s", list_xml_path, insertion_line)
+    except OSError as exc:
+        logger.warning("写入 XML 修复失败，跳过: %s, err=%s", list_xml_path, exc)
 
 
 def ensure_task_agent_files_and_lists() -> None:
-    """
-    启动时确保：
-    - `resources/data/task/agent_tasks.json` 与 `resources/data/task/text/agent_text.json` 存在
-    - `resources/data/task/list.xml` 中包含 `<task>agent_tasks.json</task>`
-    - `resources/data/task/text/list.xml` 中包含 `<text>agent_text.json</text>`
-
-    目的：保证后续 NPC 状态生成与任务/文本注册逻辑的输入齐全。
-    """
-    resources_dir = _get_resources_dir()
+    """确保 Agent 生成类任务所需文件与 list.xml 注册项齐全。"""
+    resources_dir = find_resources_directory()
     task_root = resources_dir / "data" / "task"
-    task_list_xml = task_root / "list.xml"
     task_text_root = task_root / "text"
-    task_text_list_xml = task_text_root / "list.xml"
-
-    agent_tasks_path = task_root / "agent_tasks.json"
-    agent_text_path = task_text_root / "agent_text.json"
 
     _ensure_json_file(
-        target_path=agent_tasks_path,
+        target_path=task_root / "agent_tasks.json",
         default_obj={"tasks": []},
         backup_rel_path=Path("data") / "task" / "agent_tasks.json",
     )
     _ensure_json_file(
-        target_path=agent_text_path,
+        target_path=task_text_root / "agent_text.json",
         default_obj={},
         backup_rel_path=Path("data") / "task" / "text" / "agent_text.json",
     )
-
-    _ensure_xml_entry(list_xml_path=task_list_xml, tag="task", value="agent_tasks.json")
     _ensure_xml_entry(
-        list_xml_path=task_text_list_xml,
-        tag="text",
-        value="agent_text.json",
+        list_xml_path=task_root / "list.xml", tag="task", value="agent_tasks.json"
     )
-
-
-def _get_resources_dir() -> Path:
-    """游戏资源根目录（resources 或 CrazyFlashNight）。"""
-    return find_resources_directory()
-
-
-def _get_portraits_dir() -> Path:
-    """
-    获取 resources/flashswf/portraits 目录路径。
-    """
-    resources_dir = _get_resources_dir()
-    portraits_dir = resources_dir / "flashswf" / "portraits"
-    return portraits_dir
-
-
-def _has_valid_illustrations() -> bool:
-    """
-    检查是否已经存在至少一张符合命名规则的立绘：
-    <NPC名>#<情绪>.png 或 .webp
-    """
-    try:
-        portraits_dir = _get_portraits_dir()
-        illustration_dir = portraits_dir / "illustration"
-        if not illustration_dir.exists():
-            return False
-
-        # 简单判定：存在任何包含 '#' 的 png 或 webp 文件即可视为已初始化
-        for pattern in ("*.png", "*.webp"):
-            for p in illustration_dir.glob(pattern):
-                if "#" in p.stem:
-                    return True
-        return False
-    except Exception as e:
-        print(f"[初始化] 检查立绘时出错，将在后续重试: {e}")
-        return False
-
-
-def _has_java() -> bool:
-    """
-    检测当前环境是否可用 Java（JRE 即可）。
-    FFDec 的 .jar 与 .exe 均依赖 Java 运行，立绘解压前需通过此检查。
-    """
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=10,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
-
-
-def _get_exe_or_project_dir() -> Path:
-    """打包后为 exe 所在目录，开发环境为项目根目录。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _extract_illustration_zip_if_present() -> None:
-    """
-    若与 exe/项目同目录存在 illustration.zip，则解压到
-    resources/flashswf/portraits/illustration（覆盖）。不检查 Java，解压很快。
-    """
-    base = _get_exe_or_project_dir()
-    zip_path = base / "illustration.zip"
-    if not zip_path.is_file():
-        return
-    target_dir = find_resources_directory() / "flashswf" / "portraits" / "illustration"
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        # 使用默认编码（UTF-8）：请用 UTF-8 制作 illustration.zip，避免解压后文件名乱码
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(target_dir)
-        print(f"[初始化] 已从 illustration.zip 解压立绘到 {target_dir}")
-    except Exception as e:
-        print(f"[初始化] illustration.zip 解压失败: {e}")
-
-
-def _get_ffdec_path(project_root: Path) -> Path | None:
-    """
-    从 tools 目录获取 FFDec 命令行工具路径。仅使用完整版 JAR（exe 为启动器，不需放入）。
-
-    优先顺序：
-    1) ffdec.jar（推荐：从官方 ZIP 解压的完整 JAR）
-    2) 任意 ffdec_<版本>.jar（如 ffdec_25.1.3.jar）
-
-    下载：https://github.com/jindrapetrik/jpexs-decompiler/releases
-    解压 ffdec_*.zip，将包内的 ffdec.jar 或 ffdec_<版本>.jar 放入 tools 即可。
-    """
-    tools_dir = project_root / "tools"
-    if not tools_dir.exists():
-        return None
-
-    full_jar = tools_dir / "ffdec.jar"
-    if full_jar.exists():
-        return full_jar
-    for p in sorted(tools_dir.glob("ffdec_*.jar")):
-        return p
-    return None
-
-
-def _run_portraits_extraction_blocking() -> None:
-    """
-    在后台线程中执行 SWF 立绘预处理脚本（阻塞当前线程，但由线程池执行）。
-
-    触发条件：
-      - tools 下存在 ffdec.jar 或 ffdec_<版本>.jar
-      - 当前环境有可用 Java（FFDec 依赖 JRE）
-      - 尚未检测到任何有效立绘 PNG
-    """
-    global _PORTRAITS_CHECKED
-
-    if _PORTRAITS_CHECKED:
-        return
-
-    _PORTRAITS_CHECKED = True
-
-    # 如果已经有立绘，直接返回
-    if _has_valid_illustrations():
-        print("[初始化] 已检测到立绘资源，跳过 SWF 预处理。")
-        return
-
-    project_root = Path(__file__).resolve().parent.parent
-    tools_ffdec = _get_ffdec_path(project_root)
-
-    if tools_ffdec is None:
-        print(
-            "[初始化] 未找到 FFDec 命令行工具，跳过 SWF 立绘预处理。\n"
-            "        请将 ffdec-cli.exe 或 ffdec-cli.jar 放到项目 tools 目录下。"
-        )
-        return
-
-    if not _has_java():
-        print(
-            "[初始化] 未检测到 Java 环境，跳过 SWF 立绘预处理。\n"
-            "        FFDec 需要 JRE，请安装 Java 后将 java 加入 PATH，或配置 JAVA_HOME。"
-        )
-        return
-
-    script_path = project_root / "scripts" / "extract_portraits_from_swf.py"
-    if not script_path.exists():
-        print(f"[初始化] 未找到立绘预处理脚本: {script_path}，跳过。")
-        return
-
-    print(
-        "[初始化] 检测到缺失立绘，正在后台执行 SWF 立绘预处理脚本，"
-        "该过程可能需要数十秒到数分钟，请耐心等待。"
+    _ensure_xml_entry(
+        list_xml_path=task_text_root / "list.xml", tag="text", value="agent_text.json"
     )
-
-    # 直接以当前 Python 解释器调用脚本，继承环境变量（包括 CFN_RESOURCES_DIR）
-    import subprocess
-
-    try:
-        cmd = [
-            sys.executable,
-            str(script_path),
-            "--ffdec-path",
-            str(tools_ffdec),
-            "--webp",
-        ]
-        # 在独立进程中阻塞执行；由于调用发生在线程池，不会阻塞事件循环
-        completed = subprocess.run(
-            cmd,
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-        if completed.returncode == 0:
-            print("[初始化] SWF 立绘预处理完成 ✓")
-        else:
-            print(
-                "[初始化] SWF 立绘预处理失败，脚本返回非零退出码。\n"
-                f"命令: {' '.join(cmd)}\n"
-                f"stdout:\n{completed.stdout}\n"
-                f"stderr:\n{completed.stderr}"
-            )
-    except Exception as e:
-        print(f"[初始化] 执行 SWF 立绘预处理脚本时出现异常: {e}")
 
 
 def ensure_npc_state_db() -> bool:
-    """
-    检查 npc_state_db.json 是否存在，如果不存在则执行更新脚本。
+    """npc_state_db.json：存在跳过 → backup 复制 → （缺失时 NPCManager 从对话数据兜底）。"""
+    from services.npc.manager import get_npc_state_path
 
-    Returns:
-        True 表示文件已存在或成功创建，False 表示创建失败
-    """
-    npc_state_path = get_npc_state_db_path()
-
-    if npc_state_path.exists():
-        print(f"[初始化] NPC 状态数据库已存在: {npc_state_path}")
+    path = get_npc_state_path()
+    if path.exists():
         return True
-
-    # 优先从打包内置备份恢复，避免直接跑较慢的扫描生成逻辑
     if _copy_backup_file_if_missing(
-        target_path=npc_state_path,
-        backup_rel_path=Path("data") / "rag" / "npc_state_db.json",
+        target_path=path, backup_rel_path=Path("data") / "rag" / "npc_state_db.json"
     ):
         return True
-
-    print(f"[初始化] NPC 状态数据库不存在，正在生成: {npc_state_path}")
-
-    # 执行更新脚本
-    try:
-        # 动态导入并执行脚本
-        from scripts.update_npc_state import main as update_npc_state_main
-        update_npc_state_main()
-        print("[初始化] NPC 状态数据库生成完成 ✓")
-        return True
-    except Exception as e:
-        print(f"[初始化] NPC 状态数据库生成失败: {e}")
-        return False
+    logger.warning("npc_state_db.json 不存在，将由 NPCManager 从对话数据初始化: %s", path)
+    return False
 
 
-async def preload_embed_model_async() -> None:
-    """
-    异步预加载嵌入模型。
+# ---------------------------------------------------------------------------
+# 并行初始化子任务
+# ---------------------------------------------------------------------------
 
-    这个函数会在后台线程中加载模型，避免阻塞主线程。
-    """
-    global _EMBED_MODEL_LOADED, _EMBED_MODEL_LOADING
+async def _init_retrieval() -> None:
+    """embedder 预载 + 预热 → 向量库加载（指纹不匹配则后台构建，期间检索降级）。"""
+    t0 = time.perf_counter()
+    from services.retrieval.embedder import get_default_embedder
+    from services.retrieval.hybrid import get_retrieval_engine
+    from services.retrieval.loader import compute_corpus_fingerprint, load_corpus
 
-    if _EMBED_MODEL_LOADED or _EMBED_MODEL_LOADING:
-        return
+    def _load_sync() -> tuple[bool, str]:
+        embedder = get_default_embedder()
+        embedder.warmup()
+        engine = get_retrieval_engine()
+        fingerprint = compute_corpus_fingerprint()
+        return engine.try_load(fingerprint), fingerprint
 
-    _EMBED_MODEL_LOADING = True
-    print("[初始化] 正在后台加载嵌入模型...")
+    loaded, fingerprint = await asyncio.to_thread(_load_sync)
+    logger.info("检索初始化: embedder 就绪，向量库%s（%.2fs）",
+                "已加载" if loaded else "未命中（后台构建中）", time.perf_counter() - t0)
 
-    def _load_model():
-        from ai_engine.game_data_loader import ensure_embed_model
-        ensure_embed_model(offline=True)
-        # 触发模型权重加载（通过创建一个简单的嵌入）
-        from llama_index.core import Settings
-        if Settings.embed_model is not None:
-            # 简单的预热：对空字符串进行嵌入
-            Settings.embed_model.get_text_embedding("")
+    if not loaded:
+        engine = get_retrieval_engine()
 
-    try:
-        await asyncio.to_thread(_load_model)
-        _EMBED_MODEL_LOADED = True
-        print("[初始化] 嵌入模型加载完成 ✓")
-    except Exception as e:
-        print(f"[初始化] 嵌入模型加载失败: {e}")
-    finally:
-        _EMBED_MODEL_LOADING = False
+        async def _build() -> None:
+            try:
+                nodes = await asyncio.to_thread(load_corpus)
+                await asyncio.to_thread(engine.build_store, nodes, fingerprint)
+                logger.info("向量库后台构建完成（%d 条）", len(nodes))
+            except Exception as exc:
+                logger.error("向量库后台构建失败（首次请求前可重试）: %s", exc)
 
-
-def start_embed_model_preload() -> asyncio.Task | None:
-    """
-    启动嵌入模型的异步预加载任务。
-
-    Returns:
-        返回创建的 asyncio Task，如果已经在加载或已加载完成则返回 None
-    """
-    global _EMBED_MODEL_LOAD_TASK, _EMBED_MODEL_LOADING, _EMBED_MODEL_LOADED
-
-    if _EMBED_MODEL_LOADED or _EMBED_MODEL_LOADING:
-        return None
-
-    # 尝试获取现有的事件循环
-    try:
-        loop = asyncio.get_running_loop()
-        _EMBED_MODEL_LOAD_TASK = loop.create_task(preload_embed_model_async())
-        return _EMBED_MODEL_LOAD_TASK
-    except RuntimeError:
-        # 没有运行中的事件循环，将在后续调用时加载
-        print("[初始化] 没有运行中的事件循环，模型将在首次请求时加载")
-        return None
+        asyncio.create_task(_build())
 
 
-def is_embed_model_loaded() -> bool:
-    """
-    检查嵌入模型是否已加载完成
-    """
-    return _EMBED_MODEL_LOADED
+async def _init_npc_manager() -> None:
+    from services.npc.manager import NPCManager, set_npc_manager
+
+    manager = await NPCManager.load()
+    set_npc_manager(manager)
+    state_count = len(await manager.all_states())
+    logger.info("NPC 状态库加载完成（%d 个 NPC）", state_count)
 
 
-def is_embed_model_loading() -> bool:
-    """
-    检查嵌入模型是否正在加载中
-    """
-    return _EMBED_MODEL_LOADING
+async def _init_memory_and_summary() -> None:
+    from services.memory.store import MemoryStore, set_memory_store
+    from services.memory.summarize import SummaryWorker, set_summary_worker
+
+    store = MemoryStore()
+    set_memory_store(store)
+    worker = SummaryWorker(store)
+    worker.start()
+    set_summary_worker(worker)
+    logger.info("会话存储（SQLite/WAL）就绪，摘要 worker 已启动")
 
 
-async def ensure_embed_model_ready() -> None:
-    """
-    确保嵌入模型已加载完成。
+async def _init_game_data() -> None:
+    def _load() -> None:
+        from services.game_data.registry import init_game_data_registry
 
-    如果模型正在加载中，等待加载完成；
-    如果模型未开始加载，立即开始加载并等待完成。
-
-    注意：此方法会阻塞，适用于需要使用模型的接口（如 ask）。
-    """
-    global _EMBED_MODEL_LOAD_TASK
-
-    if _EMBED_MODEL_LOADED:
-        return
-
-    if _EMBED_MODEL_LOADING and _EMBED_MODEL_LOAD_TASK is not None:
-        # 等待现有加载任务完成
-        await _EMBED_MODEL_LOAD_TASK
-        return
-
-    # 启动新的加载任务并等待
-    await preload_embed_model_async()
-
-
-async def trigger_embed_model_preload() -> None:
-    """
-    触发嵌入模型预加载，但不等待加载完成。
-
-    适用于前端初始化接口（如 /sessions），只触发加载，不阻塞返回。
-    """
-    if _EMBED_MODEL_LOADED or _EMBED_MODEL_LOADING:
-        return
-
-    start_embed_model_preload()
-
-
-async def _preload_index_async() -> None:
-    """
-    在嵌入模型加载完成后，异步构建知识库向量索引。
-    """
-    global _INDEX_BUILT, _INDEX_BUILDING
-
-    if _INDEX_BUILT or _INDEX_BUILDING:
-        return
-
-    _INDEX_BUILDING = True
-    print("[初始化] 正在后台加载或构建知识库索引（存在则从 resources/tools/vector_index 加载）...")
-
-    def _build():
-        from ai_engine.game_data_loader import get_cached_index
-        get_cached_index()
+        init_game_data_registry()
 
     try:
-        await asyncio.to_thread(_build)
-        _INDEX_BUILT = True
-        print("[初始化] 知识库索引构建完成 ✓")
-    except Exception as e:
-        print(f"[初始化] 知识库索引构建失败（将在首次请求时重试）: {e}")
-    finally:
-        _INDEX_BUILDING = False
+        await asyncio.to_thread(_load)
+        logger.info("GameDataRegistry 加载完成")
+    except Exception as exc:
+        logger.error("GameDataRegistry 加载失败（将在首次使用时重试）: %s", exc)
 
 
-def is_index_built() -> bool:
-    return _INDEX_BUILT
-
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
 
 async def run_startup_tasks() -> None:
-    """
-    执行所有启动初始化任务（全部非阻塞）。
+    """执行所有启动初始化任务：快速文件任务同步做，重型任务并行 gather。"""
+    setup_logging()
+    t0 = time.perf_counter()
+    logger.info("=" * 50)
+    logger.info("开始执行后端启动任务...")
 
-    所有重型任务均在后台执行，不阻塞 uvicorn 接受连接。
-    这样前端可以在后端初始化完成之前就正常访问轻量接口（如会话列表）。
-    """
-    print("\n" + "=" * 50)
-    print("[初始化] 开始执行后端启动任务...")
-    print("=" * 50)
-
-    # 0. 修复/补齐 Agent 生成类任务所需文件（避免 list.xml 缺项导致下游生成/注册失败）
+    # 快速任务：任务文件 ensure + npc_state backup 复制（主线程，毫秒级）
     ensure_task_agent_files_and_lists()
+    ensure_npc_state_db()
 
-    # 0-b. 尽量在主线程快速恢复 NPC 状态库（避免首个请求前被其它逻辑创建空文件）
-    _copy_backup_file_if_missing(
-        target_path=get_npc_state_db_path(),
-        backup_rel_path=Path("data") / "rag" / "npc_state_db.json",
+    await asyncio.gather(
+        _init_retrieval(),
+        _init_npc_manager(),
+        _init_memory_and_summary(),
+        _init_game_data(),
     )
 
-    # 1. 在后台线程中检查/生成 NPC 状态数据库（不阻塞服务器启动）
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, ensure_npc_state_db)
-
-    # 1-b. 若存在 illustration.zip 则后台解压到 resources/.../illustration（不检查 Java）
-    loop.run_in_executor(None, _extract_illustration_zip_if_present)
-
-    # 2. 初始化数据库（MemoryManager.create 会在首次请求时自动创建）
-    print("[初始化] 数据库将在首次请求时自动初始化...")
-
-    # 3. 链式后台预加载：嵌入模型 → 知识库索引
-    async def _chained_preload():
-        await preload_embed_model_async()
-        if _EMBED_MODEL_LOADED:
-            await _preload_index_async()
-
-    loop.create_task(_chained_preload())
-
-    # 4. 后台加载静态游戏数据（Items/Tasks/Stages/Shops/Crafting）
-    def _load_game_data():
-        try:
-            from services.game_data.registry import init_game_data_registry
-
-            init_game_data_registry()
-            print("[初始化] GameDataRegistry 加载完成 ✓")
-        except Exception as e:
-            print(f"[初始化] GameDataRegistry 加载失败（将在首次使用时重试）: {e}")
-
-    loop.run_in_executor(None, _load_game_data)
-
-    print("=" * 50)
-    print("[初始化] 所有启动任务已提交到后台，服务器即将就绪...")
-    print("=" * 50 + "\n")
-
+    logger.info("所有启动任务完成（%.2fs），服务就绪", time.perf_counter() - t0)
+    logger.info("=" * 50)

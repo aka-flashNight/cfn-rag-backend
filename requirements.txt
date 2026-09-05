@@ -1,38 +1,18 @@
+# CFN-RAG Backend 运行时依赖（exe 只装这组，对应 docs/v3-developer/06 §3.1）
+# 严禁混入：torch / transformers / llama-index / langgraph / langchain / redis / qdrant
+#           / sqlalchemy / arq / prometheus / structlog / locust / modelscope
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
 httpx
-llama-index
+openai
+aiofiles
+Pillow
+numpy
+onnxruntime
+tokenizers
+rank-bm25
 pypdf
 python-docx
-llama-index-llms-google-genai
-llama-index-embeddings-huggingface
-aiofiles
-openai
 docx2txt>=0.8
-modelscope
-Pillow
-langgraph
-langgraph-checkpoint-sqlite
-langchain-openai
-langchain-core
-# evals: retriever + Ragas
-rank-bm25
-ragas>=0.2
-datasets
-langchain-community
-# route4: server profile 云原生依赖
-redis>=5.0
-qdrant-client>=1.9
-sqlalchemy[asyncio]>=2.0
-asyncpg>=0.29
-alembic>=1.13
-arq>=0.26
-# route4: 观测性
-prometheus-fastapi-instrumentator>=7.0
-structlog>=24.1
-# route4: 压测（可选）
-locust>=2.31
-# route5: MCP Server（游戏数据查询与创作辅助）
-fastmcp>=3.0

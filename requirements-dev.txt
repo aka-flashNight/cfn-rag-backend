@@ -1,0 +1,19 @@
+# CFN-RAG Backend 开发/评估依赖（永不进 exe，对应 docs/v3-developer/06 §3.2）
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+# 注意：torch 请装 CPU 版，别污染运行时 venv 的体积口径
+
+# 模型导出（scripts/export_onnx_int8.py，一次性执行）
+optimum[onnxruntime]
+torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+
+# 评估（evals/，golden 集与 Ragas 流程）
+ragas>=0.2
+datasets
+
+# 测试
+pytest
+pytest-asyncio
+
+# 打包（scripts/build_exe.py，P8）
+pyinstaller
