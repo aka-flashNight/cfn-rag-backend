@@ -9,9 +9,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from core.startup import _get_ffdec_path, _has_java
-from scripts.extract_portraits_from_swf import run_extract
 from services.game_data.paths import find_resources_directory
+
+# v3 注：立绘体系按 D9 改为游戏 manifest 查表（P7/窗口③）。此处保留 avatar/illustration
+# 静态文件路由与 illustration.zip 解压；SWF/FFDec 导出链路已废弃（文件与脚本已删除）。
 
 
 router: APIRouter = APIRouter()
@@ -137,77 +138,40 @@ MSG_NO_JAVA_HAS_FFDEC = (
 )
 
 
+MSG_EXPORT_UNAVAILABLE = (
+    "未检测到立绘拓展包。请下载 illustration.zip 并将其与 exe 放在同一目录"
+    "（程序会自动解压），或手动解压到 resources\\flashswf\\portraits\\illustration。"
+    "（从 SWF 导出立绘的功能已下线，立绘改由游戏项目 manifest 体系提供）"
+)
+
+
 @router.post(
     "/export-illustrations",
     response_model=ExportIllustrationsResponse,
-    summary="立绘就绪（从 zip 解压或从 SWF 导出）",
+    summary="立绘就绪（仅支持 illustration.zip 解压；SWF 导出已下线）",
 )
 async def export_illustrations(body: ExportIllustrationsRequest) -> ExportIllustrationsResponse:
-    """
-    优先使用 illustration.zip：若与 exe 同目录存在 illustration.zip，则解压（很快）。
-    否则若有 tools/ffdec.jar 且本机有 Java，则从 SWF 导成立绘（约需数分钟）。
-    前端建议：请求超时设长（如 5 分钟），等待期间展示「正在准备立绘，请稍候（从 SWF 导出约需数分钟）」；
-    返回后根据 success、message、source 展示结果，503 时用 detail 展示指引。
-    """
-    # 1. 有 zip 则只做解压，不检查 Java
+    """有 illustration.zip 则解压（很快）；否则 503（SWF/FFDec 链路已按 D9 废弃）。"""
+    _ = body
     zip_path = _get_illustration_zip_path()
-    if zip_path is not None:
-        ok, msg = await asyncio.to_thread(_extract_illustration_zip)
-        if ok:
-            return ExportIllustrationsResponse(
-                success=True,
-                processed=1,
-                total=1,
-                error=None,
-                message="已从 illustration.zip 解压立绘完成。",
-                source="zip",
-            )
+    if zip_path is None:
+        raise HTTPException(status_code=503, detail=MSG_EXPORT_UNAVAILABLE)
+    ok, msg = await asyncio.to_thread(_extract_illustration_zip)
+    if ok:
         return ExportIllustrationsResponse(
-            success=False,
-            processed=0,
-            total=0,
-            error=msg,
-            message=msg,
+            success=True,
+            processed=1,
+            total=1,
+            error=None,
+            message="已从 illustration.zip 解压立绘完成。",
             source="zip",
         )
-
-    # 2. 无 zip：从 SWF 导出，需要 FFDec + Java
-    project_root = _get_project_root()
-    ffdec_path = _get_ffdec_path(project_root)
-    has_java = _has_java()
-
-    if ffdec_path is None or not ffdec_path.exists():
-        raise HTTPException(status_code=503, detail=MSG_NO_ZIP_NO_JAVA)
-    if not has_java:
-        raise HTTPException(status_code=503, detail=MSG_NO_JAVA_HAS_FFDEC)
-
-    # 有 zip 时已返回；此处为无 zip、有 FFDec 且有 Java，开始从 SWF 导出（耗时长），默认输出 WebP
-    result = await asyncio.to_thread(
-        run_extract,
-        ffdec_path=ffdec_path,
-        resources_dir=None,
-        overwrite=body.overwrite,
-        zoom=4,
-        smooth=True,
-        crop_rect=None,
-        only_npc=None,
-        webp=True,
-        webp_quality=0.85,
-    )
-    success = bool(result.get("success"))
-    processed = int(result.get("processed", 0))
-    total = int(result.get("total", 0))
-    err = result.get("error")
-    if success:
-        msg = f"已从 SWF 导成立绘完成，共处理 {processed}/{total} 个。"
-    else:
-        msg = err or "从 SWF 导成立绘失败。"
     return ExportIllustrationsResponse(
-        success=success,
-        processed=processed,
-        total=total,
-        error=err,
+        success=False,
+        processed=0,
+        total=0,
+        error=msg,
         message=msg,
-        source="swf",
+        source="zip",
     )
 

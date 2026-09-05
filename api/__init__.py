@@ -15,7 +15,7 @@ async def health_check(settings: Settings = get_settings()) -> dict[str, str]:
 
     return {
         "status": "ok",
-        "app": settings.app_name,
+        "app": "CFN-RAG Backend",
     }
 
 

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 class NPCChatRequest(BaseModel):
     """
-    游戏 NPC 对话请求体。
+    游戏 NPC 对话请求体（v3：单一路径 /api/game/ask，SSE 事件契约见 services/orchestrator/events.py）。
     """
 
     query: str = Field(..., description="玩家对 NPC 说的话")
@@ -19,10 +19,6 @@ class NPCChatRequest(BaseModel):
         ge=1,
         le=7,
         description="玩家当前主线进度阶段，1-7 的整数；不传时表示未知或未开始，用于后续 LLM 与后端工具根据进度做差异化响应",
-    )
-    agent_enabled: Optional[bool] = Field(
-        default=None,
-        description="是否启用 LangGraph 工具轮（任务发布等）；不传或 null 视为 true；为 false 时降级为单次 LLM 对话（与旧版一致，无工具轮）",
     )
     session_id: str = Field(
         ...,
@@ -46,21 +42,13 @@ class NPCChatRequest(BaseModel):
     )
     proxy_url: Optional[str] = Field(
         default=None,
-        description="可选的 HTTP 代理地址，例如 http://127.0.0.1:10809",
-    )
-    summarize_interval: Optional[int] = Field(
-        default=None,
-        description="精确短期记忆的总结间隔/历史长度档位。取值 10/30/100/500，对应前端短/中/长/几乎无限。不传时后端使用默认值 30。",
-    )
-    rag_eval_qa_mode: bool = Field(
-        default=False,
-        description="内部评估用：为 true 时使用面向问答的精简 prompt（无工具/立绘/情绪输出约定），仅 evals/rag 等脚本应开启。",
+        description="可选的 HTTP 代理地址（仅作用于本次会话的 LLM 客户端，httpx 客户端级，不改进程环境变量）",
     )
 
 
 class NPCChatResponse(BaseModel):
     """
-    游戏 NPC 对话响应体，包含好感度变更信息。
+    游戏 NPC 对话响应（stream=false 时的非流式形态；v3 内部仍走 TurnOrchestrator 单一路径）。
     """
 
     reply: str = Field(..., description="NPC 给玩家的回复内容")
@@ -72,28 +60,6 @@ class NPCChatResponse(BaseModel):
         description="本次对话好感度变化（-5 到 +5）",
     )
     emotion: str = Field(..., description="本次对话后 NPC 的情绪，用于选择立绘")
-
-
-class NPCChatConfirmRequest(BaseModel):
-    """
-    HITL v2：玩家对 pending 任务草案的确认/拒绝/修改请求。
-    调用 /api/ask/confirm 时使用；后端通过 session_id → thread_id 恢复 LangGraph 主图。
-    """
-
-    session_id: str = Field(..., description="会话 ID（= LangGraph thread_id）")
-    npc_name: str = Field(..., description="草案所属 NPC 名字")
-    draft_id: str = Field(..., description="待确认的 draft_id（与 pending_confirmation 事件一致）")
-    decision: str = Field(
-        ...,
-        description="玩家决定：accept / reject / bargain；accept 会立即调 confirm_agent_task，reject 会 cancel_agent_task，bargain 会把 reply 作为新一轮玩家消息再跑一次主图",
-    )
-    player_reply: Optional[str] = Field(
-        default=None,
-        description="玩家回复文本（bargain / reject 时用于驱动下一轮；accept 时可省略）",
-    )
-    api_key: Optional[str] = Field(default=None)
-    api_base: Optional[str] = Field(default=None)
-    model_name: Optional[str] = Field(default=None)
 
 
 class ChatMessage(BaseModel):
@@ -114,10 +80,6 @@ class SessionCreateRequest(BaseModel):
 
     npc_name: str = Field(..., description="本会话绑定的 NPC 名称")
     title: str = Field(..., description="会话标题 / 对话名称，供前端展示")
-    proxy_url: Optional[str] = Field(
-        default=None,
-        description="可选的 HTTP 代理地址，例如 http://127.0.0.1:10809",
-    )
 
 
 class SessionCreateResponse(BaseModel):
@@ -216,4 +178,3 @@ class ResetKnowledgeBaseResponse(BaseModel):
 
     success: bool = Field(..., description="是否成功")
     message: str | None = Field(None, description="说明信息，如失败原因或成功提示")
-

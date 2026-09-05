@@ -175,7 +175,41 @@ class MemoryStore:
                 )
                 """
             )
+            self._migrate_legacy_schema(cur)
             self._conn.commit()
+
+    def _migrate_legacy_schema(self, cur: sqlite3.Cursor) -> None:
+        """v3 前的旧库升级：session_task_drafts 补 bargain_count 独立列（修 D5），
+        并把旧草案 JSON 内混入的 bargain_count / _draft_commit_valid 剥离。"""
+        cur.execute("PRAGMA table_info(session_task_drafts)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+        if not cols or "bargain_count" in cols:
+            return
+        cur.execute(
+            "ALTER TABLE session_task_drafts ADD COLUMN bargain_count INTEGER NOT NULL DEFAULT 0"
+        )
+        rows = cur.execute("SELECT id, draft_json FROM session_task_drafts").fetchall()
+        for row_id, draft_json in rows:
+            try:
+                draft = json.loads(draft_json) if draft_json else {}
+            except json.JSONDecodeError:
+                continue
+            if isinstance(draft, dict) and draft.get("bargain_count") is not None:
+                try:
+                    bc = int(draft["bargain_count"])
+                except (TypeError, ValueError):
+                    bc = 0
+                cur.execute(
+                    "UPDATE session_task_drafts SET bargain_count = ? WHERE id = ?", (bc, row_id)
+                )
+        # 剥离旧草案 JSON 中的内部字段
+        cur.execute(
+            "UPDATE session_task_drafts SET draft_json = REPLACE(draft_json, '\"_draft_commit_valid\": true, ', '')"
+        )
+        cur.execute(
+            "UPDATE session_task_drafts SET draft_json = REPLACE(draft_json, ', \"_draft_commit_valid\": false', '')"
+        )
+        logger.info("旧库迁移完成：session_task_drafts 补 bargain_count 列（%d 行回填）", len(rows))
 
     # ------------------------------------------------------------------
     # 消息
@@ -409,6 +443,8 @@ class MemoryStore:
             draft = json.loads(draft_json) if draft_json else {}
         except json.JSONDecodeError:
             draft = {"_draft_json_raw": draft_json}
+        if isinstance(draft, dict):
+            draft = self._clean_draft(draft)  # 旧库可能残留内部字段
         return TaskDraftRow(
             session_id=str(row["session_id"]),
             draft_id=str(row["draft_id"]),

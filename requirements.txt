@@ -16,3 +16,4 @@ rank-bm25
 pypdf
 python-docx
 docx2txt>=0.8
+pyyaml

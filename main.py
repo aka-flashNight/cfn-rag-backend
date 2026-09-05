@@ -35,7 +35,6 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="CFN-RAG Backend",
-        debug=settings.debug,
         lifespan=lifespan,
     )
 
