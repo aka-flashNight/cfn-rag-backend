@@ -16,7 +16,7 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "可选，过滤 skill 大类。目前支持："
-                "task-publishing / task-bargaining / knowledge-search / mood-tracking / skill-discovery。"
+                "task-publishing / task-bargaining / knowledge-search / skill-discovery。"
                 "不传则返回全部 skills。"
             ),
         },

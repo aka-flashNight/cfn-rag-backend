@@ -1,5 +1,18 @@
+"""任务草案校验管线 V1~V11（聚合模式 + 增强反馈，对应 docs/v3-developer/05 §2）。
+
+与旧实现的差异（修 D1/D3）：
+- **聚合模式**：一次跑完所有（或增量关联的）规则，全量收集 ``ValidationIssue``，
+  不再串行短路「一次只报一个错」；
+- **增强反馈**：每条 issue 携带 root_cause（根因）/ fix_hint（具体修正动作，含数字）/
+  candidates（可选项清单），模型一轮即可修正；
+- V9（雷同）维持 warning 不阻塞。
+
+规则本身（V1~V11 的业务语义、常量体系）为保留资产，与旧版一致。
+"""
+
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
@@ -12,6 +25,61 @@ from services.game_data.reward_utils import (
 
 if TYPE_CHECKING:
     from services.game_data.registry import GameDataRegistry
+
+
+# ---------------------------------------------------------------------------
+# 反馈结构（05 §2.1）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ValidationIssue:
+    """单条校验问题：规则、字段、人话描述、根因定位、修正指引、候选清单。"""
+
+    rule: str                    # "V1".."V11"
+    field: str                   # 出错字段（如 rewards / finish_requirements / get_requirements）
+    message: str                 # 人话描述
+    root_cause: str = ""         # 后端定位的根因
+    fix_hint: str = ""           # 具体修正动作
+    candidates: list[str] = field(default_factory=list)   # 可选项（≤10 条）
+    auto_repairable: bool = False
+    # 修复层数据（allowed_range / item_prices 等）；仅 repair.py 使用，不进模型可见 JSON
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def to_model_json(self) -> dict[str, Any]:
+        """模型可见形态（不含 detail 内部数据）。"""
+        out: dict[str, Any] = {
+            "rule": self.rule,
+            "field": self.field,
+            "message": self.message,
+        }
+        if self.root_cause:
+            out["root_cause"] = self.root_cause
+        if self.fix_hint:
+            out["fix_hint"] = self.fix_hint
+        if self.candidates:
+            out["candidates"] = self.candidates
+        return out
+
+
+@dataclass
+class ValidationReport:
+    """聚合校验结果：一次跑完全部规则后统一返回（修 D1）。"""
+
+    issues: list[ValidationIssue] = field(default_factory=list)
+    warnings: list[dict[str, Any]] = field(default_factory=list)  # V9 等，不阻塞
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
+
+    def to_model_json(self) -> dict[str, Any]:
+        """模型可见 JSON：issues 数组 + 逐条 root_cause/fix_hint/candidates。"""
+        return {
+            "status": "validation_failed",
+            "issue_count": len(self.issues),
+            "issues": [i.to_model_json() for i in self.issues],
+            "warnings": self.warnings or None,
+        }
 
 
 @dataclass(frozen=True)
@@ -30,8 +98,7 @@ class DraftValidationContext:
     stage: int = 1
     affinity: int = 0
     npc_name: Optional[str] = None
-    # 讨价还价阶段上限放大倍数（Phase 4 传入），默认为 1.0 表示不放大。
-    # 文档 V7 中默认不含此项；此项为兼容后续讨价还价扩展。
+    # 讨价还价阶段上限放大倍数，默认为 1.0 表示不放大。
     bargain_rate: float = 1.0
 
 
@@ -44,6 +111,13 @@ COMBAT_TASK_TYPES: frozenset[str] = frozenset({
 })
 
 EQUIPMENT_TYPES: frozenset[str] = frozenset({"武器", "防具"})
+
+# V7 自动修复允许的最大偏差比例（05 §3：总值偏差 ≤ ±10% 可自动缩放）
+_V7_AUTO_REPAIR_RATIO = 0.10
+
+# 反馈清单上限
+_MAX_CANDIDATES = 10
+_MAX_FUZZY_CANDIDATES = 5
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +252,62 @@ def _compute_reward_value_range(
     return final_min, final_max
 
 
+def _fuzzy_item_candidates(
+    name: str, item_registry: Any, limit: int = _MAX_FUZZY_CANDIDATES,
+) -> list[str]:
+    """V1 增强：按编辑距离 + 子串双重策略给出真实物品名候选（05 §2.2）。"""
+    all_names: list[str] = []
+    try:
+        all_names = [it.name for it in item_registry.items if it.name]
+    except Exception:
+        return []
+    if not all_names:
+        return []
+
+    query = name.strip()
+    lower = query.lower()
+    scored: dict[str, float] = {}
+
+    # 子串命中（物品名包含查询词或反之）优先
+    for n in all_names:
+        nl = n.lower()
+        if lower and (lower in nl or nl in lower):
+            scored[n] = 0.0  # 排在最前
+
+    close = difflib.get_close_matches(query, all_names, n=limit * 2, cutoff=0.4)
+    for rank, n in enumerate(close):
+        if n not in scored:
+            scored[n] = 1.0 + rank  # 编辑距离命中次之
+
+    return sorted(scored, key=lambda n: (scored[n], n))[:limit]
+
+
+def _available_stage_candidates(
+    *,
+    stage_registry: Any,
+    main_task_max_id: int,
+    limit: int = _MAX_CANDIDATES,
+) -> list[str]:
+    """V3/V4/V5 增强：当前进度下可用的关卡候选（unlock_condition ≤ 进度上限），去重后截断。"""
+    infos = getattr(stage_registry, "_stage_infos", None)
+    if not isinstance(infos, dict):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for (_area, name), si in infos.items():
+        if name in seen:
+            continue
+        unlock = getattr(si, "unlock_condition", None)
+        # 无解锁条件（副本等）视为可用；有解锁条件则要求 ≤ 当前进度
+        if unlock is not None and isinstance(unlock, int) and unlock > main_task_max_id:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
 # =========================================================================
 # V1: 物品存在性
 # =========================================================================
@@ -187,24 +317,38 @@ def _validate_v1_item_existence(
     draft: Mapping[str, Any],
     item_registry: Any,
     keys: tuple[str, ...] = ("rewards", "finish_submit_items", "finish_contain_items"),
-) -> Optional[dict[str, Any]]:
-    missing: set[str] = set()
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    # 同名物品只在第一个出现的字段报一次，避免重复刷屏
+    reported: set[str] = set()
 
     for k in keys:
         for it in _reward_item_iter(draft, k):
             item_name = it.get("item_name")
             if not isinstance(item_name, str) or not item_name.strip():
                 continue
-            if item_registry.get_by_name(item_name) is None:
-                missing.add(item_name)
-
-    if missing:
-        return {
-            "step": "V1",
-            "error": "物品不存在，请使用合适的任务类型，重新调用prepare_task_context，查看可选物品。",
-            "missing_item_names": sorted(missing),
-        }
-    return None
+            if item_name in reported:
+                continue
+            if item_registry.get_by_name(item_name) is not None:
+                continue
+            reported.add(item_name)
+            candidates = _fuzzy_item_candidates(item_name, item_registry)
+            root = f"物品「{item_name}」不在游戏物品数据中"
+            if candidates:
+                root += f"，是否想表达：{'、'.join(candidates)}？"
+            issues.append(ValidationIssue(
+                rule="V1",
+                field=k,
+                message=f"物品「{item_name}」不存在，无法用于 {k}。",
+                root_cause=root,
+                fix_hint=(
+                    f"把 {k} 中的「{item_name}」改为真实存在的物品名"
+                    + (f"（候选：{'、'.join(candidates)}）" if candidates else "")
+                    + "；候选不足时重新调用 prepare_task_context 查看可选物品。"
+                ),
+                candidates=candidates,
+            ))
+    return issues
 
 
 # =========================================================================
@@ -218,7 +362,7 @@ def _validate_v2_item_quantity_reasonableness(
     item_registry: Any,
     context: DraftValidationContext,
     keys: tuple[str, ...] = ("rewards", "finish_submit_items", "finish_contain_items"),
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     reward_stats: dict[str, tuple[int, int]] = {}
     submit_stats: dict[str, tuple[int, int]] = {}
     contain_stats: dict[str, tuple[int, int]] = {}
@@ -237,7 +381,7 @@ def _validate_v2_item_quantity_reasonableness(
     except Exception:
         contain_stats = {}
 
-    over: list[dict[str, Any]] = []
+    issues: list[ValidationIssue] = []
     stage = int(getattr(context, "stage", 1) or 1)
     base_max = stage * REWARD_STAGE_BASE_MAX
     task_type = draft.get("task_type", "") if isinstance(draft, dict) else ""
@@ -305,21 +449,26 @@ def _validate_v2_item_quantity_reasonableness(
                 allowed_max = effective_max * 2
 
             if n < allowed_min or n > allowed_max:
-                over.append(
-                    {
+                suggest = min(max(n, allowed_min), allowed_max)
+                issues.append(ValidationIssue(
+                    rule="V2",
+                    field=k,
+                    message=f"物品「{item_name}」数量 {n} 不在合理范围 [{allowed_min}, {allowed_max}]。",
+                    root_cause=(
+                        f"「{item_name}」在历史任务中的数量统计上限为 {effective_max if effective_max > 0 else '无（按预算估算）'}，"
+                        f"当前填写的 {n} 超出可接受区间。"
+                    ),
+                    fix_hint=f"把 {k} 中「{item_name}」的数量从 {n} 调整到 {suggest}（合理范围 [{allowed_min}, {allowed_max}]）。",
+                    auto_repairable=True,
+                    detail={
+                        "key": k,
                         "item_name": item_name,
-                        "count": n,
+                        "current": n,
                         "allowed_range": [allowed_min, allowed_max],
-                    }
-                )
-
-    if over:
-        return {
-            "step": "V2",
-            "error": "物品数量不合理",
-            "quantity_issues": over,
-        }
-    return None
+                        "suggest": suggest,
+                    },
+                ))
+    return issues
 
 
 # =========================================================================
@@ -330,15 +479,30 @@ def _validate_v3_stage_existence_and_area(
     *,
     draft: Mapping[str, Any],
     stage_registry: Any,
-) -> Optional[dict[str, Any]]:
-    invalid: list[dict[str, Any]] = []
+    context: DraftValidationContext,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    candidates = _available_stage_candidates(
+        stage_registry=stage_registry, main_task_max_id=context.main_task_max_id,
+    )
     for sr in _stage_requirement_iter(draft):
         stage_name = sr.get("stage_name")
         if not isinstance(stage_name, str) or not stage_name.strip():
             continue
         stage_infos = _get_stage_infos_by_name(stage_registry=stage_registry, stage_name=stage_name)
         if not stage_infos:
-            invalid.append({"stage_name": stage_name, "reason": "无效关卡"})
+            issues.append(ValidationIssue(
+                rule="V3",
+                field="finish_requirements",
+                message=f"关卡「{stage_name}」不存在。",
+                root_cause=f"游戏关卡数据中没有名为「{stage_name}」的关卡。",
+                fix_hint=(
+                    f"把 finish_requirements 中的关卡改为可用关卡"
+                    + (f"（候选：{'、'.join(candidates)}）" if candidates else "；候选不足时重新调用 prepare_task_context")
+                    + "。"
+                ),
+                candidates=candidates,
+            ))
             continue
 
         # stage_area 由筛选阶段负责；这里只确认：至少存在一个匹配关卡，且有 unlock_condition
@@ -350,15 +514,15 @@ def _validate_v3_stage_existence_and_area(
                 break
 
         if not has_valid_unlock:
-            invalid.append({"stage_name": stage_name, "reason": "关卡无效或缺少解锁条件"})
-
-    if invalid:
-        return {
-            "step": "V3",
-            "error": "关卡存在性与解锁有问题，请使用合适的任务类型，重新调用prepare_task_context，查看可选关卡。",
-            "invalid_stages": invalid,
-        }
-    return None
+            issues.append(ValidationIssue(
+                rule="V3",
+                field="finish_requirements",
+                message=f"关卡「{stage_name}」无效或缺少解锁条件。",
+                root_cause=f"关卡「{stage_name}」在数据中缺少有效的解锁条件，不能用于任务。",
+                fix_hint="改用其他有有效解锁条件的关卡。",
+                candidates=candidates,
+            ))
+    return issues
 
 
 def _validate_v3_dungeon_recommended_level(
@@ -366,20 +530,23 @@ def _validate_v3_dungeon_recommended_level(
     draft: Mapping[str, Any],
     context: DraftValidationContext,
     game_data: "GameDataRegistry",
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     """
     对副本/切磋类的关卡按 mercenary_tasks.json 的 recommended_level 做强校验：
     - 如果某关卡在 mercenary_tasks 中存在推荐下限且推荐下限 > 玩家当前阶段上限，则拒绝。
     - 如果该关卡没有推荐等级（或 recommended_min_level 为 None），则不做推荐筛选。
     """
-    # 可用的 mercency 数据：需要 game_data
     mercenary_registry = getattr(game_data, "mercenary_tasks", None)
     if mercenary_registry is None:
-        return None
+        return []
 
     max_level = int(getattr(context, "max_level", 50) or 50)
+    stage_registry = game_data.stages
+    candidates = _available_stage_candidates(
+        stage_registry=stage_registry, main_task_max_id=context.main_task_max_id,
+    )
 
-    invalid: list[dict[str, Any]] = []
+    issues: list[ValidationIssue] = []
     for sr in _stage_requirement_iter(draft):
         stage_name = sr.get("stage_name")
         difficulty = sr.get("difficulty")
@@ -400,20 +567,19 @@ def _validate_v3_dungeon_recommended_level(
                 ok = True
                 break
         if not ok:
-            invalid.append({
-                "stage_name": stage_name,
-                "difficulty": difficulty,
-                "recommended_min_level": max(m.recommended_min_level for m in matched if m.recommended_min_level is not None),
-                "player_max_level": max_level,
-            })
-
-    if invalid:
-        return {
-            "step": "V3R",
-            "error": "关卡推荐等级不满足",
-            "invalid_stages": invalid,
-        }
-    return None
+            rec = max(m.recommended_min_level for m in matched if m.recommended_min_level is not None)
+            issues.append(ValidationIssue(
+                rule="V3R",
+                field="finish_requirements",
+                message=f"关卡「{stage_name}」推荐等级 {rec} 超出玩家当前等级上限 {max_level}。",
+                root_cause=f"「{stage_name}」为副本/切磋关卡，推荐最低等级 {rec}，玩家当前阶段等级上限为 {max_level}。",
+                fix_hint=(
+                    "改用推荐等级更低的副本关卡，或把任务类型改为普通通关类。"
+                    + (f"可用关卡候选：{'、'.join(candidates)}" if candidates else "")
+                ),
+                candidates=candidates,
+            ))
+    return issues
 
 
 # =========================================================================
@@ -425,8 +591,11 @@ def _validate_v4_stage_unlock_condition(
     draft: Mapping[str, Any],
     stage_registry: Any,
     main_task_max_id: int,
-) -> Optional[dict[str, Any]]:
-    over: list[dict[str, Any]] = []
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    candidates = _available_stage_candidates(
+        stage_registry=stage_registry, main_task_max_id=main_task_max_id,
+    )
     for sr in _stage_requirement_iter(draft):
         stage_name = sr.get("stage_name")
         if not isinstance(stage_name, str) or not stage_name.strip():
@@ -448,19 +617,18 @@ def _validate_v4_stage_unlock_condition(
         # 否则表示所有匹配关卡都超进度。
         min_unlock = min(unlock_ids)
         if min_unlock > int(main_task_max_id):
-            over.append({
-                "stage_name": stage_name,
-                "min_unlock_id": int(min_unlock),
-                "main_task_max_id": int(main_task_max_id),
-            })
-
-    if over:
-        return {
-            "step": "V4",
-            "error": "关卡解锁条件匹配失败（超进度）",
-            "over_progress_stages": over,
-        }
-    return None
+            issues.append(ValidationIssue(
+                rule="V4",
+                field="finish_requirements",
+                message=f"关卡「{stage_name}」解锁进度不足（需主线 ID ≥ {min_unlock}，当前进度上限 {main_task_max_id}）。",
+                root_cause=f"「{stage_name}」最早解锁需要完成主线任务 {min_unlock}，玩家当前主线进度只到 {main_task_max_id}。",
+                fix_hint=(
+                    "改用玩家当前进度已解锁的关卡。"
+                    + (f"可用关卡候选：{'、'.join(candidates)}" if candidates else "")
+                ),
+                candidates=candidates,
+            ))
+    return issues
 
 
 # =========================================================================
@@ -472,13 +640,13 @@ def _validate_v5_replica_stage_difficulty(
     draft: Mapping[str, Any],
     context: DraftValidationContext,
     game_data: "GameDataRegistry",
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     """
     mercenary_tasks.json 绑定的关卡难度校验：
     - 永远允许 "简单"
     - 非简单难度仅当该 stage_name 在 mercenary_tasks.json 的对应任务配置了 challenge 额外难度，且玩家满足其推荐等级下限时才允许
     """
-    invalid: list[dict[str, Any]] = []
+    issues: list[ValidationIssue] = []
     mercenary_registry = getattr(game_data, "mercenary_tasks", None)
     max_level = int(getattr(context, "max_level", 50) or 50)
     for sr in _stage_requirement_iter(draft):
@@ -505,17 +673,18 @@ def _validate_v5_replica_stage_difficulty(
                 allowed_difficulties.add(m.challenge_difficulty)
 
         if difficulty not in allowed_difficulties:
-            invalid.append(
-                {
-                    "stage_name": stage_name,
-                    "difficulty": difficulty,
-                    "expected": sorted(allowed_difficulties),
-                }
-            )
-
-    if invalid:
-        return {"step": "V5", "error": "副本关卡难度违规", "invalid_replica_stages": invalid}
-    return None
+            issues.append(ValidationIssue(
+                rule="V5",
+                field="finish_requirements",
+                message=f"关卡「{stage_name}」不允许难度「{difficulty}」（当前可用：{'、'.join(sorted(allowed_difficulties))}）。",
+                root_cause=(
+                    f"「{stage_name}」的额外难度仅当玩家等级满足其推荐下限时开放，"
+                    f"玩家当前等级上限为 {max_level}。"
+                ),
+                fix_hint=f"把「{stage_name}」的难度改为「{'、'.join(sorted(allowed_difficulties))}」之一。",
+                candidates=sorted(allowed_difficulties),
+            ))
+    return issues
 
 
 # =========================================================================
@@ -526,7 +695,8 @@ def _validate_v6_precondition_tasks(
     *,
     draft: Mapping[str, Any],
     task_registry: Any,
-) -> Optional[dict[str, Any]]:
+    context: DraftValidationContext,
+) -> list[ValidationIssue]:
     ids = _as_list(draft.get("get_requirements"))
     invalid: list[int] = []
     for x in ids:
@@ -540,9 +710,18 @@ def _validate_v6_precondition_tasks(
         if task_registry.get_by_id(tid) is None:
             invalid.append(tid)
 
-    if invalid:
-        return {"step": "V6", "error": "前置任务合法性失败", "invalid_precondition_ids": sorted(set(invalid))}
-    return None
+    if not invalid:
+        return []
+    return [ValidationIssue(
+        rule="V6",
+        field="get_requirements",
+        message=f"前置任务 ID 不合法：{sorted(set(invalid))}（-1 禁止使用）。",
+        root_cause="get_requirements 只能填写真实存在的主线任务 ID，且不允许 -1。",
+        fix_hint=(
+            "移除这些无效 ID，或改为 ≤ 当前进度上限 "
+            f"{context.main_task_max_id} 的合法主线任务 ID。"
+        ),
+    )]
 
 
 # =========================================================================
@@ -557,7 +736,7 @@ def _validate_v7_reward_total_value(
     task_type: str,
     affinity: int,
     bargain_rate: float = 1.0,
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     reward_items = list(_reward_item_iter(draft, "rewards"))
     rewards_value = _compute_items_value(reward_items, item_registry)
     submit_value = _compute_items_value(
@@ -577,7 +756,7 @@ def _validate_v7_reward_total_value(
     )
 
     if range_min <= rewards_value <= range_max:
-        return None
+        return []
 
     item_prices: list[dict[str, Any]] = []
     for it in reward_items:
@@ -596,17 +775,54 @@ def _validate_v7_reward_total_value(
         })
 
     if rewards_value < range_min:
-        error_msg = "奖励总价值低于允许区间下限，请增加奖励（如增加金币或物品）使总价值不低于 {}。".format(range_min)
+        delta = range_min - rewards_value
+        direction = "低于"
+        need = f"增加 ≥{delta}"
+        suggest_target = range_min
     else:
-        error_msg = "奖励总价值高于允许区间上限，请减少奖励或调整物品数量使总价值不超过 {}。".format(range_max)
+        delta = rewards_value - range_max
+        direction = "高于"
+        need = f"减少 ≥{delta}"
+        suggest_target = range_max
 
-    return {
-        "step": "V7",
-        "error": error_msg,
-        "item_prices": item_prices,
-        "total_value": rewards_value,
-        "allowed_range": [range_min, range_max],
-    }
+    # 给出按单价可换算的具体建议（调整最大占比奖励项的数量）
+    best = max(item_prices, key=lambda x: x["subtotal"], default=None)
+    adjust_hint = ""
+    if best and best["unit_price"] > 0:
+        best_name = best["item_name"]
+        step = max(1, delta // best["unit_price"] + (1 if delta % best["unit_price"] else 0))
+        if rewards_value < range_min:
+            new_count = best["count"] + step
+        else:
+            new_count = max(0, best["count"] - step)
+        adjust_hint = (
+            f"；可把「{best_name}」（单价 {best['unit_price']}）数量从 {best['count']} 调整到 {new_count}"
+        )
+
+    # 自动修复判定：偏差 ≤ ±10% 才可等比缩放（05 §3）
+    span_base = max(range_min, 1) if rewards_value < range_min else max(range_max, 1)
+    auto_repairable = (delta / span_base) <= _V7_AUTO_REPAIR_RATIO
+
+    return [ValidationIssue(
+        rule="V7",
+        field="rewards",
+        message=(
+            f"奖励总价值 {rewards_value} {direction}允许区间 [{range_min}, {range_max}]，需{need}。"
+        ),
+        root_cause=(
+            f"按玩家进度（阶段 {stage}）、任务类型「{task_type}」与好感度 {affinity} 计算，"
+            f"奖励总值允许区间为 [{range_min}, {range_max}]，当前总值 {rewards_value}。"
+        ),
+        fix_hint=(
+            f"当前总值 {rewards_value}，{direction}允许区间 [{range_min}, {range_max}]，需{need}{adjust_hint}。"
+        ),
+        auto_repairable=auto_repairable,
+        detail={
+            "total_value": rewards_value,
+            "allowed_range": [range_min, range_max],
+            "item_prices": item_prices,
+        },
+    )]
 
 
 # =========================================================================
@@ -620,7 +836,7 @@ def _validate_v8_reward_type_compliance(
     task_registry: Any,
     shop_registry: Any,
     npc_name: Optional[str],
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     # 从已有任务奖励物品名集合，推导出合法的物品 *类型* 集合
     existing_reward_names = task_registry.list_reward_types()
     valid_types: set[str] = set()
@@ -633,7 +849,13 @@ def _validate_v8_reward_type_compliance(
     npc_shop_items: set[str] = set()
     if npc_name:
         npc_shop_items = set(shop_registry.get_npc_shop(npc_name))
+        # 商店物品的类型也是合规奖励类型（05 §2.2：商店 ∪ 历史奖励类型）
+        for shop_name in npc_shop_items:
+            item = item_registry.get_by_name(shop_name)
+            if item and item.type:
+                valid_types.add(item.type)
 
+    compliant_types = sorted(valid_types)
     non_compliant: list[dict[str, Any]] = []
     for it in _reward_item_iter(draft, "rewards"):
         name = it.get("item_name", "")
@@ -654,20 +876,29 @@ def _validate_v8_reward_type_compliance(
         non_compliant.append({
             "item_name": name,
             "item_type": item.type,
-            "reason": f"类型 '{item.type}' 未在已有任务奖励中出现，且不属于当前NPC商店物品",
         })
 
-    if non_compliant:
-        return {
-            "step": "V8",
-            "error": "奖励类型不合规",
-            "non_compliant_items": non_compliant,
-        }
-    return None
+    issues: list[ValidationIssue] = []
+    for nc in non_compliant:
+        name = nc["item_name"]
+        itype = nc["item_type"]
+        issues.append(ValidationIssue(
+            rule="V8",
+            field="rewards",
+            message=f"奖励物品「{name}」类型「{itype}」不合规。",
+            root_cause=f"类型「{itype}」未在已有任务奖励或当前 NPC 商店中出现，「{name}」不能作为该 NPC 的奖励。",
+            fix_hint=(
+                f"把「{name}」替换为合规类型的奖励物品"
+                + (f"（合规类型：{'、'.join(compliant_types)}）" if compliant_types else "")
+                + "。"
+            ),
+            candidates=compliant_types[:_MAX_CANDIDATES],
+        ))
+    return issues
 
 
 # =========================================================================
-# V9: 任务不完全重复
+# V9: 任务不完全重复（仅 warning）
 # =========================================================================
 
 def _validate_v9_task_uniqueness(
@@ -734,14 +965,31 @@ def _validate_v9_task_uniqueness(
 # V10: 装备等级匹配
 # =========================================================================
 
+def _low_level_replacements(
+    *,
+    item_registry: Any,
+    item_type: str,
+    max_level: int,
+    limit: int = _MAX_FUZZY_CANDIDATES,
+) -> list[str]:
+    """V10 增强：同类型、等级 ≤ max_level 的替代装备候选（按等级从高到低）。"""
+    try:
+        same_type = item_registry.list_by_type(item_type)
+    except Exception:
+        return []
+    usable = [it for it in same_type if (it.level or 0) <= max_level]
+    usable.sort(key=lambda it: -(it.level or 0))
+    return [it.name for it in usable[:limit]]
+
+
 def _validate_v10_equipment_level_match(
     *,
     draft: Mapping[str, Any],
     item_registry: Any,
     max_level: int,
     keys: tuple[str, ...] = ("rewards", "finish_submit_items", "finish_contain_items"),
-) -> Optional[dict[str, Any]]:
-    over_level: list[dict[str, Any]] = []
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
 
     for k in keys:
         for it in _reward_item_iter(draft, k):
@@ -753,21 +1001,32 @@ def _validate_v10_equipment_level_match(
                 continue  # V1 已处理
             if item.type not in EQUIPMENT_TYPES:
                 continue
-            if item.level > max_level:
-                over_level.append({
+            if item.level <= max_level:
+                continue
+            replacements = _low_level_replacements(
+                item_registry=item_registry, item_type=item.type, max_level=max_level,
+            )
+            issues.append(ValidationIssue(
+                rule="V10",
+                field=k,
+                message=f"装备「{name}」等级 {item.level} 超出当前阶段上限 {max_level}。",
+                root_cause=f"「{name}」（{item.type}，等级 {item.level}）超过玩家当前阶段允许的装备等级上限 {max_level}。",
+                fix_hint=(
+                    f"把 {k} 中的「{name}」替换为低级版本"
+                    + (f"（替代候选：{'、'.join(replacements)}）" if replacements else "，或直接移除该项")
+                    + "。"
+                ),
+                candidates=replacements,
+                auto_repairable=True,
+                detail={
+                    "key": k,
                     "item_name": name,
-                    "item_type": item.type,
                     "item_level": item.level,
                     "max_level": max_level,
-                })
-
-    if over_level:
-        return {
-            "step": "V10",
-            "error": "装备等级超出当前阶段上限",
-            "over_level_items": over_level,
-        }
-    return None
+                    "replacement": replacements[0] if replacements else None,
+                },
+            ))
+    return issues
 
 
 # =========================================================================
@@ -787,7 +1046,7 @@ def _collect_reward_item_names(draft: Mapping[str, Any], key: str) -> set[str]:
 def _validate_v11_submit_reward_no_overlap(
     *,
     draft: Mapping[str, Any],
-) -> Optional[dict[str, Any]]:
+) -> list[ValidationIssue]:
     """
     finish_submit_items 与 rewards 不得出现相同物品名（易把「玩家想要的报酬」误填进提交要求）。
     """
@@ -795,33 +1054,30 @@ def _validate_v11_submit_reward_no_overlap(
     reward_names = _collect_reward_item_names(draft, "rewards")
     overlap = submit_names & reward_names
     if not overlap:
-        return None
-    return {
-        "step": "V11",
-        "error": (
+        return []
+    overlap_sorted = sorted(overlap)
+    return [ValidationIssue(
+        rule="V11",
+        field="finish_submit_items",
+        message=(
             "`finish_submit_items` 与 `rewards` 不能包含相同物品："
-            f"{sorted(overlap)}。"
-            "请检查任务是否合理：玩家需要的物品只能写在 `rewards`；"
-            "需要玩家提交给你的物品只能写在 `finish_submit_items`。"
+            f"{overlap_sorted}。"
         ),
-        "duplicate_item_names": sorted(overlap),
-    }
+        root_cause=(
+            "玩家需要的物品只能写在 `rewards`；需要玩家提交给你的物品只能写在 "
+            "`finish_submit_items`。同名物品同时出现在两侧时任务语义冲突。"
+        ),
+        fix_hint=(
+            f"从 `finish_submit_items` 中移除与 `rewards` 重名的物品 {overlap_sorted}"
+            "（保留先出现侧，自动修复时默认保留 rewards 侧）。"
+        ),
+        auto_repairable=True,
+        detail={"overlap": overlap_sorted},
+    )]
 
 
 # =========================================================================
-# 校验结果
-# =========================================================================
-
-@dataclass(frozen=True)
-class DraftValidationResult:
-    success: bool
-    validation_errors: list[dict[str, Any]]
-    """仅提示，不阻止工具调用；如 V9 高度雷同时的谨慎发布提醒。"""
-    validation_warnings: list[dict[str, Any]] = field(default_factory=list)
-
-
-# =========================================================================
-# 完整校验管线 V1-V11
+# 完整校验管线 V1-V11（聚合模式）
 # =========================================================================
 
 def validate_task_draft(
@@ -830,12 +1086,13 @@ def validate_task_draft(
     context: DraftValidationContext,
     changed_fields: Optional[set[str]] = None,
     game_data: Optional["GameDataRegistry"] = None,
-) -> DraftValidationResult:
+) -> ValidationReport:
     """
-    完整校验管线（V1-V11）。
+    完整校验管线（V1-V11，聚合模式）。
 
     - draft_agent_task：全量校验（changed_fields=None）
     - update_task_draft：增量校验（changed_fields 为仅变更字段的名称集合）
+    一次跑完所有（或增量关联的）规则，全量收集 issue 后统一返回（修 D1）。
     """
 
     if game_data is None:
@@ -854,7 +1111,6 @@ def validate_task_draft(
     rewards_keys = {"rewards", "finish_submit_items", "finish_contain_items"}
     stage_keys = {"finish_requirements"}
     precondition_keys = {"get_requirements"}
-    text_keys = {"title", "description", "get_dialogue", "finish_dialogue", "get_npc", "finish_npc"}
 
     reward_keys_to_validate = rewards_keys if full_mode else (changed & rewards_keys)
 
@@ -868,103 +1124,74 @@ def validate_task_draft(
     run_v10 = full_mode or bool(changed & rewards_keys)
     run_v11 = full_mode or bool(changed & {"rewards", "finish_submit_items"})
 
+    issues: list[ValidationIssue] = []
+    warnings: list[dict[str, Any]] = []
+
     # ---- V1: 物品存在性 ----
     if run_rewards:
-        e = _validate_v1_item_existence(
+        issues.extend(_validate_v1_item_existence(
             draft=draft,
             item_registry=item_registry,
             keys=tuple(sorted(reward_keys_to_validate)),
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        ))
 
     # ---- V2: 物品数量合理性 ----
     if run_rewards:
-        e = _validate_v2_item_quantity_reasonableness(
+        issues.extend(_validate_v2_item_quantity_reasonableness(
             draft=draft,
             task_registry=task_registry,
             item_registry=item_registry,
             context=context,
             keys=tuple(sorted(reward_keys_to_validate)),
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        ))
 
-    # ---- V3: 关卡存在性与解锁 ----
+    # ---- V3 / V3R / V4 / V5: 关卡族 ----
     if run_stages:
-        e = _validate_v3_stage_existence_and_area(
-            draft=draft, stage_registry=stage_registry,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
-
-    # ---- V3R: 副本/切磋关卡推荐等级强校验 ----
-    if run_stages:
-        e = _validate_v3_dungeon_recommended_level(
-            draft=draft,
-            context=context,
-            game_data=game_data,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
-
-    # ---- V4: 关卡解锁条件匹配 ----
-    if run_stages:
-        e = _validate_v4_stage_unlock_condition(
+        issues.extend(_validate_v3_stage_existence_and_area(
+            draft=draft, stage_registry=stage_registry, context=context,
+        ))
+        issues.extend(_validate_v3_dungeon_recommended_level(
+            draft=draft, context=context, game_data=game_data,
+        ))
+        issues.extend(_validate_v4_stage_unlock_condition(
             draft=draft,
             stage_registry=stage_registry,
             main_task_max_id=context.main_task_max_id,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
-
-    # ---- V5: 副本关卡难度 ----
-    if run_stages:
-        e = _validate_v5_replica_stage_difficulty(
-            draft=draft,
-            context=context,
-            game_data=game_data,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        ))
+        issues.extend(_validate_v5_replica_stage_difficulty(
+            draft=draft, context=context, game_data=game_data,
+        ))
 
     # ---- V6: 前置任务合法性 ----
     if run_preconditions:
-        e = _validate_v6_precondition_tasks(
-            draft=draft, task_registry=task_registry,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        issues.extend(_validate_v6_precondition_tasks(
+            draft=draft, task_registry=task_registry, context=context,
+        ))
 
     # ---- V7: 奖励总价值 ----
     if run_v7:
         task_type = draft.get("task_type", "")
         if isinstance(task_type, str) and task_type:
-            e = _validate_v7_reward_total_value(
+            issues.extend(_validate_v7_reward_total_value(
                 draft=draft,
                 item_registry=item_registry,
                 stage=context.stage,
                 task_type=task_type,
                 affinity=context.affinity,
                 bargain_rate=context.bargain_rate,
-            )
-            if e:
-                return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+            ))
 
     # ---- V8: 奖励类型合规 ----
     if run_v8:
-        e = _validate_v8_reward_type_compliance(
+        issues.extend(_validate_v8_reward_type_compliance(
             draft=draft,
             item_registry=item_registry,
             task_registry=task_registry,
             shop_registry=shop_registry,
             npc_name=context.npc_name,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        ))
 
     # ---- V9: 任务高度雷同（仅警告，不阻止发布） ----
-    validation_warnings: list[dict[str, Any]] = []
     if run_v9:
         w = _validate_v9_task_uniqueness(
             draft=draft,
@@ -972,106 +1199,25 @@ def validate_task_draft(
             npc_name=context.npc_name,
         )
         if w:
-            validation_warnings.append(w)
+            warnings.append(w)
 
     # ---- V10: 装备等级匹配 ----
     if run_v10:
         keys_for_v10 = tuple(sorted(reward_keys_to_validate))
-        e = _validate_v10_equipment_level_match(
+        issues.extend(_validate_v10_equipment_level_match(
             draft=draft,
             item_registry=item_registry,
             max_level=context.max_level,
             keys=keys_for_v10,
-        )
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=[])
+        ))
 
     # ---- V11: 提交品与奖励物品不得重名 ----
     if run_v11:
-        e = _validate_v11_submit_reward_no_overlap(draft=draft)
-        if e:
-            return DraftValidationResult(success=False, validation_errors=[e], validation_warnings=validation_warnings)
+        issues.extend(_validate_v11_submit_reward_no_overlap(draft=draft))
 
-    return DraftValidationResult(success=True, validation_errors=[], validation_warnings=validation_warnings)
+    return ValidationReport(issues=issues, warnings=warnings)
 
 
-# =========================================================================
-# 向后兼容：仅 V1-V6 校验（旧接口）
-# =========================================================================
-
-def validate_task_draft_v1_v6(
-    draft: Mapping[str, Any],
-    *,
-    context: DraftValidationContext,
-    changed_fields: Optional[set[str]] = None,
-    game_data: Optional["GameDataRegistry"] = None,
-) -> DraftValidationResult:
-    """向后兼容入口，仅执行 V1-V6。新代码推荐使用 ``validate_task_draft``。"""
-
-    if game_data is None:
-        from services.game_data.registry import get_game_data_registry
-        game_data = get_game_data_registry()
-
-    item_registry = game_data.items
-    stage_registry = game_data.stages
-    task_registry = game_data.tasks
-
-    full_mode = changed_fields is None
-    changed_fields_set = changed_fields or set()
-
-    rewards_keys = {"rewards", "finish_submit_items", "finish_contain_items"}
-    stage_keys = {"finish_requirements"}
-    precondition_keys = {"get_requirements"}
-
-    reward_keys_to_validate = rewards_keys if full_mode else (changed_fields_set & rewards_keys)
-
-    run_rewards_steps = full_mode or bool(changed_fields_set & rewards_keys)
-    run_stage_steps = full_mode or bool(changed_fields_set & stage_keys)
-    run_precondition_steps = full_mode or bool(changed_fields_set & precondition_keys)
-
-    if run_rewards_steps:
-        e1 = _validate_v1_item_existence(
-            draft=draft,
-            item_registry=item_registry,
-            keys=tuple(sorted(reward_keys_to_validate)),
-        )
-        if e1:
-            return DraftValidationResult(success=False, validation_errors=[e1], validation_warnings=[])
-
-        e2 = _validate_v2_item_quantity_reasonableness(
-            draft=draft,
-            task_registry=task_registry,
-            item_registry=item_registry,
-            context=context,
-            keys=tuple(sorted(reward_keys_to_validate)),
-        )
-        if e2:
-            return DraftValidationResult(success=False, validation_errors=[e2], validation_warnings=[])
-
-    if run_stage_steps:
-        e3 = _validate_v3_stage_existence_and_area(draft=draft, stage_registry=stage_registry)
-        if e3:
-            return DraftValidationResult(success=False, validation_errors=[e3], validation_warnings=[])
-
-        e4 = _validate_v4_stage_unlock_condition(
-            draft=draft,
-            stage_registry=stage_registry,
-            main_task_max_id=context.main_task_max_id,
-        )
-        if e4:
-            return DraftValidationResult(success=False, validation_errors=[e4], validation_warnings=[])
-
-        e5 = _validate_v5_replica_stage_difficulty(
-            draft=draft,
-            context=context,
-            game_data=game_data,
-        )
-        if e5:
-            return DraftValidationResult(success=False, validation_errors=[e5], validation_warnings=[])
-
-    if run_precondition_steps:
-        e6 = _validate_v6_precondition_tasks(draft=draft, task_registry=task_registry)
-        if e6:
-            return DraftValidationResult(success=False, validation_errors=[e6], validation_warnings=[])
-
-    return DraftValidationResult(success=True, validation_errors=[], validation_warnings=[])
+def report_to_validation_errors(report: ValidationReport) -> list[dict[str, Any]]:
+    """兼容旧字段名的序列化（tools 结果 JSON 中 errors 数组的形态）。"""
+    return [i.to_model_json() for i in report.issues]
