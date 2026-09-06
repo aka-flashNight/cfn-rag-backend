@@ -10,9 +10,8 @@ transformers
 onnx
 onnxruntime
 
-# 评估（evals/，golden 集与 Ragas 流程）
-ragas>=0.2
-datasets
+# 评估（evals/，golden 集构建与检索层评估；检索层不调 LLM 无额外依赖。v2 的
+# Ragas 端到端轨道已随旧架构移除，ragas/datasets 不再需要）
 
 # 测试
 pytest

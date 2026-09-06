@@ -1917,3 +1917,28 @@ LLM 不应在每次对话中都尝试发布任务。以下是合理的触发场�
 | Phase 3 | 5-7 天    | LangGraph 与现有 OpenAI 兼容 API 的集成调试    |
 | Phase 4 | 3-5 天    | 任务协商的多轮状态管理；文件原子写入可靠性       |
 | Phase 5 | 持续迭代   | 需要实际游戏测试数据来调优                      |
+
+---
+
+## 7. v3 落地说明：agent_tasks.json / agent_text.json 的写入调用位置
+
+> 本节为 v3 重构后的实现现状记录（2026-09-06）；上文第 6 节的任务规则、格式规范、校验口径继续有效。
+
+v3 中这两个文件的**唯一写入路径**是一条同步动作链，均带原子写入（临时文件 + 替换）：
+
+1. **触发点**：玩家明确接受草案后，聊天主 Agent 的 meta 行委派指令（act）= `task_confirm`，
+   由回合编排器在后台子 Agent 之外**同步执行**（`services/orchestrator/turn.py`，快路径 <300ms）。
+2. **动作入口**：`services/agent_tools/handlers.py` 的 `execute_confirm_agent_task(...)`
+   —— 先做一次轻量 LLM 调用生成发布文本参数（title/description/接取与完成对话；
+   LLM 失败时回退模板文案），宽松归一化后进入写入。
+3. **写入实现**：`services/agent_tools/task_tools.py` —— 读取现有
+   `agent_tasks.json` / `agent_text.json` → 分配 200001+ 递增任务 ID → 按 §4 格式
+   拼装任务与文本 JSON → 原子写入两个文件 → 清除 `session_task_drafts` 中的草案。
+4. **配套规则（v3 新增/收紧）**：
+   - 候选池严格化：任务候选注册表记录来源文件，核心池**排除 `agent_tasks.json` 与
+     `mercenary_tasks.json`**（副本/活动类任务与历史生成任务不再进入候选，见
+     `services/game_data/task_registry.py`）；
+   - 定价卡与校验同源：奖励区间数字直接调用校验器 `_compute_reward_value_range`
+     生成（`services/agent_tools/pricing_rules.py`），含提交品/持有品加成公式；
+   - 校验失败先自动微调数值（对齐奖励阶梯），选择类问题才打回（`services/agent_tools/repair.py`）。
+5. **取消路径**：act = `task_cancel` 走同一同步动作链删除草案，不触碰任何游戏文件。
