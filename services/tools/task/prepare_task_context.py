@@ -16,7 +16,7 @@ class PrepareTaskContextTool(BaseTool):
         "任务发布流程 Step 1：根据意向任务类型与奖励偏好筛选关卡/物品/NPC 候选集，"
         "并返回该任务类型的预算规则、合法值域与使用建议。"
         "可选用 requirement_keywords / reward_keywords 将相关候选排到前面。"
-        "详细任务类型说明、奖励预算、协商规则等请通过 read_skill(name=\"task-publishing\") 按需查阅。"
+        "返回结果会直接交给后台任务系统用于拟定草案。"
     )
     parameters_schema = PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA
 
