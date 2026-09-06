@@ -217,6 +217,7 @@ def build_user_shared_core(
     *,
     retrieved_context: str = "",
     mentioned_npcs_str: str = "",
+    summary_str: str = "",
     history_str: str = "",
     player_identity: str = "",
     progress_desc: str = "",
@@ -226,13 +227,12 @@ def build_user_shared_core(
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
-    排序按前缀缓存对齐（从稳定到易变）：早期摘要 → 近期对话（追加式，旧前缀
-    跨轮可命中）→ 会话态（好感/草案，微变）→ RAG/提及 NPC（单轮内一致，跨轮全变）。
+    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ RAG/提及 NPC
+    （跨轮全变、轮内不变）→ 早期摘要 → 近期对话（对话记录整体下放：摘要比对话
+    稳定放前面；对话跨轮追加，同回合内过渡话产生后还会追加——轮内有变化但不
+    高频，放最下方使追加不破坏块内前缀）。
     """
     parts: list[str] = []
-    hist = (history_str or "").strip()
-    if hist:
-        parts.append(hist)
     session_block = build_session_state_block(
         player_identity=player_identity,
         progress_desc=progress_desc,
@@ -248,6 +248,12 @@ def build_user_shared_core(
     men = (mentioned_npcs_str or "").strip()
     if men:
         parts.append(men)
+    summary = (summary_str or "").strip()
+    if summary:
+        parts.append(summary)
+    hist = (history_str or "").strip()
+    if hist:
+        parts.append(hist)
     return "\n\n".join(parts)
 
 

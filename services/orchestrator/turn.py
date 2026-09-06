@@ -504,7 +504,8 @@ class TurnOrchestrator:
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,
             mentioned_npcs_str=ctx.mentioned_npcs_str,
-            history_str=self._history_text(ctx),
+            summary_str=self._summary_text(ctx),
+            history_str=self._recent_dialogue_text(ctx, spoken_text=""),
             player_identity=self.player_identity,
             progress_desc=ctx.progress_desc,
             favorability=ctx.favorability,
@@ -516,17 +517,10 @@ class TurnOrchestrator:
             {"role": "user", "content": shared},
         ]
 
-    def _history_text(self, ctx: TurnContext) -> str:
-        if getattr(ctx, "summary", None):
-            head = f"【早期对话摘要】\n{ctx.summary}"
-        else:
-            head = ""
-        lines = [
-            (f"玩家：{m.content}" if m.role == "user" else f"{self.npc_name}：{m.content}")
-            for m in ctx.history
-        ]
-        body = "\n".join(lines)
-        return f"{head}\n\n【近期对话】\n{body}" if head else f"【近期对话】\n{body}" if body else ""
+    def _summary_text(self, ctx: TurnContext) -> str:
+        """早期对话滚动摘要（比近期对话稳定，放对话块之前）。"""
+        summary = getattr(ctx, "summary", None)
+        return f"【早期对话摘要】\n{summary}" if summary else ""
 
     async def _forward_body(
         self, events: AsyncIterator[Any], sink: list[str],
