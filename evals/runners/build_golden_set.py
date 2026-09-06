@@ -1,10 +1,12 @@
-"""
-从当前向量索引分层采样构造 golden jsonl（expected_doc_ids 与索引 node_id 对齐）。
+"""从当前检索语料分层采样构造 golden jsonl（v3：expected_doc_ids 与新索引 Node.id 对齐）。
 
 用法（在仓库根目录）::
 
     python -m evals.runners.build_golden_set --tiny
     python -m evals.runners.build_golden_set --full
+
+v3 变更：语料来源从旧 LlamaIndex docstore 换为 services.retrieval.loader.load_corpus()，
+expected_doc_ids 直接写新 Node.id（旧 uuid 不再可用，见实施手记遗留 #2）。
 """
 
 from __future__ import annotations
@@ -20,10 +22,13 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from ai_engine.game_data_loader import get_cached_index, iter_docstore_nodes
+from services.retrieval.loader import load_corpus
 
 # Golden 抽样时排除的 NPC 阵营（非典型对话样本；与 npc_state_db.json 中 faction 字段一致）
 EXCLUDED_GOLDEN_FACTIONS: frozenset[str] = frozenset({"彩蛋", "成员"})
+
+# 评估覆盖的四类池（与旧 golden 口径一致；loading/实体池非旧口径范围）
+GOLDEN_TYPES: tuple[str, ...] = ("dialogue", "world_lore", "task", "intelligence")
 
 
 def _load_character_faction_map() -> dict[str, str]:
@@ -69,8 +74,7 @@ def _filter_nodes_by_faction(nodes: list, faction_map: dict[str, str]) -> list:
     """排除彩蛋/成员阵营 NPC 的节点（dialogue / task 等带 character 的池）。"""
     kept: list = []
     for node in nodes:
-        meta = getattr(node, "metadata", None) or {}
-        ch = str(meta.get("character") or "").strip().lower()
+        ch = (node.character or "").strip().lower()
         if _faction_excluded(ch, faction_map):
             continue
         kept.append(node)
@@ -100,12 +104,10 @@ def build_rows(
     n_task: int,
     n_intel: int,
 ) -> list[dict]:
-    index = get_cached_index()
-    nodes = iter_docstore_nodes(index)
+    nodes = load_corpus()
     by_type: dict[str, list] = defaultdict(list)
     for node in nodes:
-        t = (node.metadata or {}).get("type") or "unknown"
-        by_type[str(t)].append(node)
+        by_type[str(node.type)].append(node)
 
     faction_map = _load_character_faction_map()
     if not faction_map:
@@ -137,8 +139,8 @@ def build_rows(
         )
         sys.exit(1)
     for node in _sample_from_pool(rng, d_pool, min(n_dialogue, len(d_pool))):
-        ch = (node.metadata or {}).get("character") or "unknown"
-        text = getattr(node, "text", "") or ""
+        ch = node.character or "unknown"
+        text = node.text or ""
         q = (
             f"在「{ch}」的台词中，是否出现过与下列表述相近的内容？"
             f"{_text_preview(text, 80)}"
@@ -154,7 +156,7 @@ def build_rows(
                 "npc_name": ch,
                 "question": q,
                 "retrieve_query": q,
-                "expected_doc_ids": [node.node_id],
+                "expected_doc_ids": [node.id],
                 "expected_answer_contains": [ref_name or "台词", "台词"],
             }
         )
@@ -162,7 +164,7 @@ def build_rows(
 
     w_pool = by_type.get("world_lore", [])
     for node in _sample_from_pool(rng, w_pool, min(n_world, len(w_pool))):
-        text = getattr(node, "text", "") or ""
+        text = node.text or ""
         q = f"根据核心世界观设定，下列片段讨论的主题是什么？{_text_preview(text, 120)}"
         rows.append(
             {
@@ -172,7 +174,7 @@ def build_rows(
                 "npc_name": "Andy Law",
                 "question": q,
                 "retrieve_query": q,
-                "expected_doc_ids": [node.node_id],
+                "expected_doc_ids": [node.id],
                 "expected_answer_contains": ["世界", "设定"],
             }
         )
@@ -186,8 +188,8 @@ def build_rows(
         )
         sys.exit(1)
     for node in _sample_from_pool(rng, t_pool, min(n_task, len(t_pool))):
-        ch = (node.metadata or {}).get("character") or "unknown"
-        text = getattr(node, "text", "") or ""
+        ch = node.character or "unknown"
+        text = node.text or ""
         q = f"与任务对话相关：{_text_preview(text, 100)}"
         rows.append(
             {
@@ -198,7 +200,7 @@ def build_rows(
                 "npc_name": ch,
                 "question": q,
                 "retrieve_query": q,
-                "expected_doc_ids": [node.node_id],
+                "expected_doc_ids": [node.id],
                 "expected_answer_contains": ["任务"],
             }
         )
@@ -206,7 +208,7 @@ def build_rows(
 
     i_pool = by_type.get("intelligence", [])
     for node in _sample_from_pool(rng, i_pool, min(n_intel, len(i_pool))):
-        text = getattr(node, "text", "") or ""
+        text = node.text or ""
         q = f"情报档案中是否包含下列信息？{_text_preview(text, 90)}"
         rows.append(
             {
@@ -216,7 +218,7 @@ def build_rows(
                 "npc_name": "Andy Law",
                 "question": q,
                 "retrieve_query": q,
-                "expected_doc_ids": [node.node_id],
+                "expected_doc_ids": [node.id],
                 "expected_answer_contains": ["情报"],
             }
         )
@@ -236,7 +238,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tiny", action="store_true", help="5 条微型集（调通流水线）")
-    parser.add_argument("--full", action="store_true", help="完整分层采样（约 80 条）")
+    parser.add_argument("--full", action="store_true", help="完整分层采样（约 130 条）")
     args = parser.parse_args()
 
     rng = random.Random(42)

@@ -48,7 +48,8 @@ def _build_old_id_text_map() -> dict[str, str]:
 def bench_recall(engine, nodes) -> tuple[float, int, int]:
     """tiny_golden recall@10：单池 dense 模式（按 golden 行的 type/character 过滤后 top10）。
 
-    旧 expected_doc_ids 通过「文本精确匹配」映射到新 Node id（解析逻辑照搬，文本应一致）。
+    v3 golden（build_golden_set 重建）的 expected_doc_ids 直接是新 Node id；
+    旧 golden（LlamaIndex uuid）兼容路径：通过旧 docstore「文本精确匹配」映射。
     """
     import numpy as np
 
@@ -64,8 +65,10 @@ def bench_recall(engine, nodes) -> tuple[float, int, int]:
     expected_total = 0
     for row in rows:
         expected_ids = row.get("expected_doc_ids") or []
-        expected_texts = [old_map.get(i) for i in expected_ids]
-        expected_new = {text_to_new_id[t] for t in expected_texts if t and t in text_to_new_id}
+        expected_new = {i for i in expected_ids if i in node_row}
+        if not expected_new and old_map:
+            expected_texts = [old_map.get(i) for i in expected_ids]
+            expected_new = {text_to_new_id[t] for t in expected_texts if t and t in text_to_new_id}
         mapped_total += len(expected_new)
         expected_total += len(expected_ids)
         if not expected_new:
@@ -73,7 +76,7 @@ def bench_recall(engine, nodes) -> tuple[float, int, int]:
 
         query = row.get("retrieve_query") or row.get("question") or ""
         ftype = row.get("filter_type") or row.get("type") or ""
-        fchar = (row.get("filter_character") or row.get("npc_name") or "").strip().lower()
+        fchar = (row.get("filter_character") or "").strip().lower()
         subset = [
             n for n in nodes
             if n.type == ftype and (not fchar or (n.character or "") == fchar)

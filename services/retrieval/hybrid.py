@@ -295,6 +295,54 @@ class RetrievalEngine:
 
         return bundle
 
+    def retrieve_for_eval(
+        self,
+        query: str,
+        *,
+        type_filter: set[str] | frozenset[str],
+        character: str | None = None,
+        top_k: int = 20,
+        mode: str = "hybrid_rrf",
+    ) -> list[ScoredNode]:
+        """评估专用入口：单池（type/character 过滤）+ 指定打分模式，不做阈值过滤。
+
+        供 evals/retriever 评估 golden recall（阈值会截断召回，评估口径必须放开）。
+        mode ∈ dense / bm25 / hybrid_rrf；选定模式的分数放在 fused_score（排序依据）。
+        """
+        store = self._store
+        if store is None or store.matrix.shape[0] == 0:
+            return []
+
+        mask = np.zeros(len(self._char_lower), dtype=bool)
+        for t in type_filter:
+            m = self._type_masks.get(t)
+            if m is not None:
+                mask |= m
+        char_lower = (character or "").strip().lower()
+        if char_lower:
+            mask &= np.asarray([c == char_lower for c in self._char_lower], dtype=bool)
+        idxs = np.nonzero(mask)[0]
+        if len(idxs) == 0:
+            return []
+
+        dense = store.matrix @ self._resolve_embedder().encode([query])[0]
+        if mode == "dense":
+            scores = dense
+        elif mode in ("bm25", "hybrid_rrf"):
+            bm25 = self._bm25.scores(query) if self._bm25 is not None else np.zeros(
+                store.matrix.shape[0], dtype=np.float32
+            )
+            scores = bm25 if mode == "bm25" else rrf_fuse(dense, bm25)
+        else:
+            raise ValueError(f"未知评估模式: {mode}")
+
+        order = np.argsort(-scores[idxs], kind="stable")[:top_k]
+        picked = idxs[order]
+        return [
+            ScoredNode(store.nodes[int(i)], float(dense[i]), float(scores[i]))
+            for i in picked
+        ]
+
     # ------------------------------------------------------------------
     # 池内选择
     # ------------------------------------------------------------------
