@@ -234,8 +234,8 @@ def meta_prompt_block(npc_emotions: Sequence[str], *, has_pending_draft: bool = 
             "- 玩家一句话同时表达「接受 + 要调整」（如「我接，但奖励多点」）时，"
             "**优先按 task_update 处理**，等调整后玩家认可再说确认，不要直接 task_confirm。",
             "- 玩家讨价还价时你可以不同意让步，有两种方式：**正常情况下**不调用任何工具"
-            "（act 用 null），礼貌拒绝让步并直接问玩家「到底接还是不接」；"
-            "只有玩家态度恶劣或语境确实合适时，才用 task_cancel 直接取消委托。",
+            "（act 用 null），礼貌拒绝让步并直接问玩家到底接还是不接；"
+            "只有玩家态度恶劣或你的性格强硬或语境确实合适时，才在拒绝讨价还价时用 task_cancel 直接取消委托。",
         ])
     else:
         lines.extend([
