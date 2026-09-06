@@ -83,7 +83,7 @@ async def test_split_meta_events_forward_usage_and_finish():
 
     def handler(kwargs):
         async def gen():
-            yield FakeStreamChunk(delta=FakeDelta(content='{"emo":"微笑","fav":1,"act":null}\n'))
+            yield FakeStreamChunk(delta=FakeDelta(content='{"emo":"微笑","fav":0,"act":null}\n'))
             yield FakeStreamChunk(delta=FakeDelta(content="见到你真高兴。"))
             yield FakeStreamChunk(usage=type("U", (), {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14, "prompt_tokens_details": None})())
         return gen()

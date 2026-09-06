@@ -39,7 +39,7 @@ def _orch(env, query: str) -> TurnOrchestrator:
 
 async def test_pure_chat(env):
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":1,"act":null}',
+        meta='{"emo":"微笑","fav":0,"act":null}',
         text="诶，是你啊。今天有什么想聊的？",
         usage={"prompt_tokens": 100, "completion_tokens": 20},
     )

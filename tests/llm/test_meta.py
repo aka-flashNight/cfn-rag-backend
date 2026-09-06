@@ -22,7 +22,7 @@ async def _collect_text(aiter) -> str:
 
 
 async def test_normal_meta():
-    text = '{"emo":"微笑","fav":1,"act":null}\n诶，是你啊。今天有什么想聊的？\n'
+    text = '{"emo":"微笑","fav":0,"act":null}\n诶，是你啊。今天有什么想聊的？\n'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "微笑"
@@ -133,7 +133,7 @@ async def test_reasoning_events_never_enter_meta_or_content():
     """reasoning 增量一律丢弃（修 A7），不影响 meta 判定与正文。"""
     async def stream():
         yield StreamEvent(kind="reasoning", text="用户在跟我打招呼")
-        yield StreamEvent(kind="content", text='{"emo":"微笑","fav":1,"act":null}\n')
+        yield StreamEvent(kind="content", text='{"emo":"微笑","fav":0,"act":null}\n')
         yield StreamEvent(kind="reasoning", text="继续思考")
         yield StreamEvent(kind="content", text="你好呀。")
         yield StreamEvent(kind="finish")

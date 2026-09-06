@@ -118,7 +118,7 @@ class StreamEvent:
 聊天主 Agent 的响应**第一行**必须是单行紧凑 JSON，第二行起为 NPC 台词正文：
 
 ```
-{"emo":"微笑","fav":1,"act":null}
+{"emo":"微笑","fav":0,"act":null}
 诶，是你啊。今天有什么想聊的？
 ```
 
