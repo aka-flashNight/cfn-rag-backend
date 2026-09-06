@@ -92,12 +92,12 @@ class SubagentEvent:
 
 聊天主 Agent 依据 meta.act 直接处理，**不经子 Agent**：
 
-| 玩家意图 | act | 动作 |
-|---|---|---|
-| 接受 | `task_confirm` | 同步 confirm（校验+原子写+分配 ID），成功 → 正文确认 + tool_status(success) + system_notice「委托已发布」 |
-| 拒绝 | `task_cancel` | 同步 cancel，正文符合人设地送客 |
-| 讨价还价 | `task_update` | 启动 TaskRunner（update 模式）→ 完成 → 调用 #2 重新说明方案并再次询问。**讨价还价不需要 intermediate 过渡**（调整简单，直接等 final） |
-| 岔开话题 | null | 草案保留；草案触碰计数器 +1，达到 `draft_keep_turns`（默认 3）自动 cancel + system_notice「过期的委托草案已取消」 |
+| 玩家意图 | act              | 动作                                                                                                                                         |
+| -------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 接受     | `task_confirm` | 同步 confirm（校验+原子写+分配 ID），成功 → 正文确认 + tool_status(success) + system_notice「委托已发布」                                   |
+| 拒绝     | `task_cancel`  | 同步 cancel，正文符合人设地送客                                                                                                              |
+| 讨价还价 | `task_update`  | 启动 TaskRunner（update 模式）→ 完成 → 调用#2 重新说明方案并再次询问。**讨价还价不需要 intermediate 过渡**（调整简单，直接等 final） |
+| 岔开话题 | null             | 草案保留；草案触碰计数器 +1，达到`draft_keep_turns`（默认 3）自动 cancel + system_notice「过期的委托草案已取消」                           |
 
 confirm 失败（草案过期/校验回归，极少）：丢弃已生成正文 → 补救调用让 NPC 解释（"这份委托刚才出了点问题……"）+ system_notice 真实原因。
 
@@ -118,11 +118,20 @@ class TaskRunner(SubagentBase):
              search_items, search_stages, list_skills, read_skill, read_skill_file]
 ```
 
-- **首轮强制注入**：`direction`（聊天主 Agent 给的方向，标注"必须严格遵守，仅可在候选不足时偏离并说明"）+ NPC 信息 + 玩家进度 + pending_draft（update 模式）+ skill 简表。
-- 循环：LLM（非流式，tools）→ 执行 tool_calls（**同批多个并行 asyncio.gather**，修 B3 的串行；工具本身是 CPU 轻操作 + 内存检索，无需 to_thread）→ 结果回填 → 直至 draft 成功/失败或达轮限。
-- 校验反馈形态由 `05` 定义：聚合错误 + 修复指引 + 候选清单；TaskRunner 原样回填给模型。
+- **节点精确注入**（每轮只注入当前必须内容）：system = 协调员基座 + 当前模式规则卡
+  （draft：定价卡+字段说明，与校验器同源生成；update：讨价还价卡）；user = 方向继承块
+  （prepare 参数还原）+ 最近 5 轮对话（含 NPC 过渡话，要求拟定与发言一致）+ 候选池全文 / 当前草案。
+  skills 索引与 read_skill 通道已移除（规则全部前置内联）。
+- **情形分流**：prepare 成功（交流 Agent 工具调用已执行）→ tools=[draft] 直接拟；
+  prepare 失败/缺失 → tools=[prepare] 先重取候选（继承对话思路，不回炉交流 Agent），
+  拿到候选后**轮内动态收窄**为 [draft]。
+- 循环：LLM（非流式，tools）→ 执行 tool_calls（**同批多个并行 asyncio.gather**，修 B3 的串行；
+  工具本身是 CPU 轻操作 + 内存检索，无需 to_thread）→ 结果回填 → 直至 draft 成功/失败或达轮限。
+- 校验反馈形态由 `05` 定义：聚合错误 + 修复指引 + 候选清单；数值类问题已被后端微调
+  （auto_repaired 标注），打回只含选择类问题。
 - update 模式：只调 `update_task_draft(draft_id, modify_fields)`；讨价还价计数（上限 2 次）保留。
 - 每轮向 events 队列发 progress；校验失败发 intermediate；结束发 final/failed。
+- **逐轮 INFO 日志**：轮次、工具表、结果 status、校验失败逐条 rule/field/message（可观测性）。
 
 ## 6. SearchRunner 内部（search_runner.py）
 
@@ -139,25 +148,25 @@ class SearchRunner(SubagentBase):
 
 并行 `asyncio.gather`：
 
-| 项 | 来源 | 说明 |
-|---|---|---|
-| NPC 状态 | `services/npc` 内存单例 | 阵营/称号/情绪列表/好感/关系/商店/切磋（不再每请求读 JSON，见 06） |
-| 会话记忆 | SQLite | 近 N 条 + 滚动摘要 + pending_draft 摘要块 + 玩家身份/进度 |
-| Tier-1 检索 | `services/retrieval` | 见 04：≤3 个 query 变体，单次嵌入，矩阵乘 + 池内过滤 + RRF |
-| 提及 NPC 块 | 子串匹配（沿用） | 保留现状逻辑，移入 retrieval |
-| 立绘 | `services/portraits` | 仅 vision 模型；manifest 查表 + 缓存（07） |
-| appearance 文本 | npc_state_db.json 可选字段 | 有则恒入 prompt（07） |
-| save_info | gamebridge stub | 恒 None（预留，01 §9） |
+| 项              | 来源                       | 说明                                                               |
+| --------------- | -------------------------- | ------------------------------------------------------------------ |
+| NPC 状态        | `services/npc` 内存单例  | 阵营/称号/情绪列表/好感/关系/商店/切磋（不再每请求读 JSON，见 06） |
+| 会话记忆        | SQLite                     | 近 N 条 + 滚动摘要 + pending_draft 摘要块 + 玩家身份/进度          |
+| Tier-1 检索     | `services/retrieval`     | 见 04：≤3 个 query 变体，单次嵌入，矩阵乘 + 池内过滤 + RRF        |
+| 提及 NPC 块     | 子串匹配（沿用）           | 保留现状逻辑，移入 retrieval                                       |
+| 立绘            | `services/portraits`     | 仅 vision 模型；manifest 查表 + 缓存（07）                         |
+| appearance 文本 | npc_state_db.json 可选字段 | 有则恒入 prompt（07）                                              |
+| save_info       | gamebridge stub            | 恒 None（预留，01 §9）                                            |
 
 ## 8. 新旧行为对照（必须做到的改善）
 
-| 场景 | 旧 | 新 |
-|---|---|---|
-| 纯聊天 | supervisor→(可能 worker)→dialogue，2~3 次串行 LLM | **1 次流式调用**，情绪同步前置 |
-| 发任务 | 串行等待 TaskAgent 全程，玩家干等 | 正文先出，TaskRunner 后台并行，汇合说明 |
-| 查资料 | 路由→QueryAgent→dialogue 串行 | 正文先出，SearchRunner 后台并行 |
-| 确认/取消 | 重跑整条 agent 链路 | meta 直发，后端同步执行 <300ms |
-| 情绪 | supervisor 决定+回显约束 | meta 行自带，解析即发，天然先于正文 |
+| 场景      | 旧                                                  | 新                                      |
+| --------- | --------------------------------------------------- | --------------------------------------- |
+| 纯聊天    | supervisor→(可能 worker)→dialogue，2~3 次串行 LLM | **1 次流式调用**，情绪同步前置    |
+| 发任务    | 串行等待 TaskAgent 全程，玩家干等                   | 正文先出，TaskRunner 后台并行，汇合说明 |
+| 查资料    | 路由→QueryAgent→dialogue 串行                     | 正文先出，SearchRunner 后台并行         |
+| 确认/取消 | 重跑整条 agent 链路                                 | meta 直发，后端同步执行 <300ms          |
+| 情绪      | supervisor 决定+回显约束                            | meta 行自带，解析即发，天然先于正文     |
 
 ## 9. 测试要求（P3/P4 验收）
 

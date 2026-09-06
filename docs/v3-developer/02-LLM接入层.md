@@ -35,10 +35,12 @@ class LLMClient:
 
 class ChatRequest(BaseModel):
     messages: list[dict]
-    tools: list[dict] | None = None        # 仅子 Agent 传
+    tools: list[dict] | None = None        # 聊天 Agent 按业务注册（当前仅 prepare_task_context）；
+                                           # 子 Agent 全量工具循环。流式+tools 无兼容坑（实测），
     purpose: Literal["chat", "subagent", "summary"] = "chat"
     send_image: bool = True                # purpose != "chat" 时强制 False（图片只进聊天轮）
     max_tokens: int | None = None
+    # 不支持流式 tools 的平台：chat 轮剥 tools 重试一次（turn.py 唯一降级点）
 ```
 
 ### 2.2 固定行为
@@ -69,19 +71,19 @@ class StreamEvent:
 
 按 `model_name` 小写子串匹配，先匹配先中；**匹配不到 = `DEFAULT_PROFILE`（不传任何思考参数、vision 探测型）**。
 
-| Profile（匹配子串） | vision | 思考控制参数（随请求发送） | 备注 |
-|---|---|---|---|
-| `glm-5.3-flash` | ✅ | `thinking={"type":"enabled"}` + 低强度档 | **不能关**，传 disabled 会报错（官方明确）。强度参数名官方文档待复核（调研标注），先按 `reasoning_effort="low"` 发送，靠 §3.2 降级链兜底：报参数错→只发 enabled→裸请求 |
-| `glm-5.3`（其他档） | ✅ | 同上 | 同上 |
-| `deepseek-v4-flash-vision-exp` | ✅ | `thinking={"type":"disabled"}` | 视觉需手动声明启用的细节以官方文档为准；按 OpenAI image_url 发送即可 |
-| `deepseek-v4-flash` | ❌ | `thinking={"type":"disabled"}` | 纯文本 |
-| `qwen3.8-flash` | ✅ | `extra_body={"enable_thinking": False}` | 百炼默认即关；显式传确保。另有 `/no_think` 软开关可写进 prompt 兜底 |
-| `gpt-5.6-luna` | ✅ | `reasoning_effort="none"` | none=真·非思考（官方） |
-| `doubao-seed-2-0-lite` | ✅ | `thinking={"type":"disabled"}` | 方舟统一参数 |
-| `kimi-k3` | ✅ | 不传（恒开，无法关） | 不传 temperature |
-| `minimax-m3` | ✅ | `thinking={"type":"disabled"}` | |
-| `gemini-3`（flash 系） | ✅ | `extra_body={"thinking_level":"low"}` | 未见完全关闭档；low 为最低 |
-| `DEFAULT_PROFILE` | 探测 | 不传 | 新模型接入零配置可用 |
+| Profile（匹配子串）              | vision | 思考控制参数（随请求发送）                 | 备注                                                                                                                                                                              |
+| -------------------------------- | ------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `glm-5.3-flash`                | ✅     | `thinking={"type":"enabled"}` + 低强度档 | **不能关**，传 disabled 会报错（官方明确）。强度参数名官方文档待复核（调研标注），先按 `reasoning_effort="low"` 发送，靠 §3.2 降级链兜底：报参数错→只发 enabled→裸请求 |
+| `glm-5.3`（其他档）            | ✅     | 同上                                       | 同上                                                                                                                                                                              |
+| `deepseek-v4-flash-vision-exp` | ✅     | `thinking={"type":"disabled"}`           | 视觉需手动声明启用的细节以官方文档为准；按 OpenAI image_url 发送即可                                                                                                              |
+| `deepseek-v4-flash`            | ❌     | `thinking={"type":"disabled"}`           | 纯文本                                                                                                                                                                            |
+| `qwen3.8-flash`                | ✅     | `extra_body={"enable_thinking": False}`  | 百炼默认即关；显式传确保。另有`/no_think` 软开关可写进 prompt 兜底                                                                                                              |
+| `gpt-5.6-luna`                 | ✅     | `reasoning_effort="none"`                | none=真·非思考（官方）                                                                                                                                                           |
+| `doubao-seed-2-0-lite`         | ✅     | `thinking={"type":"disabled"}`           | 方舟统一参数                                                                                                                                                                      |
+| `kimi-k3`                      | ✅     | 不传（恒开，无法关）                       | 不传 temperature                                                                                                                                                                  |
+| `minimax-m3`                   | ✅     | `thinking={"type":"disabled"}`           |                                                                                                                                                                                   |
+| `gemini-3`（flash 系）         | ✅     | `extra_body={"thinking_level":"low"}`    | 未见完全关闭档；low 为最低                                                                                                                                                        |
+| `DEFAULT_PROFILE`              | 探测   | 不传                                       | 新模型接入零配置可用                                                                                                                                                              |
 
 > 上表参数以调研文档为准，但**所有参数都被视为"可能错"**：§3.2 的降级链是正确性的最终保证。Profile 表是集中配置，后续新增/修正模型只改这一处。
 
@@ -123,7 +125,7 @@ class StreamEvent:
 ```jsonc
 // act 的全部合法形态（kind 枚举）
 null                                                        // 纯聊天
-{"kind":"task_draft","direction":"收集3个猫爪交给铁匠","reward_hint":"金币","note":"玩家赶时间"}
+{"kind":"task_draft"}   // 委派发任务：prepare 参数由 prepare_task_context 工具调用承载（台词先行、后调工具）
 {"kind":"task_update","note":"玩家嫌奖励少，希望金币加两成"}
 {"kind":"task_confirm"}                                     // 玩家确认接受当前草案
 {"kind":"task_cancel"}                                      // 玩家拒绝/放弃当前草案
@@ -131,11 +133,16 @@ null                                                        // 纯聊天
 ```
 
 字段约束：
+
 - `emo`：必须 ∈ 该 NPC 的 emotions 列表；非法 → 回退 `普通`。
 - `fav`：整数，clamp 到 [-5, 5]。
-- `direction`：任务大方向（≤60 字），**必须具体到可执行**（任务类型/目标物/目标关卡至少其一明确）；TaskRunner 须严格遵守。
-- `reward_hint`/`note`：可选，≤30 字。
+- `task_update.note`：玩家新条件（≤60 字），任务 Agent 据此修改草案。
 - `search.query`：≤40 字。
+- task_draft 的候选池参数（task_type/reward_types/keywords）不在 meta 行内——由聊天主 Agent 在流式响应中
+  调用 `prepare_task_context`（唯一注册工具）承载；后端执行后直通任务 Agent。prepare 失败/缺失时
+  由任务 Agent 以 prepare_then_draft 模式自行重试（继承对话思路，不回炉交流 Agent）。
+- meta_prompt_block 按「无草案 / 有草案」双分支互斥注入（无草案讲发起新任务，有草案讲
+  confirm/cancel/update/大改重拟路由）。
 
 ### 4.2 解析器（parse_meta_stream）
 
@@ -153,6 +160,7 @@ meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 处�
 ### 4.3 prompt 说明（生成函数 `meta_prompt_block(npc_emotions)`）
 
 写进聊天尾部指令，要点：
+
 1. 第一行只能是一个 JSON、一行、不解释、不用代码块包裹。
 2. emo 从给定列表选；fav 范围 -5~5，无变化写 0。
 3. act 决策规则（精简版）：
@@ -164,13 +172,13 @@ meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 处�
 
 ## 5. act 的执行语义（orchestrator 侧，本章只定义契约）
 
-| act | 执行方式 | 失败处理 |
-|---|---|---|
-| `task_draft` | 立即启动 TaskRunner 后台任务（direction 作为严格指令注入） | 见 03 §4 汇合规则 |
-| `task_update` | 立即启动 TaskRunner（update 模式，携带 pending draft） | 同上 |
-| `search` | 立即启动 SearchRunner 后台任务 | 同上 |
-| `task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）成功→放行正文 + tool_status(success)；失败→**丢弃已生成正文**，携带错误原因做 1 次补救调用让 NPC 解释 | 见 05 §6 |
-| `task_cancel` | 同步执行 cancel，同上 | 极少失败 |
+| act              | 执行方式                                                                                                                                                                  | 失败处理           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `task_draft`   | 立即启动 TaskRunner 后台任务（direction 作为严格指令注入）                                                                                                                | 见 03 §4 汇合规则 |
+| `task_update`  | 立即启动 TaskRunner（update 模式，携带 pending draft）                                                                                                                    | 同上               |
+| `search`       | 立即启动 SearchRunner 后台任务                                                                                                                                            | 同上               |
+| `task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）成功→放行正文 + tool_status(success)；失败→**丢弃已生成正文**，携带错误原因做 1 次补救调用让 NPC 解释 | 见 05 §6          |
+| `task_cancel`  | 同步执行 cancel，同上                                                                                                                                                     | 极少失败           |
 
 confirm/cancel 不经过子 Agent——它们是纯后端操作，聊天主 Agent 直接触发（用户决策："模型聊天+快速调用对应工具就行了"）。
 
