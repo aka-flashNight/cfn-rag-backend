@@ -132,19 +132,30 @@ def build_static_system(
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
     player_can_challenge: Optional[bool] = None,
+    has_pending_draft: bool = False,
 ) -> str:
-    """L1 世界观 + L2 扮演约束 + 同阵营表 + appearance（静态，前缀缓存命中区）。"""
+    """system 分层（前缀缓存对齐，从稳定到易变）：
+    层1 跨 NPC 一致（世界观、输出规则、prepare 指南）→ 层2 单 NPC 一致
+    （扮演约束、meta 协议、同阵营表、商店/切磋约束、appearance）。"""
     emotions_str = "、".join(state.emotions or ["普通"])
     tagline = format_npc_role_tagline(
         npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
     )
+    # ---- 层1：跨 NPC 一致 ----
     parts = [
         f"【世界观背景概要】\n{WORLD_BACKGROUND}",
+        DIALOGUE_FORMAT_RULES,
+    ]
+    if not has_pending_draft:
+        parts.append(PREPARE_TOOL_GUIDE)
+    # ---- 层2：单 NPC 一致 ----
+    parts.extend([
         tagline,
         f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。",
         "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定。",
-    ]
+        meta_prompt_block(state.emotions or ["普通"], has_pending_draft=has_pending_draft),
+    ])
     same = (same_faction_npcs or "").strip()
     if same:
         parts.append(f"【同阵营角色】\n{same}")
@@ -213,14 +224,15 @@ def build_user_shared_core(
     relationship_level: str = "陌生",
     pending_draft_summary: str = "",
 ) -> str:
-    """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言与尾部指令）。"""
+    """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
+
+    排序按前缀缓存对齐（从稳定到易变）：早期摘要 → 近期对话（追加式，旧前缀
+    跨轮可命中）→ 会话态（好感/草案，微变）→ RAG/提及 NPC（单轮内一致，跨轮全变）。
+    """
     parts: list[str] = []
-    rag = _rag_block(retrieved_context)
-    if rag:
-        parts.append(rag)
-    men = (mentioned_npcs_str or "").strip()
-    if men:
-        parts.append(men)
+    hist = (history_str or "").strip()
+    if hist:
+        parts.append(hist)
     session_block = build_session_state_block(
         player_identity=player_identity,
         progress_desc=progress_desc,
@@ -230,32 +242,19 @@ def build_user_shared_core(
     )
     if session_block:
         parts.append(session_block)
-    hist = (history_str or "").strip()
-    if hist:
-        parts.append(hist)
+    rag = _rag_block(retrieved_context)
+    if rag:
+        parts.append(rag)
+    men = (mentioned_npcs_str or "").strip()
+    if men:
+        parts.append(men)
     return "\n\n".join(parts)
 
 
-def build_chat_tail(
-    *,
-    npc_emotions: list[str],
-    user_query: str,
-    pending_draft: bool = False,
-) -> str:
-    """user tail：meta 协议（意图路由，双分支）+ prepare 工具指南 + 输出规则 + 玩家当轮发言。"""
-    parts = [
-        meta_prompt_block(npc_emotions, has_pending_draft=pending_draft),
-    ]
-    if not pending_draft:
-        parts.append(PREPARE_TOOL_GUIDE)
-    parts.append(DIALOGUE_FORMAT_RULES)
-    parts.append(f"玩家：{user_query}")
-    return "\n\n".join(parts)
+def build_player_message(user_query: str) -> str:
+    """末条 user 消息：玩家当轮发言（最易变，置于一切内容之后；图片 part 附其尾）。"""
+    return f"玩家：{user_query}"
 
-
-# ---------------------------------------------------------------------------
-# prepare_task_context 工具指南（仅无草案时注入；有草案时走 confirm/cancel/update 路由）
-# ---------------------------------------------------------------------------
 
 PREPARE_TOOL_GUIDE = """\
 【prepare_task_context 工具使用说明（仅在你决定委派 task_draft 时调用）】

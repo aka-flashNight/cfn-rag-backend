@@ -29,12 +29,12 @@ def test_data_url_format_and_bounds_crop(portrait_env):
     assert im.size == (60, 40)
 
 
-def test_long_edge_scaled_to_512(portrait_env):
+def test_long_edge_scaled_to_480(portrait_env):
     url = provider.get_portrait_data_url("清水结衣", "普通")
     assert url is not None
     im = _open_webp(_decode_data_url(url))
     # 1200×900 全幅 bounds → 长边 1200 缩到 512（512×384）
-    assert im.size == (512, 384)
+    assert im.size == (480, 360)
 
 
 def test_cache_hit_skips_pil_processing(portrait_env, monkeypatch):

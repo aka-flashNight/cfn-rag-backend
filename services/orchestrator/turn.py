@@ -54,8 +54,8 @@ from services.orchestrator.events import (
 from services.orchestrator.merge import MergeCoordinator
 from services.orchestrator.prompts import (
     CONFIRM_ARGS_SYSTEM,
-    build_chat_tail,
     build_confirm_args_user_prompt,
+    build_player_message,
     build_merge_user_prompt,
     build_static_system,
     build_user_shared_core,
@@ -270,17 +270,16 @@ class TurnOrchestrator:
             llm = deps.llm_factory(self.llm_config)
 
             # ---- BURST_STREAMING（调用 #1）----
+            # system 分层（从稳定到易变）：世界观 → 输出规则/prepare 指南（跨 NPC）
+            # → 单 NPC 扮演块（含 meta 协议）；user1 = 历史 → 会话态 → RAG（同回合
+            # 多次调用共享）；user2 = 玩家当轮话（+立绘图片 part 在尾）。
             base_messages = self._build_base_messages(ctx)
-            tail = build_chat_tail(
-                npc_emotions=list(ctx.npc_state.emotions or ["普通"]),
-                user_query=self.query,
-                pending_draft=ctx.pending_draft_row is not None,
-            )
+            player_message = build_player_message(self.query)
             # 立绘图片只进聊天调用 #1 的末条 user 消息（文本 part 前、图片 part 后）；
             # base_messages 保持纯文本，merge/补救/confirm 参数等调用天然无图
             messages = [
                 *base_messages,
-                {"role": "user", "content": build_image_message_content(tail, ctx.image_data_url)},
+                {"role": "user", "content": build_image_message_content(player_message, ctx.image_data_url)},
             ]
 
             # 聊天 Agent 唯一工具：prepare_task_context（01 §3 D4 修订：
@@ -500,6 +499,7 @@ class TurnOrchestrator:
             has_shop=ctx.has_shop,
             shop_reward_types=ctx.shop_reward_types,
             player_can_challenge=ctx.player_can_challenge,
+            has_pending_draft=ctx.pending_draft_row is not None,
         )
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,

@@ -23,7 +23,7 @@ from services.portraits.manifest_lookup import (
 
 logger = logging.getLogger(__name__)
 
-MAX_LONG_EDGE = 512  # 长边上限（控制多模态 token 消耗，07 §3）
+MAX_LONG_EDGE = 480  # 长边上限（≈480p，控制多模态 token 消耗与传输体积，07 §3）
 WEBP_QUALITY = 80
 
 # OpenAI 兼容多模态消息中的图片 part（图片 part 在文本 part 之后，02 §3.3）
