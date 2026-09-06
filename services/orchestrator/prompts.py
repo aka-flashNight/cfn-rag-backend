@@ -226,15 +226,39 @@ def build_chat_tail(
     user_query: str,
     pending_draft: bool = False,
 ) -> str:
-    """user tail：meta 协议 + 输出规则 + 玩家当轮发言。"""
-    parts = [meta_prompt_block(npc_emotions), DIALOGUE_FORMAT_RULES]
-    if pending_draft:
-        parts.append(
-            "注意：当前存在待确认草案。玩家接受→task_confirm；拒绝→task_cancel；"
-            "谈条件→task_update；岔开话题→act 保持 null。"
-        )
+    """user tail：meta 协议（意图路由，双分支）+ prepare 工具指南 + 输出规则 + 玩家当轮发言。"""
+    parts = [
+        meta_prompt_block(npc_emotions, has_pending_draft=pending_draft),
+    ]
+    if not pending_draft:
+        parts.append(PREPARE_TOOL_GUIDE)
+    parts.append(DIALOGUE_FORMAT_RULES)
     parts.append(f"玩家：{user_query}")
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# prepare_task_context 工具指南（仅无草案时注入；有草案时走 confirm/cancel/update 路由）
+# ---------------------------------------------------------------------------
+
+PREPARE_TOOL_GUIDE = """\
+【prepare_task_context 工具使用说明（仅在你决定委派 task_draft 时调用）】
+你有一个工具 prepare_task_context：筛选任务候选集（关卡/物品/奖励与预算规则）。规则：
+1. 先输出 1~2 句过渡话回应玩家，**然后**调用本工具；禁止只调用工具不说话。调用后本轮正文到此为止。
+2. task_type 合法值与选择原则（**必须严格按此选择，选错会被打回**）：
+   - 问候：让玩家来见你一面/打招呼（无实质劳动）。传话：让玩家给你带话/传信。
+   - 通关 / 清理 / 挑战：让玩家去打怪或清场（通关=打副本关卡；清理=清理区域怪物；挑战=高难度战斗）。
+   - 切磋：与玩家切磋（仅当你有切磋关卡时可选）。
+   - 资源收集：让玩家把物品**带回来交给你**（你缺物资时用）。
+   - 装备缴纳：让玩家上缴装备给你。物品持有：让玩家持有/保管某物品。
+   - 特殊物品获取：让玩家去获取某件特定物品（不算上缴，拿到即可）。
+   - 通关并收集 / 通关并持有：打完关还要收集/持有物品。
+   - **核心原则：玩家想要资源/装备时，禁止选「资源收集/装备缴纳」让他交资源（他想要的是得到）；
+     你缺什么才让他「收集/缴纳」什么。task_type 是玩家要做的事，reward_types 是玩家得到的东西，不要混淆。**
+3. reward_types：{"regular": [金币/经验值], "optional": [其他奖励类型]}。经验值仅挑战类可大量给。
+4. requirement_keywords：把玩家提到的物品/关卡/区域关键词填进去（让相关候选排前）；没有就不填。
+5. 候选池与奖励预算由工具返回，交给后台任务系统处理——你的台词里不要写任何具体任务内容或数字。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -291,25 +315,40 @@ TASK_FAIL_INSTRUCTION = (
 
 
 # ---------------------------------------------------------------------------
-# confirm 参数生成（同步动作内的轻量调用）
+# confirm 发布文本生成（与聊天 Agent 同源前缀的单次调用；无硬校验，宽松归一化）
 # ---------------------------------------------------------------------------
 
 CONFIRM_ARGS_SYSTEM = (
-    "你是任务发布文书助手。根据给定的任务草案生成发布所需文本，输出一个 JSON 对象"
-    "（不要代码块、不要解释）。字段："
-    'title（任务标题，简洁）、description（任务说明，与关卡/物品/奖励一致）、'
-    "get_dialogue（接取对话数组，1~3 条：NPC 向玩家发布任务，可含玩家 $PC 回应，"
-    '每条 {"name","title","emotion","text"}，text 为纯对话不含【动作】）、'
+    "你正在以当前扮演角色的身份，为自己刚与玩家谈妥的委托撰写发布文书。"
+    "严格按角色口吻撰写。输出一个 JSON 对象（不要代码块、不要解释）。字段："
+    'title（任务标题，简洁）、description（任务说明，与任务内容一致）、'
+    "get_dialogue（接取对话数组，1~3 条：NPC 向玩家发布任务，可穿插玩家 $PC 的回应，"
+    '每条 {"name","title","emotion","text"}，text 为纯对话，动作神态用全角【】），'
     "finish_dialogue（完成对话数组，1~3 条：玩家向 NPC 交付，NPC 验收）。"
-    "对话要符合 NPC 口吻与任务内容，不要与草案信息冲突。"
+    "对话要自然衔接上文，不要与近期发言重复或冲突。"
 )
 
 
-def build_confirm_args_user_prompt(draft_summary: str, npc_name: str) -> str:
-    return (
-        f"发布 NPC：{npc_name}\n【任务草案】\n{draft_summary}\n\n"
-        "请生成发布所需文本 JSON。"
+def build_confirm_args_user_prompt(
+    *,
+    draft_summary: str,
+    npc_name: str,
+    spoken_text: str = "",
+    emotion: str = "",
+) -> str:
+    """confirm 参数生成（复用聊天 Agent base_messages 前缀后追加的 user 消息）。"""
+    parts = []
+    if (spoken_text or "").strip():
+        parts.append(
+            f"【本轮你已对玩家说的话（情绪：{emotion or '普通'}，保持一致）】\n"
+            f"{npc_name}：{spoken_text.strip()}"
+        )
+    parts.append(f"【待发布任务详情】\n{draft_summary}")
+    parts.append(
+        "现在以你的身份生成发布文本 JSON（title/description/get_dialogue/finish_dialogue）。"
+        "对话中的玩家条目 name 用 $PC。"
     )
+    return "\n\n".join(parts)
 
 
 def parse_confirm_args_json(text: str) -> Optional[dict]:

@@ -28,9 +28,6 @@ SEARCH_TOOLS = [
     "search_knowledge",
     "search_items",
     "search_stages",
-    "list_skills",
-    "read_skill",
-    "read_skill_file",
 ]
 
 _FINDINGS_MAX_CHARS = 400
@@ -82,7 +79,6 @@ class SearchRunner(SubagentBase):
             query=query,
             npc_name=npc_name,
             player_query=player_query,
-            skill_registry=ctx.skill_registry,
         )
         runner = cls(
             llm=llm,

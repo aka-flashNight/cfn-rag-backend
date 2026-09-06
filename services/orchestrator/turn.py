@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional
@@ -33,7 +34,7 @@ from services.llm import (
     Meta,
     split_meta_events,
 )
-from services.llm.errors import LLMError
+from services.llm.errors import LLMError, is_tools_unsupported_error
 from services.memory.store import MemoryStore, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
@@ -67,9 +68,25 @@ from services.subagents import (
     TaskRunner,
     get_session_subagents,
 )
-from services.tools.base import ToolRegistry, get_tool_registry
+from services.tools.base import ToolContext, ToolRegistry, get_tool_registry
+from services.agent_tools.schemas import TASK_TYPES
 
 logger = logging.getLogger(__name__)
+
+_PREPARE_STATUS_KEYS = ("collectable_items", "stage_list", "reward_item_candidates",
+                        "holdable_items", "equipment_items", "special_items",
+                        "npc_list", "challenge_targets", "stage_loot_list")
+
+
+def _prepared_candidates_empty(prepared_json: str) -> bool:
+    """prepare 结果是否没有任何候选（task_type 无专属字段时视为空）。"""
+    try:
+        data = json.loads(prepared_json) if prepared_json else None
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    return not any(isinstance(data.get(k), list) and data.get(k) for k in _PREPARE_STATUS_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -266,27 +283,53 @@ class TurnOrchestrator:
                 {"role": "user", "content": build_image_message_content(tail, ctx.image_data_url)},
             ]
 
+            # 聊天 Agent 唯一工具：prepare_task_context（01 §3 D4 修订：
+            # 情绪/委派意图仍走 meta 行，数据准备类工具按业务注册）
+            prepare_tool = deps.registry.get("prepare_task_context")
+            chat_tools = [prepare_tool.to_openai_tool()] if prepare_tool is not None else None
+
             stream = llm.chat_stream(ChatRequest(
                 messages=messages,
+                tools=chat_tools,
                 purpose="chat",
                 send_image=self.send_image,
             ))
-            meta, events = await split_meta_events(stream, list(ctx.npc_state.emotions or ["普通"]))
+            try:
+                meta, events = await split_meta_events(
+                    stream, list(ctx.npc_state.emotions or ["普通"]),
+                )
+            except LLMError as exc:
+                if chat_tools and is_tools_unsupported_error(exc):
+                    # 平台不支持流式 tools：剥工具重试一次（聊天功能降级可用）
+                    logger.warning("模型不支持流式 tools，剥离后重试: %s", exc)
+                    stream = llm.chat_stream(ChatRequest(
+                        messages=messages, tools=None, purpose="chat",
+                        send_image=self.send_image,
+                    ))
+                    meta, events = await split_meta_events(
+                        stream, list(ctx.npc_state.emotions or ["普通"]),
+                    )
+                else:
+                    raise
             act = meta.act
             act_kind = act.kind if act is not None else None
+            tool_sink: list[dict[str, Any]] = []  # 流内模型发出的 tool_calls（prepare 用）
 
             # 情绪/好感先于正文：解析到 meta 即更新并发事件
             yield await self._emit_meta(meta, deps)
 
             if act is None:
                 # ---- 纯聊天路径 ----
-                async for ev in self._forward_body(events, collected_text):
+                async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
                     yield ev
+                if tool_sink:
+                    logger.info("纯聊天轮出现 prepare 调用（act=null），忽略: %s",
+                                [tc.get("function", {}).get("name") for tc in tool_sink])
 
             elif act.kind in ("task_confirm", "task_cancel"):
-                # ---- SYNC_ACTION：缓冲正文，先执行后端操作 ----
+                # ---- SYNC_ACTION：缓冲正文，先执行后端操作（prepare 调用忽略）----
                 buffered: list[str] = []
-                await self._collect_body(events, buffered)
+                await self._collect_body(events, buffered, tool_sink=tool_sink)
                 spoken_text = "".join(buffered)
                 tool_name = "confirm_agent_task" if act.kind == "task_confirm" else "cancel_agent_task"
                 ui_hint = "发布委托" if act.kind == "task_confirm" else "取消委托"
@@ -304,7 +347,11 @@ class TurnOrchestrator:
                         ):
                             yield ev
                     else:
-                        confirm_args = await self._generate_confirm_args(llm, ctx, draft_row, deps.game_data)
+                        confirm_args = await self._generate_confirm_args(
+                            llm, ctx, draft_row, deps.game_data,
+                            base_messages=base_messages, spoken_text=spoken_text,
+                            emotion=meta.emotion,
+                        )
                         outcome = execute_confirm_agent_task(
                             confirm_args,
                             pending_draft=draft_row.draft,
@@ -356,11 +403,19 @@ class TurnOrchestrator:
                         yield system_notice_event("委托已取消")
 
             else:
-                # ---- 后台子 Agent：立即启动（fire-and-steer），正文直发 ----
-                handle = self._launch_subagent(act, ctx, deps)
+                # ---- 后台子 Agent（fire-and-steer），正文直发 ----
+                # task_draft：prepare 由聊天 Agent 在流内调用，流结束后执行并直通任务 Agent
+                if act.kind == "task_draft":
+                    async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
+                        yield ev
+                    prepared = await self._execute_prepare(tool_sink, ctx, deps)
+                else:  # search / task_update 不需要 prepare
+                    prepared = (None, None, "")
+                    async for ev in self._forward_body(events, collected_text):
+                        yield ev
+
+                handle = self._launch_subagent(act, ctx, deps, prepared, spoken_text="".join(collected_text))
                 sess.register(handle)
-                async for ev in self._forward_body(events, collected_text):
-                    yield ev
 
                 # ---- MERGE_WAIT ----
                 merge = MergeCoordinator(
@@ -474,8 +529,9 @@ class TurnOrchestrator:
 
     async def _forward_body(
         self, events: AsyncIterator[Any], sink: list[str],
+        *, tool_sink: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[SSEEvent]:
-        """转发调用 #1 的正文流（content/usage；finish 终止）。"""
+        """转发调用 #1 的正文流（content/usage；finish 时提取 tool_calls 后终止）。"""
         async for ev in events:
             if ev.kind == "content" and ev.text:
                 sink.append(ev.text)
@@ -483,9 +539,14 @@ class TurnOrchestrator:
             elif ev.kind == "usage" and ev.usage:
                 self._usage = accumulate_usage(self._usage, ev.usage)
             elif ev.kind == "finish":
+                if tool_sink is not None and ev.tool_calls:
+                    tool_sink.extend(ev.tool_calls)
                 return
 
-    async def _collect_body(self, events: AsyncIterator[Any], sink: list[str]) -> None:
+    async def _collect_body(
+        self, events: AsyncIterator[Any], sink: list[str],
+        *, tool_sink: list[dict[str, Any]] | None = None,
+    ) -> None:
         """仅收集不转发（SYNC_ACTION 的正文缓冲，成功后才放行）。"""
         async for ev in events:
             if ev.kind == "content" and ev.text:
@@ -493,6 +554,8 @@ class TurnOrchestrator:
             elif ev.kind == "usage" and ev.usage:
                 self._usage = accumulate_usage(self._usage, ev.usage)
             elif ev.kind == "finish":
+                if tool_sink is not None and ev.tool_calls:
+                    tool_sink.extend(ev.tool_calls)
                 return
 
     async def _emit_meta(self, meta: Meta, deps: OrchestratorDeps) -> SSEEvent:
@@ -511,44 +574,127 @@ class TurnOrchestrator:
         )
 
     # ------------------------------------------------------------------
+    # prepare 执行（聊天 Agent 的 tool_calls → 候选池直通任务 Agent）
+    # ------------------------------------------------------------------
+
+    async def _execute_prepare(
+        self,
+        tool_calls: list[dict[str, Any]],
+        ctx: TurnContext,
+        deps: OrchestratorDeps,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]], str]:
+        """执行聊天 Agent 的 prepare_task_context 调用。
+
+        返回 (候选池 JSON | None, 参数 dict | None, 失败原因)。
+        失败不回炉交流 Agent：任务 Agent 将以 prepare_then_draft 模式自行重试（继承方向）。
+        """
+        calls = [
+            tc for tc in (tool_calls or [])
+            if isinstance(tc, dict)
+            and str(tc.get("function", {}).get("name") or "") == "prepare_task_context"
+        ]
+        if not calls:
+            logger.info("TurnOrchestrator: task_draft 但交流阶段未调用 prepare，任务 Agent 将重试")
+            return None, None, "交流阶段未调用 prepare_task_context"
+        raw_args = calls[-1].get("function", {}).get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("TurnOrchestrator: prepare 参数解析失败: %s", str(raw_args)[:200])
+            return None, None, "prepare 参数解析失败"
+        if not isinstance(args, dict):
+            return None, None, "prepare 参数格式错误"
+        task_type = str(args.get("task_type") or "").strip()
+        if task_type not in TASK_TYPES:
+            logger.warning("TurnOrchestrator: prepare 的 task_type 非法: %s", task_type)
+            return None, args, f"prepare 的 task_type 非法：{task_type}"
+
+        outcome = await deps.registry.dispatch("prepare_task_context", args, ToolContext(
+            npc_name=self.npc_name,
+            npc_faction=ctx.npc_state.faction or "",
+            npc_challenge=ctx.npc_state.challenge,
+            player_progress=ctx.progress_stage or 1,
+            npc_affinity=ctx.favorability,
+            npc_states=ctx.npc_states,
+            game_data=deps.game_data,
+        ))
+        try:
+            payload = json.loads(outcome.result_json)
+            status = payload.get("status") if isinstance(payload, dict) else None
+        except json.JSONDecodeError:
+            status = "unreadable"
+        candidates_empty = _prepared_candidates_empty(outcome.result_json)
+        logger.info(
+            "TurnOrchestrator prepare 执行完成: task_type=%s status=%s 候选空=%s",
+            task_type, status, candidates_empty,
+        )
+        if candidates_empty:
+            return None, args, f"prepare 候选池为空（task_type={task_type}）"
+        return outcome.result_json, args, ""
+
+    def _recent_dialogue_text(self, ctx: TurnContext, spoken_text: str) -> str:
+        """任务 Agent 的最近 5 轮对话（memory 近 4 轮 + 本轮已流出正文，含过渡话）。"""
+        lines: list[str] = []
+        for m in ctx.history[-8:]:
+            lines.append(f"玩家：{m.content}" if m.role == "user" else f"{self.npc_name}：{m.content}")
+        if spoken_text.strip():
+            lines.append(f"{self.npc_name}：{spoken_text.strip()}")
+        return "\n".join(lines) or "（暂无对话记录）"
+
+    # ------------------------------------------------------------------
     # 同步动作
     # ------------------------------------------------------------------
 
     async def _generate_confirm_args(
-        self, llm: LLMClient, ctx: TurnContext, draft_row: TaskDraftRow, game_data: Any,
+        self,
+        llm: LLMClient,
+        ctx: TurnContext,
+        draft_row: TaskDraftRow,
+        game_data: Any,
+        *,
+        base_messages: list[dict[str, Any]],
+        spoken_text: str = "",
+        emotion: str = "",
     ) -> dict[str, Any]:
-        """confirm 所需的 title/description/对话文本：轻量 LLM 调用 + 模板兜底。
+        """confirm 发布文本（title/description/接取与完成对话）生成。
 
-        （meta 行协议没有携带这些字段的通道；偏差记录见实施手记）
+        与聊天 Agent **同源前缀**（世界观/扮演/RAG/会话态/近期历史），追加本轮
+        过渡话与草案详情——保证生成的对话贴合对话脉络。单次、无工具、宽松归一化；
+        仅当 LLM 调用整体失败或解析不出 JSON 时回退模板（优先保证发布流程可用）。
         """
         draft = draft_row.draft
         summary = _detailed_draft_summary(
             draft, game_data, rag_context_text=ctx.rag_context_text,
         )
-        prompt = build_confirm_args_user_prompt(summary, self.npc_name)
+        user_prompt = (
+            CONFIRM_ARGS_SYSTEM + "\n\n"
+            + build_confirm_args_user_prompt(
+                draft_summary=summary,
+                npc_name=self.npc_name,
+                spoken_text=spoken_text,
+                emotion=emotion,
+            )
+        )
         args: dict[str, Any] | None = None
         try:
             result = await llm.chat(ChatRequest(
-                messages=[
-                    {"role": "system", "content": CONFIRM_ARGS_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=[*base_messages, {"role": "user", "content": user_prompt}],
                 purpose="subagent",
-                max_tokens=800,
+                max_tokens=1600,
             ))
             self._usage = accumulate_usage(self._usage, result.usage)
             args = self._sanitize_confirm_args(parse_confirm_args(result.content))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("confirm 参数生成失败，使用模板兜底: %s", exc)
+            logger.warning("confirm 发布文本生成失败，使用模板兜底: %s", exc)
         if not args:
             args = fallback_confirm_args(draft, self.npc_name)
         args["draft_id"] = draft_row.draft_id
         return args
 
     def _sanitize_confirm_args(self, args: dict[str, Any] | None) -> dict[str, Any] | None:
-        """宽松校验：title/description 字符串、dialogue 数组形状。"""
+        """宽松归一化（不硬打回）：字符串化 + 空对话补占位，优先保住 LLM 的产出。"""
         if not isinstance(args, dict):
             return None
         out: dict[str, Any] = {}
@@ -557,31 +703,29 @@ class TurnOrchestrator:
         out["title"] = title.strip() if isinstance(title, str) else ""
         out["description"] = desc.strip() if isinstance(desc, str) else ""
 
-        def _dlg(key: str) -> list[dict[str, Any]]:
+        def _dlg(key: str, fallback_text: str) -> list[dict[str, Any]]:
             rows = args.get(key)
-            if not isinstance(rows, list):
-                return []
             cleaned: list[dict[str, Any]] = []
-            for r in rows[:4]:
-                if not isinstance(r, dict):
-                    continue
-                text = str(r.get("text") or "").strip()
-                if not text:
-                    continue
-                cleaned.append({
-                    "name": str(r.get("name") or self.npc_name).strip() or self.npc_name,
-                    "title": str(r.get("title") or "").strip(),
-                    "emotion": str(r.get("emotion") or "").strip(),
-                    "text": text,
-                })
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    text = str(r.get("text") or "").strip()
+                    if not text:
+                        continue
+                    cleaned.append({
+                        "name": str(r.get("name") or self.npc_name).strip() or self.npc_name,
+                        "title": str(r.get("title") or "").strip(),
+                        "emotion": str(r.get("emotion") or "").strip(),
+                        "text": text,
+                    })
+            if not cleaned:
+                # 对话缺失不回炉重生成：补一条占位，保证发布流程可用
+                cleaned = [{"name": self.npc_name, "title": "", "emotion": "", "text": fallback_text}]
             return cleaned
 
-        get_dlg = _dlg("get_dialogue")
-        fin_dlg = _dlg("finish_dialogue")
-        if not get_dlg or not fin_dlg:
-            return None  # 对话缺失 → 走模板兜底
-        out["get_dialogue"] = get_dlg
-        out["finish_dialogue"] = fin_dlg
+        out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。")
+        out["finish_dialogue"] = _dlg("finish_dialogue", "干得漂亮，报酬一分不少。")
         return out
 
     @staticmethod
@@ -655,12 +799,42 @@ class TurnOrchestrator:
     # 子 Agent 启动
     # ------------------------------------------------------------------
 
-    def _launch_subagent(self, act: Any, ctx: TurnContext, deps: OrchestratorDeps) -> Any:
+    @staticmethod
+    def _direction_from_prepared(prepared_args: Optional[dict[str, Any]]) -> str:
+        """任务方向 = 交流 Agent prepare 参数（结构化委派）的自然语言还原。"""
+        if not prepared_args:
+            return ""
+        parts: list[str] = []
+        task_type = str(prepared_args.get("task_type") or "").strip()
+        if task_type:
+            parts.append(f"任务类型：{task_type}")
+        rt = prepared_args.get("reward_types")
+        if isinstance(rt, dict):
+            reg = "、".join(rt.get("regular") or [])
+            opt = "、".join(rt.get("optional") or [])
+            if reg or opt:
+                parts.append(f"奖励方向：常规[{reg or '无'}] 可选[{opt or '无'}]")
+        kws = prepared_args.get("requirement_keywords")
+        if isinstance(kws, list) and kws:
+            parts.append("目标关键词：" + "、".join(str(k) for k in kws))
+        return "；".join(parts)
+
+    def _launch_subagent(
+        self,
+        act: Any,
+        ctx: TurnContext,
+        deps: OrchestratorDeps,
+        prepared: tuple[Optional[str], Optional[dict[str, Any]], str] = (None, None, ""),
+        *,
+        spoken_text: str = "",
+    ) -> Any:
         progress = ctx.progress_stage or 1
         affinity = ctx.favorability
         npc_titles = list(ctx.npc_state.titles or [])
         npc_states = ctx.npc_states
         llm = deps.llm_factory(self.llm_config)
+        prepared_context, prepared_args, prepare_error = prepared
+        recent_dialogue = self._recent_dialogue_text(ctx, spoken_text)
 
         if act.kind == "search":
             return SearchRunner.launch(
@@ -691,7 +865,9 @@ class TurnOrchestrator:
                     direction=act.note or self.query,
                     reward_hint="",
                     note="",
-                    player_query=self.query,
+                    prepared_context=None,
+                    prepare_error="以 task_update 委派但无待修改草案，按新任务重拟",
+                    recent_dialogue=recent_dialogue,
                     npc_name=self.npc_name,
                     npc_faction=ctx.npc_state.faction or "",
                     npc_titles=npc_titles,
@@ -715,7 +891,7 @@ class TurnOrchestrator:
                 direction="",
                 reward_hint="",
                 note=act.note,
-                player_query=self.query,
+                recent_dialogue=recent_dialogue,
                 npc_name=self.npc_name,
                 npc_faction=ctx.npc_state.faction or "",
                 npc_titles=npc_titles,
@@ -733,15 +909,19 @@ class TurnOrchestrator:
                 max_rounds=deps.task_max_rounds,
             )
 
-        # task_draft
+        # task_draft：方向 = prepare 参数还原（交流 Agent 的结构化委派）；
+        # prepare 失败 → 任务 Agent 以 prepare_then_draft 模式自行重试（继承方向）
+        direction = self._direction_from_prepared(prepared_args) or self.query
         return TaskRunner.launch(
             kind="task_draft",
             llm=llm,
             registry=deps.registry,
-            direction=act.direction,
-            reward_hint=act.reward_hint,
-            note=act.note,
-            player_query=self.query,
+            direction=direction,
+            reward_hint="",
+            note="",
+            prepared_context=prepared_context,
+            prepare_error=prepare_error,
+            recent_dialogue=recent_dialogue,
             npc_name=self.npc_name,
             npc_faction=ctx.npc_state.faction or "",
             npc_titles=npc_titles,

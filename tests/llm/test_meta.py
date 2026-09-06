@@ -77,10 +77,11 @@ async def test_multiline_json_impersonation_is_content():
 
 
 async def test_act_variants():
-    draft = {"emo": "微笑", "fav": 1, "act": {"kind": "task_draft", "direction": "收集3个猫爪交给铁匠", "reward_hint": "金币"}}
+    # v3 修订：task_draft 只表达意图（prepare 参数由工具调用承载），多余字段忽略
+    draft = {"emo": "微笑", "fav": 1, "act": {"kind": "task_draft", "direction": "收集3个猫爪交给铁匠"}}
     meta, rest = await split_meta(_stream_from_text(json.dumps(draft, ensure_ascii=False) + "\n好。"), EMOTIONS)
     await _collect_text(rest)
-    assert meta.act == MetaAct(kind="task_draft", direction="收集3个猫爪交给铁匠", reward_hint="金币")
+    assert meta.act == MetaAct(kind="task_draft")
 
     search = {"emo": "普通", "fav": 0, "act": {"kind": "search", "query": "安迪·洛的过去"}}
     meta2, rest2 = await split_meta(_stream_from_text(json.dumps(search, ensure_ascii=False) + "\n嗯。"), EMOTIONS)
@@ -94,13 +95,13 @@ async def test_act_variants():
         assert meta3.act == MetaAct(kind=kind)
 
 
-async def test_act_missing_direction_becomes_null():
-    """task_draft 缺 direction → act 置 null（保住 emo/fav，不丢 meta）。"""
+async def test_act_task_draft_without_params_still_valid():
+    """task_draft 无需任何参数（prepare 由工具调用承载）→ 意图保留。"""
     text = '{"emo":"微笑","fav":1,"act":{"kind":"task_draft"}}\n好。'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     await _collect_text(rest)
     assert meta.emotion == "微笑"
-    assert meta.act is None
+    assert meta.act == MetaAct(kind="task_draft")
 
 
 async def test_unknown_act_kind_becomes_null():

@@ -34,8 +34,10 @@ class FakeLLM:
 
     # -- 脚本登记 --
 
-    def add_stream(self, text: str = "", meta: str | None = None, usage: dict | None = None) -> None:
-        self._streams.append({"meta": meta, "text": text, "usage": usage})
+    def add_stream(self, text: str = "", meta: str | None = None, usage: dict | None = None,
+                   tool_calls: list[dict] | None = None) -> None:
+        """tool_calls：随 finish 事件返回的 tool_calls（聊天 Agent 的 prepare 调用）。"""
+        self._streams.append({"meta": meta, "text": text, "usage": usage, "tool_calls": tool_calls})
 
     def add_chat(self, content: str = "", tool_calls: list[dict] | None = None,
                  usage: dict | None = None, delay: float = 0.0) -> None:
@@ -57,7 +59,7 @@ class FakeLLM:
                 await asyncio_sleep(0)
             if script["usage"]:
                 yield StreamEvent(kind="usage", usage=script["usage"])
-            yield StreamEvent(kind="finish", usage=script["usage"])
+            yield StreamEvent(kind="finish", usage=script["usage"], tool_calls=script.get("tool_calls"))
 
         return _gen()
 

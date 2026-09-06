@@ -1,8 +1,13 @@
 """meta 行协议：解析器 + 校验 + prompt 说明文本生成。
 
 对应 docs/v3-developer/02-LLM接入层.md §4。聊天主 Agent 的响应第一行是
-单行紧凑 JSON（情绪/好感/委派指令），第二行起为 NPC 台词正文。
+单行紧凑 JSON（情绪/好感/委派意图），第二行起为 NPC 台词正文。
 解析器全容错：解析失败、缺字段、类型错误一律按「无 meta」处理，绝不丢正文。
+
+v3 修订（tools 承载 prepare）：act 只表达**意图**，不再内联 prepare 参数——
+task_draft 的候选池由聊天主 Agent 在流式响应中调用 prepare_task_context 工具预取，
+后端执行后直通任务 Agent（01 §3 D4 修订：情绪/委派意图仍走 meta 行，
+数据准备类工具按业务注册）。
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterable, Sequence
+from typing import AsyncIterator, Sequence
 
 from services.llm.client import StreamEvent
 
@@ -22,25 +27,23 @@ _MAX_META_LINE_CHARS = 512
 
 DEFAULT_EMOTION = "普通"
 _FAV_MIN, _FAV_MAX = -5, 5
-_DIRECTION_MAX_CHARS = 60
-_HINT_MAX_CHARS = 30
+_HINT_MAX_CHARS = 60
 _QUERY_MAX_CHARS = 40
 
 
 @dataclass(frozen=True)
 class MetaAct:
-    """委派指令。kind ∈ ACT_KINDS；task_draft 需 direction（任务大方向）。"""
+    """委派意图声明。task_draft 仅表达意图（prepare 由工具调用承载）；
+    task_update 的 note 为玩家新条件；search 的 query 为查询要点。"""
 
     kind: str
-    direction: str = ""
-    reward_hint: str = ""
     note: str = ""
     query: str = ""
 
 
 @dataclass(frozen=True)
 class Meta:
-    """本轮 meta：情绪、好感变化、委派指令。"""
+    """本轮 meta：情绪、好感变化、委派意图。"""
 
     emotion: str = DEFAULT_EMOTION
     favorability_change: int = 0
@@ -85,27 +88,14 @@ def parse_meta_obj(obj: object, npc_emotions: Sequence[str]) -> Meta | None:
     act: MetaAct | None = None
     if isinstance(act_raw, dict):
         kind = str(act_raw.get("kind") or "").strip()
-        if kind == "task_draft":
-            direction = act_raw.get("direction")
-            if isinstance(direction, str) and direction.strip():
-                act = MetaAct(
-                    kind=kind,
-                    direction=_clip(direction, _DIRECTION_MAX_CHARS),
-                    reward_hint=_clip(str(act_raw.get("reward_hint") or ""), _HINT_MAX_CHARS)
-                    if isinstance(act_raw.get("reward_hint"), str)
-                    else "",
-                    note=_clip(str(act_raw.get("note") or ""), _HINT_MAX_CHARS)
-                    if isinstance(act_raw.get("note"), str)
-                    else "",
-                )
+        if kind in ("task_draft", "task_confirm", "task_cancel"):
+            act = MetaAct(kind=kind)
         elif kind == "task_update":
             note = act_raw.get("note")
             act = MetaAct(
                 kind=kind,
                 note=_clip(note, _HINT_MAX_CHARS) if isinstance(note, str) else "",
             )
-        elif kind in ("task_confirm", "task_cancel"):
-            act = MetaAct(kind=kind)
         elif kind == "search":
             query = act_raw.get("query")
             if isinstance(query, str) and query.strip():
@@ -208,8 +198,13 @@ async def split_meta(
     return meta, _texts()
 
 
-def meta_prompt_block(npc_emotions: Sequence[str]) -> str:
-    """生成写进聊天尾部指令的 meta 行协议说明（02 §4.3）。"""
+def meta_prompt_block(npc_emotions: Sequence[str], *, has_pending_draft: bool = False) -> str:
+    """生成写进聊天尾部指令的 meta 行协议说明（02 §4.3）。
+
+    双分支互斥注入：无草案时讲「如何发起新任务」；有草案时讲「确认/取消/讨价
+    还价/大改重拟」的路由。prepare 工具的字段说明与 TASK_TYPES 选择原则见
+    orchestrator.prompts.PREPARE_TOOL_GUIDE（本块只做意图路由）。
+    """
     emotions = list(npc_emotions) or [DEFAULT_EMOTION]
     emo_list = "、".join(emotions)
     lines = [
@@ -220,19 +215,33 @@ def meta_prompt_block(npc_emotions: Sequence[str]) -> str:
         "",
         "字段规则：",
         f"1. emo：本轮情绪，必须从列表中选择：{emo_list}。",
-        f"2. fav：本条消息对玩家好感度的变化，整数，范围 -5~5，无变化写 0。",
-        "3. act：本轮委派指令，取以下之一：",
+        "2. fav：本条消息对玩家好感度的变化，整数，范围 -5~5，无变化写 0。",
+        "3. act：本轮委派意图，取以下之一：",
         '   - null：纯聊天，不委派任何事。',
-        '   - {"kind":"task_draft","direction":"<任务大方向>","reward_hint":"<奖励方向>","note":"<备注>"}：玩家明确要求委托/工作/任务时使用。direction 必须具体到可执行（任务类型/目标物/目标关卡至少其一明确），不超过 60 字。**拟定了方向就必须委派，不要自己编任务细节**。',
-        '   - {"kind":"task_update","note":"<玩家的新条件>"}：已存在待确认草案且玩家在谈条件/要求修改时使用。',
-        '   - {"kind":"task_confirm"}：存在待确认草案且玩家明确接受时使用。',
-        '   - {"kind":"task_cancel"}：存在待确认草案且玩家明确拒绝/放弃时使用。',
-        '   - {"kind":"search","query":"<查询要点>"}：需要查证设定/物品/关卡信息才能回答时使用，query 不超过 40 字。',
-        "",
-        "重要提醒：",
-        "- 存在待确认草案时：玩家接受 → task_confirm；玩家拒绝 → task_cancel；玩家谈条件 → task_update；玩家岔开话题 → 保持 null（草案会保留若干回合）。",
-        "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
-        "- 委派 task_draft / task_update / search 时，第一段正文只写 1~2 句过渡话（如「我想想给你安排点什么……」），不要写任何具体任务内容或数字。",
-        "- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。",
     ]
+    if has_pending_draft:
+        lines.extend([
+            '   - {"kind":"task_confirm"}：玩家明确接受当前草案时使用。',
+            '   - {"kind":"task_cancel"}：玩家明确拒绝/放弃当前草案时使用。',
+            '   - {"kind":"task_update","note":"<玩家的新条件>"}：玩家在谈条件/要求小幅修改'
+            "（如只调奖励数量、换奖励物品、改难度）时使用；具体改什么由任务系统按 note 处理。",
+            '   - {"kind":"task_draft"}：**仅当玩家要求彻底重新拟定任务方向/换一个任务**时使用；'
+            "同时调用 prepare_task_context 工具重新准备候选（新草案会替换旧草案）。",
+            "",
+            "重要提醒：",
+            "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
+            "- 接受/拒绝/小幅讨价还价都不需要调用 prepare_task_context。",
+        ])
+    else:
+        lines.extend([
+            '   - {"kind":"task_draft"}：玩家明确要求委托/工作/任务时使用，**同时调用 '
+            'prepare_task_context 工具**（候选由工具返回，不要在台词里自己编任务细节）。',
+            '   - {"kind":"search","query":"<查询要点>"}：需要查证设定/物品/关卡信息才能回答时使用，query 不超过 40 字。',
+            "",
+            "重要提醒：",
+            "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
+            "- 委派 task_draft / search 时，第一段正文只写 1~2 句过渡话"
+            "（如「我想想给你安排点什么……」），不要写任何具体任务内容或数字。",
+        ])
+    lines.append("- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。")
     return "\n".join(lines)

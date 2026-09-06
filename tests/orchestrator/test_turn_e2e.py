@@ -81,14 +81,14 @@ async def test_task_draft_with_interim_rule(env):
     env.deps.merge_grace_ms = 200
     env.deps.subagent_timeout_s = 5
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft","direction":"收集食材，报酬金币"}}',
+        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
         text="哦？想找活干？我看看手头有什么适合你的……",
+        tool_calls=[tc("prepare_task_context", {
+            "task_type": "资源收集",
+            "reward_types": {"regular": ["金币"], "optional": []},
+        }, call_id="p1")],
     )
-    # TaskRunner 工具循环：prepare → 非法草案（V1，不可自动修）→ 合法草案
-    env.fake.add_chat(tool_calls=[tc("prepare_task_context", {
-        "task_type": "资源收集",
-        "reward_types": {"regular": ["金币"], "optional": []},
-    })])
+    # TaskRunner（情形 1，候选池已预取）：非法草案（V1）→ 合法草案
     env.fake.add_chat(delay=0.05, tool_calls=[tc("draft_agent_task", {
         "task_type": "资源收集",
         "title": "食材收集委托",
@@ -138,13 +138,13 @@ async def test_task_draft_within_grace_no_interim(env):
     """宽限路径：TaskRunner 在宽限内完成 → 无过渡语直接汇合（03 §9.3）。"""
     env.deps.merge_grace_ms = 500
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft","direction":"收集食材"}}',
+        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
         text="我想想给你安排点什么……",
+        tool_calls=[tc("prepare_task_context", {
+            "task_type": "资源收集",
+            "reward_types": {"regular": ["金币"], "optional": []},
+        }, call_id="p1")],
     )
-    env.fake.add_chat(tool_calls=[tc("prepare_task_context", {
-        "task_type": "资源收集",
-        "reward_types": {"regular": ["金币"], "optional": []},
-    })])
     env.fake.add_chat(tool_calls=[tc("draft_agent_task", {
         "task_type": "资源收集",
         "title": "食材收集委托",
@@ -341,7 +341,7 @@ async def test_task_draft_failed_reply(env):
     env.deps.merge_grace_ms = 50
     env.deps.subagent_timeout_s = 2
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft","direction":"收集"}}',
+        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
         text="我想想……",
     )
 
@@ -362,3 +362,52 @@ async def test_task_draft_failed_reply(env):
 @pytest.fixture
 def _unused():
     return None
+
+# ---------------------------------------------------------------------------
+# 情形 2：交流阶段未调用 prepare → 任务 Agent 先重 prepare 再 draft（工具动态收窄）
+# ---------------------------------------------------------------------------
+
+async def test_task_draft_reprepare_when_prepare_missing(env):
+    env.fake.add_stream(
+        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
+        text="我想想给你安排点什么……",  # 模型忘了调 prepare
+    )
+    env.fake.add_chat(tool_calls=[tc("prepare_task_context", {
+        "task_type": "资源收集",
+        "reward_types": {"regular": ["金币"], "optional": []},
+    }, call_id="p1")])
+    env.fake.add_chat(tool_calls=[tc("draft_agent_task", {
+        "task_type": "资源收集",
+        "title": "食材收集委托",
+        "rewards": [{"item_name": "金币", "count": 25000}],
+    })])
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    events = await collect(_orch(env, "有什么活吗？"))
+    # 工具动态收窄：轮 1 只有 prepare，轮 2 只有 draft
+    from services.llm import ChatRequest as _CR
+
+    tool_names = [
+        [t["function"]["name"] for t in (req.tools or [])]
+        for req in env.fake.chat_requests
+    ]
+    assert tool_names[0] == ["prepare_task_context"]
+    assert tool_names[1] == ["draft_agent_task"]
+    assert phases_of(events) == [("task", "drafting"), ("task", "done")]
+    assert MERGE_REPLY_TASK in "".join(contents_of(events))
+    row = await env.deps.memory.get_draft(env.session_id)
+    assert row is not None and row.draft["rewards"] == [{"item_name": "金币", "count": 25000}]
+
+
+async def test_confirm_args_sanitizer_fills_placeholder(env):
+    """confirm 发布文本归一化：LLM 缺对话时补占位，不回炉重生成（流程可用优先）。"""
+    orch = _orch(env, "接！")
+    args = orch._sanitize_confirm_args({
+        "title": "食材收集委托",
+        "description": "收集食材",
+        "get_dialogue": [{"name": "铁匠", "text": "交给你了。"}],
+        "finish_dialogue": "不是数组",
+    })
+    assert args is not None
+    assert args["get_dialogue"][0]["text"] == "交给你了。"
+    assert args["finish_dialogue"][0]["text"] == "干得漂亮，报酬一分不少。"  # 占位补齐

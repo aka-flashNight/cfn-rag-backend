@@ -160,7 +160,6 @@ class SubagentBase:
         return {"findings": text}
 
     async def run(self) -> None:
-        tools = self._tools_schema()
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": self.user_prompt},
@@ -173,6 +172,8 @@ class SubagentBase:
         try:
             for _round in range(self.max_rounds):
                 self.rounds_used = _round + 1
+                # 每轮动态取工具表（TaskRunner 的 prepare→draft 收窄依赖此）
+                tools = self._tools_schema()
                 result = await self.llm.chat(ChatRequest(
                     messages=messages,
                     tools=tools or None,
