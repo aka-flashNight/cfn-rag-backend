@@ -1,183 +1,189 @@
 #!/usr/bin/env python3
+"""CFN-RAG.exe 打包脚本（v3 重写，对应 docs/v3-developer/06-存储启动与打包瘦身.md §4）。
+
+形态：PyInstaller onefile（launcher.py 为入口，单实例互斥 + 起后端 + 前端静态服务 + /api 反代）。
+
+打包内容（仅三类 + 启动资源）：
+- dist/                          前端静态产物
+- models/bge-small-zh-v1.5-onnx-int8/   int8 嵌入模型（~55MB）
+- backup_resources/              npc_state_db / agent_tasks / agent_text 首启种子
+- scripts/icon.ico、scripts/loading_audio.mp3   启动闪屏/提示音
+
+不再打入：tools/（ffdec 已随 D9 废弃）、原始 HF 模型目录、scripts/ 其余、evals、tests。
+
+hidden imports 重点：onnxruntime / tokenizers / uvicorn 标准件；
+excludes 重点：torch、transformers、llama_index、langchain 系（06 §4 包体主战场）。
+
+用法：
+  python scripts/build_exe.py              # 日常打包
+  python scripts/build_exe.py --no-splash  # 不带闪屏（可省 ~数 MB）
 """
-打包脚本：将launcher.py和后端代码打包成单个exe文件
 
-向量索引（resources/tools/vector_index）默认不在打包时重建，以缩短打包时间；
-仅在显式传入 --rebuild-vector 时才会在打包前强制重建。
-
-示例：
-  # 日常打包（沿用已有 vector_index，若无则首次运行 exe 时会自动生成）
-  python scripts/build_exe.py
-
-  # 知识库/嵌入源有更新，需要在打包前刷新向量库再分发时
-  python scripts/build_exe.py --rebuild-vector
-"""
+from __future__ import annotations
 
 import argparse
 import os
-import sys
 import shutil
 import subprocess
-
-
-def collect_all_py_files():
-    """收集所有需要打包的Python文件目录"""
-    dirs_to_include = []
-
-    # 获取项目根目录（脚本所在目录的父目录）
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    os.chdir(project_root)
-
-    # 需要包含的目录
-    target_dirs = ['api', 'core', 'services', 'ai_engine', 'schemas']
-
-    for dir_name in target_dirs:
-        if os.path.exists(dir_name) and os.path.isdir(dir_name):
-            dirs_to_include.append(dir_name)
-            print(f"  包含目录: {dir_name}/")
-
-    # 包含根目录下的py文件
-    root_py_files = [f for f in os.listdir('.') if f.endswith('.py') and f != 'launcher.py' and f != 'build_exe.py']
-    print(f"  包含根目录Python文件: {root_py_files}")
-
-    return dirs_to_include, root_py_files
-
-
-def create_spec_file(dirs_to_include, root_py_files, script_dir):
-    """创建PyInstaller的spec文件"""
-
-    # 构建add-data参数
-    add_data_lines = []
-
-    # 添加前端dist目录
-    dist_dir = os.path.abspath('dist')
-    add_data_lines.append(f"             (r'{dist_dir}', 'dist'),")
-
-    # 添加模型目录（如果存在）
-    models_dir = os.path.abspath('models')
-    if os.path.exists(models_dir):
-        add_data_lines.append(f"             (r'{models_dir}', 'models'),")
-        print(f"  包含模型目录: models/")
-
-    # 添加 tools 目录（FFDec 等，供立绘从 SWF 导出使用）
-    tools_dir = os.path.abspath('tools')
-    if os.path.exists(tools_dir):
-        add_data_lines.append(f"             (r'{tools_dir}', 'tools'),")
-        print(f"  包含目录: tools/")
-
-    # 添加 scripts 目录（立绘导出脚本等，供 API 进程内调用）
-    scripts_dir = os.path.abspath('scripts')
-    if os.path.exists(scripts_dir):
-        add_data_lines.append(f"             (r'{scripts_dir}', 'scripts'),")
-        print(f"  包含目录: scripts/")
-
-    # 静态备份：npc_state_db / agent_tasks / agent_text（不每次从外部复制，随 exe 分发）
-    backup_resources_dir = os.path.abspath('backup_resources')
-    if os.path.exists(backup_resources_dir):
-        add_data_lines.append(f"             (r'{backup_resources_dir}', 'backup_resources'),")
-        print(f"  包含目录: backup_resources/")
-
-    # 添加后端Python目录
-    for dir_name in dirs_to_include:
-        abs_path = os.path.abspath(dir_name)
-        add_data_lines.append(f"             (r'{abs_path}', '{dir_name}'),")
-
-    # 添加根目录的py文件
-    for py_file in root_py_files:
-        abs_path = os.path.abspath(py_file)
-        add_data_lines.append(f"             (r'{abs_path}', '.'),")
-
-    add_data_str = '\n'.join(add_data_lines)
-
-    launcher_path = os.path.abspath('launcher.py')
-    splash_image = os.path.join(script_dir, 'icon.ico').replace('\\', '/')
-
-    spec_content = f'''# -*- mode: python ; coding: utf-8 -*-
-
 import sys
-sys.setrecursionlimit(5000)
+from pathlib import Path
 
-from PyInstaller.building.splash import Splash
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR_NAME = "bge-small-zh-v1.5-onnx-int8"
+EXE_NAME = "CFN-RAG"
 
-a = Analysis(
-    [r'{launcher_path}'],
-    pathex=[r'{os.path.abspath('.')}'],
-    binaries=[],
-    datas=[
-{add_data_str}
-    ],
-    hiddenimports=[
-        'main',
-        'api',
-        'api.game_api',
-        'api.assets_api',
-        'core',
-        'core.config',
-        'core.exceptions',
-        'services',
-        'services.memory_manager',
-        'services.npc_manager',
-        'services.game_rag_service',
-        'ai_engine',
-        'ai_engine.game_data_loader',
-        'fastapi',
-        'fastapi.middleware.cors',
-        'uvicorn',
-        'uvicorn.loops.auto',
-        'uvicorn.protocols.http.auto',
-        'uvicorn.lifespan.on',
-        'pydantic',
-        'pydantic_settings',
-        'llama_index',
-        'llama_index.core',
-        'llama_index.embeddings.huggingface',
-        'openai',
-        'httpx',
-        'aiofiles',
-        'pypdf',
-        'docx',
-        'sqlalchemy',
-        'sqlite3',
-        'tiktoken',
-        'tiktoken_ext',
-        'tiktoken_ext.openai_public',
-        'scripts.extract_portraits_from_swf',
-        'tkinter',
-        '_tkinter',
-    ],
-    hookspath=[],
-    hooksconfig={{}},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    noarchive=False,
-)
 
-pyz = PYZ(a.pure, a.zipped_data)
+def _collect_tool_modules() -> list[str]:
+    """枚举 services.tools/<category>/<name>.py（discover 运行时动态导入，
+    PyInstaller 静态分析看不到，必须显式进 hiddenimports）。"""
+    import importlib
+    import pkgutil
 
+    names: list[str] = []
+    pkg = importlib.import_module("services.tools")
+    for _imp, category, ispkg in pkgutil.iter_modules(list(getattr(pkg, "__path__", []))):
+        if not ispkg or category.startswith("_"):
+            continue
+        sub = importlib.import_module(f"services.tools.{category}")
+        for _imp2, mod, _ispkg2 in pkgutil.iter_modules(list(getattr(sub, "__path__", []))):
+            if not mod.startswith("_"):
+                names.append(f"services.tools.{category}.{mod}")
+    return sorted(names)
+
+HIDDEN_IMPORTS = [
+    # 运行时框架
+    "main",
+    "uvicorn",
+    "uvicorn.logging",
+    "uvicorn.loops",
+    "uvicorn.loops.auto",
+    "uvicorn.protocols",
+    "uvicorn.protocols.http",
+    "uvicorn.protocols.http.auto",
+    "uvicorn.protocols.websockets",
+    "uvicorn.protocols.websockets.auto",
+    "uvicorn.lifespan",
+    "uvicorn.lifespan.on",
+    "pydantic",
+    "pydantic_settings",
+    # 检索栈
+    "onnxruntime",
+    "tokenizers",
+    "rank_bm25",
+    "numpy",
+    # LLM / IO
+    "openai",
+    "httpx",
+    "aiofiles",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageOps",
+    "pypdf",
+    "docx",
+    "docx2txt",
+]
+
+# 06 §4：显式排除重依赖（未安装时 exclude 无副作用）
+EXCLUDES = [
+    "torch",
+    "transformers",
+    "llama_index",
+    "llama_index.core",
+    "langchain",
+    "langchain_core",
+    "langchain_community",
+    "langgraph",
+    "numpy.tests",
+    "numpy.f2py",
+    "numpy.random._examples",
+    "matplotlib",
+    "scipy",
+    "pandas",
+    "IPython",
+    "jupyter",
+    "pytest",
+    "modelscope",
+    "datasets",
+    "optimum",
+]
+
+
+def _sh(cmd: list[str]) -> None:
+    print("  $", " ".join(str(c) for c in cmd))
+    subprocess.check_call([str(c) for c in cmd])
+
+
+def build_spec(no_splash: bool) -> str:
+    """生成 PyInstaller spec（onefile：无 COLLECT）。"""
+    hidden = list(HIDDEN_IMPORTS) + _collect_tool_modules()
+    datas = [
+        (str(PROJECT_ROOT / "dist"), "dist"),
+        (str(PROJECT_ROOT / "models" / MODEL_DIR_NAME), f"models/{MODEL_DIR_NAME}"),
+        (str(PROJECT_ROOT / "backup_resources"), "backup_resources"),
+        (str(PROJECT_ROOT / "scripts" / "icon.ico"), "scripts"),
+        (str(PROJECT_ROOT / "scripts" / "loading_audio.mp3"), "scripts"),
+    ]
+    missing = [src for src, _ in datas if not Path(src).exists()]
+    if missing:
+        print(f"[错误] 打包数据缺失: {missing}")
+        print("  dist/（前端构建产物）与 models/（int8 模型）必须先就绪。")
+        sys.exit(1)
+
+    data_str = "\n".join(f"        ({src!r}, {dst!r})," for src, dst in datas)
+    hidden_str = "\n".join(f"        {name!r}," for name in hidden)
+    excludes_str = "\n".join(f"        {name!r}," for name in EXCLUDES)
+    icon = str(PROJECT_ROOT / "scripts" / "icon.ico")
+
+    splash_block = ""
+    splash_arg = ""
+    if not no_splash:
+        splash_block = f"""
 splash = Splash(
-    r'{splash_image}',
+    {icon!r},
     binaries=a.binaries,
     datas=a.datas,
     minify_script=True,
     always_on_top=True,
 )
+"""
+        splash_arg = "\n    splash,"
 
+    return f'''# -*- mode: python ; coding: utf-8 -*-
+# 由 scripts/build_exe.py 生成（06 §4：onefile + 依赖裁剪）
+
+a = Analysis(
+    [{str(PROJECT_ROOT / "launcher.py")!r}],
+    pathex=[{str(PROJECT_ROOT)!r}],
+    binaries=[],
+    datas=[
+{data_str}
+    ],
+    hiddenimports=[
+{hidden_str}
+    ],
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes=[
+{excludes_str}
+    ],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure)
+{splash_block}
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.zipfiles,
-    a.datas,
-    splash,
+    a.datas,{splash_arg}
     [],
-    name='CFN-RAG',
+    name={EXE_NAME!r},
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -186,190 +192,68 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=r'{os.path.join(script_dir, 'icon.ico')}',
+    icon={icon!r},
 )
 '''
 
-    return spec_content
 
-
-def _ensure_resources_tools(project_root, rebuild_vector: bool = False):
-    """
-    确保 resources/tools 存在；可选地在打包前重建知识库向量索引。
-
-    与 memory.db 同位于外部 resources/tools，exe 不打包索引，full zip 可将其与 exe 一起分发；
-    若用户仅下载单 exe，首次运行会在同目录下 resources/tools/vector_index 生成。
-
-    rebuild_vector:
-      False（默认）：不重建，沿用已有 vector_index；无索引时由 exe 首次运行生成。
-      True：打包前强制 rebuild_vector_index()，与「python scripts/build_exe.py --rebuild-vector」一致。
-    """
-    from pathlib import Path
-
-    pr = Path(project_root).resolve()
-    if str(pr) not in sys.path:
-        sys.path.insert(0, str(pr))
-
-    from services.game_data.paths import RESOURCE_FOLDER_NAMES
-
-    candidates = [
-        Path(project_root) / name for name in RESOURCE_FOLDER_NAMES
-    ] + [Path(project_root).parent / name for name in RESOURCE_FOLDER_NAMES]
-    resources_dir = next((p for p in candidates if p.exists()), Path(project_root) / "resources")
-    resources_dir.mkdir(parents=True, exist_ok=True)
-    tools_dir = resources_dir / "tools"
-    tools_dir.mkdir(parents=True, exist_ok=True)
-    # 与 memory_manager.get_db_path() 一致：开发/脚本时可能用 project_root 或 cwd
-    # 通过环境变量固定 resources 位置，避免脚本与 exe 解析不一致
-    os.environ["CFN_RESOURCES_DIR"] = str(resources_dir.resolve())
-    print(f"  使用 resources 目录: {resources_dir.resolve()}")
-    if not rebuild_vector:
-        print("  跳过向量索引重建（未传 --rebuild-vector；沿用已有 vector_index）")
-        return
-    print("  正在强制重建知识库向量索引（写入 resources/tools/vector_index）...")
-    try:
-        sys.path.insert(0, str(project_root))
-        from ai_engine.game_data_loader import rebuild_vector_index
-        rebuild_vector_index()
-        print("  知识库向量索引重建完成 ✓")
-    except Exception as e:
-        print(f"  [警告] 向量索引重建失败（可忽略，exe 首次运行时会自动生成）: {e}")
-
-
-def main():
-    """打包主函数"""
-    # 切换到项目根目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    os.chdir(project_root)
-
-    parser = argparse.ArgumentParser(
-        description="将 launcher.py 与后端打包为 CFN-RAG.exe",
-    )
-    parser.add_argument(
-        "--rebuild-vector",
-        action="store_true",
-        help="打包前强制重建 resources/tools/vector_index；不传则跳过以加快打包",
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="CFN-RAG.exe 打包（PyInstaller onefile）")
+    parser.add_argument("--no-splash", action="store_true", help="不打包启动闪屏")
     args = parser.parse_args()
 
+    os.chdir(PROJECT_ROOT)
     print("=" * 50)
-    print("CFN-RAG 完整打包工具")
-    print(f"项目根目录: {project_root}")
+    print("CFN-RAG 打包（v3 / onefile）")
+    print(f"项目根: {PROJECT_ROOT}")
     print("=" * 50)
 
-    # 打包前：默认不重建向量索引（见模块顶部示例）；仅 --rebuild-vector 时强制重建
-    print("\n预处理：resources / 知识库向量索引...")
-    _ensure_resources_tools(project_root, rebuild_vector=args.rebuild_vector)
-
-    # 检查是否安装了 PyInstaller
     try:
-        import PyInstaller
-        print("PyInstaller 已安装")
+        import PyInstaller  # noqa: F401
     except ImportError:
-        print("正在安装 PyInstaller...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
-        print("PyInstaller 安装完成")
+        print("[错误] 未安装 pyinstaller（requirements-dev）：pip install pyinstaller")
+        sys.exit(1)
 
-    # 清理之前的构建文件
-    print("\n清理之前的构建文件...")
-    for folder in ["build_temp", "build", "__pycache__"]:
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-            print(f"  已删除 {folder}/")
-
-    # 删除旧的exe
-    exe_path = os.path.join(project_root, 'CFN-RAG.exe')
-    if os.path.exists(exe_path):
+    # 清理旧产物
+    for folder in ("build", "build_temp"):
+        shutil.rmtree(PROJECT_ROOT / folder, ignore_errors=True)
+    old_exe = PROJECT_ROOT / f"{EXE_NAME}.exe"
+    if old_exe.exists():
         try:
-            os.remove(exe_path)
-            print(f"  已删除旧的 CFN-RAG.exe")
+            old_exe.unlink()
+            print("已删除旧 exe")
         except PermissionError:
-            print("  [警告] 无法删除旧的 CFN-RAG.exe，可能正在运行")
-            print("  请关闭正在运行的CFN-RAG.exe后再试")
-            input("  按回车键退出...")
+            print("[错误] CFN-RAG.exe 正在运行，无法覆盖，请先退出再打包")
             sys.exit(1)
 
-    # 收集文件
-    print("\n收集后端代码文件...")
-    dirs_to_include, root_py_files = collect_all_py_files()
+    spec_path = PROJECT_ROOT / "build_temp" / f"{EXE_NAME}.spec"
+    spec_path.parent.mkdir(exist_ok=True)
+    spec_path.write_text(build_spec(args.no_splash), encoding="utf-8")
+    print(f"spec 已生成: {spec_path}")
 
-    if not dirs_to_include and not root_py_files:
-        print("[错误] 没有找到后端代码文件！")
+    print("\n开始打包（可能需要几分钟）...")
+    _sh([sys.executable, "-m", "PyInstaller", str(spec_path), "--clean", "--noconfirm"])
+
+    dist_exe = PROJECT_ROOT / "dist" / f"{EXE_NAME}.exe"
+    if not dist_exe.exists():
+        print("[错误] 打包产物缺失")
         sys.exit(1)
+    shutil.move(str(dist_exe), str(old_exe))
 
-    # 创建spec文件
-    print("\n生成打包配置文件...")
-    spec_content = create_spec_file(dirs_to_include, root_py_files, script_dir)
-    spec_path = os.path.join('build_temp', 'CFN-RAG.spec')
+    size_mb = old_exe.stat().st_size / (1024 * 1024)
+    shutil.rmtree(PROJECT_ROOT / "build", ignore_errors=True)
+    shutil.rmtree(PROJECT_ROOT / "build_temp", ignore_errors=True)
 
-    os.makedirs('build_temp', exist_ok=True)
-    with open(spec_path, 'w', encoding='utf-8') as f:
-        f.write(spec_content)
-
-    print(f"  配置文件: {spec_path}")
-
-    # 执行打包
-    print("\n开始打包（这可能需要几分钟）...")
-    print("-" * 50)
-
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
-        spec_path,
-        '--clean',
-        '--noconfirm'
-    ]
-
-    try:
-        subprocess.check_call(cmd)
-        print("\n" + "=" * 50)
-        print("打包成功!")
-        print("=" * 50)
-
-        # 移动exe到根目录
-        dist_exe_path = os.path.join(project_root, 'dist', 'CFN-RAG.exe')
-        target_exe_path = os.path.join(project_root, 'CFN-RAG.exe')
-        if os.path.exists(dist_exe_path):
-            # 如果存在旧的exe，先删除
-            if os.path.exists(target_exe_path):
-                os.remove(target_exe_path)
-            shutil.move(dist_exe_path, target_exe_path)
-            # 不删除dist文件夹，保留前端文件
-            print("  保留dist/文件夹（包含前端文件）")
-
-        exe_size = os.path.getsize(target_exe_path) / (1024 * 1024)
-        print(f"输出文件: CFN-RAG.exe ({exe_size:.1f} MB)")
-
-        # 清理打包临时文件
-        print("\n清理临时文件...")
-        for folder in ["build_temp", "build", "__pycache__"]:
-            if os.path.exists(folder):
-                shutil.rmtree(folder)
-                print(f"  已删除 {folder}/")
-
-        print("\n使用方法:")
-        print("  双击 CFN-RAG.exe：解压阶段会先显示闪屏（icon）；随后为状态窗。")
-        print("  浏览器就绪后请保持状态窗开启；退出请关闭状态窗（会停止本地服务）。")
-        print("  - 后端API: http://127.0.0.1:7077")
-        print("  - 前端页面: http://127.0.0.1:7080")
-        print("\n注意事项:")
-        print("  1. 首次运行需要安装依赖，请确保网络畅通")
-        print("  2. 需要Node.js环境来启动前端服务")
-        print("  3. 知识库向量索引在 resources/tools/vector_index，未打包进 exe；")
-        print("     单 exe 首次运行会自动生成，full zip 可将该目录与 exe 一起分发。")
-
-        # 检查模型是否已打包
-        models_dir = os.path.join(project_root, 'models')
-        if os.path.exists(models_dir) and any(os.listdir(models_dir)):
-            print("  4. 模型已打包到 exe 中，无需额外下载")
-        else:
-            print("  4. [警告] 未检测到模型文件，首次运行时需联网下载")
-            print("     或手动运行: python scripts/download_model.py")
-        print("=" * 50)
-
-    except subprocess.CalledProcessError as e:
-        print(f"\n打包失败: {e}")
-        sys.exit(1)
+    print("\n" + "=" * 50)
+    print(f"打包完成: {old_exe}  ({size_mb:.1f} MB)")
+    print(f"体积预算: ≤160MB（06 §4；int8 模型按 55MB 口径复核）")
+    print("=" * 50)
+    print("冒烟提示：将 exe 与 resources（游戏资源）同目录放置后双击；")
+    print("立绘 manifest 随游戏项目根（launcher/web/assets/dialogue-portraits/）自动探测，")
+    print("或以环境变量 CFN_GAME_PROJECT_DIR 指定游戏项目根。")
+    if size_mb > 160:
+        print("[警告] 超出 160MB 预算——可回退 int8_full 量化档（22.8MB，见实施手记 §4）")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

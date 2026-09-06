@@ -18,6 +18,7 @@ import asyncio
 import importlib
 import json
 import logging
+import pkgutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,37 +125,55 @@ class ToolRegistry:
 
         每个 tool 模块必须顶层导出 ``tool``（BaseTool 实例）。
         多次调用幂等：已存在的 tool 会跳过，不会抛异常，方便热重载场景。
+
+        模块枚举经 pkgutil（PyInstaller PYZ 内亦有效）；源码目录扫描仅作
+        兜底，frozen 环境下目录不存在时静默跳过（pkgutil 分支已覆盖）。
         """
         pkg = importlib.import_module(package)
-        pkg_paths = [Path(p) for p in getattr(pkg, "__path__", [])]
-        if not pkg_paths:
-            return
 
+        def _load(mod_name: str) -> None:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception as e:  # pragma: no cover
+                raise ImportError(f"加载 tool 模块失败: {mod_name}: {e}") from e
+            tool_obj = getattr(mod, "tool", None)
+            if not isinstance(tool_obj, BaseTool):
+                return
+            if tool_obj.name in self._tools:
+                return
+            self.register(tool_obj)
+
+        pkg_paths = [Path(p) for p in getattr(pkg, "__path__", [])]
+
+        # 主路径：pkgutil 枚举（frozen PYZ 内同样有效）
+        for _imp, category, ispkg in pkgutil.iter_modules(getattr(pkg, "__path__", [])):
+            if not ispkg or category.startswith("_"):
+                continue
+            sub_name = f"{package}.{category}"
+            sub = importlib.import_module(sub_name)
+            for _imp2, mod_base, _ispkg2 in pkgutil.iter_modules(
+                list(getattr(sub, "__path__", []))
+            ):
+                if not mod_base.startswith("_"):
+                    _load(f"{sub_name}.{mod_base}")
+
+        # 兜底：源码目录扫描（frozen 下 iterdir 失败则跳过）
         for base in pkg_paths:
-            for category_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-                if category_dir.name.startswith("_"):
-                    continue
+            try:
+                category_dirs = sorted(
+                    p for p in base.iterdir()
+                    if p.is_dir() and not p.name.startswith("_")
+                )
+            except OSError:
+                continue
+            for category_dir in category_dirs:
                 for tool_py in sorted(
                     p for p in category_dir.iterdir()
                     if p.is_file()
                     and p.suffix == ".py"
                     and not p.name.startswith("_")
                 ):
-                    mod_name = (
-                        f"{package}.{category_dir.name}.{tool_py.stem}"
-                    )
-                    try:
-                        mod = importlib.import_module(mod_name)
-                    except Exception as e:  # pragma: no cover
-                        raise ImportError(
-                            f"加载 tool 模块失败: {mod_name}: {e}"
-                        ) from e
-                    tool_obj = getattr(mod, "tool", None)
-                    if not isinstance(tool_obj, BaseTool):
-                        continue
-                    if tool_obj.name in self._tools:
-                        continue
-                    self.register(tool_obj)
+                    _load(f"{package}.{category_dir.name}.{tool_py.stem}")
 
     def get(self, name: str) -> Optional[BaseTool]:
         return self._tools.get(name)

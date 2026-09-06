@@ -32,8 +32,15 @@ logger = logging.getLogger(__name__)
 _LOG_FILE_NAME = "cfn-rag.log"
 
 
+def _log_file_path() -> Path:
+    """日志文件路径：打包后写 exe 同目录（_MEIPASS 是临时解压目录，退出即删）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / _LOG_FILE_NAME
+    return Path(__file__).resolve().parent.parent / _LOG_FILE_NAME
+
+
 def setup_logging() -> None:
-    """本地路线日志：控制台 + 项目根 cfn-rag.log（幂等，重复调用不叠加 handler）。"""
+    """本地路线日志：控制台 + cfn-rag.log（幂等，重复调用不叠加 handler）。"""
     root = logging.getLogger()
     if getattr(root, "_cfn_logging_configured", False):
         return
@@ -44,7 +51,7 @@ def setup_logging() -> None:
     console.setFormatter(fmt)
     root.addHandler(console)
 
-    log_path = Path(__file__).resolve().parent.parent / _LOG_FILE_NAME
+    log_path = _log_file_path()
     try:
         file_handler = logging.FileHandler(log_path, encoding="utf-8")
         file_handler.setFormatter(fmt)
