@@ -1,4 +1,4 @@
-"""assets_api 测试：头像走原 profiles 目录；立绘走 manifest 查表裁剪 PNG（07 §6）。"""
+"""assets_api 测试：头像走原 profiles 目录；立绘 manifest 查表后原始文件直出（07 §6）。"""
 
 from __future__ import annotations
 
@@ -55,14 +55,21 @@ def test_avatar_missing_404(client):
     assert client.get("/assets/avatar/不存在的角色").status_code == 404
 
 
-def test_illustration_with_emotion_and_fallback(client):
+def test_illustration_serves_original_file_and_fallback(client):
+    """立绘原始文件直出（无裁剪/重编码）：返回尺寸 = 源 PNG 画布尺寸。"""
     resp = client.get("/assets/illustration/Andy Law/微笑")
     assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    # 微笑源图 40×30 全幅直出（若裁剪过 bounds 也恰为全幅，用「普通」区分更严）
     assert Image.open(io.BytesIO(resp.content)).size == (40, 30)
-    # 缺失情绪 → manifest 回退链兜底到「普通」，仍 200
-    resp2 = client.get("/assets/illustration/Andy Law/愤怒")
+    # 普通源图 100×80 —— 若走了裁剪会变 60×40，原始直出才是 100×80
+    resp2 = client.get("/assets/illustration/Andy Law/普通")
     assert resp2.status_code == 200
-    assert Image.open(io.BytesIO(resp2.content)).size == (60, 40)
+    assert Image.open(io.BytesIO(resp2.content)).size == (100, 80)
+    # 缺失情绪 → manifest 回退链兜底到「普通」，仍 200
+    resp3 = client.get("/assets/illustration/Andy Law/愤怒")
+    assert resp3.status_code == 200
+    assert Image.open(io.BytesIO(resp3.content)).size == (100, 80)
 
 
 def test_illustration_unknown_character_404(client):

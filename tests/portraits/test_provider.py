@@ -110,6 +110,19 @@ def test_portrait_png_for_display(portrait_env):
     assert im.size == (60, 40)  # bounds 裁剪后原分辨率（展示不缩放）
 
 
+def test_portrait_source_path_for_display(portrait_env):
+    """前端展示接口：查表定位原始文件路径，不做任何处理。"""
+    from pathlib import Path
+
+    path = provider.get_portrait_source_path("Andy Law", "普通")
+    assert path is not None and isinstance(path, Path)
+    assert path == portrait_env / "external" / "p_a" / "e_normal.png"
+    assert path.is_file()
+    # 主角/查不到角色 → None
+    assert provider.get_portrait_source_path("玩家", "微笑") is None
+    assert provider.get_portrait_source_path("不存在的角色", "微笑") is None
+
+
 def test_build_image_message_content_layout():
     text = "玩家：你好"
     assert provider.build_image_message_content(text, None) == text

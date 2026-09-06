@@ -3,10 +3,10 @@
 - GET /avatar/{npc_name}：**头像**——沿用原位置原文件
   （resources/flashswf/portraits/profiles/{npc}.png），与立绘体系无关；
 - GET /illustration/{npc_name}/{emotion}：**立绘**——游戏项目对话立绘 manifest
-  查表（角色归一化 + 情绪回退链）→ bounds 裁剪 → PNG。旧 illustration.zip
-  解压 / SWF+FFDec 导出 / 旧 `名称#情绪.webp` 体系随 D9 整体删除；立绘画布
-  格式（1024×576 / 775×1000 RGBA）与本体位置（manifest 的 asset.bounds）由
-  查表协议给出，本接口返回裁剪后的本体图。
+  查表（角色归一化 + 情绪回退链）定位后**原始文件直出**，不做任何裁剪/重编码
+  （与旧版行为一致）。查表是必须的：p_*/e_* 为内容 hash，文件名不可猜测。
+  裁剪/缩放仅用于大模型输入（services/portraits/provider.get_portrait_data_url）。
+  旧 illustration.zip 解压 / SWF+FFDec 导出 / 旧 `名称#情绪.webp` 体系随 D9 删除。
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
 from services.game_data.paths import find_resources_directory
-from services.portraits import get_portrait_png
+from services.portraits import get_portrait_source_path
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,19 @@ async def get_avatar(npc_name: str) -> FileResponse:
 
 @router.get(
     "/illustration/{npc_name}/{emotion}",
-    summary="获取 NPC 情绪立绘（manifest 查表 + bounds 裁剪，情绪缺省走回退链）",
+    summary="获取 NPC 情绪立绘（manifest 查表定位，原始文件直出，情绪缺省走回退链）",
 )
-async def get_illustration(npc_name: str, emotion: str) -> Response:
-    """返回指定 NPC + 情绪的立绘本体图 PNG；该情绪缺失时按 manifest 回退链兜底，仍无则 404。"""
+async def get_illustration(npc_name: str, emotion: str) -> FileResponse:
+    """返回指定 NPC + 情绪的立绘**原始 PNG 文件**（不做裁剪）。
+
+    该情绪缺失时按 manifest 回退链兜底；查表器缺失（无图模式）/
+    查不到角色/主角（heroKeys 无静态图）/文件缺失 → 404。
+    """
     try:
-        png_bytes = get_portrait_png(npc_name, emotion)
+        source = get_portrait_source_path(npc_name, emotion)
     except Exception as exc:
         logger.warning("立绘接口处理失败: %s %s %s", npc_name, emotion, exc)
-        png_bytes = None
-    if png_bytes is None:
+        source = None
+    if source is None:
         raise HTTPException(status_code=404, detail="立绘资源不存在")
-    return Response(content=png_bytes, media_type=_PNG_MEDIA_TYPE)
+    return FileResponse(path=str(source), media_type=_PNG_MEDIA_TYPE)

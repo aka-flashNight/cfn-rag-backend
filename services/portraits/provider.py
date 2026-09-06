@@ -1,10 +1,14 @@
 """立绘图片处理与供给（对应 docs/v3-developer/07 §3/§6）。
 
-- 多模态模型用：manifest 查表 → bounds 裁剪（人物本体）→ 长边 ≤512 → WebP q80
-  → base64 data URL（OpenAI image_url 格式；图片 part 放在文本 part 之后）。
-- 独立前端展示用（assets_api）：manifest 查表 → bounds 裁剪 → 原分辨率 PNG。
-- 缓存 key = (npc_key, 命中情绪, 源文件 mtime)（cache.py），修 F2「每请求重新 PIL 处理」。
-- 主角（heroKeys）/查不到角色/文件缺失/任何处理异常 → 返回 None（无图模式，不报错）。
+分工（用户决策，2026-09-06）：
+- **前端展示**（assets_api）：原始立绘文件直出（get_portrait_source_path）——
+  后端只做 manifest 查表定位（p_*/e_* 为内容 hash，不可猜测），不做任何
+  裁剪/重编码（与旧版 illustration 接口行为一致）；
+- **大模型输入**（编排层）：查表 → bounds 裁剪（人物本体）→ 长边 ≤480
+  → WebP q80 → base64 data URL（get_portrait_data_url；OpenAI image_url 格式，
+  图片 part 放在文本 part 之后）。裁剪/缩放代码仅服务此路径，保留勿删。
+- 缓存 key = (npc_key, 命中情绪, 源文件 mtime)（cache.py），修 F2。
+- 主角（heroKeys）/查不到角色/文件缺失/任何处理异常 → 返回 None（不报错）。
 """
 
 from __future__ import annotations
@@ -84,7 +88,7 @@ def _load_processed(
 
 
 def _process_image(asset: dict, *, resize: bool) -> Optional[tuple[bytes, str]]:
-    """PIL 处理：bounds 裁剪（两类 source 通用）→ [长边 ≤512] → WebP q80。"""
+    """PIL 处理（仅大模型输入路径）：bounds 裁剪（两类 source 通用）→ [长边 ≤480] → WebP q80。"""
     from PIL import Image
 
     bounds = asset.get("bounds")
@@ -121,8 +125,32 @@ def get_portrait_data_url(npc_name: str, emotion: str = DEFAULT_EXPRESSION) -> O
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def get_portrait_source_path(npc_name: str, emotion: str = DEFAULT_EXPRESSION) -> Optional["Path"]:
+    """前端展示接口用：manifest 查表命中的**原始立绘文件路径**（不做任何处理）。
+
+    查表仅用于定位（p_*/e_* 为内容 hash，文件名不可猜测，协议 §6.1）；
+    裁剪/缩放仅服务大模型输入（get_portrait_data_url），前端展示一律原始直出。
+    查表器缺失/主角/查不到角色/文件不存在 → None（调用方 404）。
+    """
+    from pathlib import Path
+
+    lookup = get_portrait_lookup()
+    if lookup is None:
+        return None
+    asset = _resolve_asset(lookup, npc_name, emotion)
+    if asset is None:
+        return None
+    path = Path(asset["png_path"])
+    return path if path.is_file() else None
+
+
 def get_portrait_png(npc_name: str, emotion: str = DEFAULT_EXPRESSION) -> Optional[bytes]:
-    """assets 展示接口用：bounds 裁剪后的原分辨率 PNG（重编码，去画布杂质）。"""
+    """裁剪版 PNG（bounds 裁剪、原分辨率、重编码）。
+
+    注：前端展示接口已改为原始文件直出（get_portrait_source_path）；
+    本函数保留作为裁剪处理实现的一部分（与 get_portrait_data_url 同属
+    「给大模型的图」处理链），供后续需要静态裁剪图的场景使用。
+    """
     result = _load_processed(npc_name, emotion, prefix=_PNG_CACHE_PREFIX, resize=False)
     if result is None:
         return None
