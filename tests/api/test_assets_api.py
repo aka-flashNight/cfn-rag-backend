@@ -1,10 +1,11 @@
-"""assets_api 立绘接口测试（07 §6）：manifest 查表返回裁剪 PNG，旧导出/解压接口已删。"""
+"""assets_api 测试：头像走原 profiles 目录；立绘走 manifest 查表裁剪 PNG（07 §6）。"""
 
 from __future__ import annotations
 
 import io
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -13,31 +14,45 @@ from services.portraits.cache import get_cache
 from tests.portraits.conftest import build_portrait_dir
 
 
+def _make_app() -> FastAPI:
+    from api.assets_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/assets")
+    return app
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> TestClient:
     portrait_dir = build_portrait_dir(tmp_path)
     monkeypatch.setattr(manifest_lookup, "discover_portrait_dir", lambda: portrait_dir)
     manifest_lookup.reset_portrait_lookup()
     get_cache().clear()
+    # 头像目录：resources/flashswf/portraits/profiles/
+    import services.game_data.paths as paths_mod
 
-    from api.assets_api import router
+    profiles = tmp_path / "resources" / "flashswf" / "portraits" / "profiles"
+    profiles.mkdir(parents=True)
+    Image.new("RGBA", (64, 64), (128, 128, 128, 255)).save(profiles / "Andy Law.png")
+    monkeypatch.setattr(paths_mod, "find_resources_directory", lambda: tmp_path / "resources")
 
-    from fastapi import FastAPI
-
-    app = FastAPI()
-    app.include_router(router, prefix="/assets")
-    yield TestClient(app)
+    yield TestClient(_make_app())
 
     manifest_lookup.reset_portrait_lookup()
     get_cache().clear()
 
 
-def test_avatar_returns_cropped_png(client):
+def test_avatar_uses_legacy_profiles_dir(client):
+    """头像仍在原位置（profiles/{npc}.png 原文件直出），不经 manifest 查表。"""
     resp = client.get("/assets/avatar/Andy Law")
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "image/png"
     im = Image.open(io.BytesIO(resp.content))
-    assert im.size == (60, 40)  # bounds(10,20,60,40) 裁剪
+    assert im.size == (64, 64)  # 原文件原尺寸，无裁剪
+
+
+def test_avatar_missing_404(client):
+    assert client.get("/assets/avatar/不存在的角色").status_code == 404
 
 
 def test_illustration_with_emotion_and_fallback(client):
@@ -50,30 +65,30 @@ def test_illustration_with_emotion_and_fallback(client):
     assert Image.open(io.BytesIO(resp2.content)).size == (60, 40)
 
 
-def test_unknown_character_404(client):
-    assert client.get("/assets/avatar/不存在的角色").status_code == 404
+def test_illustration_unknown_character_404(client):
     assert client.get("/assets/illustration/不存在的角色/微笑").status_code == 404
 
 
-def test_hero_key_404(client):
+def test_illustration_hero_key_404(client):
     """主角无静态立绘（heroKeys 特例）→ 404。"""
-    assert client.get("/assets/avatar/玩家").status_code == 404
+    assert client.get("/assets/illustration/玩家").status_code in (404, 422)
 
 
-def test_no_manifest_404_not_500(monkeypatch):
-    """无图模式：接口 404 而不是 500（不报错原则，07 §1）。"""
+def test_no_manifest_illustration_404_not_500(monkeypatch, tmp_path):
+    """无图模式：立绘接口 404 而不是 500（不报错原则，07 §1）；头像不受影响。"""
+    import services.game_data.paths as paths_mod
+
     monkeypatch.setattr(manifest_lookup, "discover_portrait_dir", lambda: None)
     manifest_lookup.reset_portrait_lookup()
     get_cache().clear()
+    profiles = tmp_path / "resources" / "flashswf" / "portraits" / "profiles"
+    profiles.mkdir(parents=True)
+    Image.new("RGBA", (64, 64), (128, 128, 128, 255)).save(profiles / "Andy Law.png")
+    monkeypatch.setattr(paths_mod, "find_resources_directory", lambda: tmp_path / "resources")
     try:
-        from api.assets_api import router
-
-        from fastapi import FastAPI
-
-        app = FastAPI()
-        app.include_router(router, prefix="/assets")
-        client = TestClient(app)
-        assert client.get("/assets/avatar/Andy Law").status_code == 404
+        client = TestClient(_make_app())
+        assert client.get("/assets/illustration/Andy Law/普通").status_code == 404
+        assert client.get("/assets/avatar/Andy Law").status_code == 200  # 头像不受无图模式影响
     finally:
         manifest_lookup.reset_portrait_lookup()
 
