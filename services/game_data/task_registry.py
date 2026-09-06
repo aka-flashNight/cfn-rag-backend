@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from .models import Task
 from .parsers import discover_list_entries, parse_json
 from .reward_utils import parse_name_count
+
+# 候选池排除的来源文件：agent 任务（玩家已发布委托，避免自参考）与
+# mercenary 副本任务（含大量活动遗留物品：鼠年/剑圣/兽王碎片、国庆纪念币、
+# 月饼、压缩胶囊等，混入候选池会产出垃圾任务）。
+# 仅影响"供给模型看的候选池"；校验（V1/V2/V8/V9）保持全量宽松，不受此排除影响。
+CANDIDATE_POOL_EXCLUDED_FILES: frozenset[str] = frozenset(
+    {"agent_tasks.json", "mercenary_tasks.json"}
+)
 
 
 class TaskRegistry:
@@ -25,6 +33,8 @@ class TaskRegistry:
         self._contain_stats: dict[str, tuple[int, int]] = {}
         # 奖励物品名 -> (min_qty, max_qty)
         self._reward_stats: dict[str, tuple[int, int]] = {}
+        # 任务 id -> 来源文件名（候选池过滤用）
+        self._source_by_id: dict[int, str] = {}
 
     def load(self) -> None:
         list_xml = self.task_root / "list.xml"
@@ -33,6 +43,7 @@ class TaskRegistry:
 
         entries = discover_list_entries(list_xml, tags={"task"})
         tasks: list[Task] = []
+        sources: dict[int, str] = {}
         for filename in entries:
             if not filename.lower().endswith(".json"):
                 continue
@@ -72,10 +83,11 @@ class TaskRegistry:
                     else:
                         continue
                 tasks.append(task)
+                sources[task.id] = filename
 
-        self._rebuild_indexes(tasks)
+        self._rebuild_indexes(tasks, sources)
 
-    def _rebuild_indexes(self, tasks: list[Task]) -> None:
+    def _rebuild_indexes(self, tasks: list[Task], sources: dict[int, str]) -> None:
         self._by_id = {}
         self._by_npc = {}
         self._reward_types = set()
@@ -83,6 +95,7 @@ class TaskRegistry:
         self._submit_stats = {}
         self._contain_stats = {}
         self._reward_stats = {}
+        self._source_by_id = sources
 
         for t in tasks:
             self._by_id[t.id] = t
@@ -141,6 +154,33 @@ class TaskRegistry:
     def list_all_tasks(self) -> list[Task]:
         """返回所有已加载任务（用于按区间优先级排序奖励池）。"""
         return list(self._by_id.values())
+
+    def iter_core_tasks(self) -> Iterator[Task]:
+        """核心池任务：排除 agent_tasks / mercenary_tasks 来源（候选池专用，见
+        CANDIDATE_POOL_EXCLUDED_FILES）。校验侧请继续用 list_all_tasks()（宽松全量）。"""
+        for tid, t in self._by_id.items():
+            if self._source_by_id.get(tid, "").lower() not in CANDIDATE_POOL_EXCLUDED_FILES:
+                yield t
+
+    def list_core_submit_items(self) -> set[str]:
+        """核心池提交物品名（排除 agent/mercenary 来源）。"""
+        out: set[str] = set()
+        for t in self.iter_core_tasks():
+            for expr in t.finish_submit_items or []:
+                name, _ = parse_name_count(expr)
+                if name:
+                    out.add(name)
+        return out
+
+    def list_core_reward_item_names(self) -> set[str]:
+        """核心池奖励物品名（排除 agent/mercenary 来源）。"""
+        out: set[str] = set()
+        for t in self.iter_core_tasks():
+            for reward in t.rewards or []:
+                name, _ = parse_name_count(reward)
+                if name:
+                    out.add(name)
+        return out
 
     def list_by_npc(self, npc_name: str) -> list[Task]:
         return list(self._by_npc.get(npc_name, []))

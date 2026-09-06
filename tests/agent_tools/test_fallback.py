@@ -56,3 +56,22 @@ def test_execute_fallback_draft_outcome(game_data):
     payload = outcome.payload
     assert payload["status"] == "draft_created"
     assert payload["fallback"] is True
+
+def test_prepare_candidates_exclude_agent_and_mercenary(game_data):
+    """候选池严格化：agent_tasks / mercenary_tasks 来源的物品不进 prepare 候选。"""
+    from services.agent_tools.context_builder import prepare_task_context
+    from services.agent_tools.schemas import normalize_reward_types_for_prepare_context
+
+    raw = prepare_task_context(
+        task_type="资源收集",
+        reward_types=normalize_reward_types_for_prepare_context(None, ["金币"]),
+        npc_name="铁匠",
+        player_progress=1,
+    )
+    ctx = __import__("json").loads(raw)
+    names = [it.get("name") for it in ctx.get("collectable_items", [])]
+    assert names, "候选池不应为空"
+    assert not any("碎片" in n for n in names), "碎片类活动物品不得进候选池"
+    # 校验侧保持全量宽松：历史统计仍含全量任务（V8 类型不收窄）
+    stats = game_data.tasks.get_reward_stats()
+    assert stats, "校验侧全量统计不应被池子排除影响"

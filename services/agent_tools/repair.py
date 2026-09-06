@@ -74,10 +74,33 @@ def _repair_v2(draft: dict[str, Any], issue) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# V7：总值等比缩放一个奖励项
+# V7：总值微调（单币种取整阶梯，用户定稿规则）
 # ---------------------------------------------------------------------------
 
+# 取整阶梯：金币/经验值按 5000（区间上限 < 20000 的低级任务按 1000）；K点按 100；其他物品按 1
+_ROUND_STEP_MAJOR = 5000
+_ROUND_STEP_MINOR = 1000
+_ROUND_STEP_MINOR_THRESHOLD = 20000
+_ROUND_STEP_KPOINT = 100
+_ROUND_STEP_ITEM = 1
+
+# 优先调整的奖励项（按顺序取第一个存在的）
+_PREFERRED_ADJUST_TARGETS = ("金币", "经验值", "K点")
+
+
+def _round_step_for(item_name: str, range_max: int) -> int:
+    if item_name in ("金币", "经验值"):
+        return _ROUND_STEP_MAJOR if range_max >= _ROUND_STEP_MINOR_THRESHOLD else _ROUND_STEP_MINOR
+    if item_name == "K点":
+        return _ROUND_STEP_KPOINT
+    return _ROUND_STEP_ITEM
+
+
 def _repair_v7(draft: dict[str, Any], issue, item_registry: Any) -> str | None:
+    """V7 总值微调：优先动金币/经验值/K点（按取整阶梯），否则动占比最大的奖励项。
+
+    只调奖励数量，不触碰提交品/持有品/关卡（任务内容归模型）。
+    """
     detail = issue.detail
     total = int(detail.get("total_value") or 0)
     lo, hi = detail.get("allowed_range", [0, 0])
@@ -85,7 +108,6 @@ def _repair_v7(draft: dict[str, Any], issue, item_registry: Any) -> str | None:
     rewards = draft.get("rewards")
     if not isinstance(rewards, list) or not prices:
         return None
-
     if total > hi:
         target = int(hi)
     elif total < lo:
@@ -93,40 +115,83 @@ def _repair_v7(draft: dict[str, Any], issue, item_registry: Any) -> str | None:
     else:
         return None
 
-    # 按单项小节从大到小尝试：优先用单项可吸收偏差的奖励项
-    by_subtotal = sorted(prices, key=lambda p: -int(p.get("subtotal") or 0))
-    for p in by_subtotal:
-        name = p.get("item_name")
-        unit_price = int(p.get("unit_price") or 0)
-        if unit_price <= 0:
-            continue
-        for it in rewards:
-            if not isinstance(it, dict) or it.get("item_name") != name:
-                continue
-            try:
-                cur = int(it.get("count"))
-            except Exception:
-                continue
-            excess = total - target  # 正=需减少，负=需增加
-            step = -(-excess // unit_price) if excess > 0 else -(((-excess) + unit_price - 1) // unit_price)
-            fixed = cur - step
-            if fixed < 1:
-                # 保底数量 1 后仍不足以吸收偏差则换下一项（减少场景）
-                if excess > 0:
-                    fixed_candidate = max(1, fixed)
-                    new_total = total - (cur - fixed_candidate) * unit_price
-                    if not (lo <= new_total <= hi):
-                        continue
-                    fixed = fixed_candidate
-                else:
-                    continue
-            it["count"] = fixed
-            new_total = _items_total(_items_list(draft, "rewards"), item_registry)
-            if lo <= new_total <= hi:
-                arrow = f"{cur}→{fixed}"
-                return f"已自动微调：奖励「{name}」数量 {arrow}，总值 {total}→{new_total}（区间 [{lo}, {hi}]）。"
-            # 未落回区间则回滚本项，尝试下一项
-            it["count"] = cur
+    # 调整项优先级：金币 → 经验值 → K点 → 单项小节最大者
+    name_by_priority: str | None = None
+    for preferred in _PREFERRED_ADJUST_TARGETS:
+        if any(p.get("item_name") == preferred for p in prices):
+            name_by_priority = preferred
+            break
+    if name_by_priority is None:
+        best = max(prices, key=lambda p: int(p.get("subtotal") or 0), default=None)
+        name_by_priority = str(best.get("item_name")) if best else None
+    if not name_by_priority:
+        return None
+
+    unit_price = 0
+    for p in prices:
+        if p.get("item_name") == name_by_priority:
+            unit_price = int(p.get("unit_price") or 0)
+            break
+    if unit_price <= 0:
+        return None
+
+    target_item = next(
+        (it for it in rewards if isinstance(it, dict) and it.get("item_name") == name_by_priority),
+        None,
+    )
+    if target_item is None:
+        return None
+    try:
+        cur = int(target_item.get("count"))
+    except Exception:
+        return None
+
+    step = _round_step_for(name_by_priority, hi)
+    excess = total - target  # 正=需减少，负=需增加
+    magnitude = abs(excess)
+
+    if excess > 0:
+        if unit_price >= step:
+            # 高价物品：按单价进位减少
+            new_count = cur - max(1, -(-magnitude // unit_price))
+        else:
+            # 总值对齐到 ≤hi 的最近阶梯值
+            aligned_total = (target // step) * step
+            if aligned_total < lo:
+                aligned_total += step
+            new_count = cur - max(1, -(-(total - aligned_total) // unit_price))
+    else:
+        if unit_price >= step:
+            new_count = cur + max(1, -(-magnitude // unit_price))
+        else:
+            # 总值对齐到 ≥lo 的最近阶梯值
+            aligned_total = -(-target // step) * step
+            if aligned_total > hi:
+                aligned_total -= step
+            new_count = cur + max(1, -(-(aligned_total - total) // unit_price))
+    if new_count < 1:
+        if excess > 0:
+            return None  # 该项已减无可减
+        new_count = 1
+
+    target_item["count"] = new_count
+    new_total = _items_total(_items_list(draft, "rewards"), item_registry)
+    if not (lo <= new_total <= hi):
+        # 一次未落回区间：按剩余差额精确补一刀（落区间优先于取整美感）
+        remain = target - new_total
+        if remain != 0 and unit_price > 0:
+            fix_items = remain // unit_price
+            candidate = new_count + fix_items
+            trial = new_total + fix_items * unit_price
+            if fix_items != 0 and candidate >= 1 and lo <= trial <= hi:
+                target_item["count"] = candidate
+                new_total = trial
+    if lo <= new_total <= hi:
+        return (
+            f"已自动微调：奖励「{name_by_priority}」数量 {cur}→{target_item['count']}"
+            f"（总值 {total}→{new_total}，区间 [{lo}, {hi}]，按 {_round_step_for(name_by_priority, hi)} 取整）。"
+        )
+    target_item["count"] = cur
     return None
 
 

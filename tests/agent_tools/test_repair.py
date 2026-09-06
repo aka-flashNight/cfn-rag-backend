@@ -12,7 +12,7 @@ from services.agent_tools.validator import validate_task_draft
 
 
 def test_repair_v7_scales_reward(game_data, vctx):
-    """V7 偏差 ≤10%：等比调整一个奖励项到区间内最近值，note 正确。"""
+    """V7 微调：优先动金币、按 5000 取整（区间上限 ≥20000），一次落回区间。"""
     draft = {
         "task_type": "资源收集",
         "title": "测试",
@@ -23,8 +23,46 @@ def test_repair_v7_scales_reward(game_data, vctx):
 
     new_draft, notes, fresh = auto_repair(draft, report, context=vctx, game_data=game_data)
     assert fresh.ok
-    assert new_draft["rewards"][0]["count"] == 27000
-    assert any("28000" in n and "27000" in n for n in notes)
+    count = new_draft["rewards"][0]["count"]
+    assert 9000 <= count * 1 <= 27000
+    assert count % 5000 == 0  # 金币按 5000 取整
+    assert any("自动微调" in n for n in notes)
+
+
+def test_repair_v7_minor_rounding_for_low_stage(game_data):
+    """好感高（区间上限 ≥20000 仍 5000 档）：验证 35000 类偏差对齐落区间。"""
+    from services.agent_tools.handlers import build_validation_ctx
+
+    vctx = build_validation_ctx(npc_name="铁匠", player_progress=1, npc_affinity=80)
+    draft = {
+        "task_type": "资源收集",
+        "title": "测试",
+        "rewards": [{"item_name": "金币", "count": 40000}],  # 超上限 36000
+    }
+    report = validate_task_draft(draft, context=vctx, game_data=game_data)
+    v7 = next(i for i in report.issues if i.rule == "V7")
+    lo, hi = v7.detail["allowed_range"]
+
+    new_draft, notes, fresh = auto_repair(draft, report, context=vctx, game_data=game_data)
+    count = new_draft["rewards"][0]["count"]
+    assert lo <= count <= hi
+    assert fresh.ok
+
+
+def test_repair_v7_kpoint_rounding(game_data, vctx):
+    """K点奖励按 100 取整（补刀兜底保证落区间）。"""
+    draft = {
+        "task_type": "资源收集",
+        "title": "测试",
+        "rewards": [{"item_name": "K点", "count": 600}],  # 30000 > 27000
+    }
+    report = validate_task_draft(draft, context=vctx, game_data=game_data)
+    assert any(i.rule == "V7" for i in report.issues)
+    new_draft, notes, fresh = auto_repair(draft, report, context=vctx, game_data=game_data)
+    assert fresh.ok
+    count = new_draft["rewards"][0]["count"]
+    total = count * 50
+    assert 9000 <= total <= 27000
 
 
 def test_repair_v2_and_v11_together(game_data, vctx):

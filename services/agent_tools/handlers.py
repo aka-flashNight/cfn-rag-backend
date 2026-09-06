@@ -118,9 +118,15 @@ def _failed_payload(
     *,
     rag_context_text: Optional[str] = None,
     extra: Optional[dict[str, Any]] = None,
+    repaired_notes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """校验失败载荷：全量 issue + 当前草案快照（修 D4，draft_summary 不再返回空串）。"""
+    """校验失败载荷：全量 issue + 当前草案快照（修 D4，draft_summary 不再返回空串）。
+
+    repaired_notes：后端已自动微调的内容——随打回告知模型"这些已修好，勿改动"。
+    """
     payload: dict[str, Any] = report.to_model_json()
+    if repaired_notes:
+        payload["auto_repaired"] = repaired_notes
     payload["draft_summary"] = _detailed_draft_summary(
         draft, game_data, rag_context_text=rag_context_text,
     )
@@ -209,8 +215,9 @@ def execute_draft_agent_task(
     notes: list[str] = []
 
     if not report.ok:
-        # 全部 issue 均可自动修复时先修复再复审（05 §4）
-        if report.issues and all(i.auto_repairable for i in report.issues):
+        # 数值类 issue 先由后端全量微调（V7 取整/V2 clamp/V10 降级/V11 去重），
+        # 微调后仍存在选择类问题（V1/V3~V6/V8）才打回（05 §4）
+        if report.issues:
             draft, notes, report = auto_repair(
                 draft, report, context=validation_ctx, game_data=game_data,
             )
@@ -218,7 +225,8 @@ def execute_draft_agent_task(
     if not report.ok:
         return DraftOpOutcome(
             result_json=json.dumps(
-                _failed_payload(report, draft, game_data, rag_context_text=rag_context_text),
+                _failed_payload(report, draft, game_data, rag_context_text=rag_context_text,
+                                repaired_notes=notes),
                 ensure_ascii=False,
             ),
             draft=draft,
@@ -333,7 +341,7 @@ def execute_update_task_draft(
     )
     notes: list[str] = []
     if not report.ok:
-        if report.issues and all(i.auto_repairable for i in report.issues):
+        if report.issues:
             working, notes, report = auto_repair(
                 working, report, context=validation_ctx, game_data=game_data,
             )
@@ -341,7 +349,8 @@ def execute_update_task_draft(
     if not report.ok:
         return DraftOpOutcome(
             result_json=json.dumps(
-                _failed_payload(report, working, game_data, rag_context_text=rag_context_text),
+                _failed_payload(report, working, game_data, rag_context_text=rag_context_text,
+                                repaired_notes=notes),
                 ensure_ascii=False,
             ),
             draft=working,
@@ -445,7 +454,7 @@ def execute_confirm_agent_task(
         npc_affinity=npc_affinity,
     )
     report = validate_task_draft(draft_for_commit, context=validation_ctx, game_data=game_data)
-    if not report.ok and report.issues and all(i.auto_repairable for i in report.issues):
+    if not report.ok and report.issues:
         # 草案存续期玩家进度变化导致回归时先修复再判（05 §6，S5）
         draft_for_commit, notes, report = auto_repair(
             draft_for_commit, report, context=validation_ctx, game_data=game_data,

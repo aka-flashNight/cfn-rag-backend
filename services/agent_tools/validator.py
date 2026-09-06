@@ -112,9 +112,6 @@ COMBAT_TASK_TYPES: frozenset[str] = frozenset({
 
 EQUIPMENT_TYPES: frozenset[str] = frozenset({"武器", "防具"})
 
-# V7 自动修复允许的最大偏差比例（05 §3：总值偏差 ≤ ±10% 可自动缩放）
-_V7_AUTO_REPAIR_RATIO = 0.10
-
 # 反馈清单上限
 _MAX_CANDIDATES = 10
 _MAX_FUZZY_CANDIDATES = 5
@@ -799,9 +796,8 @@ def _validate_v7_reward_total_value(
             f"；可把「{best_name}」（单价 {best['unit_price']}）数量从 {best['count']} 调整到 {new_count}"
         )
 
-    # 自动修复判定：偏差 ≤ ±10% 才可等比缩放（05 §3）
-    span_base = max(range_min, 1) if rewards_value < range_min else max(range_max, 1)
-    auto_repairable = (delta / span_base) <= _V7_AUTO_REPAIR_RATIO
+    # 总值偏差一律可由后端按取整阶梯微调（数值类问题不进打回流程，05 §4）
+    auto_repairable = True
 
     return [ValidationIssue(
         rule="V7",

@@ -115,7 +115,12 @@ class FakeEmbedder:
         self.registry[text] = np.asarray(vec, dtype=np.float32)
 
     def _default_vec(self, text: str) -> np.ndarray:
-        rng = np.random.default_rng(abs(hash(text)) % (2**32))
+        # 用内容稳定哈希做种子：进程内 hash() 受 PYTHONHASHSEED 随机化影响，
+        # 会让「无关 query 与语料正交」的假设跨进程随机失效（阈值测试 flaky 根源）
+        import hashlib
+
+        seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
         v = rng.standard_normal(self.dim).astype(np.float32)
         return v / np.linalg.norm(v)
 

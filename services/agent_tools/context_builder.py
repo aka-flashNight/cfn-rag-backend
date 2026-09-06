@@ -405,7 +405,7 @@ def _ordered_reward_item_names_from_tasks(
     按“当前区间优先”顺序产出任务奖励池中的物品名，用于 reward_item_candidates 排序。
     顺序：主线 id 在区间内 → 前置含区间内主线 id 的非主线 → mercenary 推荐等级与当前等级区间有交集 → 其他。
     """
-    all_tasks = task_registry.list_all_tasks()
+    all_tasks = list(task_registry.iter_core_tasks())  # 核心池：排除 agent/mercenary 来源
     main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
     # 前置任务包含当前区间内任一主线 id 的任务（且自身不在区间内，避免重复）
     precondition_in_range_ids = {
@@ -458,7 +458,7 @@ def _reward_item_name_progress_tier_map(
     任务奖励物品名 → 进度档 1~4（与 _ordered_reward_item_names_from_tasks 分档一致），
     未出现在任务奖励池中的名不会出现在 map 中。
     """
-    all_tasks = task_registry.list_all_tasks()
+    all_tasks = list(task_registry.iter_core_tasks())  # 核心池：排除 agent/mercenary 来源
     main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
     precondition_in_range_ids = {
         t.id for t in all_tasks
@@ -519,7 +519,7 @@ def _ordered_collectable_item_names_from_tasks(
 
     同一任务内：先其 `finish_submit_items`，再其 `rewards`。
     """
-    all_tasks = task_registry.list_all_tasks()
+    all_tasks = list(task_registry.iter_core_tasks())  # 核心池：排除 agent/mercenary 来源
     main_range_ids = {t.id for t in all_tasks if main_task_min_id <= t.id <= main_task_max_id}
     precondition_in_range_ids = {
         t.id
@@ -1345,7 +1345,7 @@ def _build_collectable_items(
     keywords = _normalize_kw_list(requirement_keywords)
 
     allowed_uses = {"食材", "药剂", "材料", "弹夹"}
-    pool = task_registry.list_submit_items() | task_registry.list_reward_item_names()
+    pool = task_registry.list_core_submit_items() | task_registry.list_core_reward_item_names()  # 核心池
     price_cap = base_max * 2
 
     main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)

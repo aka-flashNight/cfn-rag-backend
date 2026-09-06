@@ -74,8 +74,8 @@ def test_v7_gives_exact_delta(game_data, vctx):
     assert v7.auto_repairable  # 偏差 1000/27000 ≈ 3.7% ≤ 10%
 
 
-def test_v7_far_overflow_not_auto_repairable(game_data, vctx):
-    """V7 偏差 >10% 不可自动修复（必须模型重新选择）。"""
+def test_v7_far_overflow_always_auto_repairable(game_data, vctx):
+    """V7 偏差再大也是数值类问题：恒可由后端取整微调，不进打回流程。"""
     draft = {
         "task_type": "资源收集",
         "title": "测试",
@@ -83,7 +83,7 @@ def test_v7_far_overflow_not_auto_repairable(game_data, vctx):
     }
     report = validate_task_draft(draft, context=vctx, game_data=game_data)
     v7 = next(i for i in report.issues if i.rule == "V7")
-    assert not v7.auto_repairable
+    assert v7.auto_repairable
 
 
 def test_v9_stays_warning(game_data, vctx):
