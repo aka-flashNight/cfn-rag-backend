@@ -48,8 +48,8 @@ async def test_pure_chat(env):
     assert events[0].event == "meta"
     meta = events[0].data
     assert meta["emotion"] == "微笑"
-    assert meta["favorability_change"] == 1
-    assert meta["favorability"] == 31  # 30 + 1，好感更新先于正文
+    assert meta["favorability_change"] == 0
+    assert meta["favorability"] == 30  # fav=0 无变化，meta 仍先于正文
     assert meta["relationship_level"] == "熟悉"
 
     assert events[-1].event == "done"
