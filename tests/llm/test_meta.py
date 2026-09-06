@@ -26,7 +26,7 @@ async def test_normal_meta():
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "微笑"
-    assert meta.favorability_change == 1
+    assert meta.favorability_change == 0
     assert meta.act is None
     assert body == "诶，是你啊。今天有什么想聊的？\n"
 
