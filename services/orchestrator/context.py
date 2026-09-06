@@ -2,6 +2,9 @@
 
 并行 asyncio.gather：NPC 状态 / 会话记忆（近 N 条 + 滚动摘要 + 待确认草案）/
 Tier-1 检索（≤3 变体单次嵌入，经 to_thread）/ 提及 NPC 子串匹配 / appearance。
+立绘（07 §4）：仅 purpose=chat 且模型 Profile 允许视觉（vision 非 False）且该模型
+未被标记图像不支持时，按 current_emotion（上回合 meta emo；空则「普通」）取图，
+结果放 TurnContext.image_data_url；立绘不可用/任何失败 → None，纯文本不报错。
 save_info（gamebridge）恒 None，字段预留（01 §9）。
 """
 
@@ -217,6 +220,47 @@ def build_retrieve_fn(
 
 
 # ---------------------------------------------------------------------------
+# 立绘装配（07 §4）
+# ---------------------------------------------------------------------------
+
+def _resolve_effective_model(llm_config: LLMConfig) -> str:
+    """生效模型名（请求覆盖 > 会话记忆由 API 层完成 > 全局默认）。"""
+    try:
+        return llm_config.merged_with_settings().model_name
+    except Exception:
+        return llm_config.model_name or ""
+
+
+def should_send_image(llm_config: LLMConfig) -> bool:
+    """07 §4 带图前置判定（不含「是否有立绘资产」，资产缺失由 provider 兜底 None）：
+
+    - Profile vision=False → 不带（纯文本模型）；
+    - 模型曾被图像不支持错误标记 → 不带（client 降级链写入，02 §3.2.c）；
+    - vision=True 与探测型（None）→ 带图（400 由 client 降级链去图重试并标记）。
+    """
+    from services.llm.client import is_image_unsupported_model
+    from services.llm.profiles import get_profile
+
+    model_name = _resolve_effective_model(llm_config)
+    if not model_name:
+        return False
+    if get_profile(model_name).vision is False:
+        return False
+    return not is_image_unsupported_model(model_name)
+
+
+def load_portrait_image_url(npc_name: str, emotion: Optional[str]) -> Optional[str]:
+    """同步取当前情绪立绘 data URL（调用方经 to_thread 包装）；失败/缺失返回 None。"""
+    from services.portraits import get_portrait_data_url
+
+    try:
+        return get_portrait_data_url(npc_name, emotion or "普通")
+    except Exception as exc:  # 立绘任何异常不阻断回合（07 §1）
+        logger.warning("立绘取图失败，本回合无图: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 装配结果
 # ---------------------------------------------------------------------------
 
@@ -244,6 +288,8 @@ class TurnContext:
     save_info: Any = None  # gamebridge 预留（01 §9），恒 None
     retrieve_fn: Optional[Callable[[str], str]] = None
     llm_config: LLMConfig = field(default_factory=LLMConfig)
+    # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
+    image_data_url: Optional[str] = None
 
     @property
     def favorability(self) -> int:
@@ -269,6 +315,7 @@ async def assemble_context(
     player_query: str,
     player_identity: str = "",
     progress_stage: Optional[int] = None,
+    current_emotion: Optional[str] = None,
     llm_config: LLMConfig,
     memory: MemoryStore,
     npc_manager: NPCManager,
@@ -276,8 +323,9 @@ async def assemble_context(
     engine: Any = None,
     history_limit: int = 20,
     with_summary: bool = True,
+    send_image: bool = True,
 ) -> TurnContext:
-    """并行装配一轮上下文（03 §7；检索经 to_thread，目标 ≤300ms）。"""
+    """并行装配一轮上下文（03 §7；检索/取图经 to_thread，目标 ≤300ms）。"""
     stage_cfg = get_progress_stage_config(progress_stage) if progress_stage else None
 
     npc_state_task = npc_manager.get(npc_name)
@@ -366,6 +414,11 @@ async def assemble_context(
         forbidden=forbidden,
     ) if engine_obj is not None else None
 
+    # 立绘（07 §4）：情绪跟随 current_emotion（上回合 meta emo；首轮为空用「普通」）
+    image_data_url: Optional[str] = None
+    if send_image and should_send_image(llm_config):
+        image_data_url = await asyncio.to_thread(load_portrait_image_url, npc_name, current_emotion)
+
     return TurnContext(
         npc_name=npc_name,
         npc_state=npc_state,
@@ -386,6 +439,7 @@ async def assemble_context(
         forbidden=forbidden,
         retrieve_fn=retrieve_fn,
         llm_config=llm_config,
+        image_data_url=image_data_url,
     )
 
 

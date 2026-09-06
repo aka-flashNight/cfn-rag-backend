@@ -7,9 +7,6 @@ CFN-RAG 启动器
 import os
 import sys
 
-# 在导入其他模块之前设置，避免 tiktoken 编码问题
-os.environ["LLAMA_INDEX_CACHE_DIR"] = ".llamaindex_cache"
-
 import time
 import threading
 import webbrowser
@@ -616,11 +613,11 @@ BACKEND_PROXY_TARGET = "http://127.0.0.1:7077"
 API_PREFIX = "/api"
 # 普通接口代理超时（秒），至少 2 分钟
 PROXY_TIMEOUT = 120
-# 长时间任务接口（如立绘导出）代理超时（秒），15 分钟，满足 10min 以上
+# 长时间任务接口代理超时（秒），15 分钟，满足 10min 以上
 PROXY_TIMEOUT_LONG = 900
-# 需要 15 分钟长超时的路径（不含 query），立绘导出、重置向量库等
+# 需要 15 分钟长超时的路径（不含 query），重置向量库等
+# （旧「立绘导出/解压」接口已随 manifest 查表体系删除，见 docs/v3-developer/07 §7）
 LONG_TIMEOUT_PATHS = (
-    API_PREFIX + "/assets/export-illustrations",
     API_PREFIX + "/game/knowledge-base/reset",
 )
 

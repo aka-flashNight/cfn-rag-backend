@@ -95,7 +95,8 @@ async def ask(
         progress_stage=payload.progress_stage,
         current_emotion=payload.current_emotion,
         llm_config=llm_config,
-        send_image=False,  # P7 立绘/多模态接入前恒不发图
+        # send_image 不显式关：是否带图由编排层按 07 §4 判定
+        #（vision Profile + 未被标记图像不支持 + 立绘资产可用，否则纯文本不报错）
     )
 
     if stream:

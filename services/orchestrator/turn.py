@@ -38,6 +38,7 @@ from services.memory.store import MemoryStore, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
 from services.orchestrator.context import TurnContext, assemble_context
+from services.portraits import build_image_message_content
 from services.orchestrator.events import (
     SSEEvent,
     accumulate_usage,
@@ -170,9 +171,11 @@ class TurnOrchestrator:
         progress_stage: Optional[int] = None,
         current_emotion: Optional[str] = None,
         llm_config: Optional[LLMConfig] = None,
-        send_image: bool = False,
+        send_image: bool = True,
         deps: Optional[OrchestratorDeps] = None,
     ) -> None:
+        """send_image 仅是「允许带图」开关（默认允许）；是否真带图由 07 §4 规则
+        在上下文装配时判定（vision Profile + 未被标记不支持 + 立绘资产可用）。"""
         self.session_id = session_id
         self.npc_name = npc_name
         self.query = query
@@ -236,12 +239,14 @@ class TurnOrchestrator:
                 player_query=self.query,
                 player_identity=self.player_identity,
                 progress_stage=self.progress_stage,
+                current_emotion=self.current_emotion,
                 llm_config=self.llm_config,
                 memory=memory,
                 npc_manager=deps.npc_manager,
                 game_data=deps.game_data,
                 engine=deps.engine,
                 history_limit=deps.history_limit,
+                send_image=self.send_image,
             )
             self._ctx = ctx
 
@@ -254,7 +259,12 @@ class TurnOrchestrator:
                 user_query=self.query,
                 pending_draft=ctx.pending_draft_row is not None,
             )
-            messages = [*base_messages, {"role": "user", "content": tail}]
+            # 立绘图片只进聊天调用 #1 的末条 user 消息（文本 part 前、图片 part 后）；
+            # base_messages 保持纯文本，merge/补救/confirm 参数等调用天然无图
+            messages = [
+                *base_messages,
+                {"role": "user", "content": build_image_message_content(tail, ctx.image_data_url)},
+            ]
 
             stream = llm.chat_stream(ChatRequest(
                 messages=messages,

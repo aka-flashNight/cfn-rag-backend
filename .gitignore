@@ -76,7 +76,9 @@ models/*/pytorch_model.bin
 models/*/model.safetensors
 
 # Test files and test directory (not packed into exe)
-test_*.py
+# 注：tests/ 是正式 pytest 套件，纳入版本控制（不进 exe 由 PyInstaller excludes 保证）；
+# 仅忽略根目录历史临时测试脚本与 test/ 目录
+/test_*.py
 *_test.py
 test/
 
