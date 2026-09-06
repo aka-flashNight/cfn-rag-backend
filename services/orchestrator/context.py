@@ -284,6 +284,7 @@ class TurnContext:
     same_faction_block: str = ""
     has_shop: bool = False
     shop_reward_types: list[str] = field(default_factory=list)
+    player_can_challenge: bool = False  # 玩家当前能否挑战该 NPC（与 prepare 切磋判定同源）
     forbidden: set[str] = field(default_factory=set)
     save_info: Any = None  # gamebridge 预留（01 §9），恒 None
     retrieve_fn: Optional[Callable[[str], str]] = None
@@ -405,6 +406,20 @@ async def assemble_context(
     except Exception:
         pass
 
+    # 切磋可行性：与 prepare_task_context 的 _build_challenge_targets 同源判定
+    # （返回 list=可用；dict error=不可用，原因含无关卡/等级不足等）
+    player_can_challenge = False
+    try:
+        if ctx_npc_challenge := (npc_state.challenge or "").strip():
+            from services.agent_tools.context_builder import _build_challenge_targets
+
+            challenge_result = _build_challenge_targets(
+                game_data, npc_name, ctx_npc_challenge, max(1, min(7, progress_stage or 1)),
+            )
+            player_can_challenge = isinstance(challenge_result, list)
+    except Exception:
+        player_can_challenge = False
+
     engine_obj = engine
     retrieve_fn = build_retrieve_fn(
         engine=engine_obj,
@@ -436,6 +451,7 @@ async def assemble_context(
         same_faction_block=same_faction_block,
         has_shop=has_shop,
         shop_reward_types=shop_reward_types,
+        player_can_challenge=player_can_challenge,
         forbidden=forbidden,
         retrieve_fn=retrieve_fn,
         llm_config=llm_config,

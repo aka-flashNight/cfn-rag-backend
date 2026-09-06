@@ -499,6 +499,7 @@ class TurnOrchestrator:
             same_faction_npcs=ctx.same_faction_block,
             has_shop=ctx.has_shop,
             shop_reward_types=ctx.shop_reward_types,
+            player_can_challenge=ctx.player_can_challenge,
         )
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,

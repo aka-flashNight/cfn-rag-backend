@@ -103,12 +103,20 @@ def build_shop_constraint(has_shop: bool, shop_reward_types: Optional[list[str]]
     )
 
 
-def build_challenge_hint(has_challenge: bool, player_can_challenge: Optional[bool] = None) -> str:
+def build_challenge_hint(
+    has_challenge: bool,
+    player_can_challenge: Optional[bool] = None,
+) -> str:
+    """切磋提示三态（与 prepare_task_context 的切磋目标判定同源，见 context 装配）：
+    无关卡 / 有关卡但玩家实力不足 / 双方满足。满足时弱化措辞，避免过度引导模型。"""
     if not has_challenge:
         return "- 你没有切磋关卡，不可发布「切磋」类型的任务。"
     if player_can_challenge is False:
-        return "- 你拥有可用的切磋关卡，但玩家当前的实力还暂时不能挑战你，不可发布「切磋」类型的任务。"
-    return "- 你拥有可用的切磋关卡，可以发布「切磋」类型的任务。"
+        return (
+            "- 你拥有切磋关卡，但玩家当前的实力还暂时不能挑战你，"
+            "不可发布「切磋」类型的任务。"
+        )
+    return "- 在对话情景合适时可以考虑发布「切磋」类型的任务。"
 
 
 def build_static_system(
@@ -118,6 +126,7 @@ def build_static_system(
     same_faction_npcs: str = "",
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
+    player_can_challenge: Optional[bool] = None,
 ) -> str:
     """L1 世界观 + L2 扮演约束 + 同阵营表 + appearance（静态，前缀缓存命中区）。"""
     emotions_str = "、".join(state.emotions or ["普通"])
@@ -141,7 +150,9 @@ def build_static_system(
         "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，则不要发布任务并拒绝玩家的请求。"
     )
     parts.append(build_shop_constraint(has_shop, shop_reward_types))
-    parts.append(build_challenge_hint(bool(state.challenge)))
+    parts.append(build_challenge_hint(
+        bool(state.challenge), player_can_challenge,
+    ))
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)
