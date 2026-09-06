@@ -54,13 +54,13 @@ def build_pricing_card(
     bargain_rate: float = 1.0,
     game_data: "GameDataRegistry | None" = None,
 ) -> str:
-    """draft 轮的定价卡：奖励总价怎么算、区间是多少、加成怎么叠加。"""
+    """draft 轮的定价卡：奖励总价怎么算、区间是多少、加成怎么叠加、经验值怎么给。"""
     lo, hi, explain = _basic_range_text(task_type, stage, affinity)
     lines = [
         "【奖励定价规则（与后端校验完全一致，按此计算即可通过）】",
         "1. 奖励总价值 = Σ(每个奖励的数量 × 该物品单价)。常用物品单价："
         + "、".join(f"{k}={v}" for k, v in _SINGLETON_PRICES.items())
-        + "；其他物品单价以候选列表中标注的「单价/price」为准（金币单价恒为 1）。",
+        + "；其他物品单价以候选列表中标注的「单价/price」为准（金币单价恒为 1，经验值单价恒为 1，即 1 点经验值 = 1 金额）。",
         f"2. 本次任务（{task_type}，玩家阶段 {stage}）的基础区间：[{lo}, {hi}]。",
         f"   计算式：{explain}。",
         "3. 若任务带提交品（finish_submit_items）或持有品（finish_contain_items），区间会**上移**：",
@@ -70,16 +70,49 @@ def build_pricing_card(
         "     算例：持有「战宠灵石×4」(单价300，H=1200) → 上下限各 +600 → [9600, 27600]。",
         f"4. 你的 rewards 总价必须落在**最终区间**（基础区间 + 加成）内，越界会被校验打回。",
     ]
+    n = 5
     if bargain_rate > 1.0:
         lines.append(
             f"5. 当前为讨价还价轮：区间上限已放宽至 ×{bargain_rate}（即 [{lo}, {int(hi * bargain_rate)}]"
             "，下限不变）。"
         )
+        n += 1
+    # 经验值规则块固定 3 个显示行；编号显式管理（lines 元素含多行子串，len 不可作序号）
+    lines.extend(_experience_value_rules(task_type=task_type, lo=lo, hi=hi, start=n))
+    n += 3
     lines.append(
-        "5. 常见错误（都会被打回）：rewards 与 finish_submit_items 出现同名物品（报酬误填进提交）；"
+        f"{n}. 好感度奖励分寸：好感度 ≥ 50 时奖励可以略慷慨，总价值向上靠区间上限；"
+        "好感度 < 20 时奖励收敛一些，总价值靠近区间下限（好感系数已体现在上面区间中）。"
+    )
+    lines.append(
+        f"{n + 1}. 常见错误（都会被打回）：rewards 与 finish_submit_items 出现同名物品（报酬误填进提交）；"
         "数量超过候选列表标注的合理范围；选了候选列表之外的物品。"
     )
     return "\n".join(lines)
+
+
+def _experience_value_rules(*, task_type: str, lo: int, hi: int, start: int) -> list[str]:
+    """经验值作为奖励的使用规则（高经验类型：挑战/切磋；其他类型少量给）。
+
+    仅写入 prompt 供模型遵循，后端不做占比校验（宽松校验：数据合法即可）。
+    """
+    n = start
+    if task_type in ("挑战", "切磋"):
+        return [
+            f"{n}. 经验值作为奖励的使用规则（本任务为「{task_type}」类，适用高经验档）：",
+            f"   - 高经验类型的任务，经验值可以作为**主要奖励**，其金额占比可在 50% 以上"
+            f"（经验值单价为 1，即金额数 = 经验值点数；本任务区间 [{lo}, {hi}]，"
+            f"占比 50% 即经验值折算金额 ≥ {lo * 50 // 100}）——**除非玩家明确指定了其他奖励类型**"
+            "（如只要金币/装备，则按玩家要求来）。",
+            "   - 经验值之外还可以搭配少量金币或其他物品，总值仍需落在最终区间内。",
+        ]
+    return [
+        f"{n}. 经验值作为奖励的使用规则（本任务为「{task_type}」类，适用低经验档）：",
+        f"   - 非挑战/切磋类的任务，经验值**只能少量给**：折算金额范围 1000~10000"
+        f"（即 1000~10000 点经验值，经验值单价为 1，金额数 = 经验值点数）；"
+        "主要奖励请使用金币或其他物品，总值仍需落在最终区间内。",
+        "   - 禁止把经验值当作本类任务的主要奖励（大量经验值仅适用于挑战/切磋类任务）。",
+    ]
 
 
 def build_bargain_card(*, stage: int, affinity: int, task_type: str, game_data: "GameDataRegistry | None" = None) -> str:
