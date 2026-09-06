@@ -41,7 +41,7 @@ CORE_LORE_DOC_MARKER = "核心设定与世界合理性补足"
 _FINGERPRINT_SOURCE_DIRS: tuple[str, ...] = (
     "data/dialogues",
     "data/task",
-    "docs",
+    "docs/story",
     "data/intelligence",
     "data/stages",
     "data/items",
@@ -304,9 +304,9 @@ def _read_docx_text(path: Path) -> str:
 
 
 def load_lore_nodes(resources_dir: Path | None = None) -> List[Node]:
-    """读取 resources/docs 下的 PDF/DOCX 世界观文档，按文件名区分核心/补充设定。"""
+    """读取 resources/docs/story 下的 PDF/DOCX 世界观文档，按文件名区分核心/补充设定。"""
     root_dir = Path(resources_dir) if resources_dir else _resources_dir()
-    docs_dir = root_dir / "docs"
+    docs_dir = root_dir / "docs" / "story"
     if not docs_dir.exists():
         logger.warning("世界观设定目录不存在，跳过: %s", docs_dir)
         return []
@@ -614,12 +614,12 @@ def load_corpus(resources_dir: Path | None = None) -> List[Node]:
 
 
 def has_core_lore_document(resources_dir: Path | None = None) -> bool:
-    """resources/docs 下是否存在「核心设定与世界合理性补足」文档（重置知识库的业务判定）。"""
+    """resources/docs/story 下是否存在「核心设定与世界合理性补足」文档（重置知识库的业务判定）。"""
     try:
         root_dir = Path(resources_dir) if resources_dir else _resources_dir()
     except FileNotFoundError:
         return False
-    docs_dir = root_dir / "docs"
+    docs_dir = root_dir / "docs" / "story"
     if not docs_dir.exists():
         return False
     for f in docs_dir.iterdir():
