@@ -93,9 +93,10 @@ def build_portrait_dir(root: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def _reset_lookup_singleton(monkeypatch):
-    """每个测试前后重置 manifest 查表单例与缓存，并隔离全局 Settings
-    （.env 的 CFN_GAME_PROJECT_DIR 不允许泄漏进测试）。"""
-    monkeypatch.delenv("CFN_GAME_PROJECT_DIR", raising=False)
+    """每个测试前后重置 manifest 查表单例与缓存，并隔离全局 Settings：
+    用空值环境变量覆盖 .env 的 CFN_GAME_PROJECT_DIR（环境变量优先级高于
+    env_file，单测不允许读到本机真实游戏项目路径）。"""
+    monkeypatch.setenv("CFN_GAME_PROJECT_DIR", "")
     from core.config import get_settings
 
     get_settings.cache_clear()

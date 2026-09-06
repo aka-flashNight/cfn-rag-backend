@@ -38,6 +38,10 @@ def _collect_tool_modules() -> list[str]:
     PyInstaller 静态分析看不到，必须显式进 hiddenimports）。"""
     import importlib
     import pkgutil
+    import sys
+
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
 
     names: list[str] = []
     pkg = importlib.import_module("services.tools")
