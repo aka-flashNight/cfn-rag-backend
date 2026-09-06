@@ -454,10 +454,21 @@ class TurnOrchestrator:
                     yield system_notice_event(notice)
 
             # ---- POST_PROCESS ----
-            reply_text = "".join(collected_text)
+            # 记忆分段：被 agent 等待（拟定委托/检索）中断过的连续说话各存一条
+            # assistant 记录 —— 首段正文（collected_text）一段，子 Agent 汇合后的
+            # 每次说话爆发（过渡语 #2a / 汇合 #2b / FAIL_REPLY）各一段。前端历史
+            # 渲染按消息分气泡，落库分段即历史气泡分段。
+            reply_segments: list[str] = []
+            first_segment = "".join(collected_text)
+            if first_segment.strip():
+                reply_segments.append(first_segment)
+            if merge is not None:
+                reply_segments.extend(
+                    seg for seg in merge.outcome.reply_segments if seg.strip()
+                )
             await memory.add_message(self.session_id, "user", self.query)
-            if reply_text.strip():
-                await memory.add_message(self.session_id, "assistant", reply_text)
+            for segment_text in reply_segments:
+                await memory.add_message(self.session_id, "assistant", segment_text)
 
             if not draft_touched:
                 if act_kind is None:

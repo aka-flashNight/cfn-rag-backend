@@ -48,6 +48,10 @@ class MergeOutcome:
     payload: dict[str, Any] = field(default_factory=dict)
     spoke_interim: bool = False
     reply_text: str = ""          # 汇合回复正文（记忆用）
+    # 分段回复：每次 LLM 说话爆发（过渡语 #2a / 汇合 #2b / FAIL_REPLY）各占一段。
+    # 段与段之间隔着 agent_status 等待，记忆落库时各存一条 assistant 记录，
+    # 前端历史渲染即每条一个气泡（对应「连续说话分段」产品规则）。
+    reply_segments: list[str] = field(default_factory=list)
     usage: dict[str, Any] | None = None
 
 
@@ -141,6 +145,8 @@ class MergeCoordinator:
                 elif ev.kind == "usage" and ev.usage:
                     self.outcome.usage = accumulate_usage(self.outcome.usage, ev.usage)
             self.outcome.reply_text += "".join(collected)
+            if collected:
+                self.outcome.reply_segments.append("".join(collected))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -259,6 +265,7 @@ class MergeCoordinator:
             # LLM 调用也失败：静态人设话术兜底
             text = "今天手头的事都派完了，改天吧。"
             self.outcome.reply_text += text
+            self.outcome.reply_segments.append(text)
             yield content_event(text)
 
     @property
