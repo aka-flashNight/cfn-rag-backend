@@ -13,11 +13,14 @@ task_draft 的候选池由聊天主 Agent 在流式响应中调用 prepare_task_
 from __future__ import annotations
 
 import json
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import AsyncIterator, Sequence
 
 from services.llm.client import StreamEvent
+
+logger = logging.getLogger(__name__)
 
 # act 合法 kind（01 §3 / 02 §4.1）
 ACT_KINDS = ("task_draft", "task_update", "task_confirm", "task_cancel", "search")
@@ -86,7 +89,18 @@ def parse_meta_obj(obj: object, npc_emotions: Sequence[str]) -> Meta | None:
     # act：非法形态一律置 None（保住 emo/fav，不丢整个 meta）
     act_raw = obj.get("act")
     act: MetaAct | None = None
-    if isinstance(act_raw, dict):
+    if isinstance(act_raw, str):
+        # 模型常见手误：act 写成字符串而非 {"kind": ...} 对象。
+        # 无参 kind 宽容纠正（否则 confirm/cancel 会被静默丢弃）；
+        # 需要载荷的 task_update/search 无法从字符串恢复 note/query，记日志后忽略。
+        kind = act_raw.strip()
+        if kind in ("task_draft", "task_confirm", "task_cancel"):
+            act = MetaAct(kind=kind)
+        else:
+            logger.warning(
+                "meta act 为字符串且无法恢复载荷，按 null 处理: %r", act_raw,
+            )
+    elif isinstance(act_raw, dict):
         kind = str(act_raw.get("kind") or "").strip()
         if kind in ("task_draft", "task_confirm", "task_cancel"):
             act = MetaAct(kind=kind)
@@ -100,6 +114,10 @@ def parse_meta_obj(obj: object, npc_emotions: Sequence[str]) -> Meta | None:
             query = act_raw.get("query")
             if isinstance(query, str) and query.strip():
                 act = MetaAct(kind=kind, query=_clip(query, _QUERY_MAX_CHARS))
+        else:
+            logger.warning("meta act kind 非法，按 null 处理: %r", act_raw)
+    elif act_raw is not None:
+        logger.warning("meta act 形态非法（既非对象也非字符串），按 null 处理: %r", act_raw)
     return Meta(emotion=emotion, favorability_change=fav, act=act)
 
 
@@ -163,6 +181,11 @@ async def split_meta_events(
                 meta = parse_meta_obj(obj, npc_emotions) or Meta()
                 leftover = [StreamEvent(kind="content", text=rest_text)] if rest_text else []
                 return _finish(leftover, meta)
+            # 观测点：模型尝试发 meta 但格式不合法（warning），或完全没发 meta（debug）
+            if first_line.lstrip().startswith("{"):
+                logger.warning("meta 首行 JSON 解析失败，整段按正文处理: %.160r", first_line)
+            else:
+                logger.debug("模型未输出 meta 行，按纯正文处理: %.80r", first_line)
             return _finish([StreamEvent(kind="content", text=buffer)], Meta())
         if ev.kind == "reasoning":
             continue  # 思考内容绝不进正文、不参与 meta 判定
@@ -174,6 +197,8 @@ async def split_meta_events(
         obj = _try_parse_first_line(buffer)
         if obj is not None and _passes_meta_schema(obj, npc_emotions):
             return _finish(held_events, parse_meta_obj(obj, npc_emotions) or Meta())
+        if buffer.lstrip().startswith("{"):
+            logger.warning("meta 首行 JSON 解析失败（流结束无换行），按正文处理: %.160r", buffer)
         # 缓冲正文必须排在 held usage/finish 之前，否则下游「finish 即终止」的转发会丢正文
         return _finish([StreamEvent(kind="content", text=buffer), *held_events], Meta())
     return _finish(held_events, Meta())
@@ -221,18 +246,29 @@ def meta_prompt_block(npc_emotions: Sequence[str], *, has_pending_draft: bool = 
     ]
     if has_pending_draft:
         lines.extend([
-            '   - {"kind":"task_confirm"}：玩家明确接受当前草案时使用。',
+            '   - {"kind":"task_confirm"}：玩家明确接受当前草案时使用。'
+            "「我接了」「接」「成交」「就它了」「干」这类话，以及玩家点击「接」按钮，都算明确接受。",
             '   - {"kind":"task_cancel"}：玩家明确拒绝/放弃当前草案时使用。',
             '   - {"kind":"task_update","note":"<玩家的新条件>"}：玩家在谈条件/要求小幅修改'
             "（如只调奖励数量、换奖励物品、改难度）时使用；具体改什么由任务系统按 note 处理。",
             '   - {"kind":"task_draft"}：**仅当玩家要求彻底重新拟定任务方向/换一个任务**时使用；'
             "同时调用 prepare_task_context 工具重新准备候选（新草案会替换旧草案）。",
             "",
+            "task_confirm 示例：玩家说「我接了」→ 你的回复第一行必须是："
+            '{"emo":"<从情绪列表选>","fav":<整数>,"act":{"kind":"task_confirm"}}',
+            "",
             "重要提醒：",
             "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
+            "- 玩家消息已经明确接受草案（如「我接了」）时，**本轮必须直接输出 "
+            'act={"kind":"task_confirm"}**，不要再追问「你确认吗 / 你点头吗」——'
+            "草案本来就只等玩家点头一次，玩家已经点头了。",
             "- 接受/拒绝/小幅讨价还价都不需要调用 prepare_task_context。",
             "- 玩家一句话同时表达「接受 + 要调整」（如「我接，但奖励多点」）时，"
-            "**优先按 task_update 处理**，等调整后玩家认可再说确认，不要直接 task_confirm。",
+            "**优先按 task_update 处理**，等调整后玩家认可再说确认，玩家认可后再 task_confirm。",
+            "- **硬性要求**：调整完成后，玩家再次明确表示接受"
+            "（如「可以」「行，就这样」「接了」「成交」）时，"
+            "**必须本轮直接输出 act={\"kind\":\"task_confirm\"}，立刻发布**；"
+            "禁止再次追问「确定吗/点头吗」，也禁止复述一遍条件再等玩家确认——",
             "- 玩家讨价还价时你可以不同意让步，有两种方式：**正常情况下**不调用任何工具"
             "（act 用 null），礼貌拒绝让步并直接问玩家到底接还是不接；"
             "只有玩家态度恶劣或你的性格强硬或语境确实合适时，才在拒绝讨价还价时用 task_cancel 直接取消委托。",

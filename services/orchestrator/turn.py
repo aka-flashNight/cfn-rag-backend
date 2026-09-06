@@ -312,6 +312,14 @@ class TurnOrchestrator:
                     raise
             act = meta.act
             act_kind = act.kind if act is not None else None
+            if act is None and ctx.pending_draft_row is not None:
+                # 观测点：有草案时玩家常在「接/不接」，模型漏发 act 会导致草案静默过期，
+                # 玩家侧只看到「过期的委托草案已取消」，必须留痕便于排查
+                logger.warning(
+                    "会话 %s：存在待确认草案但模型未声明 act（玩家消息: %.60s）——"
+                    "若玩家在确认/拒绝，本次会按纯聊天处理并累计草案过期计数",
+                    self.session_id, self.query,
+                )
             tool_sink: list[dict[str, Any]] = []  # 流内模型发出的 tool_calls（prepare 用）
 
             # 情绪/好感先于正文：解析到 meta 即更新并发事件

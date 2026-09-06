@@ -111,6 +111,24 @@ async def test_unknown_act_kind_becomes_null():
     assert meta.act is None
 
 
+async def test_act_as_string_coerced():
+    """act 写成字符串（模型常见手误）→ 无参 kind 宽容纠正，confirm 不被静默丢弃。"""
+    for kind in ("task_confirm", "task_cancel", "task_draft"):
+        text = f'{{"emo":"微笑","fav":1,"act":"{kind}"}}\n好，就这么定。'
+        meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+        await _collect_text(rest)
+        assert meta.act == MetaAct(kind=kind), kind
+
+
+async def test_act_string_with_required_payload_becomes_null():
+    """task_update/search 需要载荷，字符串形态无法恢复 → 按 null 处理。"""
+    for kind in ("task_update", "search"):
+        text = f'{{"emo":"普通","fav":0,"act":"{kind}"}}\n嗯。'
+        meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+        await _collect_text(rest)
+        assert meta.act is None, kind
+
+
 async def test_meta_without_content():
     """流只有 meta 行（无换行无正文）→ meta 正常解析，正文为空。"""
     text = '{"emo":"惊讶","fav":-1,"act":null}'
