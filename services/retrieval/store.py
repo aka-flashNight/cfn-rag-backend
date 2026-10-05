@@ -188,6 +188,9 @@ class VectorStore:
 
 
 def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
+    # 注意：mkstemp 先创建了 0 字节的 <tmp>.tmp；np.save 会自动补 .npy 后缀，
+    # 因此实际写入的是 <tmp>.tmp.npy，replace 走的也是后者。
+    # 成功路径必须显式清掉 mkstemp 建的那个空文件，否则每次保存都泄漏一个 .tmp。
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     os.close(fd)
     try:
@@ -197,6 +200,7 @@ def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
         _silent_remove(tmp_name + ".npy")
         _silent_remove(tmp_name)
         raise
+    _silent_remove(tmp_name)
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:

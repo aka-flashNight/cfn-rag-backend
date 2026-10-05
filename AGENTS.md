@@ -6,9 +6,15 @@
 - 运行时依赖只装 `requirements.txt`；torch/transformers/pyinstaller 等开发依赖装 `requirements-dev.txt`，永不进 exe 打包清单。
 
 # 硬性约束
-- **禁止重命名向量索引目录，文件夹名必须定死。**
-  - 新格式索引恒为 `resources/tools/vector_index_v3`（`services/retrieval/store.py` 的 `INDEX_DIR_NAME`）；
-    旧版 LlamaIndex 索引为其同级的 `resources/tools/vector_index`。两者并存，不得改名、不得增删版本后缀。
-  - 改名会使所有用户已有索引失效并被重复重建，且必须同步修改游戏仓库 `CrazyFlashNight/.gitignore`，
-    否则索引文件会被误提交。
-  - 如确需换代，属独立变更：先评估迁移与兼容方案，并同轮更新游戏仓库忽略规则，不得只改常量了事。
+
+## 命名冻结：本项目生成的文件 / 文件夹名一律固定，禁止改名
+- 适用范围：本项目代码、脚本、打包流程**输出或依赖**的全部文件与文件夹名（索引、运行时状态、日志、种子等），不限于索引。
+- **尤其禁止因版本号变动而改名**（加 `_v2` / `_v3` 后缀、把年份或版本写进名字等）。版本信息应落在文件**内容**里（例：`fingerprint.json` 的 `format` 字段），不落进名字。
+- 当前已固定、不得更改的名字（括号内为定义位置）：
+  - 向量索引目录 `vector_index_v3`；索引文件 `vectors.npy` / `meta.json` / `fingerprint.json` / `bm25.pkl.gz`（`services/retrieval/store.py`、`services/retrieval/hybrid.py`）
+  - 运行时状态 `tools/memory.db`（`services/memory/store.py`）、`data/rag/npc_state_db.json`（`services/npc/manager.py`）、`data/task/agent_tasks.json` 与 `data/task/text/agent_text.json`（`services/agent_tools/task_tools.py`）
+  - 启动种子 `backup_resources/` 下的 `npc_state_db.json` / `agent_tasks.json` / `agent_text.json`
+  - 同级旧格式索引 `vector_index`（LlamaIndex 遗留）与 `vector_index_v3` 并存，两者都不得改名或增删版本后缀。
+- 改名的代价：用户与游戏侧已有文件立即失效并被重复生成，且必须同轮修改游戏仓库 `CrazyFlashNight/.gitignore`，否则生成物会被误提交。
+- **唯一例外：打包产物 exe 的文件名允许带版本号**（形如 `CFN-RAG-v3.0.0.exe`）——它是分发物，不是被程序按路径读取的对象。
+- 如确需换代：属独立变更，先评估迁移与兼容方案并同轮更新游戏仓库忽略规则，不得只改常量了事。
