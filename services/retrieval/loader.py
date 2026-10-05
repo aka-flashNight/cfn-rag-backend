@@ -34,8 +34,28 @@ _LORE_HEADING_PATTERN = re.compile(
 # 情报 TXT 的 @@@X_Y@@@ 分节标记
 _INTEL_SECTION_RE = re.compile(r"@@@\d+(?:_\d+)?@@@")
 
+# 任务配置文件黑名单：这些文件不在发行包内或为废弃数据，检索与向量化一律不命中。
+# mercenary_tasks_old.json 在游戏打包配置中被 task/*_old.json 排除（其 25 条任务
+# 已废弃、不在任何 list 引用链上），但本地 glob("*tasks*.json") 会误命中。
+_TASK_FILE_DENYLIST: frozenset[str] = frozenset({"mercenary_tasks_old"})
+
+# 情报正文分块参数：supp_intel 池对每条节点按 350 字符截断（SECTION_MAX_CHARS），
+# 故块长必须压在阈值内，否则上下文会被切掉尾巴。
+#   _CHUNK_SOFT  目标块长（尽量往这个长度靠）
+#   _CHUNK_HARD  单块上限（超过即触发池内截断，必须 < 350）
+_INTEL_CHUNK_SOFT = 280
+_INTEL_CHUNK_HARD = 340
+
+# h5 schema（intelligence_h5 / glossary）的纯展示字段，对大模型无信息量，解析时丢弃。
+# 说明：文本内容散落在 text/content/title/label/note/entries/rows/items/fragments 等
+# 字段中，由 _render_h5_blocks 按块类型还原，故这里只列出「确认无用」的字段。
+_H5_DECORATIVE_BLOCK_TYPES: frozenset[str] = frozenset({"surfaceMark", "divider"})
+
 # 核心设定文档文件名标识（「重置知识库」的业务判定）
 CORE_LORE_DOC_MARKER = "核心设定与世界合理性补足"
+
+# 设定文档扩展名：PDF/DOCX 需专门解析，MD/JSON 为纯文本直读
+_LORE_DOC_SUFFIXES: tuple[str, ...] = (".pdf", ".docx", ".md", ".json")
 
 # 参与语料指纹的源目录（相对 resources 根）；任一文件 mtime/size 变化即触发重建
 _FINGERPRINT_SOURCE_DIRS: tuple[str, ...] = (
@@ -43,6 +63,8 @@ _FINGERPRINT_SOURCE_DIRS: tuple[str, ...] = (
     "data/task",
     "docs/story",
     "data/intelligence",
+    "data/intelligence_h5",
+    "data/glossary",
     "data/stages",
     "data/items",
 )
@@ -57,21 +79,45 @@ def _resources_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 def compute_corpus_fingerprint(resources_dir: Path | None = None) -> str:
-    """扫描全部语料源文件，产出 (相对路径, mtime_ns, size) 集合哈希。"""
+    """
+    扫描全部语料源文件，产出 (相对路径, mtime_ns, size) 集合哈希。
+
+    设定文档的贡献随 resolve_lore_dir 的实际取值而定：docs/story 正常时按该目录
+    全量计入；回退到 docs 顶层时只计入被采纳的核心设定文档，否则 docs 下 200+
+    开发文档的任意改动都会误触发索引重建。
+    """
     root = Path(resources_dir) if resources_dir else _resources_dir()
     states: list[tuple[str, int, int]] = []
     for rel_dir in _FINGERPRINT_SOURCE_DIRS:
         base = root / rel_dir
         if not base.exists():
             continue
+        if rel_dir == "docs/story":
+            resolved = resolve_lore_dir(root)
+            if resolved is not None and resolved != base:
+                # 回退到 docs 顶层：只纳入被采纳的核心设定文档
+                for f in _list_lore_docs(resolved):
+                    if CORE_LORE_DOC_MARKER not in f.stem:
+                        continue
+                    st = _stat_or_none(f)
+                    if st is not None:
+                        states.append((f.relative_to(root).as_posix(), st[0], st[1]))
+                continue
         for f in base.rglob("*"):
             if f.is_file():
-                try:
-                    stat = f.stat()
-                except OSError:
-                    continue
-                states.append((f.relative_to(root).as_posix(), stat.st_mtime_ns, stat.st_size))
+                st = _stat_or_none(f)
+                if st is not None:
+                    states.append((f.relative_to(root).as_posix(), st[0], st[1]))
     return corpus_fingerprint(states)
+
+
+def _stat_or_none(f: Path) -> tuple[int, int] | None:
+    """取 (mtime_ns, size)，stat 失败返回 None。"""
+    try:
+        stat = f.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +243,9 @@ def load_task_nodes(resources_dir: Path | None = None) -> List[Node]:
 
     all_tasks: List[dict] = []
     for jpath in sorted(task_dir.glob("*tasks*.json")):
+        if jpath.stem in _TASK_FILE_DENYLIST:
+            logger.info("跳过黑名单任务配置（不参与检索/向量化）: %s", jpath.name)
+            continue
         try:
             data = json.loads(jpath.read_text(encoding="utf-8"))
             tasks = data.get("tasks") if isinstance(data, dict) else []
@@ -245,42 +294,329 @@ def load_task_nodes(resources_dir: Path | None = None) -> List[Node]:
 
 
 # ---------------------------------------------------------------------------
-# 3. 情报 TXT（@@@X_Y@@@ 分节）
+# 3. 情报 / 术语（h5 JSON schema，缺失时回退 legacy TXT）
 # ---------------------------------------------------------------------------
 
-def load_intelligence_nodes(resources_dir: Path | None = None) -> List[Node]:
-    root_dir = Path(resources_dir) if resources_dir else _resources_dir()
-    intel_dir = root_dir / "data" / "intelligence"
-    if not intel_dir.exists():
-        logger.warning("情报目录不存在，跳过: %s", intel_dir)
-        return []
+def _h5_inline_text(obj: object) -> str:
+    """
+    递归取出 h5 content 结构里的可见文本。
 
-    nodes: List[Node] = []
-    for txt_file in sorted(intel_dir.glob("*.txt")):
-        try:
-            content = txt_file.read_text(encoding="utf-8").strip()
-        except Exception:
+    content 项形如 {"type":"text","text":"..."}、
+    {"type":"colorToken","token":"...","content":[{"type":"text","text":"..."}]}、
+    {"type":"strong","content":[...]} —— 各种装饰类型（strong/underline/colorToken/
+    damageText/decryptText/outburst）只是排版样式，文本都在 text 或嵌套 content 里，
+    故统一递归取 text，样式标记（type/token/tone/…）一律丢弃。
+    """
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, list):
+        return "".join(_h5_inline_text(x) for x in obj)
+    if isinstance(obj, dict):
+        if isinstance(obj.get("text"), str):
+            return obj["text"]
+        if "content" in obj:
+            return _h5_inline_text(obj["content"])
+    return ""
+
+
+def _render_h5_blocks(blocks: object) -> List[str]:
+    """
+    把 h5 blocks 还原为纯文本行，按块类型保留有语义的结构，丢弃排版信息。
+
+    保留：段落/标题正文、表格（表头 + 行，用「 | 」分隔）、列表项、时间线条目
+    （「标签｜内容」）、终端日志、图纸材料、解密块、标注、手写注记等。
+    丢弃：x/y/w/h/rotate/opacity/layout/variant/tone/status/token/level 等纯展示字段，
+    以及 surfaceMark / divider 这类无文字装饰块。
+    """
+    lines: List[str] = []
+    if not isinstance(blocks, list):
+        return lines
+    for b in blocks:
+        if not isinstance(b, dict):
             continue
-        if len(content) < 10:
+        btype = b.get("type")
+        if btype in _H5_DECORATIVE_BLOCK_TYPES:
             continue
-        source_name = txt_file.stem
-        if _INTEL_SECTION_RE.search(content):
-            for sec in _INTEL_SECTION_RE.split(content):
-                sec = sec.strip()
-                if len(sec) < 10:
+
+        if btype == "table":
+            cols = b.get("columns") or []
+            if cols:
+                lines.append(" | ".join(str(c).strip() for c in cols))
+            for row in b.get("rows") or []:
+                cells = [_h5_inline_text(c).strip() for c in (row or [])]
+                lines.append(" | ".join(cells))
+            continue
+
+        if btype == "list":
+            for item in b.get("items") or []:
+                s = _h5_inline_text(item).strip()
+                if s:
+                    lines.append(s)
+            continue
+
+        if btype == "timeline":
+            for e in b.get("entries") or []:
+                if not isinstance(e, dict):
                     continue
-                nodes.append(
-                    Node(id=f"intel-{len(nodes) + 1}", text=sec, type="intelligence", source_file=source_name)
-                )
+                s = _h5_inline_text(e.get("content")).strip()
+                lab = str(e.get("label") or "").strip()
+                if s:
+                    lines.append(f"{lab}｜{s}" if lab else s)
+            continue
+
+        if btype == "terminalLog":
+            title = _h5_inline_text(b.get("title")).strip()
+            if title:
+                lines.append(title)
+            for e in b.get("entries") or []:
+                s = _h5_inline_text(e.get("content") if isinstance(e, dict) else e).strip()
+                if s:
+                    lines.append(s)
+            continue
+
+        if btype == "blueprint":
+            title = _h5_inline_text(b.get("title")).strip()
+            if title:
+                lines.append(title)
+            for m in b.get("materials") or []:
+                s = _h5_inline_text(m).strip()
+                if s:
+                    lines.append(s)
+            continue
+
+        if btype == "hardwareExtract":
+            label = _h5_inline_text(b.get("label")).strip()
+            if label:
+                lines.append(label)
+            for s in b.get("steps") or []:
+                s = str(s).strip()
+                if s:
+                    lines.append(s)
+            lines.extend(_render_h5_blocks(b.get("reveal")))
+            continue
+
+        if btype == "decryptBlock":
+            label = _h5_inline_text(b.get("label")).strip()
+            if label:
+                lines.append(label)
+            lines.extend(_render_h5_blocks(b.get("plain")))
+            continue
+
+        if btype == "paperStage":
+            for frag in b.get("fragments") or []:
+                s = _h5_inline_text((frag or {}).get("content") if isinstance(frag, dict) else frag).strip()
+                if s:
+                    lines.append(s)
+            continue
+
+        if btype == "annotation":
+            s = _h5_inline_text(b.get("content")).strip()
+            if s:
+                lines.append(s)
+            note = _h5_inline_text(b.get("note")).strip()
+            if note:
+                lines.append(note)
+            continue
+
+        # paragraph / heading / note / quote / stamp / handwritten 等：正文 + 兜底标题
+        s = _h5_inline_text(b.get("content")).strip()
+        if not s:
+            s = _h5_inline_text(b.get("title")).strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def _h5_document_text(doc: dict) -> str:
+    """把一个 h5 文档（pages[].blocks[]）还原为整篇纯文本。"""
+    lines: List[str] = []
+    for page in doc.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        lines.extend(_render_h5_blocks(page.get("blocks")))
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _split_long_sentence(sentence: str, limit: int) -> List[str]:
+    """超长句按次级标点（；，、：）就近切分；实在无标点才硬切，尽量不断在句中。"""
+    if len(sentence) <= limit:
+        return [sentence]
+    out: List[str] = []
+    rest = sentence
+    secondary = "；;，,、：:）)"
+    while len(rest) > limit:
+        cut = -1
+        for i in range(limit, max(limit // 2, 1) - 1, -1):
+            if rest[i - 1] in secondary:
+                cut = i
+                break
+        if cut <= 0:
+            cut = limit
+        out.append(rest[:cut].strip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        out.append(rest)
+    return [x for x in out if x]
+
+
+def _chunk_plain_text(text: str, soft: int, hard: int) -> List[str]:
+    """
+    把正文切成 soft~hard 字符的块，只在句末断开，避免断在句中。
+
+    切分优先级：空行/换行 → 句末（。！？…）→ 次级标点（；，）→ 硬切。
+    单块保证不超过 hard，从而不会被池的 max_chars 截断。
+    """
+    sentences: List[str] = []
+    for para in (text or "").split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        for sent in re.findall(r"[^。！？!?…]+[。！？!?…]+|[^。！？!?…]+", para):
+            sent = sent.strip()
+            if sent:
+                sentences.extend(_split_long_sentence(sent, hard))
+
+    chunks: List[str] = []
+    buf = ""
+    for sent in sentences:
+        if not buf:
+            buf = sent
+        elif len(buf) + len(sent) <= soft:
+            buf += sent
         else:
+            chunks.append(buf)
+            buf = sent
+    if buf:
+        chunks.append(buf)
+
+    # 尾块过短时向前合并（合并后不得超 hard），避免产生无意义的碎片
+    if len(chunks) >= 2 and len(chunks[-1]) < hard - len(chunks[-2]) and len(chunks[-2]) + len(chunks[-1]) <= hard:
+        chunks[-2] = chunks[-2] + chunks[-1]
+        chunks.pop()
+    return chunks
+
+
+def _load_intelligence_from_h5(h5_dir: Path) -> List[Node]:
+    """解析 data/intelligence_h5/*.json（游戏当前权威格式）。"""
+    nodes: List[Node] = []
+    for path in sorted(h5_dir.glob("*.json")):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("跳过情报 h5 %s: %s", path.name, exc)
+            continue
+        if not isinstance(doc, dict):
+            continue
+        name = str(doc.get("itemName") or path.stem)
+        text = _h5_document_text(doc)
+        for chunk in _chunk_plain_text(text, _INTEL_CHUNK_SOFT, _INTEL_CHUNK_HARD):
             nodes.append(
-                Node(id=f"intel-{len(nodes) + 1}", text=content, type="intelligence", source_file=source_name)
+                Node(id=f"intel-{len(nodes) + 1}", text=chunk, type="intelligence", source_file=name)
             )
     return nodes
 
 
+def _load_intelligence_from_txt(txt_dir: Path) -> List[Node]:
+    """解析 legacy data/intelligence/*.txt（@@@X_Y@@@ 分节），仅作 h5 缺失时的兜底。"""
+    nodes: List[Node] = []
+    for path in sorted(txt_dir.glob("*.txt")):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        sections = _INTEL_SECTION_RE.split(content) if _INTEL_SECTION_RE.search(content) else [content]
+        stem = path.stem
+        for sec in sections:
+            for chunk in _chunk_plain_text(sec.strip(), _INTEL_CHUNK_SOFT, _INTEL_CHUNK_HARD):
+                nodes.append(
+                    Node(id=f"intel-{len(nodes) + 1}", text=chunk, type="intelligence", source_file=stem)
+                )
+    return nodes
+
+
+def load_intelligence_nodes(resources_dir: Path | None = None) -> List[Node]:
+    """
+    情报语料：优先 data/intelligence_h5（游戏当前权威格式，结构化正文），
+    h5 目录缺失或无有效文档时回退 data/intelligence（legacy TXT）。
+
+    两者内容有重叠（h5 由 txt 生成后又经增强），同时纳入会在 supp_intel 池内
+    造成同主题重复召回，故按「二选一」处理。
+    """
+    root_dir = Path(resources_dir) if resources_dir else _resources_dir()
+    h5_dir = root_dir / "data" / "intelligence_h5"
+    txt_dir = root_dir / "data" / "intelligence"
+
+    if h5_dir.is_dir() and any(h5_dir.glob("*.json")):
+        nodes = _load_intelligence_from_h5(h5_dir)
+        if nodes:
+            logger.info("情报语料来源: intelligence_h5（h5 优先），%d 块", len(nodes))
+            return nodes
+        logger.warning("intelligence_h5 存在但未解析出内容，回退 legacy TXT")
+
+    if txt_dir.is_dir():
+        nodes = _load_intelligence_from_txt(txt_dir)
+        logger.info("情报语料来源: intelligence（legacy TXT 兜底），%d 块", len(nodes))
+        return nodes
+
+    logger.warning("情报目录不存在（h5 与 legacy 均缺失），跳过")
+    return []
+
+
+def load_glossary_nodes(resources_dir: Path | None = None) -> List[Node]:
+    """
+    名词术语表 data/glossary/*.json → world_lore 节点（一条术语一个节点）。
+
+    术语是权威世界观定义，与核心设定同属「世界观设定」，故走 world_lore 池
+    （不截断，可保留完整多页定义）；若放 supp_intel 会因 350 字符逐条截断而
+    切掉多页补录。glossary_index.json 只是目录，不含正文，跳过。
+    """
+    root_dir = Path(resources_dir) if resources_dir else _resources_dir()
+    glossary_dir = root_dir / "data" / "glossary"
+    if not glossary_dir.is_dir():
+        logger.warning("术语表目录不存在，跳过: %s", glossary_dir)
+        return []
+
+    nodes: List[Node] = []
+    for path in sorted(glossary_dir.glob("*.json")):
+        if path.stem == "glossary_index":
+            continue
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("跳过术语 %s: %s", path.name, exc)
+            continue
+        if not isinstance(doc, dict):
+            continue
+        term = str(doc.get("termName") or path.stem)
+        display = str(doc.get("displayName") or term)
+        body = _h5_document_text(doc)
+        if not body.strip():
+            continue
+        # 首行带上术语名（含别名），便于检索命中与模型辨识。
+        # displayName 通常已含 termName（如「军阀（莱昂利亚自由革命军）」），避免重复拼接。
+        if term in display:
+            header = display
+        elif display and display != term:
+            header = f"{term}（{display}）"
+        else:
+            header = term
+        nodes.append(
+            Node(
+                id=f"glossary-{len(nodes) + 1}",
+                text=f"{header}\n{body}",
+                type="world_lore",
+                source_file=term,
+            )
+        )
+    if nodes:
+        logger.info("术语表加载: %d 条（world_lore）", len(nodes))
+    return nodes
+
+
 # ---------------------------------------------------------------------------
-# 4. 世界观 PDF/DOCX（含按标题/段落/句子的 256/512 token 切分）
+# 4. 世界观 PDF/DOCX/MD/JSON（含按标题/段落/句子的 256/512 token 切分）
 # ---------------------------------------------------------------------------
 
 def _read_pdf_text(path: Path) -> str:
@@ -303,28 +639,92 @@ def _read_docx_text(path: Path) -> str:
     return "\n".join(parts)
 
 
+def _read_plain_text(path: Path) -> str:
+    """读取纯文本类文档（md/json）。按 utf-8 → utf-8-sig → gbk 依次尝试解码。
+
+    游戏项目文档多为 UTF-8，但存在带 BOM 与少量 GBK 编码的文件，逐级回退避免乱码。
+    """
+    raw = path.read_bytes()
+    for enc in ("utf-8", "utf-8-sig", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # 全部失败时用 utf-8 忽略错误字节兜底，好过整体丢弃该文件
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _read_lore_text(path: Path) -> str:
+    """按扩展名分派设定文档解析。"""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _read_pdf_text(path)
+    if suffix == ".docx":
+        return _read_docx_text(path)
+    return _read_plain_text(path)
+
+
+def _list_lore_docs(docs_dir: Path) -> List[Path]:
+    """列出目录下可解析的设定文档，按文件名排序。"""
+    if not docs_dir.is_dir():
+        return []
+    return sorted(
+        f for f in docs_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in _LORE_DOC_SUFFIXES
+    )
+
+
+def resolve_lore_dir(root_dir: Path) -> Path | None:
+    """
+    定位设定文档目录：优先 docs/story；其中无设定文档时回退到 docs 顶层。
+
+    回退到 docs 顶层属容错设计——游戏项目 docs/ 下混有大量开发文档（ADR、迁移
+    记录、技术备忘等），因此回退时只采纳命中核心设定命名的文档，不采纳 docs 顶层
+    的其他文档，避免把开发文档灌进世界观池。
+    """
+    story_dir = root_dir / "docs" / "story"
+    if _list_lore_docs(story_dir):
+        return story_dir
+
+    docs_dir = root_dir / "docs"
+    fallback = [f for f in _list_lore_docs(docs_dir) if CORE_LORE_DOC_MARKER in f.stem]
+    if fallback:
+        logger.warning(
+            "docs/story 下无设定文档，回退到 docs 顶层并仅采纳核心设定文档: %s",
+            docs_dir,
+        )
+        return docs_dir
+    return None
+
+
 def load_lore_nodes(resources_dir: Path | None = None) -> List[Node]:
-    """读取 resources/docs/story 下的 PDF/DOCX 世界观文档，按文件名区分核心/补充设定。"""
+    """
+    读取世界观设定文档，按文件名区分核心/补充设定。
+
+    目录选择见 resolve_lore_dir：优先 docs/story；docs/story 不存在或其中没有
+    设定文档时，回退到 docs 顶层且只取命中核心设定命名的文档。
+    """
     root_dir = Path(resources_dir) if resources_dir else _resources_dir()
-    docs_dir = root_dir / "docs" / "story"
-    if not docs_dir.exists():
-        logger.warning("世界观设定目录不存在，跳过: %s", docs_dir)
+    docs_dir = resolve_lore_dir(root_dir)
+    if docs_dir is None:
+        logger.warning("未找到世界观设定文档（docs/story 与 docs 顶层均无），跳过")
         return []
 
-    matching_files = [
-        f for f in docs_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in (".pdf", ".docx")
-    ]
+    # 回退到 docs 顶层时必须只保留命中核心设定命名的文档
+    in_fallback = docs_dir.name != "story"
+    matching_files = _list_lore_docs(docs_dir)
+    if in_fallback:
+        matching_files = [f for f in matching_files if CORE_LORE_DOC_MARKER in f.stem]
     if not matching_files:
-        logger.warning("docs 目录中无 PDF/DOCX 文件，跳过世界观文档加载")
+        logger.warning("设定文档目录中无可解析文件，跳过世界观文档加载: %s", docs_dir)
         return []
 
     nodes: List[Node] = []
-    for f in sorted(matching_files):
+    for f in matching_files:
         try:
-            text = _read_pdf_text(f) if f.suffix.lower() == ".pdf" else _read_docx_text(f)
+            text = _read_lore_text(f)
         except Exception as exc:
-            logger.warning("解析世界观文档 %s 失败，跳过: %s", f.name, exc)
+            logger.warning("解析设定文档 %s 失败，跳过: %s", f.name, exc)
             continue
         if not (text or "").strip():
             continue
@@ -332,6 +732,7 @@ def load_lore_nodes(resources_dir: Path | None = None) -> List[Node]:
         nodes.append(
             Node(id=f"lore-raw-{len(nodes) + 1}", text=text, type=doc_type, source_file=f.name)
         )
+    return nodes
     return nodes
 
 
@@ -589,6 +990,10 @@ def load_corpus(resources_dir: Path | None = None) -> List[Node]:
     except Exception as exc:
         logger.warning("加载情报文件时出错，跳过: %s", exc)
     try:
+        nodes.extend(load_glossary_nodes(root_dir))
+    except Exception as exc:
+        logger.warning("加载术语表时出错，跳过: %s", exc)
+    try:
         nodes.extend(load_game_entity_nodes(root_dir))
     except Exception as exc:
         logger.warning("加载游戏实体向量文档时出错，跳过: %s", exc)
@@ -614,15 +1019,16 @@ def load_corpus(resources_dir: Path | None = None) -> List[Node]:
 
 
 def has_core_lore_document(resources_dir: Path | None = None) -> bool:
-    """resources/docs/story 下是否存在「核心设定与世界合理性补足」文档（重置知识库的业务判定）。"""
+    """是否存在「核心设定与世界合理性补足」文档（重置知识库的业务判定）。
+
+    目录选择与 load_lore_nodes 保持一致（docs/story 优先，可回退 docs 顶层），
+    否则回退场景下会误判为「无核心设定」而触发多余的知识库重置。
+    """
     try:
         root_dir = Path(resources_dir) if resources_dir else _resources_dir()
     except FileNotFoundError:
         return False
-    docs_dir = root_dir / "docs" / "story"
-    if not docs_dir.exists():
+    docs_dir = resolve_lore_dir(root_dir)
+    if docs_dir is None:
         return False
-    for f in docs_dir.iterdir():
-        if f.is_file() and f.suffix.lower() in (".pdf", ".docx") and CORE_LORE_DOC_MARKER in f.stem:
-            return True
-    return False
+    return any(CORE_LORE_DOC_MARKER in f.stem for f in _list_lore_docs(docs_dir))
