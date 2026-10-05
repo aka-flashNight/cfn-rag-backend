@@ -109,6 +109,13 @@ illustration.zip
 release_notes_*.md
 
 .cursor
+
 # v3: ONNX 导出产物（由 scripts/export_onnx_int8.py 本地生成）
 models/*/model.onnx
 models/_export_onnx_tmp/
+
+# AI 助手本地工作区（记忆/缓存/临时产物，纯本地状态，不进版本库）
+.workbuddy/
+
+# 调试转储产物（prompt dump / 链路日志，由 scripts/dump_chat_prompt.py 等生成）
+debug/
