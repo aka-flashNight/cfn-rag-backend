@@ -39,6 +39,43 @@ def is_packaged_environment() -> bool:
     return hasattr(sys, "_MEIPASS") or getattr(sys, "frozen", False)
 
 
+def _dotenv_resources_dir() -> str:
+    """
+    读取 .env 中的 CFN_RESOURCES_DIR（仅供开发环境使用）。
+
+    .env 由 pydantic-settings 读入 Settings，但不会写入 os.environ，故此处显式回退读取。
+    任何异常（无 .env、无该字段、导入失败）一律返回空串，保证缺配置时行为与从前一致。
+    """
+    try:
+        from core.config import get_settings
+
+        return str(getattr(get_settings(), "cfn_resources_dir", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _explicit_resources_dir() -> Path | None:
+    """
+    显式指定的资源根目录：优先进程环境变量 CFN_RESOURCES_DIR，开发环境再回退 .env 配置。
+
+    打包环境刻意不读 .env —— exe 由 launcher.py 自行设置该环境变量，始终按 exe 所在位置
+    读取，不受开发机 .env 影响。路径不存在或不是目录时返回 None，交由自动探测兜底
+    （不抛异常，避免配置写错导致启动失败）。
+    """
+    raw = os.environ.get("CFN_RESOURCES_DIR")
+    if not raw and not is_packaged_environment():
+        raw = _dotenv_resources_dir()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        if path.exists() and path.is_dir():
+            return path.resolve()
+    except OSError:
+        return None
+    return None
+
+
 def find_resources_directory() -> Path:
     """
     定位游戏资源根目录（非交互版），对应原 `resources` 文件夹内容。
@@ -52,11 +89,9 @@ def find_resources_directory() -> Path:
     同时支持通过环境变量 `CFN_RESOURCES_DIR` 显式指定。
     """
 
-    env = os.environ.get("CFN_RESOURCES_DIR")
-    if env:
-        p = Path(env).expanduser().resolve()
-        if p.exists() and p.is_dir():
-            return p
+    env = _explicit_resources_dir()
+    if env is not None:
+        return env
 
     if is_packaged_environment():
         candidates = [Path(sys.executable).resolve().parent, Path.cwd()]
