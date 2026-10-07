@@ -20,6 +20,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # 应用版本（/api/health 暴露；与 SSE 头 X-CFN-Version、release_notes 对齐）
+    app_version: str = "3.0.0"
+
     # ------------------------------------------------------------------
     # LLM（前端可按请求覆盖 api_key/base/model；不再按消息存库）
     # ------------------------------------------------------------------

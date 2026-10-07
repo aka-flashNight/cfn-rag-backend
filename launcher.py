@@ -66,9 +66,46 @@ def is_packaged_environment():
 # 打包 exe 单实例：进程持有期间不关闭，退出时由系统回收
 _single_instance_mutex_handle = None
 
+# 启动模式：main() 解析 --embedded 后置位；置位后一切用户可见提示改为只写日志（FR-3 静默约束）
+_LAUNCH_MODE = "standalone"
+
+
+def _embedded_log_path() -> str:
+    """embedded 日志文件：与后端 setup_logging 同规则（打包＝exe 旁；开发＝项目根）"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "cfn-rag.log")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfn-rag.log")
+
+
+def _embedded_log(message: str) -> None:
+    """embedded 静默模式日志：只写 cfn-rag.log（控制台回显仅开发环境可见），不弹窗、不出声"""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [embedded] {message}"
+    try:
+        with open(_embedded_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+
+
+def _make_stdio_print_safe() -> None:
+    """embedded 下 print 绝不因控制台编码崩溃（GBK 控制台遇到 ✓/emoji 时改替换而非抛错）"""
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
 
 def _show_packaged_notice(message: str, title: str = "CFN-RAG"):
-    """无控制台 exe 下用系统对话框提示"""
+    """无控制台 exe 下用系统对话框提示；embedded 模式改只写日志（静默约束）"""
+    if _LAUNCH_MODE == "embedded":
+        _embedded_log(f"{title}: {message}")
+        return
     if os.name == "nt":
         try:
             import ctypes
@@ -881,7 +918,7 @@ def start_builtin_server(dist_path):
                 continue
 
             global _httpd_instance
-            httpd = socketserver.ThreadingTCPServer(("", port), handler)
+            httpd = socketserver.ThreadingTCPServer(("127.0.0.1", port), handler)
             _httpd_instance = httpd
             try:
                 print(f"[前端] 服务地址: http://127.0.0.1:{port}")
@@ -1037,7 +1074,59 @@ def main_packaged_gui():
     shutdown_launcher()
 
 
+def main_embedded():
+    """embedded 模式（游戏拉起，需求 FR-3）：无浏览器、无状态窗、无声音、无 7080 前端服务。
+
+    7077 单口同时伺服 API 与前端页面（B1-1）；失败只写 cfn-rag.log。
+    进程以后台方式存活，退出由游戏侧或进程管理负责。
+    """
+    _ensure_stdio_for_windowed()
+    _configure_stdio_line_buffering()
+    _make_stdio_print_safe()
+
+    if _tcp_local_port_open(7077):
+        # 已有实例在服务（含 standalone 启动者）：静默退出，游戏侧 EnsureReady 会复用并 bind
+        _embedded_log("7077 已在监听，本进程静默退出（游戏侧将复用既有实例）")
+        sys.exit(0)
+
+    if not check_python_environment():
+        _embedded_log("Python 环境检查未通过，退出")
+        sys.exit(1)
+
+    try:
+        setup_environment()
+    except SystemExit:
+        raise
+    except Exception as e:
+        _embedded_log(f"运行环境配置失败: {e}")
+        sys.exit(1)
+
+    # 开屏 icon（pyi_splash）保留至服务即将启动；此后静默，不再有任何可见窗口
+    _close_pyi_splash_if_any()
+
+    try:
+        start_backend()
+    except SystemExit as exc:
+        _embedded_log(f"后端进程退出: {exc}")
+        raise
+    # 正常情况下方不可达（uvicorn.run 阻塞至进程结束）；到达即后端未能启动
+    _embedded_log("后端未能启动，退出（详见日志）")
+    sys.exit(1)
+
+
 def main():
+    global _LAUNCH_MODE
+    if "--embedded" in sys.argv[1:]:
+        _LAUNCH_MODE = "embedded"
+        os.environ["CFN_RAG_LAUNCH_MODE"] = "embedded"
+        try:
+            main_embedded()
+        except SystemExit:
+            raise
+        except Exception as e:
+            _embedded_log(f"embedded 启动异常: {e!r}")
+            sys.exit(1)
+        return
     if is_packaged_environment():
         _ensure_stdio_for_windowed()
         if not _try_acquire_packaged_single_instance():
