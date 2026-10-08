@@ -21,6 +21,8 @@ _httpd_instance = None
 _splash_root = None
 _splash_main_label = None
 _splash_sub_label = None
+# embedded 模式下由 /api/integration/shutdown 置位：start_backend 返回后据此区分优雅退出
+_backend_shutdown_requested = False
 
 
 
@@ -349,77 +351,29 @@ def _bring_packaged_status_window_forward(tk_root):
         pass
 
 
-def _flash_windows_taskbar_for_hwnd(hwnd: int) -> None:
-    """让任务栏上对应窗口按钮闪烁若干次（全屏游戏时任务栏常不可见，仅作辅助）。"""
-    if os.name != "nt" or not hwnd:
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class FLASHWINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.UINT),
-                ("hwnd", wintypes.HANDLE),
-                ("dwFlags", wintypes.DWORD),
-                ("uCount", wintypes.UINT),
-                ("dwTimeout", wintypes.DWORD),
-            ]
-
-        FLASHW_ALL = 0x03
-        user32 = ctypes.windll.user32
-        info = FLASHWINFO()
-        info.cbSize = ctypes.sizeof(FLASHWINFO)
-        info.hwnd = wintypes.HANDLE(hwnd)
-        info.dwFlags = FLASHW_ALL
-        info.uCount = 6
-        info.dwTimeout = 200
-        user32.FlashWindowEx(ctypes.byref(info))
-    except Exception:
-        pass
-
-
 def _notify_browser_opened_user_attention():
     """
-    浏览器由 webbrowser.open 打开后，系统不保证窗口到最前；全屏独占游戏时尤其如此。
+    浏览器由 webbrowser.open 打开后，只留提示音（页面自动弹出即可被感知）。
 
-    补救（无法突破独占全屏，只能提高「被感知」概率）：
-    - Windows：播放 scripts/loading_audio.mp3（winmm MCI）；找不到或失败时回退系统提示音
-    - 打包模式：再次前置启动器 + 任务栏闪烁，与「另开终端打断全屏」类似但更快
-
-    若仍无感知：请退出全屏或切桌面后访问 127.0.0.1:708x。
+    打包模式下不再前置状态窗、不再闪任务栏：状态窗本就在任务栏可点，
+    页面已自动打开，闪动/前置只会干扰用户。
     """
-    if os.name == "nt":
-        played = False
-        audio_path = _find_loading_audio_path()
-        if audio_path:
-            try:
-                played = _play_loading_audio_mp3_windows(audio_path)
-            except Exception:
-                played = False
-        if not played:
-            try:
-                import winsound
-
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            except Exception:
-                pass
-
-    root = _splash_root
-    if not root:
+    if os.name != "nt":
         return
-
-    def _on_main_thread():
+    played = False
+    audio_path = _find_loading_audio_path()
+    if audio_path:
         try:
-            _bring_packaged_status_window_forward(root)
-            _flash_windows_taskbar_for_hwnd(int(root.winfo_id()))
+            played = _play_loading_audio_mp3_windows(audio_path)
+        except Exception:
+            played = False
+    if not played:
+        try:
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
-
-    try:
-        root.after(0, _on_main_thread)
-    except Exception:
-        pass
 
 
 def _exit_packaged_early_notice(message: str) -> None:
@@ -581,7 +535,13 @@ def setup_environment():
 
 
 def start_backend():
-    """启动后端FastAPI服务"""
+    """启动后端FastAPI服务。
+
+    用 uvicorn.Server 实例运行并注册优雅退出回调（/api/integration/shutdown 置位
+    should_exit）；本函数返回即事件循环已停止——正常退出或启动失败由调用方按
+    _backend_shutdown_requested 区分。
+    """
+    global _backend_shutdown_requested
     try:
         import uvicorn
 
@@ -607,14 +567,28 @@ def start_backend():
             traceback.print_exc()
             return
 
-        print("[后端] 正在启动Uvicorn服务器...")
-        uvicorn.run(
+        from services.integration.state import set_process_shutdown_callback
+
+        # timeout_graceful_shutdown：聊天 SSE/WebSocket 长连接未断时最多等 3 秒再强制收尾
+        config = uvicorn.Config(
             "main:app",
             host="127.0.0.1",
             port=7077,
             reload=False,
-            log_level="info"
+            log_level="info",
+            timeout_graceful_shutdown=3,
         )
+        server = uvicorn.Server(config)
+
+        def _on_shutdown_requested():
+            global _backend_shutdown_requested
+            _backend_shutdown_requested = True
+            server.should_exit = True
+
+        set_process_shutdown_callback(_on_shutdown_requested)
+
+        print("[后端] 正在启动Uvicorn服务器...")
+        server.run()
     except Exception as e:
         print(f"[后端] 启动失败: {e}")
         import traceback
@@ -1109,7 +1083,11 @@ def main_embedded():
     except SystemExit as exc:
         _embedded_log(f"后端进程退出: {exc}")
         raise
-    # 正常情况下方不可达（uvicorn.run 阻塞至进程结束）；到达即后端未能启动
+    if _backend_shutdown_requested:
+        # 游戏退出链经 /api/integration/shutdown 请求退出：优雅收尾，退出码 0
+        _embedded_log("已收到游戏侧退出请求，服务已停止，进程退出")
+        sys.exit(0)
+    # 正常情况下方不可达（server.run 阻塞至进程结束）；到达即后端未能启动
     _embedded_log("后端未能启动，退出（详见日志）")
     sys.exit(1)
 

@@ -96,3 +96,41 @@ def test_launch_mode_embedded_without_bind(state):
     assert st["launch_mode"] == "embedded"
     assert st["bound_slot"] is None
     assert st["frontend_url"] == "http://127.0.0.1:7077/?embedded=1"
+
+
+def test_shutdown_rejected_for_standalone(state):
+    from services.integration.state import set_process_shutdown_callback
+
+    calls: list[int] = []
+    set_process_shutdown_callback(lambda: calls.append(1))
+    try:
+        assert state.launch_mode == "standalone"
+        resp = _make_client().post("/integration/shutdown")
+        assert resp.status_code == 409
+        assert calls == []  # 用户手动启动的进程即使被 bind 也绝不触发退出
+    finally:
+        set_process_shutdown_callback(None)
+
+
+def test_shutdown_embedded_requests_process_exit(state):
+    from services.integration.state import set_process_shutdown_callback
+
+    calls: list[int] = []
+    set_process_shutdown_callback(lambda: calls.append(1))
+    try:
+        state.launch_mode = "embedded"
+        resp = _make_client().post("/integration/shutdown")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "status": "shutting_down"}
+        assert calls == [1]
+    finally:
+        set_process_shutdown_callback(None)
+
+
+def test_shutdown_without_callback_unavailable(state):
+    from services.integration.state import set_process_shutdown_callback
+
+    set_process_shutdown_callback(None)
+    state.launch_mode = "embedded"
+    resp = _make_client().post("/integration/shutdown")
+    assert resp.status_code == 503

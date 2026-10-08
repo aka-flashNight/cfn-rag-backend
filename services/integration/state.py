@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from typing import Callable
 
 #: 槽位键校验：镜像游戏侧 SaveSlotKey.cs:18（^[A-Za-z0-9_-]{1,128}$），拒绝路径分隔符
 SLOT_KEY_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
@@ -95,6 +96,26 @@ class IntegrationState:
 
 
 _STATE = IntegrationState()
+
+_shutdown_lock = threading.Lock()
+_process_shutdown_callback: Callable[[], None] | None = None
+
+
+def set_process_shutdown_callback(callback: Callable[[], None]) -> None:
+    """注册进程优雅退出回调（由 launcher.py 在启动 uvicorn 前调用）。"""
+    global _process_shutdown_callback
+    with _shutdown_lock:
+        _process_shutdown_callback = callback
+
+
+def request_process_shutdown() -> bool:
+    """请求本进程优雅退出；未注册回调（非 launcher 托管）时返回 False。"""
+    with _shutdown_lock:
+        callback = _process_shutdown_callback
+    if callback is None:
+        return False
+    callback()
+    return True
 
 
 def get_integration_state() -> IntegrationState:

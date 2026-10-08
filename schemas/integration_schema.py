@@ -47,6 +47,11 @@ class UnbindResponse(BaseModel):
     mode: str
 
 
+class ShutdownResponse(BaseModel):
+    ok: bool = True
+    status: str = "shutting_down"
+
+
 class IntegrationStatusResponse(BaseModel):
     ok: bool = True
     mode: str

@@ -29,6 +29,7 @@ def test_embedded_launch_is_silent(monkeypatch):
     )
     monkeypatch.setattr(launcher.webbrowser, "open", lambda url: calls.setdefault("browser", True))
     monkeypatch.setattr(launcher, "_LAUNCH_MODE", "standalone")
+    monkeypatch.setattr(launcher, "_backend_shutdown_requested", False)
     monkeypatch.setenv("CFN_RAG_LAUNCH_MODE", "placeholder")
     monkeypatch.setattr(sys, "argv", ["CFN-RAG-v3.0.0.exe", "--embedded"])
 
@@ -66,6 +67,33 @@ def test_embedded_exits_quietly_when_port_busy(monkeypatch):
 
     assert "backend" not in calls and "check" not in calls
     assert any("已在监听" in msg for msg in logs)
+
+
+def test_embedded_graceful_shutdown_exits_zero(monkeypatch):
+    logs: list[str] = []
+
+    monkeypatch.setattr(launcher, "_ensure_stdio_for_windowed", lambda: None)
+    monkeypatch.setattr(launcher, "_configure_stdio_line_buffering", lambda: None)
+    monkeypatch.setattr(launcher, "_embedded_log", logs.append)
+    monkeypatch.setattr(launcher, "_close_pyi_splash_if_any", lambda: None)
+    monkeypatch.setattr(launcher, "_tcp_local_port_open", lambda port: False)
+    monkeypatch.setattr(launcher, "check_python_environment", lambda: True)
+    monkeypatch.setattr(launcher, "setup_environment", lambda: None)
+    monkeypatch.setattr(launcher, "_LAUNCH_MODE", "standalone")
+    monkeypatch.setattr(launcher, "_backend_shutdown_requested", False)
+    monkeypatch.setenv("CFN_RAG_LAUNCH_MODE", "placeholder")
+    monkeypatch.setattr(sys, "argv", ["CFN-RAG-v3.0.0.exe", "--embedded"])
+
+    def fake_start_backend():
+        # 模拟 /api/integration/shutdown 回调置位后 uvicorn 事件循环返回
+        launcher._backend_shutdown_requested = True
+
+    monkeypatch.setattr(launcher, "start_backend", fake_start_backend)
+
+    with pytest.raises(SystemExit) as exc:
+        launcher.main()
+    assert exc.value.code == 0
+    assert any("游戏侧退出请求" in msg for msg in logs)
 
 
 def test_standalone_launch_untouched(monkeypatch):
