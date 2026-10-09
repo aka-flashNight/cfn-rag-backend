@@ -296,9 +296,14 @@ class TurnOrchestrator:
             # ---- BURST_STREAMING（调用 #1）----
             # system 分层（从稳定到易变）：世界观 → 输出规则/prepare 指南（跨 NPC）
             # → 单 NPC 扮演块（含 meta 协议）；user1 = 历史 → 会话态 → RAG（同回合
-            # 多次调用共享）；user2 = 玩家当轮话（+立绘图片 part 在尾）。
+            # 多次调用共享）；user2 = 玩家当轮话 + 立绘说明/情绪连贯提示（+图片 part 在尾）。
             base_messages = self._build_base_messages(ctx, dialogue_limit=dialogue_limit)
-            player_message = build_player_message(self.query)
+            player_message = build_player_message(
+                self.query,
+                npc_name=self.npc_name,
+                has_image=bool(ctx.image_data_url),
+                current_emotion=self.current_emotion,
+            )
             # 立绘图片只进聊天调用 #1 的末条 user 消息（文本 part 前、图片 part 后）；
             # base_messages 保持纯文本，merge/补救/confirm 参数等调用天然无图
             messages = [
@@ -563,9 +568,7 @@ class TurnOrchestrator:
             retrieved_context=ctx.rag_context_text,
             mentioned_npcs_str=ctx.mentioned_npcs_str,
             summary_str=self._summary_text(ctx),
-            history_str=self._recent_dialogue_text(
-                ctx, spoken_text="", limit=dialogue_limit,
-            ),
+            history_str=self._history_block(ctx, limit=dialogue_limit),
             player_identity=self.player_identity,
             progress_desc=ctx.progress_desc,
             favorability=ctx.favorability,
@@ -584,9 +587,32 @@ class TurnOrchestrator:
         return str(summary).strip() if summary else ""
 
     def _summary_text(self, ctx: TurnContext) -> str:
-        """早期对话滚动摘要（比近期对话稳定，放对话块之前）。"""
+        """早期对话滚动摘要（比近期对话稳定，放对话块之前）。标题沿用 v2 口径。"""
         summary = self._raw_summary(ctx)
-        return f"【早期对话摘要】\n{summary}" if summary else ""
+        return f"当前对话历史较长，早期对话已整理为以下摘要：\n{summary}" if summary else ""
+
+    def _history_block(self, ctx: TurnContext, *, limit: int) -> str:
+        """近期对话逐字块（聊天主 Agent 用）。
+
+        两点沿用 v2 口径：① 带引导语，其中「在保持人物性格与情节连贯的前提下
+        继续对话」是每轮一次、且位置紧贴生成点的入戏提醒，v3 一度整块裸奔；
+        ② 无历史记录时整块不注入，不给模型一个空对话框。
+        引导语按有无摘要二选一，与 v2 完全一致。
+        """
+        lines = [
+            f"玩家：{m.content}" if m.role == "user" else f"{self.npc_name}：{m.content}"
+            for m in ctx.history[-limit:]
+        ]
+        if not lines:
+            return ""
+        header = (
+            "以下是最近的对话记录（按时间从早到晚排列），"
+            "请结合上述摘要与近期记录，在保持人物性格与情节连贯的前提下继续对话："
+            if self._raw_summary(ctx)
+            else "下面是你与玩家之间的对话历史（按时间从早到晚排列），"
+            "请在保持人物性格与情节连贯的前提下继续对话："
+        )
+        return header + "\n" + "\n".join(lines)
 
     async def _forward_body(
         self, events: AsyncIterator[Any], sink: list[str],
@@ -696,10 +722,11 @@ class TurnOrchestrator:
     def _recent_dialogue_text(
         self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
     ) -> str:
-        """近期对话逐字块。
+        """子 Agent 用的近期对话逐字块（聊天主 Agent 走 _history_block）。
 
-        聊天主 Agent 传玩家选的精确短期记忆档位；子 Agent 用默认固定预算
-        （SUBAGENT_RECENT_MESSAGES，近 4 轮 + 本轮已流出正文，含过渡话）。
+        固定预算 SUBAGENT_RECENT_MESSAGES（近 4 轮 + 本轮已流出正文，含过渡话），
+        不随玩家选的精确短期记忆档位变化；无记录时给占位行，因为子 Agent 的
+        prompt 里这块有标题、留空会让它以为装配出错。
         """
         lines: list[str] = []
         for m in ctx.history[-limit:]:

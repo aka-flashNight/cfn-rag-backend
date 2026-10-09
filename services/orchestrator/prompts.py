@@ -16,6 +16,7 @@ from typing import Optional
 
 from services.game_progress import StageConfig
 from services.llm import meta_prompt_block
+from services.llm.meta import DEFAULT_EMOTION
 from services.npc.manager import NPCState
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ DIALOGUE_FORMAT_RULES = """\
 2. 非必要时不出现动作描写；若需要肢体动作/神态/环境描写，必须且只能使用全角粗括号【】包裹；台词直接输出，不加引号；严禁用半角括号 () 或星号 * 描述动作。
 3. 你输出的动作若涉及人称，一律单独起一行，采用第三人称视角：用角色名指代你自己，用「你」指代玩家。
 4. 全角粗括号【】仅可用于动作/神态/环境描写，其它内容不得放入。
-5. 用简体中文、陈述语气；不要输出 JSON（第一行除外）、不要提及工具、系统或立绘。
+5. 用简体中文；不要输出 JSON（第一行除外）、不要提及工具、系统或立绘。
 6. 第一行 JSON 之后**必须输出台词正文，不得输出空回复**；没有合适的长话也要以角色身份自然回应。
 """
 
@@ -159,9 +160,10 @@ def build_static_system(
     # ---- 层2：单 NPC 一致 ----
     parts.extend([
         tagline,
-        f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。",
+        f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。",
-        "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定。",
+        "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定，"
+        "无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。",
         meta_prompt_block(
             state.emotions or ["普通"],
             has_pending_draft=has_pending_draft,
@@ -176,7 +178,9 @@ def build_static_system(
         parts.append(
             f"你作为「{npc_name}」（{state.faction or '未知阵营'}）："
             "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
-            "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，则不要发布任务并拒绝玩家的请求。"
+            "发布动机要自然融入对话；"
+            "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，"
+            "则不要发布任务，并拒绝玩家的发布任务请求；"
         )
         parts.append(build_shop_constraint(has_shop, shop_reward_types))
         parts.append(build_challenge_hint(
@@ -195,13 +199,17 @@ def build_static_system(
 # user shared core
 # ---------------------------------------------------------------------------
 
+# 检索为空时的兜底沿用 v2 口径：明确授权模型按自己的设定发挥，而不是整块留白——
+# 留白会让模型退回通用套话，是伪人感的来源之一。
+RAG_EMPTY_FALLBACK = "（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）"
+
+
 def _rag_block(retrieved_context: str) -> str:
-    if not (retrieved_context or "").strip():
-        return ""
+    body = (retrieved_context or "").strip() or RAG_EMPTY_FALLBACK
     return (
         "下面是可能与你相关的检索设定和你的过往台词片段"
         "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
-        f"{retrieved_context}"
+        f"{body}"
     )
 
 
@@ -272,9 +280,42 @@ def build_user_shared_core(
     return "\n\n".join(parts)
 
 
-def build_player_message(user_query: str) -> str:
-    """末条 user 消息：玩家当轮发言（最易变，置于一切内容之后；图片 part 附其尾）。"""
-    return f"玩家：{user_query}"
+def build_portrait_note(npc_name: str) -> str:
+    """立绘文字说明（v2 口径）：告诉模型这张图是谁，并免掉它硬拿图开话题。
+
+    v3 一度只发图片 part 不发说明，而兜底的 appearance 块在现网数据里恒为空
+    （npc_state_db.json 的 85 个 NPC 无一填 appearance），模型等于收到一张
+    没头没尾的人像——弱模型会去描述图或被图带跑。
+    """
+    who = (npc_name or "").strip() or "当前 NPC"
+    return f"现在传入了你所扮演的角色「{who}」的肖像（不需要强行通过肖像内容开启话题）。"
+
+
+def build_emotion_hint(current_emotion: Optional[str]) -> str:
+    """上一轮情绪连贯提示（v2 口径）：仅在有非「普通」的历史情绪时注入。"""
+    emo = (current_emotion or "").strip()
+    if not emo or emo == DEFAULT_EMOTION:
+        return ""
+    return f"你之前的情绪是「{emo}」。"
+
+
+def build_player_message(
+    user_query: str,
+    *,
+    npc_name: str = "",
+    has_image: bool = False,
+    current_emotion: Optional[str] = None,
+) -> str:
+    """末条 user 消息：玩家当轮发言（最易变，置于一切内容之后；图片 part 附其尾）。
+
+    发言之后按 v2 口径追加立绘说明与情绪连贯提示：这两句是模型生成前最后读到
+    的文字，位置最贴近生成点，情绪连贯尤其依赖它（否则每轮情绪都从零起跳）。
+    """
+    tail = ""
+    if has_image:
+        tail += build_portrait_note(npc_name)
+    tail += build_emotion_hint(current_emotion)
+    return f"玩家：{user_query}" + (f"\n\n{tail}" if tail else "")
 
 
 PREPARE_TOOL_GUIDE = """\
@@ -350,7 +391,8 @@ TASK_MERGE_INSTRUCTION = (
     "后台任务系统已拟好委托草案（结果见上）。请以你的口吻向玩家详细说明这份委托："
     "任务内容、要求、奖励都讲清楚，结尾必须征询玩家是否接取。"
     "问法不要固定成同一句：结合当下的语境（事情的轻重缓急、任务的性质、你刚才那句过渡话）与你的性格、"
-    "和玩家的关系/好感，从下面两类说法里挑一种，并尽量换着说——"
+    "和玩家的关系/好感，从下面两类说法里挑一种，并尽量换着说。"
+    "下面这些**仅供参考，不要照抄**——照你的身份和当下情景，用自己的话问："
     "疑问式：「没问题吧？」「能完成吗？」「条件满意吗？」「可以接受吧？」「有意向吗？」"
     "「愿意接吗？」「有信心吗？」「能帮忙吗？」「合你心意吗？」「这活儿你接吗？」；"
     "陈述式：「如果愿意，我就发派任务给你。」「接受的话我就把任务派给你。」"
