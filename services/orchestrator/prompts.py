@@ -133,10 +133,18 @@ def build_static_system(
     shop_reward_types: Optional[list[str]] = None,
     player_can_challenge: Optional[bool] = None,
     has_pending_draft: bool = False,
+    agent_enabled: bool = True,
 ) -> str:
     """system 分层（前缀缓存对齐，从稳定到易变）：
     层1 跨 NPC 一致（世界观、输出规则、prepare 指南）→ 层2 单 NPC 一致
-    （扮演约束、meta 协议、同阵营表、商店/切磋约束、appearance）。"""
+    （扮演约束、meta 协议、同阵营表、商店/切磋约束、appearance）。
+
+    agent_enabled=False（玩家关闭 Agent 能力）时，任务发布相关的全部约束块
+    （prepare 指南、发布硬约束、商店奖励类型、切磋可行性）都不注入——它们只在
+    能派发委托时才有意义，留着只会白占 token 并诱导模型承诺做不到的事；改为注入
+    NO_AGENT_CONSTRAINT，让 NPC 以人设口吻婉拒而不是空口答应；玩家坚持要活时，
+    还要引导他去终端打开接取委托的权限（v2 同名提示的口径）。
+    """
     emotions_str = "、".join(state.emotions or ["普通"])
     tagline = format_npc_role_tagline(
         npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
@@ -146,7 +154,7 @@ def build_static_system(
         f"【世界观背景概要】\n{WORLD_BACKGROUND}",
         DIALOGUE_FORMAT_RULES,
     ]
-    if not has_pending_draft:
+    if agent_enabled and not has_pending_draft:
         parts.append(PREPARE_TOOL_GUIDE)
     # ---- 层2：单 NPC 一致 ----
     parts.extend([
@@ -154,21 +162,28 @@ def build_static_system(
         f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。",
         "非特殊要求下，每次对话长度不必太长。不要自己脑补不存在的设定。",
-        meta_prompt_block(state.emotions or ["普通"], has_pending_draft=has_pending_draft),
+        meta_prompt_block(
+            state.emotions or ["普通"],
+            has_pending_draft=has_pending_draft,
+            agent_enabled=agent_enabled,
+        ),
     ])
     same = (same_faction_npcs or "").strip()
     if same:
         parts.append(f"【同阵营角色】\n{same}")
-    parts.append("【任务发布硬约束（详细流程由后台任务系统处理，你只负责给出方向）】")
-    parts.append(
-        f"你作为「{npc_name}」（{state.faction or '未知阵营'}）："
-        "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
-        "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，则不要发布任务并拒绝玩家的请求。"
-    )
-    parts.append(build_shop_constraint(has_shop, shop_reward_types))
-    parts.append(build_challenge_hint(
-        bool(state.challenge), player_can_challenge,
-    ))
+    if agent_enabled:
+        parts.append("【任务发布硬约束（详细流程由后台任务系统处理，你只负责给出方向）】")
+        parts.append(
+            f"你作为「{npc_name}」（{state.faction or '未知阵营'}）："
+            "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
+            "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，则不要发布任务并拒绝玩家的请求。"
+        )
+        parts.append(build_shop_constraint(has_shop, shop_reward_types))
+        parts.append(build_challenge_hint(
+            bool(state.challenge), player_can_challenge,
+        ))
+    else:
+        parts.append(NO_AGENT_CONSTRAINT)
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)
@@ -288,6 +303,17 @@ PREPARE_TOOL_GUIDE = """\
    玩家说「我要上装」→ reward_keywords 填 ["上装装备"]；
    玩家说「想要药剂」→ requirement_keywords 或 reward_keywords 填 ["药剂"]。
 5. 候选池与奖励预算由工具返回，交给后台任务系统处理——你的台词里不要写任何具体任务内容或数字。
+"""
+
+
+NO_AGENT_CONSTRAINT = """\
+【当前无法派发委托】
+你现在不能给玩家派发任何委托、代办或差事，也查不了外部情报——只能凭自己已知的设定交谈。
+因此：不要答应「我去安排」「回头给你派个活」这类承诺，也不要编造具体任务内容或报酬数字。
+玩家索要任务/委托时，先以符合你身份和当前关系的口吻婉拒（如手头没活、时机不合适、不放心交给他）。
+若玩家坚持要接活，则提醒他：得先在自己那台终端上把接取委托的权限打开，你这边才派得出去。
+这类提醒同样要用角色口吻说（例：「你那终端的委托权限还关着呢，打开了我才好给你派活」），
+不要用界面或系统术语（面板、开关、勾选、参数名之类），也不要把它说成系统故障。
 """
 
 

@@ -157,7 +157,7 @@ async def split_meta(stream: AsyncIterator[StreamEvent]
 
 meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 处理 act（§5）→ 继续转发明文正文。这保证**情绪先于正文到达前端**（B5 开发者注的硬性要求）。
 
-### 4.3 prompt 说明（生成函数 `meta_prompt_block(npc_emotions)`）
+### 4.3 prompt 说明（生成函数 `meta_prompt_block(npc_emotions, *, has_pending_draft, agent_enabled)`）
 
 写进聊天尾部指令，要点：
 
@@ -169,6 +169,10 @@ meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 处�
    - 需要查证设定/物品/关卡信息才能回答 → `search`。
    - **草案只是拟定，不是已发布**。确认前禁止说"任务已发布"。
 4. 委派 task_draft/task_update/search 时，第一段的正文只写 1~2 句过渡话（如"我想想给你安排点什么……"），不要写任何具体任务内容/数字。
+5. `agent_enabled=False`（玩家在设置页关掉 Agent 能力）时，第 3、4 点整块不注入：
+   协议里 act 只剩「本轮固定写 null」，任何委派 kind 与 `prepare_task_context`
+   都不出现——不给模型可以越权的字面入口。emo/fav 协议不受影响。
+   编排层另有兜底：模型仍硬发 act 时忽略并按纯聊天处理（03 §2）。
 
 ## 5. act 的执行语义（orchestrator 侧，本章只定义契约）
 

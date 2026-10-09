@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # 摘要触发间隔（消息条数）
 SUMMARIZE_INTERVAL = 30
 
+# 精确短期记忆长度档位白名单（消息条数）：前端 短/中/长/几乎无限。
+# 与 SUMMARIZE_INTERVAL 是两回事——档位决定「多少条近期对话逐字进 prompt」，
+# 摘要间隔决定「多久把近期对话压成一段永久模糊记忆」，后者不随档位变化。
+PRECISE_MEMORY_OPTIONS = (10, 30, 100, 500)
+
 # 不允许混入草案 JSON 的内部/业务分离字段（修 D5）
 _DRAFT_INTERNAL_FIELDS = ("bargain_count", "_draft_commit_valid")
 

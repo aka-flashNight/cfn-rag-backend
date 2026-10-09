@@ -214,6 +214,7 @@ class TaskRunner(SubagentBase):
         prepared_context: Optional[str] = None,
         prepare_error: str = "",
         recent_dialogue: str = "",
+        memory_summary: str = "",
         player_query: str = "",
         npc_name: str,
         npc_faction: str = "",
@@ -274,6 +275,7 @@ class TaskRunner(SubagentBase):
             user = build_task_user(
                 direction_block=build_direction_for_task(direction="", note=note or ""),
                 recent_dialogue=recent_dialogue,
+                memory_summary=memory_summary,
                 npc_name=npc_name,
                 npc_faction=npc_faction,
                 npc_titles=npc_titles,
@@ -290,6 +292,7 @@ class TaskRunner(SubagentBase):
                     direction=direction, reward_hint=reward_hint, note=note,
                 ),
                 recent_dialogue=recent_dialogue,
+                memory_summary=memory_summary,
                 candidates_block=candidates,
                 npc_name=npc_name,
                 npc_faction=npc_faction,

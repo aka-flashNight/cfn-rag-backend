@@ -97,6 +97,7 @@ def build_task_user(
     *,
     direction_block: str,
     recent_dialogue: str,
+    memory_summary: str = "",
     candidates_block: str = "",
     npc_name: str,
     npc_faction: str = "",
@@ -119,6 +120,11 @@ def build_task_user(
     lines.append(npc_block)
     lines.append(f"【玩家进度】阶段 {player_progress}。{progress_desc}")
     lines.append("")
+    # 永久模糊记忆排在最近对话之前：它体积恒定、不随玩家的精确短期记忆档位膨胀，
+    # 但只是压缩后的印象，不能当本轮原话用，所以单列一块并写明用途。
+    if memory_summary:
+        lines.append(f"【更早的对话印象（模糊记忆，只作背景参考，不是本轮原话）】\n{memory_summary}")
+        lines.append("")
     lines.append(f"【最近对话（拟定内容必须与之一致）】\n{recent_dialogue}")
     if candidates_block:
         lines.append("")

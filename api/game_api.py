@@ -95,6 +95,10 @@ async def ask(
         progress_stage=payload.progress_stage,
         current_emotion=payload.current_emotion,
         llm_config=llm_config,
+        # Agent 能力开关与精确短期记忆档位都按请求生效（前端每次都带）；
+        # agent_enabled 缺省（None）按启用处理，即老客户端行为不变
+        agent_enabled=payload.agent_enabled is not False,
+        summarize_interval=payload.summarize_interval,
         # send_image 不显式关：是否带图由编排层按 07 §4 判定
         #（vision Profile + 未被标记图像不支持 + 立绘资产可用，否则纯文本不报错）
     )

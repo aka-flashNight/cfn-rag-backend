@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from services.llm.client import StreamEvent
-from services.llm.meta import Meta, MetaAct, split_meta, split_meta_events
+from services.llm.meta import Meta, MetaAct, meta_prompt_block, split_meta, split_meta_events
 
 EMOTIONS = ["普通", "微笑", "生气", "惊讶"]
 
@@ -166,3 +166,34 @@ async def test_reasoning_events_never_enter_meta_or_content():
     assert meta.emotion == "微笑"
     assert "reasoning" not in kinds
     assert "".join(texts) == "你好呀。"
+
+
+# ---------------------------------------------------------------------------
+# meta 协议说明文本：Agent 能力开关（玩家设置项）
+# ---------------------------------------------------------------------------
+
+def test_meta_prompt_block_agent_enabled_lists_delegation_kinds():
+    block = meta_prompt_block(EMOTIONS, has_pending_draft=False, agent_enabled=True)
+    assert '"kind":"task_draft"' in block
+    assert '"kind":"search"' in block
+    assert "prepare_task_context" in block
+    assert "本轮固定写 null" not in block
+
+
+def test_meta_prompt_block_agent_enabled_with_draft_lists_confirm_kinds():
+    block = meta_prompt_block(EMOTIONS, has_pending_draft=True, agent_enabled=True)
+    assert '"kind":"task_confirm"' in block
+    assert '"kind":"task_cancel"' in block
+    assert '"kind":"task_update"' in block
+
+
+def test_meta_prompt_block_agent_disabled_exposes_no_delegation():
+    """关闭态：act 只有 null，任何委派 kind 与工具名都不得出现在协议里。"""
+    for has_draft in (False, True):
+        block = meta_prompt_block(EMOTIONS, has_pending_draft=has_draft, agent_enabled=False)
+        assert "本轮固定写 null" in block
+        for forbidden in ("task_draft", "task_update", "task_confirm", "task_cancel",
+                          "search", "prepare_task_context"):
+            assert forbidden not in block
+        # emo/fav 协议不受开关影响
+        assert "1. emo" in block and "2. fav" in block

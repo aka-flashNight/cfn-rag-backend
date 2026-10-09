@@ -42,6 +42,20 @@ IDLE
 
 **LLM 调用预算（替代旧 token 死熔断，B4）**：每回合聊天主 Agent ≤ 3 次调用（#1 + 过渡 #2a + 汇合 #2b）；TaskRunner ≤ 4 轮、SearchRunner ≤ 3 轮工具循环（config 可调）。任何超限立即走失败话术路径，绝不无限循环。
 
+**请求级开关（玩家设置项，经 `NPCChatRequest` 传入）**：
+
+- `agent_enabled=false`：本回合只可能走 `meta.act == null` 那条分支。三处闸门——
+  ① 不下发 `prepare_task_context` 工具（模型连调用入口都没有）；
+  ② system prompt 去掉 prepare 指南与全部任务发布约束（发布硬约束/商店奖励类型/切磋可行性），
+  改注入 `NO_AGENT_CONSTRAINT`，让 NPC 以人设口吻婉拒而不是空口答应；玩家坚持要活时
+  还要引导他去终端打开接取委托的权限（沿用 v2 `game_rag_service` 同口径的提示，
+  但要求用角色口吻说，不报界面术语）；
+  ③ meta 协议里 act 只保留 null（`meta_prompt_block(agent_enabled=False)`）。
+  模型仍越权硬发 act 时记 warning 并按纯聊天处理。残留的待确认草案不进 prompt
+  （模型既无法确认也无法取消，摆着只会诱导它承诺做不到的事），但仍照常装配以
+  累计 `draft_keep_turns` 计数被自然清理。
+- `summarize_interval`：精确短期记忆档位，见 §7.1。
+
 ## 3. 后台子 Agent 基座（base.py）
 
 ```python
@@ -157,6 +171,33 @@ class SearchRunner(SubagentBase):
 | 立绘            | `services/portraits`     | 仅 vision 模型；manifest 查表 + 缓存（07）                         |
 | appearance 文本 | npc_state_db.json 可选字段 | 有则恒入 prompt（07）                                              |
 | save_info       | gamebridge stub            | 恒 None（预留，01 §9）                                            |
+
+### 7.1 精确短期记忆档位（summarize_interval）
+
+前端「精确短期记忆长度」滑条（短/中/长/几乎无限 → 10/30/100/500）按请求传入；
+白名单唯一权威是 `services.memory.store.PRECISE_MEMORY_OPTIONS`，非白名单值一律
+按「未提供」处理（不静默改写，收敛在 `TurnOrchestrator.__init__`）。
+
+| 请求档位                     | 从库读多少条（history_limit）  | 逐字进 prompt 多少条              | 滚动摘要节奏 |
+| ---------------------------- | ------------------------------ | --------------------------------- | ------------ |
+| 10 / 30 / 100 / 500          | = 档位                         | = 档位                            | 不变         |
+| 不传 / 非白名单              | `deps.history_limit`（20）     | `deps.recent_dialogue_limit`（8） | 不变         |
+
+两条边界，都是刻意的：
+
+- **档位只作用于聊天主 Agent。** 子 Agent 的 `recent_dialogue` 用固定预算
+  `SUBAGENT_RECENT_MESSAGES`（8 条），不随档位膨胀——它只需要「刚才谈到哪」，
+  灌 500 条历史只会挤占它自己的工具循环预算。任务 Agent 另外拿到滚动摘要
+  （`memory_summary`，来自同一份永久模糊记忆），在 prompt 里作为独立的
+  「更早的对话印象」块排在最近 8 条之前：摘要体积恒定、不随档位膨胀，
+  既补上「这玩家早先谈过什么」的背景，又不吃掉工具循环预算。
+  `SearchRunner` 不吃 `recent_dialogue`，因此也不带摘要。
+- **档位不影响滚动摘要。** 摘要恒为每 `SUMMARIZE_INTERVAL`（30）条触发、压最近
+  30 条。前端设置页对玩家的承诺是「角色已具有单个会话内容的永久模糊记忆，此处
+  调整的仅为精确的短期记忆长度」；若让档位连带拉长摘要间隔，选「几乎无限」的
+  玩家反而会在 500 条之前彻底失去模糊记忆，与承诺相反。
+  （字段名 `summarize_interval` 是 v2 遗留——当年它同时驱动摘要间隔与历史长度，
+  v3 恢复时只保留了后者，名字为兼容已发布前端而未改。）
 
 ## 8. 新旧行为对照（必须做到的改善）
 

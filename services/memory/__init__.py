@@ -1,6 +1,7 @@
 """services/memory：会话存储（SQLite 单连接 WAL）与滚动摘要（有界队列 worker）。"""
 
 from services.memory.store import (
+    PRECISE_MEMORY_OPTIONS,
     SUMMARIZE_INTERVAL,
     ChatMessage,
     MemoryStore,
@@ -19,6 +20,7 @@ from services.memory.summarize import (
 )
 
 __all__ = [
+    "PRECISE_MEMORY_OPTIONS",
     "SUMMARIZE_INTERVAL",
     "ChatMessage",
     "MemoryStore",

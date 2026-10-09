@@ -44,6 +44,24 @@ class NPCChatRequest(BaseModel):
         default=None,
         description="可选的 HTTP 代理地址（仅作用于本次会话的 LLM 客户端，httpx 客户端级，不改进程环境变量）",
     )
+    agent_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "是否启用 Agent 能力（委派任务草案、后台检索子 Agent）。"
+            "不传按启用处理，即与未提供该字段时的既有行为一致；"
+            "关闭后 NPC 只做纯聊天，不下发 prepare_task_context 工具、不响应任何委派意图。"
+        ),
+    )
+    summarize_interval: Optional[int] = Field(
+        default=None,
+        description=(
+            "精确短期记忆长度档位：逐字进入 prompt 的近期对话条数。"
+            "合法取值 10/30/100/500，对应前端 短/中/长/几乎无限"
+            "（唯一权威白名单见 services.memory.store.PRECISE_MEMORY_OPTIONS）。"
+            "不传或非法值时回落到服务端默认，行为与本字段引入前一致。"
+            "注意：档位只影响精确短期记忆，会话的滚动摘要（永久模糊记忆）节奏不受其影响。"
+        ),
+    )
 
 
 class NPCChatResponse(BaseModel):

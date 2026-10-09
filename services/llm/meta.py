@@ -223,12 +223,20 @@ async def split_meta(
     return meta, _texts()
 
 
-def meta_prompt_block(npc_emotions: Sequence[str], *, has_pending_draft: bool = False) -> str:
+def meta_prompt_block(
+    npc_emotions: Sequence[str],
+    *,
+    has_pending_draft: bool = False,
+    agent_enabled: bool = True,
+) -> str:
     """生成写进聊天尾部指令的 meta 行协议说明（02 §4.3）。
 
     双分支互斥注入：无草案时讲「如何发起新任务」；有草案时讲「确认/取消/讨价
     还价/大改重拟」的路由。prepare 工具的字段说明与 TASK_TYPES 选择原则见
     orchestrator.prompts.PREPARE_TOOL_GUIDE（本块只做意图路由）。
+
+    agent_enabled=False（玩家关闭 Agent 能力）时两个分支都不注入，act 固定为
+    null——协议里不出现任何委派 kind，模型无从发起，后端也会兜底忽略。
     """
     emotions = list(npc_emotions) or [DEFAULT_EMOTION]
     emo_list = "、".join(emotions)
@@ -241,9 +249,18 @@ def meta_prompt_block(npc_emotions: Sequence[str], *, has_pending_draft: bool = 
         "字段规则：",
         f"1. emo：本轮情绪，必须从列表中选择：{emo_list}。",
         "2. fav：本条消息对玩家好感度的变化，整数，范围 -5~5，无变化写 0。日常对话通常无需变化，有情绪起伏/情感变化时可调整好感度。",
+    ]
+    if not agent_enabled:
+        lines.extend([
+            "3. act：当前不开放任何委派，本轮固定写 null。",
+        ])
+        lines.append("- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。")
+        return "\n".join(lines)
+
+    lines.extend([
         "3. act：本轮委派意图，取以下之一：",
         '   - null：纯聊天，不委派任何事。',
-    ]
+    ])
     if has_pending_draft:
         lines.extend([
             '   - {"kind":"task_confirm"}：玩家明确接受当前草案时使用。'

@@ -35,7 +35,7 @@ from services.llm import (
     split_meta_events,
 )
 from services.llm.errors import LLMError, is_tools_unsupported_error
-from services.memory.store import MemoryStore, TaskDraftRow
+from services.memory.store import MemoryStore, PRECISE_MEMORY_OPTIONS, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
 from services.orchestrator.context import TurnContext, assemble_context
@@ -77,6 +77,11 @@ _PREPARE_STATUS_KEYS = ("collectable_items", "stage_list", "reward_item_candidat
                         "holdable_items", "equipment_items", "special_items",
                         "npc_list", "challenge_targets", "stage_loot_list")
 
+# 子 Agent（任务/检索）的近期对话预算：固定 8 条（4 轮），不随玩家的精确短期
+# 记忆档位变化——子 Agent 只需要「刚才谈到哪」，把 500 条历史灌进去只会挤占
+# 它自己的工具循环预算。玩家档位只作用于聊天主 Agent 的 prompt。
+SUBAGENT_RECENT_MESSAGES = 8
+
 
 def _prepared_candidates_empty(prepared_json: str) -> bool:
     """prepare 结果是否没有任何候选（task_type 无专属字段时视为空）。"""
@@ -110,6 +115,9 @@ class OrchestratorDeps:
     search_max_rounds: int = 3
     draft_keep_turns: int = 3
     history_limit: int = 20
+    # 聊天主 Agent prompt 里逐字保留的近期对话条数（服务端默认；请求带合法
+    # 精确短期记忆档位时由该档位覆盖）
+    recent_dialogue_limit: int = 8
     enable_summary: bool = True
 
 
@@ -189,10 +197,18 @@ class TurnOrchestrator:
         current_emotion: Optional[str] = None,
         llm_config: Optional[LLMConfig] = None,
         send_image: bool = True,
+        agent_enabled: bool = True,
+        summarize_interval: Optional[int] = None,
         deps: Optional[OrchestratorDeps] = None,
     ) -> None:
         """send_image 仅是「允许带图」开关（默认允许）；是否真带图由 07 §4 规则
-        在上下文装配时判定（vision Profile + 未被标记不支持 + 立绘资产可用）。"""
+        在上下文装配时判定（vision Profile + 未被标记不支持 + 立绘资产可用）。
+
+        agent_enabled=False 时本回合只做纯聊天：不下发 prepare_task_context 工具、
+        prompt 不含任何委派协议、模型仍硬发的 act 一律忽略。
+        summarize_interval 是前端「精确短期记忆长度」档位（10/30/100/500，对应
+        短/中/长/几乎无限）；非白名单值一律按未提供处理，回落到服务端默认。
+        """
         self.session_id = session_id
         self.npc_name = npc_name
         self.query = query
@@ -201,6 +217,10 @@ class TurnOrchestrator:
         self.current_emotion = current_emotion
         self.llm_config = llm_config or LLMConfig()
         self.send_image = send_image
+        self.agent_enabled = agent_enabled
+        self.precise_memory_limit = (
+            summarize_interval if summarize_interval in PRECISE_MEMORY_OPTIONS else None
+        )
         self.deps = deps
 
         self._ctx: Optional[TurnContext] = None
@@ -250,6 +270,10 @@ class TurnOrchestrator:
             sess.cancel_unfinished()
 
             # ---- BUILD_CONTEXT ----
+            # 精确短期记忆档位同时决定「从库里读多少条」与「逐字进 prompt 多少条」；
+            # 未提供（或非法）时两者各回落到服务端默认，行为与档位引入前一致。
+            history_limit = self.precise_memory_limit or deps.history_limit
+            dialogue_limit = self.precise_memory_limit or deps.recent_dialogue_limit
             ctx = await assemble_context(
                 session_id=self.session_id,
                 npc_name=self.npc_name,
@@ -262,7 +286,7 @@ class TurnOrchestrator:
                 npc_manager=deps.npc_manager,
                 game_data=deps.game_data,
                 engine=deps.engine,
-                history_limit=deps.history_limit,
+                history_limit=history_limit,
                 send_image=self.send_image,
             )
             self._ctx = ctx
@@ -273,7 +297,7 @@ class TurnOrchestrator:
             # system 分层（从稳定到易变）：世界观 → 输出规则/prepare 指南（跨 NPC）
             # → 单 NPC 扮演块（含 meta 协议）；user1 = 历史 → 会话态 → RAG（同回合
             # 多次调用共享）；user2 = 玩家当轮话（+立绘图片 part 在尾）。
-            base_messages = self._build_base_messages(ctx)
+            base_messages = self._build_base_messages(ctx, dialogue_limit=dialogue_limit)
             player_message = build_player_message(self.query)
             # 立绘图片只进聊天调用 #1 的末条 user 消息（文本 part 前、图片 part 后）；
             # base_messages 保持纯文本，merge/补救/confirm 参数等调用天然无图
@@ -284,7 +308,8 @@ class TurnOrchestrator:
 
             # 聊天 Agent 唯一工具：prepare_task_context（01 §3 D4 修订：
             # 情绪/委派意图仍走 meta 行，数据准备类工具按业务注册）
-            prepare_tool = deps.registry.get("prepare_task_context")
+            # Agent 能力关闭时不下发工具：模型连调用入口都没有
+            prepare_tool = deps.registry.get("prepare_task_context") if self.agent_enabled else None
             chat_tools = [prepare_tool.to_openai_tool()] if prepare_tool is not None else None
 
             stream = llm.chat_stream(ChatRequest(
@@ -311,8 +336,16 @@ class TurnOrchestrator:
                 else:
                     raise
             act = meta.act
+            if act is not None and not self.agent_enabled:
+                # Agent 能力已关闭：prompt 无委派协议、工具也没下发，模型仍硬发 act
+                # 属越权，一律按纯聊天处理（残留草案交给下方的过期计数自然清理）
+                logger.warning(
+                    "会话 %s：Agent 能力已关闭但模型仍声明 act=%s，按纯聊天处理",
+                    self.session_id, act.kind,
+                )
+                act = None
             act_kind = act.kind if act is not None else None
-            if act is None and ctx.pending_draft_row is not None:
+            if act is None and self.agent_enabled and ctx.pending_draft_row is not None:
                 # 观测点：有草案时玩家常在「接/不接」，模型漏发 act 会导致草案静默过期，
                 # 玩家侧只看到「过期的委托草案已取消」，必须留痕便于排查
                 logger.warning(
@@ -509,8 +542,13 @@ class TurnOrchestrator:
     # 组装与转发
     # ------------------------------------------------------------------
 
-    def _build_base_messages(self, ctx: TurnContext) -> list[dict[str, Any]]:
+    def _build_base_messages(
+        self, ctx: TurnContext, *, dialogue_limit: int,
+    ) -> list[dict[str, Any]]:
         """[system 静态, user shared core]（前缀缓存对齐；tail 与玩家话在末条 user）。"""
+        # Agent 能力关闭时待确认草案不进 prompt：模型既无法确认也无法取消，
+        # 摆在它面前只会诱导它空口答应。草案仍照常装配，交给过期计数清理。
+        has_pending_draft = self.agent_enabled and ctx.pending_draft_row is not None
         system = build_static_system(
             npc_name=self.npc_name,
             state=ctx.npc_state,
@@ -518,27 +556,36 @@ class TurnOrchestrator:
             has_shop=ctx.has_shop,
             shop_reward_types=ctx.shop_reward_types,
             player_can_challenge=ctx.player_can_challenge,
-            has_pending_draft=ctx.pending_draft_row is not None,
+            has_pending_draft=has_pending_draft,
+            agent_enabled=self.agent_enabled,
         )
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,
             mentioned_npcs_str=ctx.mentioned_npcs_str,
             summary_str=self._summary_text(ctx),
-            history_str=self._recent_dialogue_text(ctx, spoken_text=""),
+            history_str=self._recent_dialogue_text(
+                ctx, spoken_text="", limit=dialogue_limit,
+            ),
             player_identity=self.player_identity,
             progress_desc=ctx.progress_desc,
             favorability=ctx.favorability,
             relationship_level=ctx.relationship_level,
-            pending_draft_summary=ctx.pending_draft_summary,
+            pending_draft_summary=ctx.pending_draft_summary if has_pending_draft else "",
         )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": shared},
         ]
 
+    @staticmethod
+    def _raw_summary(ctx: TurnContext) -> str:
+        """滚动摘要原文（永久模糊记忆），无摘要时为空串。"""
+        summary = getattr(ctx, "summary", None)
+        return str(summary).strip() if summary else ""
+
     def _summary_text(self, ctx: TurnContext) -> str:
         """早期对话滚动摘要（比近期对话稳定，放对话块之前）。"""
-        summary = getattr(ctx, "summary", None)
+        summary = self._raw_summary(ctx)
         return f"【早期对话摘要】\n{summary}" if summary else ""
 
     async def _forward_body(
@@ -646,10 +693,16 @@ class TurnOrchestrator:
             return None, args, f"prepare 候选池为空（task_type={task_type}）"
         return outcome.result_json, args, ""
 
-    def _recent_dialogue_text(self, ctx: TurnContext, spoken_text: str) -> str:
-        """任务 Agent 的最近 5 轮对话（memory 近 4 轮 + 本轮已流出正文，含过渡话）。"""
+    def _recent_dialogue_text(
+        self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
+    ) -> str:
+        """近期对话逐字块。
+
+        聊天主 Agent 传玩家选的精确短期记忆档位；子 Agent 用默认固定预算
+        （SUBAGENT_RECENT_MESSAGES，近 4 轮 + 本轮已流出正文，含过渡话）。
+        """
         lines: list[str] = []
-        for m in ctx.history[-8:]:
+        for m in ctx.history[-limit:]:
             lines.append(f"玩家：{m.content}" if m.role == "user" else f"{self.npc_name}：{m.content}")
         if spoken_text.strip():
             lines.append(f"{self.npc_name}：{spoken_text.strip()}")
@@ -849,6 +902,10 @@ class TurnOrchestrator:
         llm = deps.llm_factory(self.llm_config)
         prepared_context, prepared_args, prepare_error = prepared
         recent_dialogue = self._recent_dialogue_text(ctx, spoken_text)
+        # 子 Agent 的对话预算固定 8 条，但永久模糊记忆（滚动摘要）另算：它体积恒定
+        # 且不随档位膨胀，能让任务 Agent 知道「这玩家早先谈过什么」，故一并带上，
+        # 在 prompt 里排在最近 8 条之前（详见 subagents/prompts.build_task_user）。
+        memory_summary = self._raw_summary(ctx)
 
         if act.kind == "search":
             return SearchRunner.launch(
@@ -882,6 +939,7 @@ class TurnOrchestrator:
                     prepared_context=None,
                     prepare_error="以 task_update 委派但无待修改草案，按新任务重拟",
                     recent_dialogue=recent_dialogue,
+                    memory_summary=memory_summary,
                     npc_name=self.npc_name,
                     npc_faction=ctx.npc_state.faction or "",
                     npc_titles=npc_titles,
@@ -906,6 +964,7 @@ class TurnOrchestrator:
                 reward_hint="",
                 note=act.note,
                 recent_dialogue=recent_dialogue,
+                memory_summary=memory_summary,
                 npc_name=self.npc_name,
                 npc_faction=ctx.npc_state.faction or "",
                 npc_titles=npc_titles,
@@ -936,6 +995,7 @@ class TurnOrchestrator:
             prepared_context=prepared_context,
             prepare_error=prepare_error,
             recent_dialogue=recent_dialogue,
+            memory_summary=memory_summary,
             npc_name=self.npc_name,
             npc_faction=ctx.npc_state.faction or "",
             npc_titles=npc_titles,

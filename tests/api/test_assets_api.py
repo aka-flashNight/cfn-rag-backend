@@ -13,6 +13,22 @@ from services.portraits import manifest_lookup
 from services.portraits.cache import get_cache
 from tests.portraits.conftest import build_portrait_dir
 
+import api.assets_api as assets_api
+
+
+def _patch_resource_root(monkeypatch, tmp_path) -> None:
+    """把资源根指到 tmp_path。
+
+    必须打 assets_api 上的绑定：接口是 `from services.game_data.paths import
+    find_resources_directory`，只补 paths 模块的话，assets_api 早在导入时就绑死了
+    真实函数，补丁静默失效（表现为读到真实资源目录里的头像，测试随导入顺序时好时坏）。
+    """
+    import services.game_data.paths as paths_mod
+
+    fake_root = lambda: tmp_path / "resources"  # noqa: E731
+    monkeypatch.setattr(paths_mod, "find_resources_directory", fake_root)
+    monkeypatch.setattr(assets_api, "find_resources_directory", fake_root)
+
 
 def _make_app() -> FastAPI:
     from api.assets_api import router
@@ -29,12 +45,10 @@ def client(tmp_path, monkeypatch) -> TestClient:
     manifest_lookup.reset_portrait_lookup()
     get_cache().clear()
     # 头像目录：resources/flashswf/portraits/profiles/
-    import services.game_data.paths as paths_mod
-
     profiles = tmp_path / "resources" / "flashswf" / "portraits" / "profiles"
     profiles.mkdir(parents=True)
     Image.new("RGBA", (64, 64), (128, 128, 128, 255)).save(profiles / "Andy Law.png")
-    monkeypatch.setattr(paths_mod, "find_resources_directory", lambda: tmp_path / "resources")
+    _patch_resource_root(monkeypatch, tmp_path)
 
     yield TestClient(_make_app())
 
@@ -83,15 +97,13 @@ def test_illustration_hero_key_404(client):
 
 def test_no_manifest_illustration_404_not_500(monkeypatch, tmp_path):
     """无图模式：立绘接口 404 而不是 500（不报错原则，07 §1）；头像不受影响。"""
-    import services.game_data.paths as paths_mod
-
     monkeypatch.setattr(manifest_lookup, "discover_portrait_dir", lambda: None)
     manifest_lookup.reset_portrait_lookup()
     get_cache().clear()
     profiles = tmp_path / "resources" / "flashswf" / "portraits" / "profiles"
     profiles.mkdir(parents=True)
     Image.new("RGBA", (64, 64), (128, 128, 128, 255)).save(profiles / "Andy Law.png")
-    monkeypatch.setattr(paths_mod, "find_resources_directory", lambda: tmp_path / "resources")
+    _patch_resource_root(monkeypatch, tmp_path)
     try:
         client = TestClient(_make_app())
         assert client.get("/assets/illustration/Andy Law/普通").status_code == 404
