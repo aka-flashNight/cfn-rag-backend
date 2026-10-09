@@ -152,8 +152,26 @@ class SubagentBase:
         """子类覆盖：轮限耗尽且无终态时的兜底（TaskRunner 的 fallback 草案）。"""
         return None
 
+    def _on_round_tool_calls(self, tool_calls: Optional[list[dict[str, Any]]]) -> None:
+        """子类覆盖：dispatch 之前看到本轮的原始 tool_calls（含参数）。
+
+        用途：工具**结果**里不一定带得回调用参数（prepare 的返回没有 task_type，
+        而 task_type 只存在于调用参数中），需要参数的子类在这里自行记录。
+        """
+
     def _on_round_results(self, results: list[tuple[str, "ToolResult", ToolContext]]) -> None:
         """子类覆盖：每轮工具结果后的进度/中间事件。"""
+
+    def _post_round_messages(
+        self, results: list[tuple[str, "ToolResult", ToolContext]],
+    ) -> list[dict[str, Any]]:
+        """子类覆盖：本轮工具结果之后要追加进对话的消息。
+
+        用途：某些规则卡依赖工具返回的事实（例如定价卡依赖 prepare 揭示的真实
+        task_type），launch 时无法预知，只能等结果回来后补投。追加而不是改写
+        messages[0]，system 前缀保持不变，前缀缓存不受影响。
+        """
+        return []
 
     def _final_from_text(self, text: str) -> dict[str, Any]:
         """子类覆盖：模型停止调用工具时，把文本转成 final payload。"""
@@ -189,6 +207,7 @@ class SubagentBase:
                     last_text = result.content
                     break  # 模型停止调用工具 → 视为结束
 
+                self._on_round_tool_calls(result.tool_calls)
                 batch = await self.registry.dispatch_batch(result.tool_calls, self.ctx)
                 for _call_id, tr, new_ctx in batch:
                     self.ctx = new_ctx
@@ -198,6 +217,7 @@ class SubagentBase:
                         "content": tr.result_json,
                     })
                 self._on_round_results(batch)
+                messages.extend(self._post_round_messages(batch))
 
                 terminal = self._terminal_payload(batch)
                 if terminal is not None:

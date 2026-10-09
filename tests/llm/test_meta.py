@@ -1,11 +1,13 @@
-"""meta 行协议解析器测试（02 §6.1：正常/无 meta/半截 JSON/非法 emo/fav 越界/多行 JSON 冒充）。"""
+"""meta 行协议解析器测试（02 §6.1：正常/无 meta/半截 JSON/非法 emo/fav 越界/多行 JSON 冒充）。
+
+v3 再次重构后 meta 行只剩 emo/fav 两个字段，委派意图改由路由工具承载
+（见 tests/orchestrator/test_turn_e2e.py），故本文件不再有 act 相关断言。
+"""
 
 from __future__ import annotations
 
-import json
-
 from services.llm.client import StreamEvent
-from services.llm.meta import Meta, MetaAct, meta_prompt_block, split_meta, split_meta_events
+from services.llm.meta import Meta, meta_prompt_block, split_meta, split_meta_events
 
 EMOTIONS = ["普通", "微笑", "生气", "惊讶"]
 
@@ -22,12 +24,11 @@ async def _collect_text(aiter) -> str:
 
 
 async def test_normal_meta():
-    text = '{"emo":"微笑","fav":0,"act":null}\n诶，是你啊。今天有什么想聊的？\n'
+    text = '{"emo":"微笑","fav":0}\n诶，是你啊。今天有什么想聊的？\n'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "微笑"
     assert meta.favorability_change == 0
-    assert meta.act is None
     assert body == "诶，是你啊。今天有什么想聊的？\n"
 
 
@@ -37,13 +38,12 @@ async def test_no_meta_plain_text():
     body = await _collect_text(rest)
     assert meta.emotion == "普通"
     assert meta.favorability_change == 0
-    assert meta.act is None
     # 无 meta 时缓冲文本必须原样还给正文
     assert body == text
 
 
 async def test_partial_json_line_treated_as_no_meta():
-    text = '{"emo":"微笑","fav":1,"ac\n正文开始了。'
+    text = '{"emo":"微笑","fav":1\n正文开始了。'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "普通" and meta.favorability_change == 0
@@ -51,7 +51,7 @@ async def test_partial_json_line_treated_as_no_meta():
 
 
 async def test_invalid_emotion_falls_back():
-    text = '{"emo":"暴怒","fav":0,"act":null}\n哼。'
+    text = '{"emo":"暴怒","fav":0}\n哼。'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "普通"  # 非法 → 回退默认
@@ -59,12 +59,31 @@ async def test_invalid_emotion_falls_back():
 
 
 async def test_fav_out_of_range_clamped():
-    text = '{"emo":"生气","fav":99,"act":null}\n别怪我发火。'
+    text = '{"emo":"生气","fav":99}\n别怪我发火。'
     meta, _ = await split_meta(_stream_from_text(text), EMOTIONS)
     assert meta.favorability_change == 5
-    text2 = '{"emo":"生气","fav":-50,"act":null}\n哼。'
+    text2 = '{"emo":"生气","fav":-50}\n哼。'
     meta2, _ = await split_meta(_stream_from_text(text2), EMOTIONS)
     assert meta2.favorability_change == -5
+
+
+async def test_unknown_extra_keys_ignored():
+    """协议外的多余键不影响 emo/fav 解析（模型偶发夹带字段不至于整行作废）。"""
+    text = '{"emo":"微笑","fav":1,"act":{"kind":"task_draft"},"foo":"bar"}\n好。'
+    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+    body = await _collect_text(rest)
+    assert meta.emotion == "微笑"
+    assert meta.favorability_change == 1
+    assert body == "好。"
+
+
+async def test_json_without_emotion_or_fav_is_content():
+    """首行是合法 JSON 但既无 emo 也无 fav → 不认作 meta，整段按正文。"""
+    text = '{"result":"ok"}\n这是台词。'
+    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+    body = await _collect_text(rest)
+    assert meta == Meta()
+    assert body == text
 
 
 async def test_multiline_json_impersonation_is_content():
@@ -76,62 +95,12 @@ async def test_multiline_json_impersonation_is_content():
     assert body == text
 
 
-async def test_act_variants():
-    # v3 修订：task_draft 只表达意图（prepare 参数由工具调用承载），多余字段忽略
-    draft = {"emo": "微笑", "fav": 1, "act": {"kind": "task_draft", "direction": "收集3个猫爪交给铁匠"}}
-    meta, rest = await split_meta(_stream_from_text(json.dumps(draft, ensure_ascii=False) + "\n好。"), EMOTIONS)
-    await _collect_text(rest)
-    assert meta.act == MetaAct(kind="task_draft")
-
-    search = {"emo": "普通", "fav": 0, "act": {"kind": "search", "query": "安迪·洛的过去"}}
-    meta2, rest2 = await split_meta(_stream_from_text(json.dumps(search, ensure_ascii=False) + "\n嗯。"), EMOTIONS)
-    await _collect_text(rest2)
-    assert meta2.act == MetaAct(kind="search", query="安迪·洛的过去")
-
-    for kind in ("task_confirm", "task_cancel"):
-        obj = {"emo": "普通", "fav": 0, "act": {"kind": kind}}
-        meta3, rest3 = await split_meta(_stream_from_text(json.dumps(obj) + "\n好。"), EMOTIONS)
-        await _collect_text(rest3)
-        assert meta3.act == MetaAct(kind=kind)
-
-
-async def test_act_task_draft_without_params_still_valid():
-    """task_draft 无需任何参数（prepare 由工具调用承载）→ 意图保留。"""
-    text = '{"emo":"微笑","fav":1,"act":{"kind":"task_draft"}}\n好。'
-    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
-    await _collect_text(rest)
-    assert meta.emotion == "微笑"
-    assert meta.act == MetaAct(kind="task_draft")
-
-
-async def test_unknown_act_kind_becomes_null():
-    text = '{"emo":"普通","fav":0,"act":{"kind":"nuke_the_world"}}\n好。'
-    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
-    await _collect_text(rest)
-    assert meta.act is None
-
-
-async def test_act_as_string_coerced():
-    """act 写成字符串（模型常见手误）→ 无参 kind 宽容纠正，confirm 不被静默丢弃。"""
-    for kind in ("task_confirm", "task_cancel", "task_draft"):
-        text = f'{{"emo":"微笑","fav":1,"act":"{kind}"}}\n好，就这么定。'
-        meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
-        await _collect_text(rest)
-        assert meta.act == MetaAct(kind=kind), kind
-
-
-async def test_act_string_with_required_payload_becomes_null():
-    """task_update/search 需要载荷，字符串形态无法恢复 → 按 null 处理。"""
-    for kind in ("task_update", "search"):
-        text = f'{{"emo":"普通","fav":0,"act":"{kind}"}}\n嗯。'
-        meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
-        await _collect_text(rest)
-        assert meta.act is None, kind
-
-
 async def test_meta_without_content():
-    """流只有 meta 行（无换行无正文）→ meta 正常解析，正文为空。"""
-    text = '{"emo":"惊讶","fav":-1,"act":null}'
+    """流只有 meta 行（无换行无正文）→ meta 正常解析，正文为空。
+
+    路由轮就是这种形态：第一行 JSON 之后不写台词，只发工具调用。
+    """
+    text = '{"emo":"惊讶","fav":-1}'
     meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
     body = await _collect_text(rest)
     assert meta.emotion == "惊讶" and meta.favorability_change == -1
@@ -151,7 +120,7 @@ async def test_reasoning_events_never_enter_meta_or_content():
     """reasoning 增量一律丢弃（修 A7），不影响 meta 判定与正文。"""
     async def stream():
         yield StreamEvent(kind="reasoning", text="用户在跟我打招呼")
-        yield StreamEvent(kind="content", text='{"emo":"微笑","fav":0,"act":null}\n')
+        yield StreamEvent(kind="content", text='{"emo":"微笑","fav":0}\n')
         yield StreamEvent(kind="reasoning", text="继续思考")
         yield StreamEvent(kind="content", text="你好呀。")
         yield StreamEvent(kind="finish")
@@ -169,31 +138,43 @@ async def test_reasoning_events_never_enter_meta_or_content():
 
 
 # ---------------------------------------------------------------------------
-# meta 协议说明文本：Agent 能力开关（玩家设置项）
+# meta 协议说明文本：只讲情绪与好感，且对同一 NPC 跨轮恒定
 # ---------------------------------------------------------------------------
 
-def test_meta_prompt_block_agent_enabled_lists_delegation_kinds():
-    block = meta_prompt_block(EMOTIONS, has_pending_draft=False, agent_enabled=True)
-    assert '"kind":"task_draft"' in block
-    assert '"kind":"search"' in block
-    assert "prepare_task_context" in block
-    assert "本轮固定写 null" not in block
+def test_meta_prompt_block_covers_only_emotion_and_favorability():
+    block = meta_prompt_block(EMOTIONS)
+    assert "1. emo" in block and "2. fav" in block
+    assert "、".join(EMOTIONS) in block
+    # 委派意图不在 meta 协议里：任何路由/工具词汇都不得出现
+    for forbidden in ("act", "task_draft", "task_update", "task_confirm",
+                      "task_cancel", "search", "prepare_task_context", "route_"):
+        assert forbidden not in block
 
 
-def test_meta_prompt_block_agent_enabled_with_draft_lists_confirm_kinds():
-    block = meta_prompt_block(EMOTIONS, has_pending_draft=True, agent_enabled=True)
-    assert '"kind":"task_confirm"' in block
-    assert '"kind":"task_cancel"' in block
-    assert '"kind":"task_update"' in block
+def test_meta_prompt_block_mentions_routing_tool_as_the_other_branch():
+    """第一行之后「要么台词、要么路由工具调用」必须写清，否则模型会在路由轮硬凑台词。"""
+    block = meta_prompt_block(EMOTIONS)
+    assert "路由工具调用" in block
+    assert "两者只取其一" in block
 
 
-def test_meta_prompt_block_agent_disabled_exposes_no_delegation():
-    """关闭态：act 只有 null，任何委派 kind 与工具名都不得出现在协议里。"""
-    for has_draft in (False, True):
-        block = meta_prompt_block(EMOTIONS, has_pending_draft=has_draft, agent_enabled=False)
-        assert "本轮固定写 null" in block
-        for forbidden in ("task_draft", "task_update", "task_confirm", "task_cancel",
-                          "search", "prepare_task_context"):
-            assert forbidden not in block
-        # emo/fav 协议不受开关影响
-        assert "1. emo" in block and "2. fav" in block
+def test_meta_prompt_block_drops_routing_branch_when_agent_disabled():
+    """关闭 Agent 能力时不提路由：既无工具也无路由说明块，提了就是悬空指代。"""
+    block = meta_prompt_block(EMOTIONS, agent_enabled=False)
+    assert "路由" not in block
+    assert "第一行之后是台词正文" in block
+    # 情绪/好感规则本身不受开关影响
+    assert "1. emo" in block and "2. fav" in block
+    assert "、".join(EMOTIONS) in block
+
+
+def test_meta_prompt_block_is_stable_across_calls():
+    """前缀缓存要求：同 NPC、同开关状态跨轮必须逐字一致（有无草案不影响它）。"""
+    assert meta_prompt_block(EMOTIONS) == meta_prompt_block(EMOTIONS)
+    assert (meta_prompt_block(EMOTIONS, agent_enabled=False)
+            == meta_prompt_block(EMOTIONS, agent_enabled=False))
+
+
+def test_meta_prompt_block_empty_emotions_falls_back():
+    block = meta_prompt_block([])
+    assert "普通" in block

@@ -2,16 +2,22 @@
 
 一个玩家消息 = 一个 Turn（一个 orchestrator 实例）：
 
-    IDLE → BUILD_CONTEXT → BURST_STREAMING（调用 #1：meta 行 → 正文流）
-         → SYNC_ACTION（confirm/cancel）或 启动子 Agent
-         → MERGE_WAIT（宽限/中间结果/汇合 #2）→ POST_PROCESS → DONE
+    IDLE → BUILD_CONTEXT → BURST_STREAMING（调用 #1：meta 行 → 台词 或 路由工具调用）
+         → SYNC_ACTION（confirm/cancel + 动作后回复）或 启动子 Agent
+         → MERGE_WAIT（宽限/过渡语/汇合 #2）→ POST_PROCESS → DONE
+
+v3 再次重构（路由工具化）：聊天主 Agent 的工具表就是它的路由表——只有
+services/tools/route/ 下的五个路由声明，不再持有 prepare_task_context。meta 行
+只剩情绪与好感，委派意图改由路由工具承载；路由轮不输出台词，后台办完结果交回来
+再让 NPC 开口。任务选型（task_type / reward_types）整体移交任务 Agent。
 
 硬约束：
 - 情绪先于正文（meta 行解析瞬间发 meta 事件）；
-- 中间结果只说一次、不报数字（merge.py）；
-- confirm 失败丢弃已生成正文 → 1 次补救调用 → system_notice 真实原因；
+- 过渡语只说一次、只说方向不报数字（merge.py）；
+- confirm 失败 → system_notice 真实原因 + 1 次补救回复；
 - 同会话并发请求经会话级锁串行；新回合取消旧子 Agent（fire-and-steer）；
-- LLM 预算：聊天主 Agent ≤3 次（#1 + #2a + #2b），TaskRunner ≤4 轮、SearchRunner ≤3 轮。
+- LLM 预算：聊天主 Agent ≤3 次（#1 + 过渡/动作后回复 + 汇合 #2），
+  TaskRunner ≤4 轮、SearchRunner ≤3 轮。
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Optional
 
 from services.agent_tools.draft_formatting import _detailed_draft_summary
@@ -34,7 +40,7 @@ from services.llm import (
     Meta,
     split_meta_events,
 )
-from services.llm.errors import LLMError, is_tools_unsupported_error
+from services.llm.errors import LLMError
 from services.memory.store import MemoryStore, PRECISE_MEMORY_OPTIONS, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
@@ -54,6 +60,10 @@ from services.orchestrator.events import (
 from services.orchestrator.merge import MergeCoordinator
 from services.orchestrator.prompts import (
     CONFIRM_ARGS_SYSTEM,
+    CONFIRM_FAIL_INSTRUCTION,
+    TASK_CANCEL_MERGE_INSTRUCTION,
+    TASK_CANCEL_NOOP_INSTRUCTION,
+    TASK_CONFIRM_MERGE_INSTRUCTION,
     build_confirm_args_user_prompt,
     build_player_message,
     build_merge_user_prompt,
@@ -68,30 +78,54 @@ from services.subagents import (
     TaskRunner,
     get_session_subagents,
 )
-from services.tools.base import ToolContext, ToolRegistry, get_tool_registry
-from services.agent_tools.schemas import TASK_TYPES
+from services.tools.base import (
+    ROUTE_TOOLS_DRAFT,
+    ROUTE_TOOLS_NEW,
+    ToolRegistry,
+    get_tool_registry,
+)
 
 logger = logging.getLogger(__name__)
-
-_PREPARE_STATUS_KEYS = ("collectable_items", "stage_list", "reward_item_candidates",
-                        "holdable_items", "equipment_items", "special_items",
-                        "npc_list", "challenge_targets", "stage_loot_list")
 
 # 子 Agent（任务/检索）的近期对话预算：固定 8 条（4 轮），不随玩家的精确短期
 # 记忆档位变化——子 Agent 只需要「刚才谈到哪」，把 500 条历史灌进去只会挤占
 # 它自己的工具循环预算。玩家档位只作用于聊天主 Agent 的 prompt。
 SUBAGENT_RECENT_MESSAGES = 8
 
+# 路由声明工具名的公共前缀：去掉后即后台分派用的 kind（task_draft/search/...）
+_ROUTE_PREFIX = "route_"
+_ROUTE_NOTE_MAX_CHARS = 60
+_ROUTE_QUERY_MAX_CHARS = 40
 
-def _prepared_candidates_empty(prepared_json: str) -> bool:
-    """prepare 结果是否没有任何候选（task_type 无专属字段时视为空）。"""
-    try:
-        data = json.loads(prepared_json) if prepared_json else None
-    except json.JSONDecodeError:
-        return True
-    if not isinstance(data, dict):
-        return True
-    return not any(isinstance(data.get(k), list) and data.get(k) for k in _PREPARE_STATUS_KEYS)
+
+@dataclass(frozen=True)
+class Route:
+    """聊天主 Agent 本轮的路由声明（从 tool_calls 解析；None 表示纯聊天）。"""
+
+    kind: str
+    note: str = ""
+    query: str = ""
+
+
+def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
+    """取第一个路由声明工具调用；参数解析失败按空载荷处理（路由本身仍生效）。"""
+    for tc in tool_calls or []:
+        func = tc.get("function", tc) if isinstance(tc, dict) else {}
+        name = str(func.get("name", "") or "")
+        if not name.startswith(_ROUTE_PREFIX):
+            continue
+        raw = func.get("arguments") or "{}"
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("路由参数解析失败，按空载荷处理: %s %.200s", name, str(raw))
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        note = str(args.get("note") or "").strip()[:_ROUTE_NOTE_MAX_CHARS]
+        query = str(args.get("query") or "").strip()[:_ROUTE_QUERY_MAX_CHARS]
+        return Route(kind=name[len(_ROUTE_PREFIX):], note=note, query=query)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +238,8 @@ class TurnOrchestrator:
         """send_image 仅是「允许带图」开关（默认允许）；是否真带图由 07 §4 规则
         在上下文装配时判定（vision Profile + 未被标记不支持 + 立绘资产可用）。
 
-        agent_enabled=False 时本回合只做纯聊天：不下发 prepare_task_context 工具、
-        prompt 不含任何委派协议、模型仍硬发的 act 一律忽略。
+        agent_enabled=False 时本回合只做纯聊天：不下发任何路由工具、
+        prompt 不含路由说明、模型仍硬发的路由调用一律忽略。
         summarize_interval 是前端「精确短期记忆长度」档位（10/30/100/500，对应
         短/中/长/几乎无限）；非白名单值一律按未提供处理，回落到服务端默认。
         """
@@ -261,8 +295,8 @@ class TurnOrchestrator:
         collected_text: list[str] = []
         handle = None
         merge: Optional[MergeCoordinator] = None
-        act_kind: Optional[str] = None
-        draft_touched = False  # 本回合任务工具被触碰（confirm/cancel 成功也算）
+        route_kind: Optional[str] = None
+        draft_touched = False  # 本回合任务被触碰（confirm/cancel 成功也算）
 
         try:
             # ---- steer：取消同会话未完成的旧子 Agent（01 §4）----
@@ -294,7 +328,7 @@ class TurnOrchestrator:
             llm = deps.llm_factory(self.llm_config)
 
             # ---- BURST_STREAMING（调用 #1）----
-            # system 分层（从稳定到易变）：世界观 → 输出规则/prepare 指南（跨 NPC）
+            # system 分层（从稳定到易变）：世界观 → 输出规则/路由说明（跨 NPC）
             # → 单 NPC 扮演块（含 meta 协议）；user1 = 历史 → 会话态 → RAG（同回合
             # 多次调用共享）；user2 = 玩家当轮话 + 立绘说明/情绪连贯提示（+图片 part 在尾）。
             base_messages = self._build_base_messages(ctx, dialogue_limit=dialogue_limit)
@@ -311,155 +345,149 @@ class TurnOrchestrator:
                 {"role": "user", "content": build_image_message_content(player_message, ctx.image_data_url)},
             ]
 
-            # 聊天 Agent 唯一工具：prepare_task_context（01 §3 D4 修订：
-            # 情绪/委派意图仍走 meta 行，数据准备类工具按业务注册）
-            # Agent 能力关闭时不下发工具：模型连调用入口都没有
-            prepare_tool = deps.registry.get("prepare_task_context") if self.agent_enabled else None
-            chat_tools = [prepare_tool.to_openai_tool()] if prepare_tool is not None else None
+            # 聊天 Agent 的工具表 = 路由表（判据写在工具描述里，见 services/tools/route/）。
+            # Agent 能力关闭时不下发任何工具：模型连路由入口都没有。
+            chat_tools = (
+                self._routing_tools(
+                    deps.registry,
+                    has_pending_draft=self.agent_enabled and ctx.pending_draft_row is not None,
+                )
+                if self.agent_enabled else []
+            )
 
             stream = llm.chat_stream(ChatRequest(
                 messages=messages,
-                tools=chat_tools,
+                tools=chat_tools or None,
                 purpose="chat",
                 send_image=self.send_image,
             ))
-            try:
-                meta, events = await split_meta_events(
-                    stream, list(ctx.npc_state.emotions or ["普通"]),
-                )
-            except LLMError as exc:
-                if chat_tools and is_tools_unsupported_error(exc):
-                    # 平台不支持流式 tools：剥工具重试一次（聊天功能降级可用）
-                    logger.warning("模型不支持流式 tools，剥离后重试: %s", exc)
-                    stream = llm.chat_stream(ChatRequest(
-                        messages=messages, tools=None, purpose="chat",
-                        send_image=self.send_image,
-                    ))
-                    meta, events = await split_meta_events(
-                        stream, list(ctx.npc_state.emotions or ["普通"]),
-                    )
-                else:
-                    raise
-            act = meta.act
-            if act is not None and not self.agent_enabled:
-                # Agent 能力已关闭：prompt 无委派协议、工具也没下发，模型仍硬发 act
-                # 属越权，一律按纯聊天处理（残留草案交给下方的过期计数自然清理）
-                logger.warning(
-                    "会话 %s：Agent 能力已关闭但模型仍声明 act=%s，按纯聊天处理",
-                    self.session_id, act.kind,
-                )
-                act = None
-            act_kind = act.kind if act is not None else None
-            if act is None and self.agent_enabled and ctx.pending_draft_row is not None:
-                # 观测点：有草案时玩家常在「接/不接」，模型漏发 act 会导致草案静默过期，
-                # 玩家侧只看到「过期的委托草案已取消」，必须留痕便于排查
-                logger.warning(
-                    "会话 %s：存在待确认草案但模型未声明 act（玩家消息: %.60s）——"
-                    "若玩家在确认/拒绝，本次会按纯聊天处理并累计草案过期计数",
-                    self.session_id, self.query,
-                )
-            tool_sink: list[dict[str, Any]] = []  # 流内模型发出的 tool_calls（prepare 用）
+            meta, events = await split_meta_events(
+                stream, list(ctx.npc_state.emotions or ["普通"]),
+            )
 
             # 情绪/好感先于正文：解析到 meta 即更新并发事件
             yield await self._emit_meta(meta, deps)
 
-            if act is None:
-                # ---- 纯聊天路径 ----
-                async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
-                    yield ev
+            # 正文直发。路由声明只在 finish 事件里聚合出来（client 不流式吐 tool_calls），
+            # 所以「路由轮不说话」由提示词与工具描述约束，这里只在模型违规时留痕。
+            tool_sink: list[dict[str, Any]] = []
+            async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
+                yield ev
+            # Agent 能力关闭时即便模型硬发路由调用也一律忽略：本回合只有纯聊天。
+            # （工具表已经没下发路由工具，这里是防越权的第二道闸。）
+            route = _parse_route(tool_sink) if self.agent_enabled else None
+            route_kind = route.kind if route is not None else None
+            spoken_text = "".join(collected_text)
+
+            if route is not None and spoken_text.strip():
+                logger.warning(
+                    "会话 %s：路由轮（%s）仍输出了台词 %.60s——提示词要求该轮只路由不说话",
+                    self.session_id, route.kind, spoken_text,
+                )
+            if route is None and self.agent_enabled and ctx.pending_draft_row is not None:
+                # 观测点：有草案时玩家常在「接/不接」，模型漏发路由会导致草案静默过期，
+                # 玩家侧只看到「过期的委托草案已取消」，必须留痕便于排查
+                logger.warning(
+                    "会话 %s：存在待确认草案但模型未路由（玩家消息: %.60s）——"
+                    "若玩家在确认/拒绝，本次会按纯聊天处理并累计草案过期计数",
+                    self.session_id, self.query,
+                )
+
+            if route is None:
+                # ---- 纯聊天路径：正文已直发，无后台动作 ----
                 if tool_sink:
-                    logger.info("纯聊天轮出现 prepare 调用（act=null），忽略: %s",
-                                [tc.get("function", {}).get("name") for tc in tool_sink])
+                    names = [tc.get("function", {}).get("name") for tc in tool_sink]
+                    if self.agent_enabled:
+                        logger.info("纯聊天轮出现非路由工具调用，忽略: %s", names)
+                    else:
+                        logger.warning("Agent 能力已关闭，模型仍硬发路由调用，忽略: %s", names)
 
-            elif act.kind in ("task_confirm", "task_cancel"):
-                # ---- SYNC_ACTION：缓冲正文，先执行后端操作（prepare 调用忽略）----
-                buffered: list[str] = []
-                await self._collect_body(events, buffered, tool_sink=tool_sink)
-                spoken_text = "".join(buffered)
-                tool_name = "confirm_agent_task" if act.kind == "task_confirm" else "cancel_agent_task"
-                ui_hint = "发布委托" if act.kind == "task_confirm" else "取消委托"
-
+            elif route.kind in ("task_confirm", "task_cancel"):
+                # ---- SYNC_ACTION：路由轮按契约不说话，后端办完再让 NPC 开口 ----
+                is_confirm = route.kind == "task_confirm"
+                tool_name = "confirm_agent_task" if is_confirm else "cancel_agent_task"
+                ui_hint = "发布委托" if is_confirm else "取消委托"
                 draft_row = ctx.pending_draft_row
-                if act.kind == "task_confirm":
-                    yield tool_status_event(tool_name, "running", ui_hint=ui_hint)
-                    if draft_row is None:
-                        yield tool_status_event(tool_name, "failed", ui_hint=ui_hint)
-                        fail_reason = "当前没有待确认的委托草案"
-                        yield system_notice_event(f"委托确认失败：{fail_reason}")
-                        async for ev in self._remediation_reply(
-                            llm, base_messages, meta, spoken_text, fail_reason,
-                            collected_text,
-                        ):
-                            yield ev
-                    else:
-                        confirm_args = await self._generate_confirm_args(
-                            llm, ctx, draft_row, deps.game_data,
-                            base_messages=base_messages, spoken_text=spoken_text,
-                            emotion=meta.emotion,
-                        )
-                        outcome = execute_confirm_agent_task(
-                            confirm_args,
-                            pending_draft=draft_row.draft,
-                            npc_name=self.npc_name,
-                            player_progress=ctx.progress_stage or 1,
-                            npc_affinity=ctx.favorability,
-                            game_data=deps.game_data,
-                            rag_context_text=ctx.rag_context_text,
-                        )
-                        if outcome.payload.get("status") == "confirmed":
-                            draft_touched = True
-                            await memory.delete_draft(self.session_id, draft_id=draft_row.draft_id)
-                            await memory.reset_rounds_without_task(self.session_id)
-                            yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
-                            for chunk in buffered:
-                                yield content_event(chunk)
-                            collected_text.extend(buffered)
-                            yield system_notice_event("委托已发布")
-                        else:
-                            # confirm 失败：丢弃已生成正文 → 补救调用（03 §4.2）
-                            yield tool_status_event(tool_name, "failed", ui_hint=ui_hint)
-                            fail_reason = self._extract_fail_reason(outcome.payload)
-                            yield system_notice_event(f"委托确认失败：{fail_reason}")
-                            async for ev in self._remediation_reply(
-                                llm, base_messages, meta, spoken_text, fail_reason,
-                                collected_text,
-                            ):
-                                yield ev
-                else:  # task_cancel
-                    yield tool_status_event(tool_name, "running", ui_hint=ui_hint)
-                    if draft_row is None:
-                        # 无草案可取消：不视为失败，人设地放行正文
-                        yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
-                        for chunk in buffered:
-                            yield content_event(chunk)
-                        collected_text.extend(buffered)
-                    else:
-                        outcome = execute_cancel_agent_task(
-                            {"draft_id": draft_row.draft_id},
-                            pending_draft=draft_row.draft,
-                        )
+                yield tool_status_event(tool_name, "running", ui_hint=ui_hint)
+
+                # reply = (结果块, 指令, 静态兜底话术, 事后系统通知)
+                if not is_confirm and draft_row is None:
+                    # 无草案可撤：不视为失败，让 NPC 顺着话头自然回应
+                    yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
+                    reply = (
+                        "【后台结果】你手上并没有正在跟他谈的委托，没什么可撤销的。",
+                        TASK_CANCEL_NOOP_INSTRUCTION,
+                        "嗯？我这儿可没什么活儿要办。",
+                        "",
+                    )
+                elif not is_confirm:
+                    execute_cancel_agent_task(
+                        {"draft_id": draft_row.draft_id},
+                        pending_draft=draft_row.draft,
+                    )
+                    draft_touched = True
+                    await memory.delete_draft(self.session_id, draft_id=draft_row.draft_id)
+                    await memory.reset_rounds_without_task(self.session_id)
+                    yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
+                    reply = (
+                        "【后台结果】这份委托已经撤销，玩家手上不再有它。",
+                        TASK_CANCEL_MERGE_INSTRUCTION,
+                        "行，那这事就算了。",
+                        "委托已取消",
+                    )
+                elif draft_row is None:
+                    yield tool_status_event(tool_name, "failed", ui_hint=ui_hint)
+                    fail_reason = "当前没有待确认的委托草案"
+                    yield system_notice_event(f"委托确认失败：{fail_reason}")
+                    reply = self._fail_reply_args(fail_reason)
+                else:
+                    confirm_args = await self._generate_confirm_args(
+                        llm, ctx, draft_row, deps.game_data,
+                        base_messages=base_messages, spoken_text=spoken_text,
+                        emotion=meta.emotion,
+                    )
+                    outcome = execute_confirm_agent_task(
+                        confirm_args,
+                        pending_draft=draft_row.draft,
+                        npc_name=self.npc_name,
+                        player_progress=ctx.progress_stage or 1,
+                        npc_affinity=ctx.favorability,
+                        game_data=deps.game_data,
+                        rag_context_text=ctx.rag_context_text,
+                    )
+                    if outcome.payload.get("status") == "confirmed":
                         draft_touched = True
                         await memory.delete_draft(self.session_id, draft_id=draft_row.draft_id)
                         await memory.reset_rounds_without_task(self.session_id)
                         yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
-                        for chunk in buffered:
-                            yield content_event(chunk)
-                        collected_text.extend(buffered)
-                        yield system_notice_event("委托已取消")
+                        reply = (
+                            "【后台结果】这份委托已经正式派给玩家了"
+                            "（内容就是上面会话状态里那份待确认草案）。",
+                            TASK_CONFIRM_MERGE_INSTRUCTION,
+                            "这事就这么定了，去办吧。",
+                            "委托已发布",
+                        )
+                    else:
+                        # confirm 失败：system_notice 给真实原因 + 1 次补救回复（03 §4.2）
+                        yield tool_status_event(tool_name, "failed", ui_hint=ui_hint)
+                        fail_reason = self._extract_fail_reason(outcome.payload)
+                        yield system_notice_event(f"委托确认失败：{fail_reason}")
+                        reply = self._fail_reply_args(fail_reason)
+
+                # 成功路径的系统行排在 NPC 台词之后（先听人说、再看到系统行，
+                # 与重构前观感一致）；失败路径相反，真实原因已经先发了
+                result_block, instruction, fallback_text, notice = reply
+                async for ev in self._sync_action_reply(
+                    llm, base_messages, meta, spoken_text, result_block,
+                    instruction, fallback_text, collected_text,
+                ):
+                    yield ev
+                if notice:
+                    yield system_notice_event(notice)
 
             else:
-                # ---- 后台子 Agent（fire-and-steer），正文直发 ----
-                # task_draft：prepare 由聊天 Agent 在流内调用，流结束后执行并直通任务 Agent
-                if act.kind == "task_draft":
-                    async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
-                        yield ev
-                    prepared = await self._execute_prepare(tool_sink, ctx, deps)
-                else:  # search / task_update 不需要 prepare
-                    prepared = (None, None, "")
-                    async for ev in self._forward_body(events, collected_text):
-                        yield ev
-
-                handle = self._launch_subagent(act, ctx, deps, prepared, spoken_text="".join(collected_text))
+                # ---- 后台子 Agent（fire-and-steer）----
+                handle = self._launch_subagent(route, ctx, deps, spoken_text=spoken_text)
                 sess.register(handle)
 
                 # ---- MERGE_WAIT ----
@@ -469,7 +497,7 @@ class TurnOrchestrator:
                     base_messages=base_messages,
                     npc_name=self.npc_name,
                     player_query=self.query,
-                    spoken_text="".join(collected_text),
+                    spoken_text=spoken_text,
                     emotion=meta.emotion,
                     grace_s=deps.merge_grace_ms / 1000.0,
                     timeout_s=float(deps.subagent_timeout_s),
@@ -509,7 +537,7 @@ class TurnOrchestrator:
                 await memory.add_message(self.session_id, "assistant", segment_text)
 
             if not draft_touched:
-                if act_kind is None:
+                if route_kind is None:
                     # 岔开话题：草案触碰计数 +1，达到上限自动过期取消（03 §4.2）
                     counter = await memory.increment_rounds_without_task(self.session_id)
                     if (
@@ -521,7 +549,7 @@ class TurnOrchestrator:
                         )
                         await memory.reset_rounds_without_task(self.session_id)
                         yield system_notice_event("过期的委托草案已取消")
-                elif act_kind in ("task_draft", "task_update"):
+                elif route_kind in ("task_draft", "task_update"):
                     await memory.reset_rounds_without_task(self.session_id)
 
             await self._maybe_summarize(deps)
@@ -630,21 +658,6 @@ class TurnOrchestrator:
                     tool_sink.extend(ev.tool_calls)
                 return
 
-    async def _collect_body(
-        self, events: AsyncIterator[Any], sink: list[str],
-        *, tool_sink: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """仅收集不转发（SYNC_ACTION 的正文缓冲，成功后才放行）。"""
-        async for ev in events:
-            if ev.kind == "content" and ev.text:
-                sink.append(ev.text)
-            elif ev.kind == "usage" and ev.usage:
-                self._usage = accumulate_usage(self._usage, ev.usage)
-            elif ev.kind == "finish":
-                if tool_sink is not None and ev.tool_calls:
-                    tool_sink.extend(ev.tool_calls)
-                return
-
     async def _emit_meta(self, meta: Meta, deps: OrchestratorDeps) -> SSEEvent:
         if meta.favorability_change:
             state = await deps.npc_manager.update_favorability(
@@ -661,63 +674,27 @@ class TurnOrchestrator:
         )
 
     # ------------------------------------------------------------------
-    # prepare 执行（聊天 Agent 的 tool_calls → 候选池直通任务 Agent）
+    # 路由表下发
     # ------------------------------------------------------------------
 
-    async def _execute_prepare(
-        self,
-        tool_calls: list[dict[str, Any]],
-        ctx: TurnContext,
-        deps: OrchestratorDeps,
-    ) -> tuple[Optional[str], Optional[dict[str, Any]], str]:
-        """执行聊天 Agent 的 prepare_task_context 调用。
+    @staticmethod
+    def _routing_tools(
+        registry: ToolRegistry, *, has_pending_draft: bool,
+    ) -> list[dict[str, Any]]:
+        """聊天主 Agent 的工具表 = 路由表（判据写在工具 description 里）。
 
-        返回 (候选池 JSON | None, 参数 dict | None, 失败原因)。
-        失败不回炉交流 Agent：任务 Agent 将以 prepare_then_draft 模式自行重试（继承方向）。
+        按有无待确认草案二选一：无草案时 confirm/cancel/update 都无从下手，
+        摆出来只会诱导模型空调用；有草案时反过来要给足四个任务侧入口。
+        顺序固定（ROUTE_TOOLS_* 的定义序），保证 system/tools 前缀稳定，
+        有利于前缀缓存与逐轮 diff。
         """
-        calls = [
-            tc for tc in (tool_calls or [])
-            if isinstance(tc, dict)
-            and str(tc.get("function", {}).get("name") or "") == "prepare_task_context"
-        ]
-        if not calls:
-            logger.info("TurnOrchestrator: task_draft 但交流阶段未调用 prepare，任务 Agent 将重试")
-            return None, None, "交流阶段未调用 prepare_task_context"
-        raw_args = calls[-1].get("function", {}).get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("TurnOrchestrator: prepare 参数解析失败: %s", str(raw_args)[:200])
-            return None, None, "prepare 参数解析失败"
-        if not isinstance(args, dict):
-            return None, None, "prepare 参数格式错误"
-        task_type = str(args.get("task_type") or "").strip()
-        if task_type not in TASK_TYPES:
-            logger.warning("TurnOrchestrator: prepare 的 task_type 非法: %s", task_type)
-            return None, args, f"prepare 的 task_type 非法：{task_type}"
-
-        outcome = await deps.registry.dispatch("prepare_task_context", args, ToolContext(
-            npc_name=self.npc_name,
-            npc_faction=ctx.npc_state.faction or "",
-            npc_challenge=ctx.npc_state.challenge,
-            player_progress=ctx.progress_stage or 1,
-            npc_affinity=ctx.favorability,
-            npc_states=ctx.npc_states,
-            game_data=deps.game_data,
-        ))
-        try:
-            payload = json.loads(outcome.result_json)
-            status = payload.get("status") if isinstance(payload, dict) else None
-        except json.JSONDecodeError:
-            status = "unreadable"
-        candidates_empty = _prepared_candidates_empty(outcome.result_json)
-        logger.info(
-            "TurnOrchestrator prepare 执行完成: task_type=%s status=%s 候选空=%s",
-            task_type, status, candidates_empty,
-        )
-        if candidates_empty:
-            return None, args, f"prepare 候选池为空（task_type={task_type}）"
-        return outcome.result_json, args, ""
+        names = ROUTE_TOOLS_DRAFT if has_pending_draft else ROUTE_TOOLS_NEW
+        out: list[dict[str, Any]] = []
+        for name in names:
+            tool = registry.get(name)
+            if tool is not None:
+                out.append(tool.to_openai_tool())
+        return out
 
     def _recent_dialogue_text(
         self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
@@ -832,38 +809,48 @@ class TurnOrchestrator:
         message = payload.get("message")
         return str(message or "未知原因")
 
-    async def _remediation_reply(
+    @staticmethod
+    def _fail_reply_args(fail_reason: str) -> tuple[str, str, str, str]:
+        """confirm 失败的补救回复参数（真实原因已先发 system_notice，这里只让 NPC 收场）。"""
+        return (
+            f"【真实原因（对玩家只说人话，不要提系统/校验等词汇）】{fail_reason}",
+            CONFIRM_FAIL_INSTRUCTION,
+            "这份委托刚才出了点问题，改天再谈吧。",
+            "",
+        )
+
+    async def _sync_action_reply(
         self,
         llm: LLMClient,
         base_messages: list[dict[str, Any]],
         meta: Meta,
-        discarded_text: str,
-        reason: str,
+        spoken_text: str,
+        result_block: str,
+        instruction: str,
+        fallback_text: str,
         sink: list[str],
     ) -> AsyncIterator[SSEEvent]:
-        """confirm 失败补救调用：让 NPC 解释（丢弃已生成正文，03 §4.2）。"""
-        _ = discarded_text
-        result_block = (
-            f"【真实原因（对玩家只说人话，不要提系统/校验等词汇）】{reason}"
-        )
+        """同步动作（confirm/cancel）办完后让 NPC 开口。
+
+        路由轮按契约不说话，所以这里必须补一次生成——否则玩家只看到一条
+        system_notice 就没了下文。与汇合 #2 同构（同前缀 + 情绪回显 + 结果块 +
+        指令），差别是不用等子 Agent、也不需要过渡语。
+        """
         prompt = build_merge_user_prompt(
             npc_name=self.npc_name,
             player_query=self.query,
-            spoken_text="",  # 已丢弃
+            spoken_text=spoken_text,
             emotion=meta.emotion,
             result_block=result_block,
-            instruction=(
-                "刚才那份委托出了点问题，暂时给不了玩家。用 1~3 句话以你的口吻解释并自然收场"
-                "（如「这份委托刚才出了点问题……改天再谈」），不要提任何系统词汇。"
-            ),
+            instruction=instruction,
         )
         before = len(sink)
         async for ev in self._stream_simple(llm, base_messages, prompt, sink):
             yield ev
         if len(sink) == before:
-            text = "这份委托刚才出了点问题，改天再谈吧。"
-            sink.append(text)
-            yield content_event(text)
+            # 生成失败或空回复：静态兜底，玩家侧不能留空白
+            sink.append(fallback_text)
+            yield content_event(fallback_text)
 
     async def _stream_simple(
         self,
@@ -893,52 +880,36 @@ class TurnOrchestrator:
     # 子 Agent 启动
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _direction_from_prepared(prepared_args: Optional[dict[str, Any]]) -> str:
-        """任务方向 = 交流 Agent prepare 参数（结构化委派）的自然语言还原。"""
-        if not prepared_args:
-            return ""
-        parts: list[str] = []
-        task_type = str(prepared_args.get("task_type") or "").strip()
-        if task_type:
-            parts.append(f"任务类型：{task_type}")
-        rt = prepared_args.get("reward_types")
-        if isinstance(rt, dict):
-            reg = "、".join(rt.get("regular") or [])
-            opt = "、".join(rt.get("optional") or [])
-            if reg or opt:
-                parts.append(f"奖励方向：常规[{reg or '无'}] 可选[{opt or '无'}]")
-        kws = prepared_args.get("requirement_keywords")
-        if isinstance(kws, list) and kws:
-            parts.append("目标关键词：" + "、".join(str(k) for k in kws))
-        return "；".join(parts)
-
     def _launch_subagent(
         self,
-        act: Any,
+        route: Route,
         ctx: TurnContext,
         deps: OrchestratorDeps,
-        prepared: tuple[Optional[str], Optional[dict[str, Any]], str] = (None, None, ""),
         *,
         spoken_text: str = "",
     ) -> Any:
+        """按路由声明启动后台子 Agent（fire-and-steer）。
+
+        任务侧三个入口（draft/update，含 update 无草案时的降级）共享一套 NPC 身份
+        与能力参数——报酬能力（商店类型）和切磋可行性是任务 Agent 自己选型时要用
+        的硬边界，聊天主 Agent 只负责说「往哪个方向派」。
+        """
         progress = ctx.progress_stage or 1
         affinity = ctx.favorability
         npc_titles = list(ctx.npc_state.titles or [])
         npc_states = ctx.npc_states
         llm = deps.llm_factory(self.llm_config)
-        prepared_context, prepared_args, prepare_error = prepared
         recent_dialogue = self._recent_dialogue_text(ctx, spoken_text)
         # 子 Agent 的对话预算固定 8 条，但永久模糊记忆（滚动摘要）另算：它体积恒定
         # 且不随档位膨胀，能让任务 Agent 知道「这玩家早先谈过什么」，故一并带上，
         # 在 prompt 里排在最近 8 条之前（详见 subagents/prompts.build_task_user）。
         memory_summary = self._raw_summary(ctx)
 
-        if act.kind == "search":
+        if route.kind == "search":
             return SearchRunner.launch(
                 llm=llm,
                 registry=deps.registry,
-                query=act.query,
+                query=route.query or self.query,
                 player_query=self.query,
                 npc_name=self.npc_name,
                 npc_faction=ctx.npc_state.faction or "",
@@ -952,75 +923,9 @@ class TurnOrchestrator:
                 max_rounds=deps.search_max_rounds,
             )
 
-        if act.kind == "task_update":
-            draft_row = ctx.pending_draft_row
-            if draft_row is None or not isinstance(draft_row.draft, dict) or not draft_row.draft:
-                # 无草案可更新：降级为按备注重拟（模型错误委派的容错）
-                return TaskRunner.launch(
-                    kind="task_draft",
-                    llm=llm,
-                    registry=deps.registry,
-                    direction=act.note or self.query,
-                    reward_hint="",
-                    note="",
-                    prepared_context=None,
-                    prepare_error="以 task_update 委派但无待修改草案，按新任务重拟",
-                    recent_dialogue=recent_dialogue,
-                    memory_summary=memory_summary,
-                    npc_name=self.npc_name,
-                    npc_faction=ctx.npc_state.faction or "",
-                    npc_titles=npc_titles,
-                    npc_challenge=ctx.npc_state.challenge,
-                    player_progress=progress,
-                    progress_desc=ctx.progress_desc,
-                    npc_affinity=affinity,
-                    npc_states=npc_states,
-                    pending_draft=None,
-                    bargain_count=0,
-                    draft_commit_valid=False,
-                    game_data=deps.game_data,
-                    rag_context_text=ctx.rag_context_text,
-                    retrieve_fn=ctx.retrieve_fn,
-                    max_rounds=deps.task_max_rounds,
-                )
-            return TaskRunner.launch(
-                kind="task_update",
-                llm=llm,
-                registry=deps.registry,
-                direction="",
-                reward_hint="",
-                note=act.note,
-                recent_dialogue=recent_dialogue,
-                memory_summary=memory_summary,
-                npc_name=self.npc_name,
-                npc_faction=ctx.npc_state.faction or "",
-                npc_titles=npc_titles,
-                npc_challenge=ctx.npc_state.challenge,
-                player_progress=progress,
-                progress_desc=ctx.progress_desc,
-                npc_affinity=affinity,
-                npc_states=npc_states,
-                pending_draft=draft_row.draft,
-                bargain_count=draft_row.bargain_count,
-                draft_commit_valid=True,
-                game_data=deps.game_data,
-                rag_context_text=ctx.rag_context_text,
-                retrieve_fn=ctx.retrieve_fn,
-                max_rounds=deps.task_max_rounds,
-            )
-
-        # task_draft：方向 = prepare 参数还原（交流 Agent 的结构化委派）；
-        # prepare 失败 → 任务 Agent 以 prepare_then_draft 模式自行重试（继承方向）
-        direction = self._direction_from_prepared(prepared_args) or self.query
-        return TaskRunner.launch(
-            kind="task_draft",
+        task_kwargs: dict[str, Any] = dict(
             llm=llm,
             registry=deps.registry,
-            direction=direction,
-            reward_hint="",
-            note="",
-            prepared_context=prepared_context,
-            prepare_error=prepare_error,
             recent_dialogue=recent_dialogue,
             memory_summary=memory_summary,
             npc_name=self.npc_name,
@@ -1031,13 +936,57 @@ class TurnOrchestrator:
             progress_desc=ctx.progress_desc,
             npc_affinity=affinity,
             npc_states=npc_states,
-            pending_draft=None,
-            bargain_count=0,
-            draft_commit_valid=False,
             game_data=deps.game_data,
             rag_context_text=ctx.rag_context_text,
             retrieve_fn=ctx.retrieve_fn,
             max_rounds=deps.task_max_rounds,
+        )
+        new_draft_kwargs = {
+            **task_kwargs,
+            "has_shop": ctx.has_shop,
+            "shop_reward_types": ctx.shop_reward_types,
+            "player_can_challenge": ctx.player_can_challenge,
+            "pending_draft": None,
+            "bargain_count": 0,
+            "draft_commit_valid": False,
+        }
+
+        draft_row = ctx.pending_draft_row
+        if route.kind == "task_update" and (
+            draft_row is None or not isinstance(draft_row.draft, dict) or not draft_row.draft
+        ):
+            # 无草案可更新：降级为按备注重拟（路由错发的容错）
+            logger.info(
+                "会话 %s：task_update 但无待修改草案，降级为新草案", self.session_id,
+            )
+            return TaskRunner.launch(
+                kind="task_draft",
+                direction=route.note or self.query,
+                player_query=self.query,
+                note="",
+                **new_draft_kwargs,
+            )
+
+        if route.kind == "task_update":
+            return TaskRunner.launch(
+                kind="task_update",
+                direction="",
+                player_query=self.query,
+                note=route.note,
+                pending_draft=draft_row.draft,
+                bargain_count=draft_row.bargain_count,
+                draft_commit_valid=True,
+                **task_kwargs,
+            )
+
+        # task_draft：note 是聊天主 Agent 提炼的诉求要点，缺省时回落到玩家原话；
+        # task_type / reward_types 由任务 Agent 自己 prepare 选型，聊天侧不再决定
+        return TaskRunner.launch(
+            kind="task_draft",
+            direction=route.note or self.query,
+            player_query=self.query,
+            note="",
+            **new_draft_kwargs,
         )
 
     # ------------------------------------------------------------------

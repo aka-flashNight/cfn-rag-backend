@@ -1,20 +1,18 @@
 """meta 行协议：解析器 + 校验 + prompt 说明文本生成。
 
 对应 docs/v3-developer/02-LLM接入层.md §4。聊天主 Agent 的响应第一行是
-单行紧凑 JSON（情绪/好感/委派意图），第二行起为 NPC 台词正文。
+单行紧凑 JSON（情绪/好感），第二行起为 NPC 台词正文。
 解析器全容错：解析失败、缺字段、类型错误一律按「无 meta」处理，绝不丢正文。
 
-v3 修订（tools 承载 prepare）：act 只表达**意图**，不再内联 prepare 参数——
-task_draft 的候选池由聊天主 Agent 在流式响应中调用 prepare_task_context 工具预取，
-后端执行后直通任务 Agent（01 §3 D4 修订：情绪/委派意图仍走 meta 行，
-数据准备类工具按业务注册）。
+v3 再次重构（路由工具化）：meta 行只剩情绪与好感两个字段。委派意图不再走 meta——
+聊天主 Agent 通过 services/tools/route/ 下的路由声明工具把本轮交给后台系统，
+路由判据写在工具描述里，本轮不输出台词。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections import deque
 from dataclasses import dataclass
 from typing import AsyncIterator, Sequence
 
@@ -22,35 +20,19 @@ from services.llm.client import StreamEvent
 
 logger = logging.getLogger(__name__)
 
-# act 合法 kind（01 §3 / 02 §4.1）
-ACT_KINDS = ("task_draft", "task_update", "task_confirm", "task_cancel", "search")
-
 # 首行缓冲上限：超过 512 字符仍无换行即视为无 meta
 _MAX_META_LINE_CHARS = 512
 
 DEFAULT_EMOTION = "普通"
 _FAV_MIN, _FAV_MAX = -5, 5
-_HINT_MAX_CHARS = 60
-_QUERY_MAX_CHARS = 40
-
-
-@dataclass(frozen=True)
-class MetaAct:
-    """委派意图声明。task_draft 仅表达意图（prepare 由工具调用承载）；
-    task_update 的 note 为玩家新条件；search 的 query 为查询要点。"""
-
-    kind: str
-    note: str = ""
-    query: str = ""
 
 
 @dataclass(frozen=True)
 class Meta:
-    """本轮 meta：情绪、好感变化、委派意图。"""
+    """本轮 meta：情绪与好感变化。"""
 
     emotion: str = DEFAULT_EMOTION
     favorability_change: int = 0
-    act: MetaAct | None = None
 
 
 def default_emotion_for(npc_emotions: Sequence[str]) -> str:
@@ -60,10 +42,6 @@ def default_emotion_for(npc_emotions: Sequence[str]) -> str:
     if npc_emotions:
         return npc_emotions[0]
     return DEFAULT_EMOTION
-
-
-def _clip(text: str, limit: int) -> str:
-    return text.strip()[:limit]
 
 
 def parse_meta_obj(obj: object, npc_emotions: Sequence[str]) -> Meta | None:
@@ -86,39 +64,7 @@ def parse_meta_obj(obj: object, npc_emotions: Sequence[str]) -> Meta | None:
     except (TypeError, ValueError):
         fav = 0
 
-    # act：非法形态一律置 None（保住 emo/fav，不丢整个 meta）
-    act_raw = obj.get("act")
-    act: MetaAct | None = None
-    if isinstance(act_raw, str):
-        # 模型常见手误：act 写成字符串而非 {"kind": ...} 对象。
-        # 无参 kind 宽容纠正（否则 confirm/cancel 会被静默丢弃）；
-        # 需要载荷的 task_update/search 无法从字符串恢复 note/query，记日志后忽略。
-        kind = act_raw.strip()
-        if kind in ("task_draft", "task_confirm", "task_cancel"):
-            act = MetaAct(kind=kind)
-        else:
-            logger.warning(
-                "meta act 为字符串且无法恢复载荷，按 null 处理: %r", act_raw,
-            )
-    elif isinstance(act_raw, dict):
-        kind = str(act_raw.get("kind") or "").strip()
-        if kind in ("task_draft", "task_confirm", "task_cancel"):
-            act = MetaAct(kind=kind)
-        elif kind == "task_update":
-            note = act_raw.get("note")
-            act = MetaAct(
-                kind=kind,
-                note=_clip(note, _HINT_MAX_CHARS) if isinstance(note, str) else "",
-            )
-        elif kind == "search":
-            query = act_raw.get("query")
-            if isinstance(query, str) and query.strip():
-                act = MetaAct(kind=kind, query=_clip(query, _QUERY_MAX_CHARS))
-        else:
-            logger.warning("meta act kind 非法，按 null 处理: %r", act_raw)
-    elif act_raw is not None:
-        logger.warning("meta act 形态非法（既非对象也非字符串），按 null 处理: %r", act_raw)
-    return Meta(emotion=emotion, favorability_change=fav, act=act)
+    return Meta(emotion=emotion, favorability_change=fav)
 
 
 def _try_parse_first_line(line: str) -> dict | None:
@@ -134,8 +80,8 @@ def _try_parse_first_line(line: str) -> dict | None:
 
 
 def _passes_meta_schema(obj: dict, npc_emotions: Sequence[str]) -> bool:
-    """首行是否被认定为 meta 行：emo/fav/act 三键至少出现一个（防台词恰似 JSON）。"""
-    return any(key in obj for key in ("emo", "fav", "act"))
+    """首行是否被认定为 meta 行：emo/fav 两键至少出现一个（防台词恰似 JSON）。"""
+    return any(key in obj for key in ("emo", "fav"))
 
 
 def _forwardable(kind: str) -> bool:
@@ -223,83 +169,34 @@ async def split_meta(
     return meta, _texts()
 
 
-def meta_prompt_block(
-    npc_emotions: Sequence[str],
-    *,
-    has_pending_draft: bool = False,
-    agent_enabled: bool = True,
-) -> str:
-    """生成写进聊天尾部指令的 meta 行协议说明（02 §4.3）。
+def meta_prompt_block(npc_emotions: Sequence[str], *, agent_enabled: bool = True) -> str:
+    """生成写进聊天 system 的 meta 行协议说明（02 §4.3）。
 
-    双分支互斥注入：无草案时讲「如何发起新任务」；有草案时讲「确认/取消/讨价
-    还价/大改重拟」的路由。prepare 工具的字段说明与 TASK_TYPES 选择原则见
-    orchestrator.prompts.PREPARE_TOOL_GUIDE（本块只做意图路由）。
+    v3 再次重构后本块只讲情绪与好感两个字段，因此对同一 NPC 跨轮完全稳定
+    （有无待确认草案不再影响它，前缀缓存命中率随之提高）。路由判据不在这里：
+    它们写在 services/tools/route/ 各工具的描述与
+    orchestrator.prompts.build_routing_guide 中。
 
-    agent_enabled=False（玩家关闭 Agent 能力）时两个分支都不注入，act 固定为
-    null——协议里不出现任何委派 kind，模型无从发起，后端也会兜底忽略。
+    唯一的分支是 agent_enabled：关闭 Agent 能力时既不下发路由工具、也不注入路由
+    说明块，此处再提「或者发一个路由工具调用」就成了悬空指代，会诱导模型凭空
+    编一个调用（编排层会忽略它，但这一轮就白跑了）。
     """
     emotions = list(npc_emotions) or [DEFAULT_EMOTION]
     emo_list = "、".join(emotions)
-    lines = [
+    after_first_line = (
+        "第一行之后要么是台词正文，要么是一个路由工具调用——两者只取其一（路由见下方说明）。格式示例："
+        if agent_enabled else
+        "第一行之后是台词正文。格式示例："
+    )
+    return "\n".join([
         "【输出格式（最高优先级）】",
-        "你的回复第一行必须是一个单行 JSON（不要解释、不要用代码块包裹），第二行起为台词正文。格式示例：",
-        '{"emo":"微笑","fav":0,"act":null}',
+        "你的回复第一行必须是一个单行 JSON（不要解释、不要用代码块包裹）。" + after_first_line,
+        '{"emo":"微笑","fav":0}',
         "诶，是你啊。今天有什么想聊的？",
         "",
         "字段规则：",
         f"1. emo：本轮情绪，必须从列表中选择：{emo_list}。",
-        "2. fav：本条消息对玩家好感度的变化，整数，范围 -5~5，无变化写 0。日常对话通常无需变化，有情绪起伏/情感变化时可调整好感度。",
-    ]
-    if not agent_enabled:
-        lines.extend([
-            "3. act：当前不开放任何委派，本轮固定写 null。",
-        ])
-        lines.append("- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。")
-        return "\n".join(lines)
-
-    lines.extend([
-        "3. act：本轮委派意图，取以下之一：",
-        '   - null：纯聊天，不委派任何事。',
+        "2. fav：本条消息对玩家好感度的变化，整数，范围 -5~5，无变化写 0。"
+        "日常对话通常无需变化，有情绪起伏/情感变化时可调整好感度。",
+        "- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。",
     ])
-    if has_pending_draft:
-        lines.extend([
-            '   - {"kind":"task_confirm"}：玩家明确接受当前草案时使用。'
-            "「我接了」「接」「成交」「就它了」「干」这类话，以及玩家点击「接」按钮，都算明确接受。",
-            '   - {"kind":"task_cancel"}：玩家明确拒绝/放弃当前草案时使用。',
-            '   - {"kind":"task_update","note":"<玩家的新条件>"}：玩家在谈条件/要求小幅修改'
-            "（如只调奖励数量、换奖励物品、改难度）时使用；具体改什么由任务系统按 note 处理。",
-            '   - {"kind":"task_draft"}：**仅当玩家要求彻底重新拟定任务方向/换一个任务**时使用；'
-            "同时调用 prepare_task_context 工具重新准备候选（新草案会替换旧草案）。",
-            "",
-            "task_confirm 示例：玩家说「我接了」→ 你的回复第一行必须是："
-            '{"emo":"<从情绪列表选>","fav":<整数>,"act":{"kind":"task_confirm"}}',
-            "",
-            "重要提醒：",
-            "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
-            "- 玩家消息已经明确接受草案（如「我接了」）时，**本轮必须直接输出 "
-            'act={"kind":"task_confirm"}**，不要再追问「你确认吗 / 你点头吗」——'
-            "草案本来就只等玩家点头一次，玩家已经点头了。",
-            "- 接受/拒绝/小幅讨价还价都不需要调用 prepare_task_context。",
-            "- 玩家一句话同时表达「接受 + 要调整」（如「我接，但奖励多点」）时，"
-            "**优先按 task_update 处理**，等调整后玩家认可再说确认，玩家认可后再 task_confirm。",
-            "- **硬性要求**：调整完成后，玩家再次明确表示接受"
-            "（如「可以」「行，就这样」「接了」「成交」）时，"
-            "**必须本轮直接输出 act={\"kind\":\"task_confirm\"}，立刻发布**；"
-            "禁止再次追问「确定吗/点头吗」，也禁止复述一遍条件再等玩家确认——",
-            "- 玩家讨价还价时你可以不同意让步，有两种方式：**正常情况下**不调用任何工具"
-            "（act 用 null），礼貌拒绝让步并直接问玩家到底接还是不接；"
-            "只有玩家态度恶劣或你的性格强硬或语境确实合适时，才在拒绝讨价还价时用 task_cancel 直接取消委托。",
-        ])
-    else:
-        lines.extend([
-            '   - {"kind":"task_draft"}：玩家明确要求委托/工作/任务时使用，**同时调用 '
-            'prepare_task_context 工具**（候选由工具返回，不要在台词里自己编任务细节）。',
-            '   - {"kind":"search","query":"<查询要点>"}：需要查证设定/物品/关卡信息才能回答时使用，query 不超过 40 字。',
-            "",
-            "重要提醒：",
-            "- **草案只是拟定，不是已发布**。确认前禁止说「任务已发布」。",
-            "- 委派 task_draft / search 时，第一段正文只写 1~2 句过渡话"
-            "（如「我想想给你安排点什么……」），不要写任何具体任务内容或数字。",
-        ])
-    lines.append("- 第一行 JSON 之后的所有内容都是 NPC 台词本身，不要再输出任何 JSON。")
-    return "\n".join(lines)

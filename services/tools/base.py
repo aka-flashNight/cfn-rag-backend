@@ -8,7 +8,9 @@ Atomic tool contract + registry.
   通过 ``list_skills / read_skill / read_skill_file`` 三个元工具按需加载。
 - Tools 与 Skills 完全解耦：同一个工具可能被多个 Skill 文档引用，同一个 Skill 可能只是纯文档、不对应任何独立工具。
 
-v3：工具只服务后台子 Agent（TaskRunner / SearchRunner）；聊天主 Agent 不持有任何工具（决策走 meta 行）。
+v3 再次重构：工具分两类用途——``route`` 类别是聊天主 Agent 的**路由声明**（编排层
+直接读取 tool_calls 分派，不进 dispatch）；其余类别只服务后台子 Agent
+（TaskRunner / SearchRunner）。聊天主 Agent 不再持有 prepare 之类的业务工具。
 ``ToolRegistry.dispatch`` 为 async；同批 tool_calls 按 task pipeline 分组并行执行（asyncio.gather，修 B3 串行）。
 """
 
@@ -31,9 +33,27 @@ if TYPE_CHECKING:  # pragma: no cover
     from services.skills import SkillRegistry
 
 
-Category = Literal["task", "query", "system"]
+Category = Literal["route", "task", "query", "system"]
 
-_VALID_CATEGORIES: tuple[str, ...] = ("task", "query", "system")
+_VALID_CATEGORIES: tuple[str, ...] = ("route", "task", "query", "system")
+
+# 聊天主 Agent 可用的路由声明工具（编排层按有无待确认草案挑选下发）
+ROUTE_TOOL_NAMES: tuple[str, ...] = (
+    "route_task_draft",
+    "route_task_update",
+    "route_task_confirm",
+    "route_task_cancel",
+    "route_search",
+)
+# 无待确认草案时可路由的目标（confirm/cancel/update 都针对既有草案）
+ROUTE_TOOLS_NEW: tuple[str, ...] = ("route_task_draft", "route_search")
+# 有待确认草案时可路由的目标
+ROUTE_TOOLS_DRAFT: tuple[str, ...] = (
+    "route_task_confirm",
+    "route_task_cancel",
+    "route_task_update",
+    "route_task_draft",
+)
 
 
 # ---------------------------------------------------------------------------

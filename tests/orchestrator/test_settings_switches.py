@@ -2,7 +2,8 @@
 
 两项都是前端「终端设置」面板的请求级字段（NPCChatRequest.agent_enabled /
 summarize_interval），语义边界：
-- 开关关闭 = 本回合纯聊天（无工具、无委派协议、模型硬发的 act 一律忽略）；
+- 开关关闭 = 本回合纯聊天（不下发任何路由工具、prompt 不含路由说明、
+  模型硬发的 route_* 调用一律忽略）；
 - 档位 = 逐字进 prompt 的近期对话条数，同时决定从库里读多少条；
 - 两者都不传时行为与字段引入前完全一致（服务端默认 20 条读库 / 8 条进 prompt）。
 """
@@ -10,6 +11,7 @@ summarize_interval），语义边界：
 from __future__ import annotations
 
 from services.orchestrator.turn import SUBAGENT_RECENT_MESSAGES, TurnOrchestrator
+from services.tools.base import ROUTE_TOOLS_DRAFT, ROUTE_TOOLS_NEW
 from tests.orchestrator.conftest import (
     MERGE_REPLY_TASK,
     NPC_NAME,
@@ -41,6 +43,10 @@ def _shared_core(env) -> str:
     return env.fake.stream_requests[0].messages[1]["content"]
 
 
+def _chat_tool_names(env) -> list[str]:
+    return [t["function"]["name"] for t in (env.fake.stream_requests[0].tools or [])]
+
+
 async def _seed_history(env, count: int) -> None:
     """按 玩家/NPC 交替塞入带序号的历史消息（序号零填充，便于子串断言）。"""
     for i in range(1, count + 1):
@@ -53,33 +59,40 @@ async def _seed_history(env, count: int) -> None:
 # ---------------------------------------------------------------------------
 
 async def test_agent_disabled_offers_no_tool(env):
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯，聊什么都行。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
     await collect(_orch(env, "你好", agent_enabled=False))
     assert env.fake.stream_requests[0].tools is None
 
 
-async def test_agent_enabled_by_default_still_offers_prepare(env):
-    """不传开关 = 既有行为：prepare_task_context 照常下发。"""
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯，聊什么都行。")
+async def test_agent_enabled_by_default_offers_new_task_routes(env):
+    """不传开关 = 既有行为：聊天主 Agent 拿到路由表（无草案分支）。"""
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
     await collect(_orch(env, "你好"))
-    tools = env.fake.stream_requests[0].tools
-    assert [t["function"]["name"] for t in tools] == ["prepare_task_context"]
+    assert _chat_tool_names(env) == list(ROUTE_TOOLS_NEW)
+
+
+async def test_pending_draft_widens_route_table(env):
+    """有待确认草案时换成草案分支表：confirm/cancel/update 三个入口才有意义。"""
+    await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
+    await collect(_orch(env, "在吗"))
+    assert _chat_tool_names(env) == list(ROUTE_TOOLS_DRAFT)
 
 
 async def test_agent_disabled_system_prompt_drops_delegation(env):
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="今天没活。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="今天没活。")
     await collect(_orch(env, "给我个任务", agent_enabled=False))
 
     system = _system_prompt(env)
     assert "当前无法派发委托" in system
-    for forbidden in ("prepare_task_context", "task_draft", "task_confirm",
+    for forbidden in ("prepare_task_context", "route_", "路由",
                       "任务发布硬约束", "reward_types"):
         assert forbidden not in system
 
 
 async def test_agent_disabled_prompt_guides_player_to_open_permission(env):
     """玩家坚持要活时，NPC 要引导他去终端打开接取委托的权限（沿用 v2 口径）。"""
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="终端权限还关着呢。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="终端权限还关着呢。")
     await collect(_orch(env, "我就要接活", agent_enabled=False))
 
     system = _system_prompt(env)
@@ -89,11 +102,12 @@ async def test_agent_disabled_prompt_guides_player_to_open_permission(env):
     assert "你那终端的委托权限还关着呢" in system
 
 
-async def test_agent_disabled_ignores_model_declared_act(env):
-    """模型越权硬发 task_draft：按纯聊天放行正文，不起子 Agent、不落草案。"""
+async def test_agent_disabled_ignores_model_declared_route(env):
+    """模型越权硬发 route_task_draft：按纯聊天放行正文，不起子 Agent、不落草案。"""
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
+        meta='{"emo":"微笑","fav":0}',
         text="这事我记下了。",
+        tool_calls=[tc("route_task_draft", {"note": "玩家想要个活"})],
     )
     events = await collect(_orch(env, "给我安排个活", agent_enabled=False))
 
@@ -111,22 +125,25 @@ async def test_agent_disabled_hides_pending_draft_and_lets_it_expire(env):
     await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
 
     for i in range(3):
-        env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text=f"闲聊{i}。")
+        env.fake.add_stream(meta='{"emo":"普通","fav":0}', text=f"闲聊{i}。")
         await collect(_orch(env, "聊点别的", agent_enabled=False))
 
     assert "食材收集委托" not in _shared_core(env)
     assert "待确认的任务草案" not in _shared_core(env)
+    # 关闭态连路由表都不下发，残留草案也不会让 confirm/cancel 入口冒出来
+    assert env.fake.stream_requests[0].tools is None
     assert await env.store.get_draft(env.session_id) is None
 
 
-async def test_agent_disabled_confirm_act_does_not_publish(env, monkeypatch):
-    """关闭态下 task_confirm 也不能发布任务：不写任务文件、草案保留待过期。"""
+async def test_agent_disabled_confirm_route_does_not_publish(env, monkeypatch):
+    """关闭态下 route_task_confirm 也不能发布任务：不写任务文件、草案保留待过期。"""
     await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
     monkeypatch.setattr(env.game_data, "data_root", env.tmp_path / "data")
 
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_confirm"}}',
+        meta='{"emo":"微笑","fav":0}',
         text="行，那就这样。",
+        tool_calls=[tc("route_task_confirm", {})],
     )
     events = await collect(_orch(env, "我接了", agent_enabled=False))
 
@@ -142,7 +159,7 @@ async def test_agent_disabled_confirm_act_does_not_publish(env, monkeypatch):
 
 async def test_default_window_keeps_last_eight_messages(env):
     await _seed_history(env, 30)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _orch(env, "还记得前面说的吗")
     await collect(orch)
 
@@ -155,7 +172,7 @@ async def test_default_window_keeps_last_eight_messages(env):
 
 async def test_precise_memory_tier_widens_prompt_and_db_read(env):
     await _seed_history(env, 14)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _orch(env, "还记得前面说的吗", summarize_interval=10)
     await collect(orch)
 
@@ -169,7 +186,7 @@ async def test_precise_memory_tier_widens_prompt_and_db_read(env):
 
 async def test_precise_memory_almost_unlimited_keeps_everything(env):
     await _seed_history(env, 40)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _orch(env, "全都记得吗", summarize_interval=500)
     await collect(orch)
 
@@ -181,7 +198,7 @@ async def test_precise_memory_almost_unlimited_keeps_everything(env):
 
 async def test_invalid_tier_falls_back_to_server_default(env):
     await _seed_history(env, 14)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _orch(env, "在吗", summarize_interval=7)
     await collect(orch)
 
@@ -194,7 +211,7 @@ async def test_invalid_tier_falls_back_to_server_default(env):
 async def test_tier_does_not_change_subagent_dialogue_budget(env):
     """档位只作用于聊天主 Agent；子 Agent 的近期对话仍用固定预算。"""
     await _seed_history(env, 30)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _orch(env, "都记得吗", summarize_interval=500)
     await collect(orch)
 
@@ -218,15 +235,18 @@ SUMMARY_TEXT = "玩家早先替铁匠跑过一趟腿，还问过废城的路。"
 
 
 async def _drive_task_draft(env, **orch_kwargs) -> TurnOrchestrator:
-    """跑一轮完整的 task_draft（prepare → draft → 汇合），返回编排器实例。"""
+    """跑一轮完整的 task_draft（路由 → prepare → draft → 汇合），返回编排器实例。"""
+    # 宽限期给足，避免过渡语多插一次流式调用打乱 stream_requests 的下标
+    env.deps.merge_grace_ms = 500
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft"}}',
-        text="我看看手头有什么适合你的活……",
-        tool_calls=[tc("prepare_task_context", {
-            "task_type": "资源收集",
-            "reward_types": {"regular": ["金币"], "optional": []},
-        }, call_id="p1")],
+        meta='{"emo":"微笑","fav":0}',
+        text="",
+        tool_calls=[tc("route_task_draft", {"note": "玩家想找点活干"})],
     )
+    env.fake.add_chat(tool_calls=[tc("prepare_task_context", {
+        "task_type": "资源收集",
+        "reward_types": {"regular": ["金币"], "optional": []},
+    }, call_id="p1")])
     env.fake.add_chat(tool_calls=[tc("draft_agent_task", {
         "task_type": "资源收集",
         "title": "食材收集委托",

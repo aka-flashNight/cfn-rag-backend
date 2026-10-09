@@ -35,12 +35,14 @@ class LLMClient:
 
 class ChatRequest(BaseModel):
     messages: list[dict]
-    tools: list[dict] | None = None        # 聊天 Agent 按业务注册（当前仅 prepare_task_context）；
-                                           # 子 Agent 全量工具循环。流式+tools 无兼容坑（实测），
+    tools: list[dict] | None = None        # 聊天 Agent 只注册路由声明工具（services/tools/route/，
+                                           # 按有无待确认草案二选一）；子 Agent 全量工具循环。
+                                           # 流式+tools 无兼容坑（实测）。
     purpose: Literal["chat", "subagent", "summary"] = "chat"
     send_image: bool = True                # purpose != "chat" 时强制 False（图片只进聊天轮）
     max_tokens: int | None = None
-    # 不支持流式 tools 的平台：chat 轮剥 tools 重试一次（turn.py 唯一降级点）
+    # 聊天轮**不做**「剥 tools 重试」：现网没有不支持流式 tools 的平台，
+    # 兼容分支只会白拖慢流程（用户裁定）。tools 不支持只影响子 Agent 路径，见 §3.2。
 ```
 
 ### 2.2 固定行为
@@ -111,85 +113,98 @@ class StreamEvent:
 - 图片 part 在后、文本 part 在前（沿用现状的缓存对齐注释结论）。
 - 图片来源与处理见 `07-立绘与多模态.md`；形象描述文本（appearance）恒在 prompt 中，与是否发图无关。
 
-## 4. meta 行协议（meta.py）
+## 4. meta 行协议 + 路由工具（meta.py / tools/route/）
 
 ### 4.1 格式
 
-聊天主 Agent 的响应**第一行**必须是单行紧凑 JSON，第二行起为 NPC 台词正文：
+聊天主 Agent 的响应**第一行**必须是单行紧凑 JSON，其后要么是 NPC 台词正文，
+要么是一个路由工具调用——两者只取其一：
 
 ```
-{"emo":"微笑","fav":0,"act":null}
+{"emo":"微笑","fav":0}
 诶，是你啊。今天有什么想聊的？
 ```
 
-```jsonc
-// act 的全部合法形态（kind 枚举）
-null                                                        // 纯聊天
-{"kind":"task_draft"}   // 委派发任务：prepare 参数由 prepare_task_context 工具调用承载（台词先行、后调工具）
-{"kind":"task_update","note":"玩家嫌奖励少，希望金币加两成"}
-{"kind":"task_confirm"}                                     // 玩家确认接受当前草案
-{"kind":"task_cancel"}                                      // 玩家拒绝/放弃当前草案
-{"kind":"search","query":"安迪·洛的过去"}                     // 需要深入查资料
-```
+meta 行只有 `emo` / `fav` 两个字段。委派意图不在 meta 里，改由五个路由声明工具承载
+（`services/tools/route/`，`category="route"`，工具本体零副作用）：
+
+| 路由工具 | 参数 | 何时下发 |
+|---|---|---|
+| `route_task_draft` | `note`（必填，≤60 字，只写诉求要点、不写数量/金额） | 恒下发 |
+| `route_search` | `query`（必填，≤40 字） | 仅无待确认草案时 |
+| `route_task_confirm` | 无 | 仅有待确认草案时 |
+| `route_task_cancel` | 无 | 仅有待确认草案时 |
+| `route_task_update` | `note`（必填，≤60 字，玩家的新条件） | 仅有待确认草案时 |
 
 字段约束：
 
 - `emo`：必须 ∈ 该 NPC 的 emotions 列表；非法 → 回退 `普通`。
 - `fav`：整数，clamp 到 [-5, 5]。
-- `task_update.note`：玩家新条件（≤60 字），任务 Agent 据此修改草案。
-- `search.query`：≤40 字。
-- task_draft 的候选池参数（task_type/reward_types/keywords）不在 meta 行内——由聊天主 Agent 在流式响应中
-  调用 `prepare_task_context`（唯一注册工具）承载；后端执行后直通任务 Agent。prepare 失败/缺失时
-  由任务 Agent 以 prepare_then_draft 模式自行重试（继承对话思路，不回炉交流 Agent）。
-- meta_prompt_block 按「无草案 / 有草案」双分支互斥注入（无草案讲发起新任务，有草案讲
-  confirm/cancel/update/大改重拟路由）。
+- meta 行里的未知键一律忽略（模型偶发多写 `"act"` 之类不会让整行作废）。
+- 路由参数是坏 JSON 时**路由本身仍生效**，`note`/`query` 按空处理（回落到玩家原话），
+  不让一次解析失败毁掉整轮委派。
+- 工具表按「有无待确认草案」二选一（`ROUTE_TOOLS_NEW` / `ROUTE_TOOLS_DRAFT`），
+  顺序固定 → system/tools 前缀逐轮稳定，利于前缀缓存与逐轮 diff。无草案时不给
+  confirm/cancel/update，摆出来只会诱导模型空调用。
+- 任务选型（task_type / reward_types / keywords）完全不在聊天侧：那是任务 Agent
+  自己的 `prepare_task_context` 调用，见 `03` §5。
 
-### 4.2 解析器（parse_meta_stream）
+### 4.2 解析器（split_meta / split_meta_events）
 
 ```python
-async def split_meta(stream: AsyncIterator[StreamEvent]
-                     ) -> tuple[Meta, AsyncIterator[str]]:
+async def split_meta_events(stream: AsyncIterator[StreamEvent], npc_emotions: Sequence[str]
+                            ) -> tuple[Meta, AsyncIterator[StreamEvent]]:
     """缓冲流的开头，直到凑齐第一行（\n）或超过 512 字符：
-    - 首非空字符是 '{' 且首行 json.loads 成功且通过 schema 校验 → Meta + 正文流
-    - 否则 → 默认 Meta(emo=普通, fav=0, act=null)，已缓冲文本原样还给正文流
+    - 首非空字符是 '{' 且首行 json.loads 成功且通过 schema 校验 → Meta + 剩余事件流
+    - 否则 → 默认 Meta(emo=普通, fav=0)，已缓冲文本原样还给事件流
     容错：JSON 解析失败、缺字段、类型错误一律按『无 meta』处理，绝不让解析失败弄丢正文。"""
 ```
 
-meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 处理 act（§5）→ 继续转发明文正文。这保证**情绪先于正文到达前端**（B5 开发者注的硬性要求）。
+meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 继续转发正文与 `finish`
+里的 `tool_calls`。这保证**情绪先于正文到达前端**（B5 开发者注的硬性要求）。
 
-### 4.3 prompt 说明（生成函数 `meta_prompt_block(npc_emotions, *, has_pending_draft, agent_enabled)`）
+⚠ `client.py` 只在 `finish` 事件里聚合出 `tool_calls`，**不流式吐工具调用**，所以编排层
+在正文开始流出时还不知道本轮会不会路由。取舍（用户裁定）：正文无条件直发以保住
+token 流式体验，「路由轮不说话」由提示词与工具描述约束，模型违规说话时只在日志留痕
+（`路由轮（X）仍输出了台词`）而不吞掉玩家已经看到的内容。**不为「平台不支持流式
+tools」做任何兼容分支**——现网没有这种平台，兼容只会白白拖慢流程。
 
-写进聊天尾部指令，要点：
+### 4.3 prompt 说明（生成函数 `meta_prompt_block(npc_emotions, *, agent_enabled)`）
+
+写进聊天 system 层2，要点：
 
 1. 第一行只能是一个 JSON、一行、不解释、不用代码块包裹。
 2. emo 从给定列表选；fav 范围 -5~5，无变化写 0。
-3. act 决策规则（精简版）：
-   - 玩家明确要求委托/工作/任务 → `task_draft`，direction 写清方向。**拟定了方向就必须委派，不要自己编任务细节**。
-   - 存在待确认草案时：玩家接受 → `task_confirm`；拒绝 → `task_cancel`；谈条件 → `task_update`；岔开话题 → 保持 null（草案会保留若干回合）。
-   - 需要查证设定/物品/关卡信息才能回答 → `search`。
-   - **草案只是拟定，不是已发布**。确认前禁止说"任务已发布"。
-4. 委派 task_draft/task_update/search 时，第一段的正文只写 1~2 句过渡话（如"我想想给你安排点什么……"），不要写任何具体任务内容/数字。
-5. `agent_enabled=False`（玩家在设置页关掉 Agent 能力）时，第 3、4 点整块不注入：
-   协议里 act 只剩「本轮固定写 null」，任何委派 kind 与 `prepare_task_context`
-   都不出现——不给模型可以越权的字面入口。emo/fav 协议不受影响。
-   编排层另有兜底：模型仍硬发 act 时忽略并按纯聊天处理（03 §2）。
+3. 第一行之后要么台词、要么一个路由工具调用，两者只取其一。
+4. `agent_enabled=False`（玩家在设置页关掉 Agent 能力）时，第 3 点里「路由工具调用」
+   那半句整块不注入——既不下发路由工具、也没有路由说明块，提了就是悬空指代。
+   emo/fav 协议不受影响。编排层另有兜底：模型仍硬发 `route_*` 时忽略并按纯聊天处理（03 §2）。
 
-## 5. act 的执行语义（orchestrator 侧，本章只定义契约）
+路由判据本体**不在 meta 协议块里**，而在各路由工具的 `description`（工具表就是聊天主
+Agent 的路由提示词）与 `build_routing_guide`（跨工具公共规则：路由轮不说话、一轮最多
+路由一件事、草案不等于已发布）中。三处分工不重叠，避免同一规则写两遍后自相矛盾。
 
-| act              | 执行方式                                                                                                                                                                  | 失败处理           |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `task_draft`   | 立即启动 TaskRunner 后台任务（direction 作为严格指令注入）                                                                                                                | 见 03 §4 汇合规则 |
-| `task_update`  | 立即启动 TaskRunner（update 模式，携带 pending draft）                                                                                                                    | 同上               |
-| `search`       | 立即启动 SearchRunner 后台任务                                                                                                                                            | 同上               |
-| `task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）成功→放行正文 + tool_status(success)；失败→**丢弃已生成正文**，携带错误原因做 1 次补救调用让 NPC 解释 | 见 05 §6          |
-| `task_cancel`  | 同步执行 cancel，同上                                                                                                                                                     | 极少失败           |
+## 5. 路由的执行语义（orchestrator 侧，本章只定义契约）
 
-confirm/cancel 不经过子 Agent——它们是纯后端操作，聊天主 Agent 直接触发（用户决策："模型聊天+快速调用对应工具就行了"）。
+| 路由 | 执行方式 | 失败处理 |
+| --- | --- | --- |
+| `route_task_draft` | 立即启动 TaskRunner（draft 模式，`note` 作为方向注入；无 note 时回落玩家原话） | 见 03 §4 汇合规则 |
+| `route_task_update` | 立即启动 TaskRunner（update 模式，携带 pending draft）；无草案可改时降级为 draft 模式重拟 | 同上 |
+| `route_search` | 立即启动 SearchRunner（`query` 缺省时回落玩家原话） | 同上 |
+| `route_task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）→ tool_status(success) → 一次收场调用让 NPC 交代；失败 → tool_status(failed) + `system_notice` 给真实原因 + 携带原因做 1 次补救调用让 NPC 解释 | 见 05 §6 |
+| `route_task_cancel` | 同步执行 cancel → tool_status(success) → 收场调用；无草案可撤不算失败，让 NPC 顺着话头自然回应 | 极少失败 |
+
+confirm/cancel 不经过子 Agent——它们是纯后端操作，编排层直接执行（用户决策："模型聊天+快速调用对应工具就行了"）。
+**路由轮不输出台词**，所以这两条路径上 NPC 的那句话来自事后的收场调用（模型空回复时
+用静态兜底话术，玩家侧不留空白）；事件顺序固定为
+`meta → tool_status(running) → tool_status(success) → content → system_notice → done`
+（失败时 `system_notice` 排在补救 `content` 之前，让真实原因先落地）。
 
 ## 6. 测试要求（P1 验收）
 
-1. meta 解析器：正常 meta / 无 meta / 半截 JSON / 非法 emo / fav 越界 / 多行 JSON 冒充 共 6 类用例。
-2. Profile 匹配：表中每个模型名命中正确 Profile；未知模型落 DEFAULT。
-3. 降级链（mock HTTP）：思考参数 400→剥离重试成功；图像 400→去图重试成功且后续不再带图；两次都 400→上抛原始错误；401→不重试不上抛错码混淆。
-4. reasoning delta 不混入 content。
-5. 流式 usage 正确回收。
+1. meta 解析器：正常 meta / 无 meta / 半截 JSON / 非法 emo / fav 越界 / 多行 JSON 冒充 / 未知多余键（如残留的 `"act"`）不影响整行 / 首行 JSON 但既无 emo 也无 fav → 当正文 / meta 之后无正文（路由轮的形态）——`tests/llm/test_meta.py`。
+2. meta 协议说明块：只讲 emo/fav 两个字段（不得出现 act / task_* / search / prepare_task_context / route_ 等词汇）、写清「台词或路由工具调用二选一」、`agent_enabled=False` 时不提路由、同 NPC 同开关状态跨轮逐字一致。
+3. Profile 匹配：表中每个模型名命中正确 Profile；未知模型落 DEFAULT。
+4. 降级链（mock HTTP）：思考参数 400→剥离重试成功；图像 400→去图重试成功且后续不再带图；两次都 400→上抛原始错误；401→不重试不上抛错码混淆。
+5. reasoning delta 不混入 content。
+6. 流式 usage 正确回收。

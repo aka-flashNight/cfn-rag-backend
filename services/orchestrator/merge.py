@@ -2,10 +2,18 @@
 
 规则（硬性产品规则，实现在此）：
 - 宽限 merge_grace_ms 内拿到 final → 直接汇合回复 #2（不发过渡语）；
-- 超时且有中间结果且未说过过渡语 → 过渡语 #2a（只说一次、只说大概、**不报数字**），
-  之后继续等 final → 汇合 #2b；
-- 无中间结果 → 等待（SSE 保活注释帧）→ final → 汇合；
+- 宽限期过后拿到中间结果且未说过过渡语 → 过渡语 #2a（只说一次、只说方向、
+  **不报数字**），之后继续等 final → 汇合 #2b；
+- 中间结果晚于宽限期到达时同样要说（bridge 排水遇到 intermediate 立即返回），
+  否则玩家会一直对着空白等草案拟完；
+- 始终无中间结果 → 等待（SSE 保活注释帧）→ final → 汇合；
 - 子 Agent 失败/超时 → FAIL_REPLY（NPC 人设话术，不甩错误码）。
+
+过渡语的口径（v3 再次重构定稿）：NPC **心里有大致方向**，只是细节还没敲定。
+既不能表现得茫然（像别人塞给它的活），也不能假装细节已经定了；只讲方向，
+不涉及物品名/数量/金额/人名/地名。方向措辞来自子 Agent 的 vague_note
+（TaskRunner 按 prepare 选出的真实 task_type 生成，见
+subagents.prompts.build_direction_vague_note）。
 
 LLM 调用预算：聊天主 Agent 每回合 ≤ 3 次（#1 + 过渡 #2a + 汇合 #2b）。
 """
@@ -31,7 +39,9 @@ from services.orchestrator.prompts import (
     TASK_MERGE_INSTRUCTION,
     TASK_UPDATE_MERGE_INSTRUCTION,
     build_merge_user_prompt,
+    task_merge_hint,
 )
+from services.subagents.prompts import DIRECTION_VAGUE_FALLBACK
 
 logger = logging.getLogger(__name__)
 
@@ -92,16 +102,27 @@ class MergeCoordinator:
     # ------------------------------------------------------------------
 
     def _phase_for(self, ev: Any) -> str:
-        if ev.kind == "intermediate":
-            return "repairing" if self.agent == "task" else "searching"
+        """agent_status 的 phase 一律由 ui_hint 推：只有「校验修正中」算 repairing。
+
+        v3 再次重构后 intermediate 有两种来源——prepare 完成（方向已定，仍在拟定）
+        和校验失败（确实在返工），前者不该报 repairing。
+        """
         if ev.kind == "failed":
             return "failed"
         if self.agent == "search":
             return "searching"
         return "repairing" if "修正" in (ev.ui_hint or "") else "drafting"
 
-    async def _drain(self, timeout: float) -> AsyncIterator[SSEEvent]:
-        """在 timeout 内消费子 Agent 事件；final/failed 记入 self._final_event 并返回。"""
+    async def _drain(
+        self, timeout: float, *, bridge_on_intermediate: bool = False,
+    ) -> AsyncIterator[SSEEvent]:
+        """在 timeout 内消费子 Agent 事件；final/failed 记入 self._final_event 并返回。
+
+        bridge_on_intermediate=True（宽限期过后的排水）时，收到 intermediate 立即
+        返回，把控制权交回 stream() 去说过渡语——否则晚于宽限期到达的中间结果
+        永远等不到说话时机。宽限期内的排水不带该标志：那段时间要先看 final
+        会不会紧跟着到，抢着说过渡话反而多余。
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
@@ -122,9 +143,14 @@ class MergeCoordinator:
                 return
             if ev.kind == "intermediate":
                 self.saw_intermediate = True
-                if ev.vague_note:
+                # 首条方向种子优先：任务流里 prepare 完成时推的是「这件事大致是
+                # 什么性质」，之后校验失败推的是「还在调整」。过渡语的职责是报方向，
+                # 被后到的调整话覆盖会让玩家觉得 NPC 自己也说不清要派什么活。
+                if ev.vague_note and not self._vague_note_cache:
                     self._vague_note_cache = ev.vague_note
             yield agent_status_event(self.agent, self._phase_for(ev), ev.ui_hint)
+            if bridge_on_intermediate and ev.kind == "intermediate":
+                return
 
     # ------------------------------------------------------------------
     # LLM 调用（流式，跳过模型可能冒出的 meta 行）
@@ -153,12 +179,15 @@ class MergeCoordinator:
             logger.warning("汇合回复调用失败: %s", exc)
 
     async def _interim_reply(self, vague_note: str) -> AsyncIterator[SSEEvent]:
-        """过渡语 #2a：1~2 句模糊过渡，禁止数字/物品名/金额（03 §3 硬性规则）。"""
+        """过渡语 #2a：1~2 句报方向的模糊过渡，禁止数字/物品名/金额（03 §3）。"""
         self.spoke_interim = True
         self.outcome.spoke_interim = True
+        direction = (vague_note or "").strip() or DIRECTION_VAGUE_FALLBACK
         result_block = (
-            "【后台进度】相关事项还在处理中（这是中间状态）。"
-            "硬性要求：本轮**绝对不要**说出任何具体数字、物品名、金额、任务细节。"
+            "【当前状况】这事是你自己在盘算的：方向你心里有数，只是具体怎么安排还没定下来，"
+            "也还没跟玩家说全。别表现得茫然（这不是谁塞给你的活），"
+            "也别假装细节已经敲定了。"
+            "硬性要求：本轮**绝对不要**说出任何具体数字、物品名、金额、人名、地名或任务细节。"
         )
         prompt = build_merge_user_prompt(
             npc_name=self.npc_name,
@@ -167,12 +196,20 @@ class MergeCoordinator:
             emotion=self.emotion,
             result_block=result_block,
             instruction=(
-                f"只输出 1~2 句过渡话（大意：{vague_note or '还在准备'}），"
-                "说完就停，不要展开。"
+                f"只输出 1~2 句过渡话，把方向点到为止：{direction}。"
+                "口吻是「先跟你打个招呼，容我把这事安排出来」，说完就停，"
+                "不要展开、不要追问玩家、不要许诺任何具体内容。"
             ),
         )
+        before = self.outcome.reply_text
         async for ev in self._stream_reply(prompt):
             yield ev
+        if self.outcome.reply_text == before:
+            # 过渡话调用也失败：补一句中性话填住静默期，别让玩家对着空白等草案
+            text = "稍等，容我把这事想周全。"
+            self.outcome.reply_text += text
+            self.outcome.reply_segments.append(text)
+            yield content_event(text)
 
     def _result_block(self, payload: dict[str, Any]) -> str:
         if self.agent == "search":
@@ -181,11 +218,15 @@ class MergeCoordinator:
         lines = ["【后台结果：任务草案】"]
         summary = (payload.get("draft_summary") or "").strip()
         lines.append(summary or "（草案信息缺失）")
-        if payload.get("fallback"):
-            lines.append("（注意：这是按最保守规则拟定的方案，说明时保持自然，不要显得敷衍）")
         deviation = (payload.get("deviation_note") or "").strip()
         if deviation:
             lines.append(f"偏离说明：{deviation}")
+        # 按任务类型条件拼接说明要点：摘要给的是「有什么」，这里补「讲的时候别漏什么」
+        hint = task_merge_hint(str(payload.get("task_type") or ""))
+        if hint:
+            lines.append(f"说明要点：{hint}")
+        if payload.get("fallback"):
+            lines.append("（注意：这是按最保守规则拟定的方案，说明时保持自然，不要显得敷衍）")
         return "\n".join(lines)
 
     def _merge_instruction(self) -> str:
@@ -200,21 +241,33 @@ class MergeCoordinator:
     # ------------------------------------------------------------------
 
     async def stream(self) -> AsyncIterator[SSEEvent]:
+        loop = asyncio.get_running_loop()
+        # 总预算 = 宽限期 + 子 Agent 超时；过渡语说完后剩余部分全用来等 final
+        deadline = loop.time() + self.grace_s + self.timeout_s
+
         # 1) 宽限期：拿到 final 直接汇合（不发过渡语）
         async for ev in self._drain(self.grace_s):
             yield ev
 
-        final_ev = self._final_event
-        if final_ev is None:
-            # 2) 有中间结果且未说过过渡语 → 过渡语 #2a（只说一次）
+        # 2) 宽限期已过仍无终态：等到「可说话的时机」——过渡语只说一次，
+        #    bridge 排水遇到 intermediate 立即返回，晚到的中间结果也不会漏说
+        while self._final_event is None:
             if self.saw_intermediate and not self.spoke_interim:
-                async for ev in self._interim_reply(self._last_vague_note):
+                async for ev in self._interim_reply(self._vague_note_cache):
                     yield ev
-            # 3) 继续等最终结果（保活由 _drain 产生）
-            async for ev in self._drain(self.timeout_s):
+                async for ev in self._drain(self._remaining(deadline)):
+                    yield ev
+                break
+            remaining = self._remaining(deadline)
+            if remaining <= 0:
+                break
+            # 过渡语说过之后不再 bridge：一路等到终态或预算耗尽
+            async for ev in self._drain(
+                remaining, bridge_on_intermediate=not self.spoke_interim,
+            ):
                 yield ev
-            final_ev = self._final_event
 
+        final_ev = self._final_event
         if final_ev is None:
             self.outcome.status = "timeout"
             self.outcome.payload = {"reason": "等待后台任务超时"}
@@ -268,6 +321,7 @@ class MergeCoordinator:
             self.outcome.reply_segments.append(text)
             yield content_event(text)
 
-    @property
-    def _last_vague_note(self) -> str:
-        return self._vague_note_cache or "委托内容还在调整"
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        """距总预算截止还剩多少秒（不为负）。"""
+        return max(0.0, deadline - asyncio.get_running_loop().time())

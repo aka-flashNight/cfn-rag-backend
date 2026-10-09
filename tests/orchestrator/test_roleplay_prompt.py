@@ -53,7 +53,7 @@ async def _seed_history(env, count: int) -> None:
 
 
 async def _one_turn(env, query: str = "你好", **kwargs) -> None:
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     await collect(_orch(env, query, **kwargs))
 
 

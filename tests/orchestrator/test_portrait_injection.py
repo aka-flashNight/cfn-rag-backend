@@ -20,7 +20,7 @@ from services.orchestrator.context import should_send_image
 from services.orchestrator.turn import TurnOrchestrator
 from services.orchestrator.prompts import build_static_system
 from services.npc.manager import NPCState
-from tests.orchestrator.conftest import NPC_NAME, collect
+from tests.orchestrator.conftest import NPC_NAME, collect, tc
 
 FAKE_IMAGE_URL = "data:image/webp;base64,QUJD"
 
@@ -91,7 +91,7 @@ def test_should_send_image_false_after_unsupported_mark():
 # ---------------------------------------------------------------------------
 
 async def test_vision_model_request_carries_image(env, inject_fake_portrait):
-    env.fake.add_stream(meta='{"emo":"微笑","fav":0,"act":null}', text="好呀。")
+    env.fake.add_stream(meta='{"emo":"微笑","fav":0}', text="好呀。")
     orch = _vision_orch(env, "今天干什么", current_emotion="生气")
     await collect(orch)
 
@@ -108,7 +108,7 @@ async def test_vision_model_request_carries_image(env, inject_fake_portrait):
 
 
 async def test_default_emotion_is_normal_when_no_current(env, inject_fake_portrait):
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="嗯。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = _vision_orch(env, "在吗", current_emotion=None)
     await collect(orch)
     # 首轮 meta 未出 → 用「普通」
@@ -116,7 +116,7 @@ async def test_default_emotion_is_normal_when_no_current(env, inject_fake_portra
 
 
 async def test_non_vision_model_never_has_image(env):
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="哦。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="哦。")
     orch = TurnOrchestrator(
         session_id=env.session_id,
         npc_name=NPC_NAME,
@@ -136,7 +136,7 @@ async def test_marked_unsupported_model_has_no_image(env, inject_fake_portrait):
     model = "vision-marked-orch-test"
     mark_image_unsupported(model)
     try:
-        env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="哦。")
+        env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="哦。")
         orch = TurnOrchestrator(
             session_id=env.session_id,
             npc_name=NPC_NAME,
@@ -161,7 +161,7 @@ async def test_portrait_failure_does_not_break_turn(env, monkeypatch):
         raise RuntimeError("PIL boom")
 
     monkeypatch.setattr("services.portraits.get_portrait_data_url", boom)
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="没事。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="没事。")
     orch = _vision_orch(env, "你好")
     events = await collect(orch)
     assert not [e for e in events if e.event == "error"]
@@ -171,7 +171,9 @@ async def test_portrait_failure_does_not_break_turn(env, monkeypatch):
 async def test_subagent_and_merge_calls_never_carry_image(env, inject_fake_portrait):
     """任何子 Agent / 汇合调用永不带图（07 §4）：merge 用的 base_messages 是纯文本。"""
     env.fake.add_stream(
-        meta='{"emo":"普通","fav":0,"act":null,"kind":"search","query":"废城"}', text="我查查。"
+        meta='{"emo":"普通","fav":0}',
+        text="",
+        tool_calls=[tc("route_search", {"query": "废城"})],
     )
     env.fake.add_chat(content='{"conclusion":"废城很危险"}')
     env.fake.add_stream(text="废城到处是天网残兵，别单独去。")

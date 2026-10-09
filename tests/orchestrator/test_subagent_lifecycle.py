@@ -9,7 +9,6 @@ from services.subagents import count_pending_subagent_tasks, get_session_subagen
 from tests.orchestrator.conftest import (
     NPC_NAME,
     collect,
-    contents_of,
     phases_of,
     tc,
 )
@@ -29,10 +28,11 @@ async def test_stale_subagent_cancelled_by_new_turn(env):
     env.deps.merge_grace_ms = 50
     env.deps.subagent_timeout_s = 0.4
 
-    # 回合 1：task_draft 的第一轮 LLM 调用挂起 5s → 汇合等待超时收场
+    # 回合 1：路由到任务 Agent，其第一轮 prepare 调用挂起 5s → 汇合等待超时收场
     env.fake.add_stream(
-        meta='{"emo":"微笑","fav":0,"act":{"kind":"task_draft","direction":"收集"}}',
-        text="我想想……",
+        meta='{"emo":"微笑","fav":0}',
+        text="",
+        tool_calls=[tc("route_task_draft", {"note": "玩家想找点活干"})],
     )
     env.fake.add_chat(delay=5.0, tool_calls=[tc("prepare_task_context", {
         "task_type": "资源收集",
@@ -47,7 +47,7 @@ async def test_stale_subagent_cancelled_by_new_turn(env):
     assert count_pending_subagent_tasks() == 1
 
     # 回合 2：新回合启动时取消旧子 Agent
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="好。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="好。")
     events2 = await collect(_orch(env, "先不聊任务"))
     assert events2[0].event == "meta"
     await asyncio.sleep(0.1)  # 等取消生效
@@ -58,8 +58,8 @@ async def test_stale_subagent_cancelled_by_new_turn(env):
 
 async def test_session_lock_serializes_concurrent_turns(env):
     """同会话两请求不交叉：第二个回合的全部事件在第一个回合 done 之后（03 §9.6）。"""
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="回答甲。")
-    env.fake.add_stream(meta='{"emo":"普通","fav":0,"act":null}', text="回答乙。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="回答甲。")
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="回答乙。")
 
     order: list[str] = []
 
@@ -74,8 +74,8 @@ async def test_session_lock_serializes_concurrent_turns(env):
 
 async def test_npc_favorability_not_lost_under_concurrency(env):
     """并发好感度更新不丢失（修 E1 的回合级验证）。"""
-    env.fake.add_stream(meta='{"emo":"微笑","fav":2,"act":null}', text="甲。")
-    env.fake.add_stream(meta='{"emo":"微笑","fav":3,"act":null}', text="乙。")
+    env.fake.add_stream(meta='{"emo":"微笑","fav":2}', text="甲。")
+    env.fake.add_stream(meta='{"emo":"微笑","fav":3}', text="乙。")
 
     async def run_one(query: str) -> None:
         async for _ in _orch(env, query).run():

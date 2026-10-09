@@ -1,15 +1,23 @@
 """TaskRunner：任务拟定/修改后台子 Agent（对应 docs/v3-developer/03 §5）。
 
-两种情形（按交流阶段 prepare 的成败分流）：
-- 情形 1（prepare 成功）：tools=[draft_agent_task]，候选池已在首轮 user 注入，直接 draft；
-- 情形 2（prepare 失败/参数非法/候选池空）：**不回炉交流 Agent**——先 tools=[prepare_task_context]
-  重新准备候选（必须继承 direction 思路），拿到候选后轮内动态收窄为 [draft_agent_task]。
+v3 再次重构（路由工具化）后只有两种模式：
+- draft：新草案。聊天主 Agent 只发路由声明，**不再预取候选**，所以本 Agent 每轮
+  新草案都自己走 tools=[prepare_task_context] → 拿到候选后轮内动态收窄为
+  [draft_agent_task]。task_type 由本 Agent 按选型规则自行判断，选错落进自己的
+  重试循环（校验打回后可换类型重新 prepare），不再像旧设计那样一旦交流阶段选错
+  就无法挽回。
+- update：讨价还价/小幅修改，tools=[update_task_draft]。
 
 事件：
-- 启动：progress（ui_hint「拟定委托中」/「准备候选中」）；
-- 校验失败：首次 intermediate（vague_note 只说类型不说数字，03 §3 硬性规则）；
+- 启动：progress（ui_hint「准备候选中」/「修改方案中」）；
+- prepare 完成：intermediate（vague_note 只给方向、不给具体内容）——聊天主 Agent
+  据此说一句模糊过渡话，填住拟定草案的静默期（03 §3）；
+- 校验失败：首次 intermediate（只说类型不说数字），之后降为 progress；
 - 终态：final（draft/draft_summary/bargain_count/deviation_note/fallback 等）；
 - LLM/工具失败：failed。
+
+定价卡依赖 task_type，而 task_type 要等 prepare 回来才知道，故 launch 时不注入，
+改由 _post_round_messages 在 prepare 完成后按真实类型补投（追加消息，system 前缀不变）。
 
 每一轮记 INFO 日志：轮次、工具表、结果 status、校验失败逐条摘要（可观测性）。
 """
@@ -22,6 +30,8 @@ import logging
 from typing import Any, Callable, Optional
 
 from services.agent_tools.handlers import execute_fallback_draft
+from services.agent_tools.pricing_rules import build_pricing_card
+from services.agent_tools.schemas import TASK_TYPES
 from services.llm import LLMClient
 from services.subagents.base import (
     AgentLabel,
@@ -32,6 +42,7 @@ from services.subagents.base import (
 )
 from services.subagents.prompts import (
     build_direction_for_task,
+    build_direction_vague_note,
     build_task_system,
     build_task_user,
 )
@@ -45,10 +56,12 @@ _UPDATE_TOOLS = ["update_task_draft"]
 
 _TERMINAL_STATUSES = ("draft_created", "draft_updated")
 
-# 拟定模式（情形 1 直接 draft；情形 2 先 prepare 再 draft）
 MODE_DRAFT = "draft"
-MODE_PREPARE_THEN_DRAFT = "prepare_then_draft"
 MODE_UPDATE = "update"
+
+# prepare 结果里出现任一类型专属字段即视为候选池已就绪
+_PREPARE_KEYS = {"collectable_items", "stage_list", "reward_item_candidates", "holdable_items",
+                 "equipment_items", "special_items", "npc_list", "challenge_targets", "stage_loot_list"}
 
 
 class TaskRunner(SubagentBase):
@@ -58,11 +71,14 @@ class TaskRunner(SubagentBase):
 
     def __init__(self, *, mode: str = MODE_DRAFT, **kwargs: Any) -> None:
         self.direction = str(kwargs.pop("direction", "") or "")
-        self._reward_hint = str(kwargs.pop("reward_hint", "") or "")
+        self.player_query = str(kwargs.pop("player_query", "") or "")
         super().__init__(**kwargs)
         self.mode = mode
         self._intermediate_sent = False
-        self._prepare_done = mode != MODE_PREPARE_THEN_DRAFT
+        self._prepare_done = mode != MODE_DRAFT
+        # prepare 的 task_type 只存在于调用参数里（工具返回不带），故单独记录
+        self._prepare_task_type = ""
+        self._pricing_injected = False
 
     # ------------------------------------------------------------------
     # 动态工具表（prepare 未完成时只给 prepare；完成后收窄为 draft/update）
@@ -81,6 +97,48 @@ class TaskRunner(SubagentBase):
             if tool is not None:
                 out.append(tool.to_openai_tool())
         return out
+
+    # ------------------------------------------------------------------
+    # prepare 参数捕获 → 定价卡补投 + 过渡方向
+    # ------------------------------------------------------------------
+
+    def _on_round_tool_calls(self, tool_calls: Optional[list[dict[str, Any]]]) -> None:
+        for tc in tool_calls or []:
+            func = tc.get("function", tc) if isinstance(tc, dict) else {}
+            if str(func.get("name", "") or "") != "prepare_task_context":
+                continue
+            raw = func.get("arguments") or "{}"
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("TaskRunner: prepare 参数解析失败: %.200s", str(raw))
+                continue
+            task_type = str((args or {}).get("task_type") or "").strip()
+            if task_type in TASK_TYPES:
+                self._prepare_task_type = task_type
+            else:
+                logger.warning("TaskRunner: prepare 的 task_type 非法: %r", task_type)
+
+    def _post_round_messages(self, results: list[tuple[str, Any, ToolContext]]) -> list[dict[str, Any]]:
+        if self.mode == MODE_UPDATE or self._pricing_injected or not self._prepare_done:
+            return []
+        if not self._prepare_task_type:
+            return []
+        self._pricing_injected = True
+        card = build_pricing_card(
+            task_type=self._prepare_task_type,
+            stage=self.ctx.player_progress,
+            affinity=self.ctx.npc_affinity,
+            game_data=self.ctx.game_data,
+        )
+        logger.info("TaskRunner 按 prepare 选型补投定价卡: task_type=%s", self._prepare_task_type)
+        return [{
+            "role": "user",
+            "content": (
+                f"【后台补充规则（候选已按 task_type={self._prepare_task_type} 取回，"
+                "拟定草案时按此计算奖励）】\n" + card
+            ),
+        }]
 
     # ------------------------------------------------------------------
     # 事件与日志
@@ -117,9 +175,19 @@ class TaskRunner(SubagentBase):
                     statuses)
 
         if saw_prepare and not self._prepare_done:
-            # prepare 完成 → 下一轮收窄为 draft
+            # prepare 完成 → 下一轮收窄为 draft，并请聊天主 Agent 说一句过渡话。
+            # vague_note 只给方向：过渡语的职责是填住静默期，说具体了会和最终草案打架。
             self._prepare_done = True
-            logger.info("TaskRunner 候选池已就绪，切换至 draft 节点")
+            note = build_direction_vague_note(self._prepare_task_type)
+            self._push(SubagentEvent(
+                kind="intermediate",
+                ui_hint="拟定委托中",
+                vague_note=note,
+            ))
+            logger.info(
+                "TaskRunner 候选池已就绪（task_type=%s），切换至 draft 节点并请求过渡话",
+                self._prepare_task_type or "未知",
+            )
 
         if saw_failure:
             if not self._intermediate_sent:
@@ -151,6 +219,8 @@ class TaskRunner(SubagentBase):
                 "repaired_notes": payload.get("repaired_notes") or [],
                 "deviation_note": self._extract_deviation_note(),
                 "fallback": bool((draft or {}).get("fallback")),
+                # 聊天主 Agent 按任务类型条件拼接说明要点（orchestrator.prompts.task_merge_hint）
+                "task_type": self._prepare_task_type or (draft or {}).get("task_type", ""),
             }
         return None
 
@@ -166,10 +236,11 @@ class TaskRunner(SubagentBase):
     async def _on_exhausted(self) -> Optional[dict[str, Any]]:
         """轮限耗尽 → 后端兜底草案（仅当模型始终未交出结构完整草案时才会走到）。"""
         self._push(SubagentEvent(kind="progress", ui_hint="生成保底方案"))
-        logger.warning("TaskRunner 轮限耗尽（draft 未成功），触发后端兜底草案: direction=%s", self.direction)
+        direction = self.direction or self.player_query
+        logger.warning("TaskRunner 轮限耗尽（draft 未成功），触发后端兜底草案: direction=%s", direction)
         outcome = execute_fallback_draft(
-            direction=self.direction,
-            reward_hint=self._reward_hint,
+            direction=direction,
+            reward_hint="",
             npc_name=self.ctx.npc_name,
             npc_faction=self.ctx.npc_faction,
             npc_challenge=self.ctx.npc_challenge,
@@ -197,6 +268,7 @@ class TaskRunner(SubagentBase):
             "deviation_note": "",
             "fallback": True,
             "fallback_note": payload.get("fallback_note", ""),
+            "task_type": (outcome.draft or {}).get("task_type", ""),
         }
 
     # ------------------------------------------------------------------
@@ -208,14 +280,11 @@ class TaskRunner(SubagentBase):
         kind: SubagentKind,
         llm: LLMClient,
         registry: ToolRegistry,
-        direction: str,
-        reward_hint: str = "",
+        direction: str = "",
+        player_query: str = "",
         note: str = "",
-        prepared_context: Optional[str] = None,
-        prepare_error: str = "",
         recent_dialogue: str = "",
         memory_summary: str = "",
-        player_query: str = "",
         npc_name: str,
         npc_faction: str = "",
         npc_titles: Optional[list[str]] = None,
@@ -227,6 +296,9 @@ class TaskRunner(SubagentBase):
         pending_draft: Optional[dict[str, Any]] = None,
         bargain_count: int = 0,
         draft_commit_valid: bool = False,
+        has_shop: bool = False,
+        shop_reward_types: Optional[list[str]] = None,
+        player_can_challenge: bool = False,
         game_data: Any = None,
         rag_context_text: Optional[str] = None,
         retrieve_fn: Optional[Callable[[str], str]] = None,
@@ -235,17 +307,12 @@ class TaskRunner(SubagentBase):
         """构造并启动后台任务，返回 Handle。
 
         - kind=task_update：update 模式（讨价还价），tools=[update_task_draft]；
-        - kind=task_draft 且 prepared_context 非空：情形 1，tools=[draft]；
-        - kind=task_draft 且 prepared_context 为空：情形 2，先 prepare 后 draft（动态收窄）。
+        - kind=task_draft：draft 模式，先 prepare 后 draft（工具表轮内动态收窄）。
         """
-        if kind == "task_update":
-            mode = MODE_UPDATE
-            task_type = str((pending_draft or {}).get("task_type") or "")
-        else:
-            prepared_ok = bool((prepared_context or "").strip())
-            mode = MODE_DRAFT if prepared_ok else MODE_PREPARE_THEN_DRAFT
-            # task_type 用于定价卡：从 prepared_context 解析；情形 2 由后端兜底解析
-            task_type = _task_type_from_prepared(prepared_context) or _guess_task_type(direction)
+        mode = MODE_UPDATE if kind == "task_update" else MODE_DRAFT
+        # update 的定价/讨价卡在 launch 时就能算（task_type 来自既有草案）；
+        # draft 的 task_type 要等 prepare，故此处为空串，定价卡走 _post_round_messages
+        task_type = str((pending_draft or {}).get("task_type") or "") if mode == MODE_UPDATE else ""
 
         ctx = ToolContext(
             npc_name=npc_name,
@@ -267,13 +334,16 @@ class TaskRunner(SubagentBase):
             task_type=task_type,
             stage=ctx.player_progress,
             affinity=npc_affinity,
-            prepare_error=prepare_error,
+            has_shop=has_shop,
+            shop_reward_types=shop_reward_types,
+            has_challenge=bool((npc_challenge or "").strip()),
+            player_can_challenge=player_can_challenge,
         )
         if mode == MODE_UPDATE:
             from services.agent_tools.draft_formatting import _detailed_draft_summary
 
             user = build_task_user(
-                direction_block=build_direction_for_task(direction="", note=note or ""),
+                direction_block=build_direction_for_task(player_query=player_query, note=note or ""),
                 recent_dialogue=recent_dialogue,
                 memory_summary=memory_summary,
                 npc_name=npc_name,
@@ -286,14 +356,12 @@ class TaskRunner(SubagentBase):
                 player_note=note or "",
             )
         else:
-            candidates = prepared_context or ""
             user = build_task_user(
                 direction_block=build_direction_for_task(
-                    direction=direction, reward_hint=reward_hint, note=note,
+                    direction=direction, player_query=player_query,
                 ),
                 recent_dialogue=recent_dialogue,
                 memory_summary=memory_summary,
-                candidates_block=candidates,
                 npc_name=npc_name,
                 npc_faction=npc_faction,
                 npc_titles=npc_titles,
@@ -304,7 +372,7 @@ class TaskRunner(SubagentBase):
         runner = cls(
             mode=mode,
             direction=direction,
-            reward_hint=reward_hint,
+            player_query=player_query,
             llm=llm,
             registry=registry,
             tool_names=[],  # 动态表见 _tools_schema
@@ -315,45 +383,9 @@ class TaskRunner(SubagentBase):
             queue=asyncio.Queue(),
         )
         runner.kind = kind
-        runner.default_ui_hint = "准备候选中" if mode == MODE_PREPARE_THEN_DRAFT else (
-            "修改方案中" if mode == MODE_UPDATE else "拟定委托中"
-        )
+        runner.default_ui_hint = "修改方案中" if mode == MODE_UPDATE else "准备候选中"
         logger.info(
-            "TaskRunner 启动: kind=%s mode=%s task_type=%s prepared=%s rounds=%d",
-            kind, mode, task_type, bool(prepared_context), max_rounds,
+            "TaskRunner 启动: kind=%s mode=%s task_type=%s rounds=%d",
+            kind, mode, task_type or "待 prepare 决定", max_rounds,
         )
         return SubagentHandle(kind=kind, agent="task", coro=runner.run(), events=runner.queue)
-
-
-_PREPARE_KEYS = {"collectable_items", "stage_list", "reward_item_candidates", "holdable_items",
-                 "equipment_items", "special_items", "npc_list", "challenge_targets", "stage_loot_list"}
-
-
-def _task_type_from_prepared(prepared_context: Optional[str]) -> str:
-    """从 prepare 结果 JSON 推断 task_type（定价卡用；解析失败返回空串）。"""
-    if not prepared_context:
-        return ""
-    try:
-        data = json.loads(prepared_context)
-    except (json.JSONDecodeError, TypeError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    if data.get("stage_list") or data.get("challenge_targets") or data.get("stage_loot_list"):
-        return "通关"
-    if data.get("npc_list"):
-        return "问候"
-    if data.get("equipment_items"):
-        return "装备缴纳"
-    if data.get("special_items"):
-        return "特殊物品获取"
-    if data.get("holdable_items"):
-        return "物品持有"
-    return "资源收集"
-
-
-def _guess_task_type(direction: str) -> str:
-    """prepare 失败时的类型兜底解析（与 fallback.detect_task_type 同规则）。"""
-    from services.agent_tools.fallback import detect_task_type
-
-    return detect_task_type(direction)

@@ -32,7 +32,6 @@ from services.llm.errors import (
 )
 from services.llm.meta import (
     Meta,
-    MetaAct,
     meta_prompt_block,
     parse_meta_obj,
     split_meta,
@@ -61,7 +60,6 @@ __all__ = [
     "is_param_error",
     "is_tools_unsupported_error",
     "Meta",
-    "MetaAct",
     "meta_prompt_block",
     "parse_meta_obj",
     "split_meta",
