@@ -172,6 +172,11 @@ async def test_task_draft_with_interim_rule(env):
     interim_prompt = env.fake.stream_requests[1].messages[-1]["content"]
     assert build_direction_vague_note("资源收集") in interim_prompt
     assert "绝对不要" in interim_prompt
+    # 过渡语不再给固定口吻模板：真机上模型会逐字照抄，且跨轮重复同一句，
+    # 读起来像念稿；「稍后再细讲」还与紧接着的汇合详述自相矛盾。
+    assert "先跟你打个招呼" not in interim_prompt
+    assert "不要照搬固定句式" in interim_prompt
+    assert "不要许诺稍后再细讲" in interim_prompt
 
     # 汇合详述 + 按任务类型条件拼接的说明要点 + 系统通知
     assert MERGE_REPLY_TASK in all_text
