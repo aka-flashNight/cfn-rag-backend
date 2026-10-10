@@ -16,7 +16,6 @@ class DraftAgentTaskTool(BaseTool):
         "任务发布流程 Step 2：根据 prepare_task_context 返回的候选生成结构化任务草案并做合法性校验。"
         "成功返回 draft_id 与 draft_summary；校验失败返回全量 issues（含 root_cause/fix_hint/candidates）"
         "与当前草案快照，请按 fix_hint 逐条修正后重试。"
-        "此时不应写入任务描述与接取/完成对话——它们只在 confirm_agent_task 时填入。"
     )
     parameters_schema = DRAFT_AGENT_TASK_PARAMETERS_SCHEMA
 

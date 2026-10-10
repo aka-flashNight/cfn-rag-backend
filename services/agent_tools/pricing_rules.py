@@ -124,7 +124,6 @@ def build_bargain_card(*, stage: int, affinity: int, task_type: str, game_data: 
         f"2. 当前区间 [{lo}, {hi}]，讨价还价时上限放宽 ×{BARGAIN_RATE}（→ [{lo}, {int(hi * BARGAIN_RATE)}]，下限不变），"
         "修改后的 rewards 总价必须落在放宽后的区间内。",
         "3. 讨价还价最多 2 次（已计入计数）；超过会返回错误，此时应向玩家说明无法再让步。",
-        "4. 不要传 description / get_dialogue / finish_dialogue（只在玩家接受发布时写入）。",
     ])
 
 

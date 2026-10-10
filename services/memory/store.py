@@ -548,17 +548,6 @@ class MemoryStore:
     # 草案过期计数（连续 N 次 ask 未触碰任务工具即删除）
     # ------------------------------------------------------------------
 
-    # 任务相关工具名（触碰即视为「任务轮」，计数归零）
-    TASK_RELATED_TOOL_NAMES = frozenset(
-        {
-            "prepare_task_context",
-            "draft_agent_task",
-            "update_task_draft",
-            "confirm_agent_task",
-            "cancel_agent_task",
-        }
-    )
-
     def get_rounds_without_task_sync(self, session_id: str) -> int:
         session_id = session_id.strip()
         if not session_id:

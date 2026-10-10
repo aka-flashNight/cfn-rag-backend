@@ -105,7 +105,7 @@ def _title_duplicate_warning(
         "step": "TITLE_DUPLICATE",
         "warning": (
             f"当前草案标题「{s}」与已有任务重复。"
-            "建议在 confirm_agent_task 时适当调整标题内容。"
+            "建议调整标题内容。"
         ),
         "title": s,
     }
@@ -296,11 +296,7 @@ def execute_update_task_draft(
         return DraftOpOutcome(result_json=json.dumps(
             {
                 "status": "error",
-                "message": (
-                    "modify_fields 不能为空。"
-                    "任务说明与接取/完成对话请仅在玩家接受任务时通过 confirm_agent_task 传入，"
-                    "不要写在 update_task_draft 中。"
-                ),
+                "message": "modify_fields 不能为空。任务说明与接取/完成对话不在此工具的修改范围内。",
             },
             ensure_ascii=False,
         ))

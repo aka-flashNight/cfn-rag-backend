@@ -73,6 +73,17 @@ PREPARE_SELECTION_GUIDE = """\
 """
 
 
+# draft_agent_task 的字段要求：draft 全流程与 update 的重拟路径共用
+_DRAFT_FIELD_REQUIREMENTS = (
+    "【draft_agent_task 字段要求】\n"
+    "- task_type 必须与你 prepare 时选的类型一致；只有该类型要求的字段才填"
+    "（收集类填 finish_submit_items/finish_contain_items，战斗类填 finish_requirements，"
+    "通关并收集/持有两者都填，问候/传话可全空）。\n"
+    "- rewards 是玩家得到的东西，finish_submit_items 是玩家交给你的东西，两者禁止同名物品。\n"
+    "- 物品数量参考候选列表标注的数量范围；奖励物品从候选列表中选（候选即合规）。"
+)
+
+
 def build_capability_block(
     *,
     has_shop: bool,
@@ -117,13 +128,34 @@ def build_task_system(
 
     draft 模式 launch 时 task_type 未知，定价卡留到 prepare 回来后由
     TaskRunner._post_round_messages 按真实类型补投。
+    update 模式默认只做局部修改；仅玩家明确要求整体换向时走 prepare→draft 重拟，
+    因此选型规则、报酬能力与字段要求块在两种模式下都注入（重拟需要它们）。
     """
     parts = [_TASK_COORDINATOR_BASE]
     if mode == "update":
         parts.append(build_bargain_card(stage=stage, affinity=affinity, task_type=task_type))
         parts.append(
+            "【整体重拟（少数情况才用）】\n"
+            "默认一律用 update_task_draft 局部修改当前草案；**除非玩家明确要求把任务方向整个换掉**"
+            "（如「这活我不干了，给我换件别的」「别让我打怪了，找个跑腿的活」），"
+            "否则不要调用 prepare_task_context。\n"
+            "确需重拟时按两步式流程重走一遍（新草案整体替换当前草案）：先调用 "
+            "prepare_task_context 取候选池（task_type 由你按下面的选型规则决定），"
+            "拿到候选后再调用 draft_agent_task 提交新草案。"
+        )
+        parts.append(PREPARE_SELECTION_GUIDE)
+        parts.append(build_capability_block(
+            has_shop=has_shop,
+            shop_reward_types=shop_reward_types,
+            has_challenge=has_challenge,
+            player_can_challenge=player_can_challenge,
+        ))
+        parts.append(_DRAFT_FIELD_REQUIREMENTS)
+        parts.append(
             "【输出要求】\n"
-            "- 只调用 update_task_draft 修改草案；修改完成后输出一句总结，不要复述全文。"
+            "- 常规修改只调用 update_task_draft；"
+            "只有确需重拟时才走 prepare_task_context → draft_agent_task。\n"
+            "- 修改或重拟完成后输出一句总结，不要复述全文。"
         )
         return "\n\n".join(parts)
 
@@ -139,15 +171,7 @@ def build_task_system(
         "【本次流程】先调用 prepare_task_context 取候选池（task_type 由你按上面的选型规则决定），"
         "拿到候选后立即调用 draft_agent_task 提交草案。奖励定价规则会在候选回来后一并给你。"
     )
-    parts.append(
-        "【draft_agent_task 字段要求】\n"
-        "- task_type 必须与你 prepare 时选的类型一致；只有该类型要求的字段才填"
-        "（收集类填 finish_submit_items/finish_contain_items，战斗类填 finish_requirements，"
-        "通关并收集/持有两者都填，问候/传话可全空）。\n"
-        "- rewards 是玩家得到的东西，finish_submit_items 是玩家交给你的东西，两者禁止同名物品。\n"
-        "- 物品数量参考候选列表标注的数量范围；奖励物品从候选列表中选（候选即合规）。\n"
-        "- 不要填 description / get_dialogue / finish_dialogue（玩家接受发布时才写入）。"
-    )
+    parts.append(_DRAFT_FIELD_REQUIREMENTS)
     parts.append(
         "【输出要求】\n"
         "- 每轮只输出 tool_calls（或等待工具结果），不要输出与任务无关的对话。\n"

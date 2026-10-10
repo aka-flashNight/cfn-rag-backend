@@ -14,6 +14,11 @@ Anthropic-style Agent Skills registry (YAML frontmatter + Markdown body).
 Level 1: ``list_skills`` 返回 {name, description} 简表进入上下文
 Level 2: ``read_skill(skill_name)`` 返回完整 body
 Level 3: ``read_skill_file(skill_name, file)`` 返回 references/xxx 附件
+
+当前状态（2026-10-10）：本通道**暂时未使用**——各子 Agent 的规则已全部前置内联，
+``list_skills / read_skill / read_skill_file`` 三个元工具不在任何 LLM 工具表内。
+整目录与元工具、技能文档一并保留，以备后续可能的复杂 SOP 流程场景重启
+（例如「更改游戏对话」的子 Agent 可能需要多步流程说明）。
 """
 
 from __future__ import annotations

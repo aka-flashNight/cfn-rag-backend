@@ -153,8 +153,6 @@ def _detailed_draft_summary(
     _desc = draft.get("description")
     if isinstance(_desc, str) and _desc.strip():
         lines.append(f"描述: {_desc}")
-    else:
-        lines.append("描述: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
     npc_name_fallback = draft.get("npc_name") or "?"
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
     lines.append(f"完成NPC: {draft.get('finish_npc') or npc_name_fallback}")
@@ -215,8 +213,6 @@ def _detailed_draft_summary(
         get_text = draft.get("get_conversation_text", "")
         if isinstance(get_text, str) and get_text.strip():
             lines.append(f"接取对话(旧字段): {get_text.strip()[:120]}{'…' if len(get_text.strip()) > 120 else ''}")
-        else:
-            lines.append("接取对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     finish_dialogue = draft.get("finish_dialogue")
     finish_summary = _summarize_dialogue(finish_dialogue)
@@ -226,8 +222,6 @@ def _detailed_draft_summary(
         finish_text = draft.get("finish_conversation_text", "")
         if isinstance(finish_text, str) and finish_text.strip():
             lines.append(f"完成对话(旧字段): {finish_text.strip()[:120]}{'…' if len(finish_text.strip()) > 120 else ''}")
-        else:
-            lines.append("完成对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     entity_lines = _build_draft_entity_context_lines(
         draft, game_data, rag_context_text=rag_context_text,

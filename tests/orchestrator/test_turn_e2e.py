@@ -63,6 +63,15 @@ def _tool_names_per_round(env) -> list[list[str]]:
     ]
 
 
+def _subagent_blob(env) -> str:
+    """任务子 Agent 全部轮次的可见文本（messages + 工具表），锁禁词用。"""
+    parts: list[str] = []
+    for req in env.fake.chat_requests:
+        parts.append("\n".join(str(m.get("content", "")) for m in req.messages))
+        parts.append(str(req.tools))
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # 1. 纯聊天：meta → content×N → done
 # ---------------------------------------------------------------------------
@@ -168,6 +177,13 @@ async def test_task_draft_with_interim_rule(env):
     assert MERGE_REPLY_TASK in all_text
     merge_prompt = env.fake.stream_requests[2].messages[-1]["content"]
     assert task_merge_hint("资源收集") in merge_prompt
+    # 汇合 #2b 必须看得见过渡语：第二次生成要顺着第一次说过的话说（同回合内衔接）
+    assert "【你本轮已经说过的话（已推送给玩家，衔接它继续说，不要重复）】" in merge_prompt
+    assert "缺些东西，得让人替我弄回来，稍等我一下。" in merge_prompt
+    # 纯净化锁：三次聊天主 Agent 调用（路由/过渡/汇合）不含未注册工具的任何字样
+    for req in env.fake.stream_requests:
+        blob = "\n".join(str(m.get("content", "")) for m in req.messages) + "\n" + str(req.tools)
+        assert "prepare" not in blob.lower()
     assert "任务草案已拟定，等待确认" in notices_of(events)
     assert events[-1].event == "done"
 
@@ -201,6 +217,8 @@ async def test_task_draft_within_grace_no_interim(env):
     # 只有两次流式调用：路由 #1 + 汇合 #2（没有过渡语 #2a）
     assert len(env.fake.stream_requests) == 2
     assert MERGE_REPLY_TASK in "".join(contents_of(events))
+    # 本轮什么都没说过 → 汇合提示词不注入「已说过的话」块
+    assert "【你本轮已经说过的话" not in env.fake.stream_requests[1].messages[-1]["content"]
     assert "任务草案已拟定，等待确认" in notices_of(events)
 
 
@@ -218,9 +236,27 @@ async def test_transition_line_when_prepare_finishes_after_grace(env):
 
     assert len(env.fake.stream_requests) == 3  # 路由 + 过渡 + 汇合
     assert build_direction_vague_note("资源收集") in env.fake.stream_requests[1].messages[-1]["content"]
+    # 晚到的中间结果说出的过渡语同样要进汇合 #2b 的「已说过的话」块
+    assert "缺些东西，得让人替我弄回来，稍等。" in env.fake.stream_requests[2].messages[-1]["content"]
     assert "缺些东西" in "".join(contents_of(events))
     assert MERGE_REPLY_TASK in "".join(contents_of(events))
     assert phases_of(events)[-1] == ("task", "done")
+
+
+async def test_interim_fallback_line_flows_into_merge_prompt(env):
+    """过渡语调用哑火走静态兜底：兜底话也要并入「已说过的话」，汇合 #2b 顺着它说。"""
+    env.deps.merge_grace_ms = 50
+    env.deps.subagent_timeout_s = 5
+    _route(env, "route_task_draft", {"note": "玩家想找点活干"})
+    env.fake.add_chat(delay=0.3, tool_calls=[tc("prepare_task_context", PREPARE_COLLECT, call_id="p1")])
+    env.fake.add_chat(tool_calls=[tc("draft_agent_task", DRAFT_VALID)])
+    env.fake.add_stream(text="")  # 过渡语 #2a 哑火 → 静态兜底
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    events = await collect(_orch(env, "有什么活吗？"))
+
+    assert "稍等，容我把这事想周全。" in "".join(contents_of(events))
+    assert "稍等，容我把这事想周全。" in env.fake.stream_requests[2].messages[-1]["content"]
 
 
 async def test_task_draft_narrows_tools_and_injects_pricing_card(env):
@@ -383,11 +419,56 @@ async def test_task_bargain_update(env):
     events = await collect(_orch(env, "奖励太少了，加点"))
 
     assert phases_of(events) == [("task", "drafting"), ("task", "done")]
-    assert _tool_names_per_round(env) == [["update_task_draft"]]
+    # update 初表带 prepare（重拟用），但本回合模型只调了 update_task_draft
+    assert _tool_names_per_round(env) == [["update_task_draft", "prepare_task_context"]]
     assert "任务草案已更新，等待确认" in notices_of(events)
     row = await env.store.get_draft(env.session_id)
     assert row.draft["rewards"] == [{"item_name": "金币", "count": 25000}]
     assert row.bargain_count == 1  # 讨价还价计数（独立列）
+
+
+async def test_task_update_redraft_via_prepare_and_draft(env):
+    """玩家明确要求整体换向：update 轮走 prepare→draft 重拟，工具表轮内收窄、新草案替换旧的。"""
+    await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
+    _route(env, "route_task_update", {"note": "玩家要彻底换一件"}, meta='{"emo":"普通","fav":0}')
+    env.fake.add_chat(tool_calls=[tc("prepare_task_context", PREPARE_COLLECT, call_id="p1")])
+    env.fake.add_chat(tool_calls=[tc("draft_agent_task", DRAFT_VALID)])
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    events = await collect(_orch(env, "这活我不干了，给我换件别的"))
+
+    # 初表 [update+prepare] → prepare 完成收窄为 [draft]（重走两步式生成）
+    assert _tool_names_per_round(env) == [
+        ["update_task_draft", "prepare_task_context"],
+        ["draft_agent_task"],
+    ]
+    # update 系统提示词里写明触发限制（除非玩家明确要求整体换向，否则不调用 prepare）
+    system_prompt = env.fake.chat_requests[0].messages[0]["content"]
+    assert "除非玩家明确要求把任务方向整个换掉" in system_prompt
+    assert "任务草案已更新，等待确认" in notices_of(events)
+    row = await env.store.get_draft(env.session_id)
+    assert row is not None and row.draft["draft_id"] != "testd001"  # 新草案整体替换旧草案
+
+
+async def test_task_update_redraft_speaks_interim_after_grace(env):
+    """update 重拟路径：prepare 晚于宽限期完成 → 照常说过渡语（与 draft 流程同规矩）。"""
+    env.deps.merge_grace_ms = 50
+    env.deps.subagent_timeout_s = 5
+    await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
+    _route(env, "route_task_update", {"note": "玩家要彻底换一件"}, meta='{"emo":"普通","fav":0}')
+    env.fake.add_chat(delay=0.3, tool_calls=[tc("prepare_task_context", PREPARE_COLLECT, call_id="p1")])
+    env.fake.add_chat(tool_calls=[tc("draft_agent_task", DRAFT_VALID)])
+    env.fake.add_stream(text="缺些东西，得让人替我弄回来，稍等。")
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    events = await collect(_orch(env, "这活我不干了，给我换件别的"))
+
+    assert len(env.fake.stream_requests) == 3  # 路由 + 过渡 + 汇合
+    assert build_direction_vague_note("资源收集") in env.fake.stream_requests[1].messages[-1]["content"]
+    assert "缺些东西，得让人替我弄回来，稍等。" in env.fake.stream_requests[2].messages[-1]["content"]
+    assert "缺些东西" in "".join(contents_of(events))
+    assert "任务草案已更新，等待确认" in notices_of(events)
+    assert phases_of(events)[-1] == ("task", "done")
 
 
 async def test_task_update_without_draft_degrades_to_new_draft(env):
@@ -516,3 +597,56 @@ async def test_confirm_args_sanitizer_fills_placeholder(env):
     assert args is not None
     assert args["get_dialogue"][0]["text"] == "交给你了。"
     assert args["finish_dialogue"][0]["text"] == "干得漂亮，报酬一分不少。"  # 占位补齐
+
+
+# ---------------------------------------------------------------------------
+# 任务子 Agent 提示词纯度（禁词锁）
+# ---------------------------------------------------------------------------
+
+# description 是工具 schema 的 JSON 键，无法作子串禁词，只锁其余两个字段名
+_SUBAGENT_FORBIDDEN = (
+    "confirm_agent_task",       # 确认机制不在任何一轮的工具表里：零提及
+    "尚未写入",                 # 不描述字段缺席状态
+    "不要填", "不要传",         # 不对本轮不会做的动作加否定式保护句
+    "get_dialogue", "finish_dialogue",
+)
+
+
+async def test_task_draft_prompts_clean_of_confirm_mechanism(env):
+    """draft 全程（prepare 轮 + draft 轮）的可见文本零提及确认机制与字段缺席状态。"""
+    env.deps.merge_grace_ms = 500
+    _route(env, "route_task_draft", {"note": "玩家想找点活干"})
+    env.fake.add_chat(tool_calls=[tc("prepare_task_context", PREPARE_COLLECT, call_id="p1")])
+    env.fake.add_chat(tool_calls=[tc("draft_agent_task", DRAFT_VALID)])
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    await collect(_orch(env, "有什么活吗？"))
+
+    blob = _subagent_blob(env)
+    assert "【draft_agent_task 字段要求】" in blob  # 前提：确实在看任务子 Agent 的请求
+    for word in _SUBAGENT_FORBIDDEN:
+        assert word not in blob
+
+
+async def test_task_update_prompts_clean_of_confirm_mechanism(env):
+    """update 轮（含 confirm 专属字段被拒的往返）：可见文本同样零提及。"""
+    await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
+    env.deps.merge_grace_ms = 500
+    _route(env, "route_task_update", {"note": "玩家嫌奖励少"}, meta='{"emo":"普通","fav":0}')
+    # 第一轮模型擅自改 description（confirm 专属）→ 被拒，拒绝文案不得点名确认机制
+    env.fake.add_chat(tool_calls=[tc("update_task_draft", {
+        "draft_id": "testd001",
+        "modify_fields": {"description": "想改任务说明"},
+    }, call_id="u1")])
+    env.fake.add_chat(tool_calls=[tc("update_task_draft", {
+        "draft_id": "testd001",
+        "modify_fields": {"rewards": [{"item_name": "金币", "count": 25000}]},
+    })])
+    env.fake.add_stream(text=MERGE_REPLY_TASK)
+
+    await collect(_orch(env, "奖励太少了，加点"))
+
+    blob = _subagent_blob(env)
+    assert "modify_fields 不能为空" in blob  # 前提：被拒错误确实回给了模型
+    for word in _SUBAGENT_FORBIDDEN:
+        assert word not in blob

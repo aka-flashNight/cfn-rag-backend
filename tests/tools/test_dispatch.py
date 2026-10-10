@@ -133,3 +133,20 @@ def test_batch_malformed_arguments_become_empty_dict():
     ))
     assert len(results) == 1
     assert tool.seen_ctx[0] is not None
+
+
+def test_all_llm_tool_tables_are_registered():
+    """聊天主 Agent 与子 Agent 的全部工具表名都必须已注册（未注册会被 _tools_schema 静默跳过）。"""
+    from services.subagents.search_runner import SEARCH_TOOLS
+    from services.subagents.task_runner import _DRAFT_TOOLS, _PREPARE_TOOLS, _UPDATE_TOOLS
+    from services.tools import get_tool_registry
+    from services.tools.base import ROUTE_TOOLS_DRAFT, ROUTE_TOOLS_NEW
+
+    registry = get_tool_registry()
+    names = [
+        *ROUTE_TOOLS_NEW, *ROUTE_TOOLS_DRAFT,
+        *_PREPARE_TOOLS, *_DRAFT_TOOLS, *_UPDATE_TOOLS,
+        *SEARCH_TOOLS,
+    ]
+    missing = [n for n in names if registry.get(n) is None]
+    assert missing == []

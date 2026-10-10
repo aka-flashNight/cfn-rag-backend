@@ -15,9 +15,8 @@ class UpdateTaskDraftTool(BaseTool):
     description = (
         "局部修改已有草案并触发增量校验（仅校验变更字段）。"
         "常用于玩家讨价还价（调整奖励/提交品/持有品）或微调关卡/难度；"
-        "不要传 description / get_dialogue / finish_dialogue —— 这三项仅在 confirm_agent_task 时写入。"
-        "讨价还价次数上限 2；玩家大幅改任务方向时请改用 prepare_task_context + draft_agent_task 整体重拟。"
-        "详细协商规则请通过 read_skill(name=\"task-bargaining\") 查阅。"
+        "讨价还价次数上限 2；仅当玩家明确要求大幅改变任务方向时，才改用 "
+        "prepare_task_context + draft_agent_task 整体重拟。"
     )
     parameters_schema = UPDATE_TASK_DRAFT_PARAMETERS_SCHEMA
 

@@ -6,7 +6,9 @@ v3 再次重构（路由工具化）后只有两种模式：
   [draft_agent_task]。task_type 由本 Agent 按选型规则自行判断，选错落进自己的
   重试循环（校验打回后可换类型重新 prepare），不再像旧设计那样一旦交流阶段选错
   就无法挽回。
-- update：讨价还价/小幅修改，tools=[update_task_draft]。
+- update：讨价还价/小幅修改，初表 tools=[update_task_draft, prepare_task_context]。
+  仅当玩家明确要求整体改变任务方向时才走重拟：调用 prepare_task_context（拿到候选后
+  轮内动态收窄为 [draft_agent_task]）提交新草案整体替换，等于重走两步式生成。
 
 事件：
 - 启动：progress（ui_hint「准备候选中」/「修改方案中」）；
@@ -52,7 +54,8 @@ logger = logging.getLogger(__name__)
 
 _DRAFT_TOOLS = ["draft_agent_task"]
 _PREPARE_TOOLS = ["prepare_task_context"]
-_UPDATE_TOOLS = ["update_task_draft"]
+# update 初表：常规修改走 update；玩家明确要求整体换向时才用 prepare 重拟（罕见路径）
+_UPDATE_TOOLS = ["update_task_draft", "prepare_task_context"]
 
 _TERMINAL_STATUSES = ("draft_created", "draft_updated")
 
@@ -75,22 +78,25 @@ class TaskRunner(SubagentBase):
         super().__init__(**kwargs)
         self.mode = mode
         self._intermediate_sent = False
-        self._prepare_done = mode != MODE_DRAFT
+        # 两种模式都从「prepare 未完成」起步：draft 先只给 prepare；update 给
+        # [update + prepare]，prepare 完成（重拟路径触发）后才收窄为 draft
+        self._prepare_done = False
         # prepare 的 task_type 只存在于调用参数里（工具返回不带），故单独记录
         self._prepare_task_type = ""
         self._pricing_injected = False
 
     # ------------------------------------------------------------------
-    # 动态工具表（prepare 未完成时只给 prepare；完成后收窄为 draft/update）
+    # 动态工具表（prepare 前：draft 只给 prepare，update 给 update+prepare；
+    # prepare 完成后统一收窄为 draft）
     # ------------------------------------------------------------------
 
     def _tools_schema(self) -> list[dict[str, Any]]:
-        if self.mode == MODE_UPDATE:
-            names = _UPDATE_TOOLS
-        elif not self._prepare_done:
-            names = _PREPARE_TOOLS
-        else:
+        if self._prepare_done:
             names = _DRAFT_TOOLS
+        elif self.mode == MODE_UPDATE:
+            names = _UPDATE_TOOLS
+        else:
+            names = _PREPARE_TOOLS
         out: list[dict[str, Any]] = []
         for name in names:
             tool = self.registry.get(name)
@@ -120,9 +126,7 @@ class TaskRunner(SubagentBase):
                 logger.warning("TaskRunner: prepare 的 task_type 非法: %r", task_type)
 
     def _post_round_messages(self, results: list[tuple[str, Any, ToolContext]]) -> list[dict[str, Any]]:
-        if self.mode == MODE_UPDATE or self._pricing_injected or not self._prepare_done:
-            return []
-        if not self._prepare_task_type:
+        if self._pricing_injected or not self._prepare_done or not self._prepare_task_type:
             return []
         self._pricing_injected = True
         card = build_pricing_card(
@@ -170,9 +174,11 @@ class TaskRunner(SubagentBase):
             if status in _TERMINAL_STATUSES and payload.get("repaired_notes"):
                 logger.info("TaskRunner 后端自动微调: %s", payload["repaired_notes"])
 
-        logger.info("TaskRunner R%d tools=%s statuses=%s", self.rounds_used,
-                    "prepare" if not self._prepare_done else ("update" if self.mode == MODE_UPDATE else "draft"),
-                    statuses)
+        if not self._prepare_done:
+            table_label = "update+prepare" if self.mode == MODE_UPDATE else "prepare"
+        else:
+            table_label = "draft"
+        logger.info("TaskRunner R%d tools=%s statuses=%s", self.rounds_used, table_label, statuses)
 
         if saw_prepare and not self._prepare_done:
             # prepare 完成 → 下一轮收窄为 draft，并请聊天主 Agent 说一句过渡话。
@@ -306,7 +312,8 @@ class TaskRunner(SubagentBase):
     ) -> SubagentHandle:
         """构造并启动后台任务，返回 Handle。
 
-        - kind=task_update：update 模式（讨价还价），tools=[update_task_draft]；
+        - kind=task_update：update 模式（讨价还价），初表 [update_task_draft, prepare_task_context]，
+          玩家明确要求整体换向时才走 prepare→draft 重拟（工具表轮内动态收窄）；
         - kind=task_draft：draft 模式，先 prepare 后 draft（工具表轮内动态收窄）。
         """
         mode = MODE_UPDATE if kind == "task_update" else MODE_DRAFT

@@ -47,6 +47,13 @@ def _chat_tool_names(env) -> list[str]:
     return [t["function"]["name"] for t in (env.fake.stream_requests[0].tools or [])]
 
 
+def _request_blob(env, index: int = 0) -> str:
+    """整条请求的可见文本（messages + 工具表），锁禁词用。"""
+    req = env.fake.stream_requests[index]
+    messages = "\n".join(str(m.get("content", "")) for m in req.messages)
+    return f"{messages}\n{req.tools}"
+
+
 async def _seed_history(env, count: int) -> None:
     """按 玩家/NPC 交替塞入带序号的历史消息（序号零填充，便于子串断言）。"""
     for i in range(1, count + 1):
@@ -77,6 +84,27 @@ async def test_pending_draft_widens_route_table(env):
     env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
     await collect(_orch(env, "在吗"))
     assert _chat_tool_names(env) == list(ROUTE_TOOLS_DRAFT)
+
+
+async def test_enabled_prompt_never_names_unregistered_tools(env):
+    """「无」＝完全不提：工具没注册就一句相关提示词都不留（含"不要调用 X"式否定句）。"""
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
+    await collect(_orch(env, "你好"))
+
+    blob = _request_blob(env)
+    assert "route_task_draft" in blob  # 前提：确实在看注册了路由工具的请求
+    assert "prepare" not in blob.lower()
+
+
+async def test_draft_branch_prompt_never_names_unregistered_tools(env):
+    """宽表分支（有待确认草案）同样零提及。"""
+    await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯，聊什么都行。")
+    await collect(_orch(env, "在吗"))
+
+    blob = _request_blob(env)
+    assert "route_task_confirm" in blob
+    assert "prepare" not in blob.lower()
 
 
 async def test_agent_disabled_system_prompt_drops_delegation(env):

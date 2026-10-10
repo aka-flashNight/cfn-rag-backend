@@ -1,7 +1,8 @@
 """confirm_agent_task tool — 玩家接受后写入任务文件。
 
-v3：confirm 由 orchestrator 的同步动作（meta.act=task_confirm）直接触发，
-本工具保留给兜底路径 / 子 Agent 语义完整性使用。
+不在任何 LLM 工具表内：玩家接受由聊天主 Agent 的路由声明 `route_task_confirm` 表达，
+编排层收到后直接调用 `execute_confirm_agent_task`（同步动作）。本文件是该执行函数的
+工具封装，供注册表与 dispatch 语义完整性保留。
 """
 
 from __future__ import annotations

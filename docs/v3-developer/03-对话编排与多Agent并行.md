@@ -145,7 +145,7 @@ class SubagentEvent:
 | -------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | 接受     | `route_task_confirm` | 同步 confirm（校验+原子写+分配 ID）→ tool_status(success) → 收场调用 #2 让 NPC 交代 → system_notice「委托已发布」 |
 | 拒绝     | `route_task_cancel`  | 同步 cancel → tool_status(success) → 收场调用符合人设地送客 → system_notice「委托已取消」；无草案可撤不算失败，NPC 顺着话头自然回应、不发系统行 |
-| 讨价还价 | `route_task_update`  | 启动 TaskRunner（update 模式）→ 完成 → 调用#2 重新说明方案并再次询问。**讨价还价不需要 intermediate 过渡**（调整简单，直接等 final）。路由错发 update 而实际无草案时降级为 draft 模式重拟 |
+| 讨价还价 | `route_task_update`  | 启动 TaskRunner（update 模式）→ 完成 → 调用#2 重新说明方案并再次询问。**讨价还价不需要 intermediate 过渡**（调整简单，直接等 final）。玩家明确要求整体换向时由任务 Agent 自己走 prepare→draft 重拟（见 §5），此时 prepare 完成后照常说过渡语；路由错发 update 而实际无草案时降级为 draft 模式重拟 |
 | 岔开话题 | 无路由调用 | 草案保留；草案触碰计数器 +1，达到`draft_keep_turns`（默认 3）自动 cancel + system_notice「过期的委托草案已取消」 |
 
 「不愿意让步」不是一种路由：模型不调任何工具，直接以角色口吻拒绝并问玩家到底接还是不接
@@ -183,11 +183,12 @@ confirm 失败（草案过期/校验回归，极少）：tool_status(failed) →
 
 ```python
 MODE_DRAFT:  轮1 [prepare_task_context] → 轮2+ [draft_agent_task]
-MODE_UPDATE: 每轮 [update_task_draft]
+MODE_UPDATE: 初表 [update_task_draft, prepare_task_context] →（重拟 prepare 后）[draft_agent_task]
 ```
 
 - **节点精确注入**（每轮只注入当前必须内容）：system = 协调员基座 + 当前模式规则卡
-  （draft：任务选型规则 `PREPARE_SELECTION_GUIDE` + 字段说明；update：讨价还价卡）；
+  （draft：任务选型规则 `PREPARE_SELECTION_GUIDE` + 字段说明；update：讨价还价卡 +
+  整体重拟条目 + 同一套选型规则/报酬能力/字段说明——重拟路径要用）；
   user = 方向块（路由 `note`，缺省回落玩家原话）+ 「更早的对话印象」（滚动摘要，
   见 §7.1）+ 最近 8 条对话（近 4 轮，含本回合已流出的过渡话，要求拟定与发言一致）
   + 候选池全文 / 当前草案。skills 索引与 read_skill 通道已移除（规则全部前置内联）。
@@ -198,13 +199,16 @@ MODE_UPDATE: 每轮 [update_task_draft]
   `_on_round_tool_calls` 在 dispatch 前捕获 prepare 的**调用参数**（工具返回里没有
   task_type），`_post_round_messages` 再把定价卡作为一条 `user` 消息**追加**到对话尾部
   ——不改写 `messages[0]`，system 前缀保持不变，前缀缓存不受影响。
-- **情形分流**：draft 模式启动时 `_prepare_done=False` → 轮1 只有 prepare；prepare 回来
-  即翻转为 True，轮内**动态收窄**为 [draft]。update 模式 `_prepare_done` 恒 True，全程只有 update。
+- **情形分流**：两种模式都从 `_prepare_done=False` 起步——draft 轮1 只有 prepare，update
+  初表 [update + prepare]；prepare 回来即翻转为 True，轮内**动态收窄**为 [draft]。
+  update 的 prepare 是**重拟路径**（仅玩家明确要求整体换向时触发，提示词里写明限制），
+  走完等于重走两步式生成、新草案整体替换旧草案；常规讨价还价不碰它。
 - 循环：LLM（非流式，tools）→ 执行 tool_calls（**同批多个并行 asyncio.gather**，修 B3 的串行；
   工具本身是 CPU 轻操作 + 内存检索，无需 to_thread）→ 结果回填 → 直至 draft 成功/失败或达轮限。
 - 校验反馈形态由 `05` 定义：聚合错误 + 修复指引 + 候选清单；数值类问题已被后端微调
   （auto_repaired 标注），打回只含选择类问题。
-- update 模式：只调 `update_task_draft(draft_id, modify_fields)`；讨价还价计数（上限 2 次）保留。
+- update 模式：常规只调 `update_task_draft(draft_id, modify_fields)`；讨价还价计数（上限 2 次）保留。
+  整体重拟（罕见）走 `prepare_task_context → draft_agent_task`，定价卡同样按新类型补投。
 - 事件：启动发 progress（「准备候选中」/「修改方案中」）；prepare 完成发 intermediate
   （方向种子，见 §3）；校验失败发一次 intermediate（「校验修正中」）+ 后续 progress；
   结束发 final（`draft_summary` + `task_type`，供汇合按类型条件拼接说明要点）/failed。
@@ -288,3 +292,7 @@ class SearchRunner(SubagentBase):
 10. `agent_enabled` 开关：关闭时不下发任何工具、system 不含路由/发布约束、残留草案不进 prompt 但照常过期、模型硬发 `route_*` 一律忽略（不发布任务、不落草案）。
 11. 子 Agent 取消：回合中玩家新消息到达 → 旧子 Agent cancelled，无泄漏（task 数归零）。
 12. 并发：同会话两请求不交叉（会话级锁）；NPC 状态更新不丢（06 的锁）。
+13. update 整体重拟：update 回合模型走 prepare→draft，断言逐轮工具表为
+    `[[update_task_draft, prepare_task_context], [draft_agent_task]]`、update 系统提示含
+    「除非玩家明确要求把任务方向整个换掉，否则不要调用 prepare」限制、新草案整体替换旧草案。
+14. 工具表完整性：聊天路由表 + 任务/检索子 Agent 的全部工具名都能在默认注册表解析（`tests/tools/test_dispatch.py`）。

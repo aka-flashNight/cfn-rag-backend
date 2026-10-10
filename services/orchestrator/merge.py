@@ -3,7 +3,8 @@
 规则（硬性产品规则，实现在此）：
 - 宽限 merge_grace_ms 内拿到 final → 直接汇合回复 #2（不发过渡语）；
 - 宽限期过后拿到中间结果且未说过过渡语 → 过渡语 #2a（只说一次、只说方向、
-  **不报数字**），之后继续等 final → 汇合 #2b；
+  **不报数字**），之后继续等 final → 汇合 #2b（过渡语说完并入 spoken_text，
+  汇合提示词带「你本轮已经说过的话」块，第二次生成要顺着它说）；
 - 中间结果晚于宽限期到达时同样要说（bridge 排水遇到 intermediate 立即返回），
   否则玩家会一直对着空白等草案拟完；
 - 始终无中间结果 → 等待（SSE 保活注释帧）→ final → 汇合；
@@ -210,6 +211,12 @@ class MergeCoordinator:
             self.outcome.reply_text += text
             self.outcome.reply_segments.append(text)
             yield content_event(text)
+        # 过渡语已推送给玩家：并入 spoken_text，汇合 #2b / 失败话术的
+        # 「你本轮已经说过的话」块要带上它，第二次生成才能顺着过渡句说
+        interim_text = self.outcome.reply_text[len(before):].strip()
+        if interim_text:
+            prev = self.spoken_text.strip()
+            self.spoken_text = f"{prev}\n{interim_text}" if prev else interim_text
 
     def _result_block(self, payload: dict[str, Any]) -> str:
         if self.agent == "search":

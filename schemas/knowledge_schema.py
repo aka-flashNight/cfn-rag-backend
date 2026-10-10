@@ -49,7 +49,7 @@ class NPCChatRequest(BaseModel):
         description=(
             "是否启用 Agent 能力（委派任务草案、后台检索子 Agent）。"
             "不传按启用处理，即与未提供该字段时的既有行为一致；"
-            "关闭后 NPC 只做纯聊天，不下发 prepare_task_context 工具、不响应任何委派意图。"
+            "关闭后 NPC 只做纯聊天，不下发任何路由工具、不响应任何委派意图。"
         ),
     )
     summarize_interval: Optional[int] = Field(
