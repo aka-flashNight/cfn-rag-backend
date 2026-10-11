@@ -189,7 +189,11 @@ async def test_history_header_switches_when_summary_present(env):
     await _seed_history(env, 4)
     await _one_turn(env)
     core = _shared_core(env)
-    assert f"当前对话历史较长，早期对话已整理为以下摘要：\n{SUMMARY_TEXT}" in core
+    assert (
+        "当前对话历史较长，早期对话已整理为以下摘要"
+        "（这是本轮较早的对话内容的摘要，近期对话原文在其后的对话记录里给出）："
+        f"\n{SUMMARY_TEXT}"
+    ) in core
     assert "以下是最近的对话记录（按时间从早到晚排列），" in core
     assert "请结合上述摘要与近期记录，" in core
     assert CONTINUITY in core

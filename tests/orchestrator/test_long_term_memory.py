@@ -257,7 +257,7 @@ async def test_finished_task_block_reaches_prompt(env, bound_slot, monkeypatch):
 
     assert orch._ctx.finished_task_block.startswith("【你发布的委托已被玩家完成】")
     core = _shared_core(env)
-    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成，以下对话已经发生：" in core
+    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n以下对话已经发生：" in core
     assert "玩家：带回来了。" in core
     # 已有关键记录时才要求把「已发布」改成「已完成」
     assert LTM_TASK_DONE_HINT not in core
@@ -309,8 +309,10 @@ def test_block_order_session_then_finished_then_long_term():
         history_str="玩家：你好",
     )
     assert core.index("【已完成委托块】") < core.index("【长期记忆块】")
-    assert core.index("【长期记忆块】") < core.index("检索到的资料")
-    assert core.index("早期摘要") < core.index("玩家：你好")
+    # 摘要与长期记忆同属跨轮稀疏层，两块相邻；RAG 跨轮全变，排在它们之后
+    assert core.index("【长期记忆块】") < core.index("早期摘要")
+    assert core.index("早期摘要") < core.index("检索到的资料")
+    assert core.index("检索到的资料") < core.index("玩家：你好")
 
 
 def test_finished_block_wrapper_appends_hint_only_with_facts():

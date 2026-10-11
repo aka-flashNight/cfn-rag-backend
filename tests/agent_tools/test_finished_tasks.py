@@ -55,11 +55,37 @@ def test_block_contains_title_and_dialogue(data_root):
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
     assert block.startswith("【你发布的委托已被玩家完成】")
-    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成，以下对话已经发生：" in block
+    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n以下对话已经发生：" in block
     assert "玩家：铁锤给你带回来了。" in block
     assert f"{NPC}：太好了，这份情我记着。" in block
     # 玩家占位符 $PC 不暴露给模型
     assert "$PC" not in block
+    # 说明与需求字段缺失时不给空行
+    assert "任务说明" not in block
+    assert "需要玩家" not in block
+
+
+def test_block_carries_description_and_requirements(data_root):
+    """NPC 要能复述自己发过的是什么活：说明文本与需求字段排在完成对话之前。
+    落盘记录里没有 task_type（只存在于草案），类型由需求字段体现。"""
+    tasks_path, text_path = shared_task_paths(data_root)
+    _write(tasks_path, {"tasks": [{
+        **_task(200001),
+        "finish_submit_items": ["祖传铁锤#1", "兽皮#3"],
+        "finish_requirements": ["堕落城#普通"],
+    }]})
+    _write(text_path, {
+        "$AGENT_TITLE_200001": "取回祖传铁锤",
+        "$AGENT_DESCRIPTION_200001": "把落在堕落城的祖传铁锤找回来。",
+        "$AGENT_FINISH_200001": [{"name": "$PC", "text": "铁锤给你带回来了。"}],
+    })
+
+    block = build_finished_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
+    )
+    assert "任务说明：把落在堕落城的祖传铁锤找回来。" in block
+    assert "需要玩家提交：祖传铁锤×1、兽皮×3；需要玩家通过关卡：堕落城（普通）" in block
+    assert block.index("任务说明") < block.index("以下对话已经发生")
 
 
 def test_empty_when_nothing_finished_or_no_match(data_root):

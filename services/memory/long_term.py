@@ -40,7 +40,9 @@ CHAT_TOOL_NAME = "update_long_term_memory"
 SUMMARY_TOOL_NAME = "set_base_long_term_memory"
 
 #: 提示词里给的期望长度（入库上限统一是 LTM_MAX_CHARS，超出截断）
+#: 首次写入只给 100 字：基础印象之后还要靠摘要轮逐次补全，一开始写满会挤掉后续空间。
 BASE_EXPECT_CHARS = 300
+BASE_FIRST_EXPECT_CHARS = 100
 FACT_EXPECT_CHARS = 100
 
 
@@ -185,8 +187,10 @@ def build_chat_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
             CHAT_TOOL_NAME,
             (
                 "记录你对这个玩家的长期记忆（跨对话窗口保留）。调用时必须同时给出两项："
-                f"base_content＝玩家与你的整体关系情况、你对玩家的整体印象的总结式状态描述"
-                f"（{BASE_EXPECT_CHARS} 字以内）；content＝一条关键记录，只记重要、重大、影响明显的"
+                "base_content＝玩家与你的整体关系情况、你对玩家的整体印象的总结式状态描述"
+                "（必须精简，如果当前对话中有效信息较少，可以只输出一句简短的总结，例如15字以内。"
+                f"若关键信息较多，可视情况增加。总字数不得超过{BASE_FIRST_EXPECT_CHARS} 字）；"
+                "content＝一条关键记录，只记重要、重大、影响明显的"
                 f"事件或信息，日常寒暄与随口闲聊不记，{FACT_EXPECT_CHARS} 字以内，只写结论性事实。"
             ),
             {
@@ -233,7 +237,11 @@ def build_chat_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
             "维护你对这个玩家的长期记忆（跨对话窗口保留）。长期记忆分两部分：一条基础印象"
             "（玩家与你的整体关系情况和你对玩家的整体印象），以及若干条关键记录"
             "（重要、重大、影响明显的事件或信息），编号见提示词中的长期记忆块。"
-            "日常寒暄、随口闲聊、普通小委托都不记。要记录的信息与某条既有关键记录相关时，"
+            "日常寒暄、随口闲聊、普通小委托都不记"
+            "（除非是陌生状态下的首次任务，可记录一次。"
+            "已有任何一条任务/委托的长期记忆后，不再记忆不重要小任务，"
+            "只可记录关键、重要、有长期影响的任务）。"
+            "要记录的信息与某条既有关键记录相关时，"
             "填 entry_no 把新信息融合进那条记录、content 给出融合后的完整内容，不要另记一条；"
             "与任何既有记录都无关时才留空 entry_no 新记一条。"
             f"每条关键记录 {FACT_EXPECT_CHARS} 字以内，只写结论性事实。"
@@ -258,9 +266,10 @@ def build_summary_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
         return _tool(
             SUMMARY_TOOL_NAME,
             (
-                "记录你对这个玩家的基础印象——跨对话窗口保留的一条总结式状态描述，只写玩家与你的"
-                f"整体关系情况和你对玩家的整体印象（{BASE_EXPECT_CHARS} 字以内）。"
-                "根据本次给出的对话内容写，可写的信息少就写得短。"
+                "记录你对这个玩家的基础印象——跨对话窗口保留的一条总结式状态描述，"
+                "只写玩家与你的整体关系情况和你对玩家的整体印象。"
+                "根据本次给出的对话内容写，当可写的信息少时就写得短，例如只有简短的一句话；"
+                f"有效关键信息较多时可适当增多，最大{BASE_FIRST_EXPECT_CHARS} 字以内。"
             ),
             {
                 "content": {

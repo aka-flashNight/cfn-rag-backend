@@ -13,7 +13,8 @@
 global——它们是 NPC 设定，不随存档变化，整条复制到每个存档会让新存档里的 NPC
 丢掉阵营与头衔（同阵营提示词块与情绪白名单都会跟着退化）。只有 PER_SAVE_FIELDS
 （好感度与关系等级）按存档隔离：绑定存档时写入 saves.<slotKey>，未绑定时写 global。
-读取时合并——绑定存档下某 NPC 没有存档内记录＝该存档里好感为初始值，不继承 global。
+读取时合并——绑定存档下某 NPC 没有存档内记录时直接沿用 global 的那份，
+那是设定里的初始好感（A 兵团 25/熟悉、其余 10/陌生），归零等于每个新存档都从零开始。
 加载时若检测到旧版平铺结构（顶层直接是 NPC 名），整体视为 global 读入，
 下一次落盘自然写成新结构，不做额外迁移/回填。
 """
@@ -227,8 +228,9 @@ class NPCManager:
     def _scoped_locked(self, npc_name: str, slot: str | None) -> NPCState:
         """合并出该作用域下的 NPC 状态：设定取 global，好感度取作用域内记录。
 
-        绑定存档但作用域内没有该 NPC 的记录＝这个存档里好感为初始值，
-        不继承 global（global 的好感度属于未绑定存档时那一份）。
+        绑定存档但作用域内没有该 NPC 的记录＝这个存档还没动过这份好感，
+        直接返回 global 那一份：那是 NPC 设定里的初始好感（A 兵团 25/熟悉、
+        其余 10/陌生），归零会让每个新存档都从「谁都不认识」开始。
         """
         base = self._global.get(npc_name)
         if slot is None:
@@ -237,7 +239,7 @@ class NPCManager:
         if base is None:
             return override if override is not None else _empty_state()
         if override is None:
-            return replace(base, favorability=0, relationship_level="陌生")
+            return base
         return replace(
             base,
             favorability=override.favorability,

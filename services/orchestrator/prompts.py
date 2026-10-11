@@ -296,14 +296,25 @@ def _rag_block(retrieved_context: str) -> str:
 
 
 def _save_player_name_line(save_info: Any) -> str:
-    """绑定存档投影里的玩家名字行（B2-1）；未绑定/投影缺名字＝空串。"""
+    """绑定存档投影里的玩家名字行（B2-1）＋称呼口径；未绑定/投影缺名字＝空串。
+
+    名字由游戏投影原样给出，网名/字符串这类不像名字的取值不能当称呼用，
+    所以称呼规则跟名字同行给出。
+    """
     if not isinstance(save_info, dict):
         return ""
     character = save_info.get("character")
     if not isinstance(character, dict):
         return ""
     name = str(character.get("name") or "").strip()
-    return f"玩家的名字是「{name}」。" if name else ""
+    if not name:
+        return ""
+    return (
+        f"玩家的名字是「{name}」。"
+        "如果玩家的名字看起来像正常的名字或佣兵代号，你可以在合适的情况下用这个来称呼玩家。"
+        "如果名字像非正式的网名或字符，那么你不要用名字作为称呼，"
+        "如果一定要称呼，可以用「佣兵」之类的身份来指代。"
+    )
 
 
 def _save_scene_line(save_info: Any) -> str:
@@ -386,9 +397,9 @@ def build_user_shared_core(
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
     排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ 已完成委托 →
-    长期记忆（跨窗口，改动稀疏）→ RAG/提及 NPC（跨轮全变、轮内不变）→ 早期摘要
-    → 近期对话（对话记录整体下放：摘要比对话稳定放前面；对话跨轮追加，同回合内
-    过渡话产生后还会追加——轮内有变化但不高频，放最下方使追加不破坏块内前缀）。
+    长期记忆（跨窗口，改动稀疏）→ 早期摘要（同为跨轮稀疏，紧跟长期记忆）→
+    RAG/提及 NPC（跨轮全变、轮内不变）→ 近期对话（对话跨轮追加，同回合内过渡话
+    产生后还会追加——轮内有变化但不高频，放最下方使追加不破坏块内前缀）。
     """
     parts: list[str] = []
     session_block = build_session_state_block(
@@ -407,15 +418,15 @@ def build_user_shared_core(
     long_term = (long_term_block or "").strip()
     if long_term:
         parts.append(long_term)
+    summary = (summary_str or "").strip()
+    if summary:
+        parts.append(summary)
     rag = _rag_block(retrieved_context)
     if rag:
         parts.append(rag)
     men = (mentioned_npcs_str or "").strip()
     if men:
         parts.append(men)
-    summary = (summary_str or "").strip()
-    if summary:
-        parts.append(summary)
     hist = (history_str or "").strip()
     if hist:
         parts.append(hist)

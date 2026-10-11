@@ -224,6 +224,10 @@ async def test_chat_tool_form_without_base_requires_both_fields(store):
     assert fn["name"] == CHAT_TOOL_NAME
     assert fn["parameters"]["required"] == ["base_content", "content"]
     assert "必须同时给出两项" in fn["description"]
+    # 首次写入只给 100 字，留足后续补充空间；已有印象时按 300 字
+    assert "例如15字以内" in fn["description"]
+    assert "总字数不得超过100 字" in fn["description"]
+    assert "300" not in fn["description"]
 
 
 async def test_chat_tool_form_with_room_makes_entry_no_optional(store):
@@ -234,6 +238,12 @@ async def test_chat_tool_form_with_room_makes_entry_no_optional(store):
     assert fn["parameters"]["required"] == ["content"]
     assert "entry_no" in fn["parameters"]["properties"]
     assert "不要另记一条" in fn["description"]
+    # 陌生状态下的首次任务是唯一例外，之后只记有长期影响的任务
+    assert (
+        "普通小委托都不记（除非是陌生状态下的首次任务，可记录一次。"
+        "已有任何一条任务/委托的长期记忆后，不再记忆不重要小任务，"
+        "只可记录关键、重要、有长期影响的任务）。"
+    ) in fn["description"]
 
 
 async def test_chat_tool_form_when_full_only_accepts_entry_no(store):
@@ -399,9 +409,11 @@ async def test_summary_tool_two_forms(store):
     assert "没有明显变化就不调用" in with_base["description"]
     assert "必须完整保留" in with_base["description"]
     assert "不复述" in with_base["description"]
+    assert "（300 字以内）" in with_base["description"]
 
     assert without_base["description"].startswith("记录你对这个玩家的基础印象")
     assert "根据本次给出的对话内容写" in without_base["description"]
+    assert "最大100 字以内" in without_base["description"]
     assert without_base["parameters"]["required"] == ["content"]
 
 

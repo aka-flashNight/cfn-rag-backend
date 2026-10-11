@@ -73,6 +73,41 @@ def _dialogue_lines(items: Any) -> list[str]:
     return lines
 
 
+def _item_phrase(values: Any, prefix: str) -> str:
+    """["物品名#数量"] → 「prefix：物品名×数量、…」；只呈现，不参与判定。"""
+    parts: list[str] = []
+    for raw in values if isinstance(values, list) else []:
+        name, _, count = str(raw or "").strip().partition("#")
+        if not name.strip():
+            continue
+        parts.append(f"{name.strip()}×{count.strip()}" if count.strip() else name.strip())
+    joined = "、".join(parts)
+    return f"{prefix}：{joined}" if joined else ""
+
+
+def _stage_phrase(values: Any, prefix: str) -> str:
+    """["关卡名#难度"] → 「prefix：关卡名（难度）」——难度套上 × 会被读成数量。"""
+    parts: list[str] = []
+    for raw in values if isinstance(values, list) else []:
+        name, _, difficulty = str(raw or "").strip().partition("#")
+        if not name.strip():
+            continue
+        tail = difficulty.strip()
+        parts.append(f"{name.strip()}（{tail}）" if tail else name.strip())
+    joined = "、".join(parts)
+    return f"{prefix}：{joined}" if joined else ""
+
+
+def _demand_phrase(record: dict) -> str:
+    """任务要求行：落盘记录里没有 task_type（只存在于草案），按需求字段原样列出。"""
+    parts = [
+        _item_phrase(record.get("finish_submit_items"), "需要玩家提交"),
+        _item_phrase(record.get("finish_contain_items"), "需要玩家收集"),
+        _stage_phrase(record.get("finish_requirements"), "需要玩家通过关卡"),
+    ]
+    return "；".join(p for p in parts if p)
+
+
 def build_finished_task_block(
     *,
     data_root: Path,
@@ -108,13 +143,18 @@ def build_finished_task_block(
         if not title:
             logger.warning("委托 %d 缺少标题文本，跳过完成拼接", task_id)
             continue
-        lines = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
-        section = f"此前你发布的委托「{title}」已被玩家完成"
-        if lines:
-            section += "，以下对话已经发生：\n" + "\n".join(lines)
-        else:
-            section += "。"
-        sections.append(section)
+        lines = [f"此前你发布的委托「{title}」已被玩家完成。"]
+        description = str(texts.get(f"$AGENT_DESCRIPTION_{task_id}") or "").strip()
+        if description:
+            lines.append(f"任务说明：{description}")
+        demand = _demand_phrase(record)
+        if demand:
+            lines.append(demand)
+        dialogue = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
+        if dialogue:
+            lines.append("以下对话已经发生：")
+            lines.extend(dialogue)
+        sections.append("\n".join(lines))
 
     if not sections:
         return ""

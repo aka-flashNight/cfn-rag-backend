@@ -659,9 +659,19 @@ class TurnOrchestrator:
         return str(summary).strip() if summary else ""
 
     def _summary_text(self, ctx: TurnContext) -> str:
-        """早期对话滚动摘要（比近期对话稳定，放对话块之前）。标题沿用 v2 口径。"""
+        """早期对话滚动摘要（与长期记忆同属跨轮稀疏层，两块相邻）。标题沿用 v2 口径。
+
+        澄清句不可省：摘要现在紧贴长期记忆块，不点明它只总结本轮较早的对话，
+        模型会把两块当成同一份记忆。
+        """
         summary = self._raw_summary(ctx)
-        return f"当前对话历史较长，早期对话已整理为以下摘要：\n{summary}" if summary else ""
+        if not summary:
+            return ""
+        return (
+            "当前对话历史较长，早期对话已整理为以下摘要"
+            "（这是本轮较早的对话内容的摘要，近期对话原文在其后的对话记录里给出）：\n"
+            f"{summary}"
+        )
 
     def _history_block(self, ctx: TurnContext, *, limit: int) -> str:
         """近期对话逐字块（聊天主 Agent 用）。

@@ -160,8 +160,9 @@ async def test_corrupted_file_starts_empty(tmp_path):
 # 按存档作用域（B3-1）：只有好感度与关系等级隔离，NPC 设定仍来自 global
 # ---------------------------------------------------------------------------
 
-async def test_bound_slot_starts_fresh_but_keeps_npc_settings(tmp_path, bound_slot):
-    """新存档不继承 global 好感；阵营/头衔/性别等设定照旧（同阵营块与情绪白名单不退化）。"""
+async def test_bound_slot_without_record_keeps_settings_favorability(tmp_path, bound_slot):
+    """新存档里没动过的 NPC 沿用设定里的初始好感（A 兵团 25/熟悉、其余 10/陌生），
+    归零会让每个新存档都从「谁都不认识」开始；阵营/头衔/性别等设定照旧。"""
     state_path = tmp_path / "s.json"
     _write_state(state_path, {
         "铁匠": {
@@ -177,12 +178,20 @@ async def test_bound_slot_starts_fresh_but_keeps_npc_settings(tmp_path, bound_sl
 
     bound_slot("slot_1")
     st = await manager.get("铁匠")
-    assert st.favorability == 0
-    assert st.relationship_level == "陌生"
+    assert st.favorability == 85
+    assert st.relationship_level == "生死之交"
     assert st.sex == "男"
     assert st.faction == "A兵团"
     assert st.titles == ["大师铁匠"]
     assert st.emotions == ["普通", "微笑"]
+
+    # 第一次改动从设定初值起算，且只落进本存档
+    updated = await manager.update_favorability("铁匠", -10)
+    assert updated.favorability == 75 and updated.relationship_level == "朋友"
+    await manager.flush()
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["saves"]["slot_1"]["铁匠"] == {"favorability": 75, "relationship_level": "朋友"}
+    assert raw["global"]["铁匠"]["favorability"] == 85
 
 
 async def test_two_slots_do_not_share_favorability(tmp_path, bound_slot):
@@ -216,13 +225,14 @@ async def test_unbound_writes_global_and_bound_leaves_it_alone(tmp_path, bound_s
 
     await manager.update_favorability("铁匠", 25)
     bound_slot("slot_1")
-    await manager.update_favorability("铁匠", 90)
+    await manager.update_favorability("铁匠", 10)
     await manager.flush()
 
     raw = json.loads(state_path.read_text(encoding="utf-8"))
     assert raw["global"]["铁匠"]["favorability"] == 25
     assert raw["global"]["铁匠"]["relationship_level"] == "熟悉"
-    assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 90
+    # 绑定档从 global 的 25 起算，但增量只落进 saves
+    assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 35
 
 
 async def test_all_states_follows_current_scope(tmp_path, bound_slot):
@@ -235,7 +245,12 @@ async def test_all_states_follows_current_scope(tmp_path, bound_slot):
     bound_slot("slot_1")
     states = await manager.all_states()
     assert set(states) == {"铁匠", "药师"}
-    assert all(st.favorability == 0 and st.relationship_level == "陌生" for st in states.values())
+    # 该存档一条记录都没有＝全部沿用设定初值
+    assert states["铁匠"].favorability == 70 and states["药师"].favorability == 40
+
+    await manager.update_favorability("铁匠", 10)
+    bound_slot("slot_2")
+    assert (await manager.all_states())["铁匠"].favorability == 70
 
 
 async def test_legacy_flat_file_read_as_global(tmp_path, bound_slot):

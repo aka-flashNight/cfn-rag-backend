@@ -1,6 +1,7 @@
 """B2-1 编排层接入：绑定存档投影 → save_info → 会话态块玩家名字行；#83 场景行与阶段推导。
 
-- bind 且角色名存在 → user shared core（messages[1]）出现「玩家的名字是「X」。」；
+- bind 且角色名存在 → user shared core（messages[1]）出现「玩家的名字是「X」。」＋称呼口径
+  （名字像网名或字符时不用名字称呼，必要时用「佣兵」这类身份指代）；
 - 未绑定 → 不出现该行（standalone 行为与现状一致，FR-9）；
 - 名字行位于玩家身份行之后、好感行之前；save_info 收全 {slot_key, character, progress, scene, player}；
 - 场景行：非战斗给地图 label（帧标签归一，缺标签回落原文），战斗中给关卡名（inCombat 门控）；
@@ -17,6 +18,12 @@ from services.orchestrator.turn import TurnOrchestrator
 from tests.orchestrator.conftest import NPC_NAME, collect
 
 NAME_LINE = "玩家的名字是「林三」。"
+#: 名字行后面紧跟的称呼口径：投影里的名字可能是网名或一串字符，不能当称呼用
+ADDRESS_RULE = (
+    "如果玩家的名字看起来像正常的名字或佣兵代号，你可以在合适的情况下用这个来称呼玩家。"
+    "如果名字像非正式的网名或字符，那么你不要用名字作为称呼，"
+    "如果一定要称呼，可以用「佣兵」之类的身份来指代。"
+)
 
 
 @pytest.fixture
@@ -103,6 +110,7 @@ async def test_name_line_between_identity_and_favorability(env, integration_stat
     await _one_turn(env, player_identity="男，佣兵，跑单帮的")
 
     shared = _shared_core(env)
+    assert NAME_LINE + ADDRESS_RULE in shared
     identity_idx = shared.index("玩家的身份是：男，佣兵，跑单帮的")
     name_idx = shared.index(NAME_LINE)
     favor_idx = shared.index("好感度")
