@@ -34,6 +34,7 @@ from schemas.knowledge_schema import (
     SessionTitleUpdateRequest,
     SessionTitleUpdateResponse,
 )
+from services.integration.state import get_integration_state
 from services.llm import LLMConfig
 from services.memory.store import get_memory_store
 from services.npc.manager import NPCManager, get_npc_manager
@@ -205,11 +206,13 @@ async def get_session_history(
 @router.get(
     "/sessions",
     response_model=SessionListResponse,
-    summary="获取所有会话列表及可选 NPC 列表",
+    summary="获取当前存档作用域内的会话列表及可选 NPC 列表",
 )
 async def list_sessions(npc_manager: NPCManager = Depends(get_npc_manager)) -> SessionListResponse:
     memory = _memory()
-    sessions_raw = await memory.list_sessions()
+    # B2-5：bind 态只回当前槽位会话；standalone（或未绑定）只回 standalone 会话
+    bound_slot = get_integration_state().snapshot()["bound_slot"]
+    sessions_raw = await memory.list_sessions(slot_key=bound_slot)
     sessions = [
         SessionInfo(
             session_id=item.session_id,
@@ -234,7 +237,11 @@ async def list_sessions(npc_manager: NPCManager = Depends(get_npc_manager)) -> S
 )
 async def create_session(payload: SessionCreateRequest) -> SessionCreateResponse:
     memory = _memory()
-    info = await memory.create_session(npc_name=payload.npc_name, title=payload.title)
+    # B2-5：创建时记录当前绑定槽位（未绑定＝NULL，事后换存档不再改归属）
+    bound_slot = get_integration_state().snapshot()["bound_slot"]
+    info = await memory.create_session(
+        npc_name=payload.npc_name, title=payload.title, slot_key=bound_slot,
+    )
     return SessionCreateResponse(
         session_id=info.session_id,
         npc_name=info.npc_name,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
@@ -118,3 +120,52 @@ def test_rounds_without_task_counters(store):
     assert store.increment_rounds_without_task_sync("s1") == 2
     store.reset_rounds_without_task_sync("s1")
     assert store.get_rounds_without_task_sync("s1") == 0
+
+
+def test_session_slot_scope_filtering(store):
+    """B2-5：会话按存档作用域过滤；空串槽位归一成 None（standalone）。"""
+    s1 = store.create_session_sync("铁匠", "standalone 会")
+    s2 = store.create_session_sync("铁匠", "a 槽会", slot_key="slot_a")
+    s3 = store.create_session_sync("铁匠", "b 槽会", slot_key="slot_b")
+    s4 = store.create_session_sync("铁匠", "空串槽", slot_key="")
+
+    assert s2.slot_key == "slot_a"
+    assert s4.slot_key is None
+    assert [x.session_id for x in store.list_sessions_sync(None)] == sorted(
+        [s1.session_id, s4.session_id]
+    )
+    assert [x.session_id for x in store.list_sessions_sync("slot_a")] == [s2.session_id]
+    assert [x.session_id for x in store.list_sessions_sync("slot_b")] == [s3.session_id]
+    assert store.list_sessions_sync("slot_c") == []
+
+
+def test_legacy_sessions_db_gains_slot_key_without_backfill(tmp_path):
+    """B2-5：旧库（无 slot_key 列）打开时 ALTER 补列；既有行保持 NULL，不回填。"""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL UNIQUE,
+            npc_name TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions (session_id, npc_name, title, created_at) VALUES ('s-legacy', '铁匠', '旧会话', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path=db_path)
+    cols = {str(r[1]) for r in store._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    assert "slot_key" in cols
+
+    sessions = store.list_sessions_sync(None)
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "s-legacy"
+    assert sessions[0].slot_key is None  # 不迁移回填：旧会话＝standalone
+    assert store.list_sessions_sync("slot_a") == []

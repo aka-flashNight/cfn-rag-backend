@@ -5,7 +5,7 @@ Tier-1 检索（≤3 变体单次嵌入，经 to_thread）/ 提及 NPC 子串匹
 立绘（07 §4）：仅 purpose=chat 且模型 Profile 允许视觉（vision 非 False）且该模型
 未被标记图像不支持时，按 current_emotion（上回合 meta emo；空则「普通」）取图，
 结果放 TurnContext.image_data_url；立绘不可用/任何失败 → None，纯文本不报错。
-save_info（gamebridge）恒 None，字段预留（01 §9）。
+save_info 填入集成层绑定投影 {slot_key, character, progress}（B2-1）；未绑定＝None。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from services.game_progress import StageConfig, get_progress_stage_config
+from services.integration.state import get_integration_state
 from services.llm import LLMConfig
 from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
 from services.npc.manager import NPCManager, NPCState
@@ -306,7 +307,7 @@ class TurnContext:
     shop_reward_types: list[str] = field(default_factory=list)
     player_can_challenge: bool = False  # 玩家当前能否挑战该 NPC（与 prepare 切磋判定同源）
     forbidden: set[str] = field(default_factory=set)
-    save_info: Any = None  # gamebridge 预留（01 §9），恒 None
+    save_info: Any = None  # 绑定存档投影 {slot_key, character, progress}（B2-1）；未绑定＝None
     retrieve_fn: Optional[Callable[[str], str]] = None
     llm_config: LLMConfig = field(default_factory=LLMConfig)
     # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
@@ -479,6 +480,16 @@ async def assemble_context(
     if send_image and should_send_image(llm_config):
         image_data_url = await asyncio.to_thread(load_portrait_image_url, npc_name, current_emotion)
 
+    # 绑定存档投影（B2-1）：未绑定＝None，standalone 行为与现状一致（FR-9）
+    snap = get_integration_state().snapshot()
+    save_info: Any = None
+    if snap["bound_slot"] is not None:
+        save_info = {
+            "slot_key": snap["bound_slot"],
+            "character": snap["character"],
+            "progress": snap["progress"],
+        }
+
     return TurnContext(
         npc_name=npc_name,
         npc_state=npc_state,
@@ -500,6 +511,7 @@ async def assemble_context(
         shop_reward_types=shop_reward_types,
         player_can_challenge=player_can_challenge,
         forbidden=forbidden,
+        save_info=save_info,
         retrieve_fn=retrieve_fn,
         llm_config=llm_config,
         image_data_url=image_data_url,

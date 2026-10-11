@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Callable, List
 
 from services.game_data.paths import find_resources_directory
+from services.integration.save_paths import agent_save_task_paths
+from services.integration.state import get_integration_state
 from services.retrieval.hybrid import cjk_tokenizer
 from services.retrieval.store import Node, corpus_fingerprint
 
@@ -74,6 +76,11 @@ def _resources_dir() -> Path:
     return find_resources_directory()
 
 
+def _bound_slot_key() -> str | None:
+    """当前绑定存档的槽位键（未绑定为 None）。B2-7 覆盖层与指纹以它为作用域。"""
+    return get_integration_state().slot_key
+
+
 # ---------------------------------------------------------------------------
 # 语料指纹
 # ---------------------------------------------------------------------------
@@ -108,6 +115,17 @@ def compute_corpus_fingerprint(resources_dir: Path | None = None) -> str:
                 st = _stat_or_none(f)
                 if st is not None:
                     states.append((f.relative_to(root).as_posix(), st[0], st[1]))
+    # B2-7：当前绑定存档的任务覆盖层计入指纹（只含本槽两文件——其他槽或阶段四
+    # 对话侧文件的写入不误触发重建；agent_saves 目录本身不进 _FINGERPRINT_SOURCE_DIRS）
+    bound_slot = _bound_slot_key()
+    if bound_slot is not None:
+        resolved_root = root.resolve()
+        for path in agent_save_task_paths(root / "data", bound_slot):
+            if not path.is_file():
+                continue
+            st = _stat_or_none(path)
+            if st is not None:
+                states.append((path.relative_to(resolved_root).as_posix(), st[0], st[1]))
     return corpus_fingerprint(states)
 
 
@@ -221,69 +239,103 @@ def _task_character_from_item(item: dict) -> str | None:
     return name.lower() if name else None
 
 
+def _task_id_part(task: dict) -> str | None:
+    """任务 id 段：优先规范化 int；异常值取原串；缺 id 返回 None（由调用方退回对话 key）。"""
+    raw_id = task.get("id")
+    if raw_id is None:
+        return None
+    try:
+        return str(int(raw_id))
+    except (TypeError, ValueError):
+        text = str(raw_id).strip()
+        return text or None
+
+
 def load_task_nodes(resources_dir: Path | None = None) -> List[Node]:
-    """任务台词：*tasks*.json + text/*.json，单条 NPC 台词一节点（guide 类打 task_source）。"""
+    """任务台词：共享 *tasks*.json + text/*.json；绑定存档时叠加该存档覆盖层（B2-7）。
+
+    覆盖层＝data/rag/agent_saves/<slotKey>/ 下的 agent_tasks.json + agent_text.json，
+    显式拼接路径增读（不走自动发现；文件缺失静默跳过）；槽内与共享同名文本 key 时
+    槽文本生效（覆盖层后加载，存档优先）。
+
+    节点 id 为稳定标识 task-{任务id}-{get|finish}-{台词序号}，与加载顺序无关：
+    覆盖层增删或共享任务调整时，未变条目的 id 不漂移。任务缺 id 时退回用对话 key
+    做 id 段（旧数据兜底）。
+    """
     root_dir = Path(resources_dir) if resources_dir else _resources_dir()
     task_dir = root_dir / "data" / "task"
     text_dir = task_dir / "text"
-    if not task_dir.exists() or not text_dir.exists():
+
+    # 共享文本 key；preview_text.json 仅用于任务预览，显式跳过
+    text_paths: List[Path] = []
+    if text_dir.is_dir():
+        text_paths = [p for p in sorted(text_dir.glob("*.json")) if p.stem != "preview_text"]
+
+    # 共享任务配置；教学引导类仅在高分时才采用，避免与 NPC 形象弱关联时混入
+    task_sources: List[tuple[Path, str | None]] = []
+    if task_dir.is_dir():
+        for jpath in sorted(task_dir.glob("*tasks*.json")):
+            if jpath.stem in _TASK_FILE_DENYLIST:
+                logger.info("跳过黑名单任务配置（不参与检索/向量化）: %s", jpath.name)
+                continue
+            task_sources.append((jpath, "guide" if "guide" in jpath.name.lower() else None))
+
+    # B2-7：当前绑定存档的任务覆盖层（追加在末位＝同名 key 槽文本优先；缺失静默）
+    bound_slot = _bound_slot_key()
+    if bound_slot is not None:
+        slot_tasks_path, slot_text_path = agent_save_task_paths(root_dir / "data", bound_slot)
+        if slot_text_path.is_file():
+            text_paths.append(slot_text_path)
+        if slot_tasks_path.is_file():
+            task_sources.append((slot_tasks_path, None))
+
+    if not text_paths and not task_sources:
         return []
 
-    # 合并所有 text/*.json 的 key；preview_text.json 仅用于任务预览，显式跳过
+    # 合并所有文本 key（后加载覆盖先加载：槽覆盖层覆盖共享同名 key）
     text_data: dict[str, object] = {}
-    for jpath in sorted(text_dir.glob("*.json")):
-        if jpath.stem == "preview_text":
-            continue
+    for tpath in text_paths:
         try:
-            data = json.loads(jpath.read_text(encoding="utf-8"))
+            data = json.loads(tpath.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 text_data.update(data)
         except Exception as exc:
-            logger.warning("跳过任务文本 %s: %s", jpath.name, exc)
+            logger.warning("跳过任务文本 %s: %s", tpath.name, exc)
 
-    all_tasks: List[dict] = []
-    for jpath in sorted(task_dir.glob("*tasks*.json")):
-        if jpath.stem in _TASK_FILE_DENYLIST:
-            logger.info("跳过黑名单任务配置（不参与检索/向量化）: %s", jpath.name)
-            continue
+    all_tasks: List[tuple[str | None, dict]] = []
+    for jpath, task_source in task_sources:
         try:
             data = json.loads(jpath.read_text(encoding="utf-8"))
             tasks = data.get("tasks") if isinstance(data, dict) else []
             if not isinstance(tasks, list):
                 continue
-            # 教学引导类仅在高分时才采用，避免与 NPC 形象弱关联时混入
-            task_source = "guide" if "guide" in jpath.name.lower() else None
             for task in tasks:
-                if not isinstance(task, dict):
-                    continue
-                t = dict(task)
-                if task_source:
-                    t["_task_source"] = task_source
-                all_tasks.append(t)
+                if isinstance(task, dict):
+                    all_tasks.append((task_source, task))
         except Exception as exc:
             logger.warning("跳过任务配置 %s: %s", jpath.name, exc)
 
     nodes: List[Node] = []
-    seq = 0
-    for task in all_tasks:
-        task_source: str | None = task.get("_task_source")
-        for key in (task.get("get_conversation"), task.get("finish_conversation")):
+    for task_source, task in all_tasks:
+        task_id_part = _task_id_part(task)
+        for kind, key_field in (("get", "get_conversation"), ("finish", "finish_conversation")):
+            key = task.get(key_field)
             if not key:
                 continue
             raw = text_data.get(str(key))
             if not isinstance(raw, list):
                 continue
-            for item in raw:
+            id_part = task_id_part or str(key)
+            for idx, item in enumerate(raw):
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text") or "").strip()
                 character = _task_character_from_item(item)
                 if not text or not character:
                     continue
-                seq += 1
                 nodes.append(
                     Node(
-                        id=f"task-{seq}",
+                        id=f"task-{id_part}-{kind}-{idx}",
                         text=text,
                         type="task",
                         character=character,

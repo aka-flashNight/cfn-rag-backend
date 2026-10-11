@@ -4,7 +4,8 @@
 - 单连接 sqlite3.connect(check_same_thread=False) + threading.Lock + WAL，不再每操作新建连接；
 - 统一返回 dataclass（ChatMessage），消灭「dict 列表 vs dataclass 双形状」；
 - 草案过期：连续 N 次 ask 未触碰任务工具即删除，N 由 draft_keep_turns 配置；
-- bargain_count 独立成列，不再混进草案 JSON（修 D5），内部字段 _draft_commit_valid 同样不入库。
+- bargain_count 独立成列，不再混进草案 JSON（修 D5），内部字段 _draft_commit_valid 同样不入库；
+- sessions.slot_key 存档作用域列（B2-5）：创建时记录当前绑定槽位，缺省 NULL＝standalone，不做迁移回填。
 """
 
 from __future__ import annotations
@@ -97,6 +98,7 @@ class SessionInfo:
     npc_name: str
     title: str
     created_at: float
+    slot_key: str | None = None
 
 
 class MemoryStore:
@@ -142,7 +144,8 @@ class MemoryStore:
                     session_id TEXT NOT NULL UNIQUE,
                     npc_name TEXT NOT NULL,
                     title TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    slot_key TEXT
                 )
                 """
             )
@@ -184,6 +187,15 @@ class MemoryStore:
             self._conn.commit()
 
     def _migrate_legacy_schema(self, cur: sqlite3.Cursor) -> None:
+        """旧库升级：草案补 bargain_count 独立列（修 D5）＋ sessions 补 slot_key（B2-5）。"""
+        self._migrate_draft_bargain_count(cur)
+        cur.execute("PRAGMA table_info(sessions)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+        if cols and "slot_key" not in cols:
+            cur.execute("ALTER TABLE sessions ADD COLUMN slot_key TEXT")
+            logger.info("旧库迁移完成：sessions 补 slot_key 列（缺省 NULL＝standalone，不回填）")
+
+    def _migrate_draft_bargain_count(self, cur: sqlite3.Cursor) -> None:
         """v3 前的旧库升级：session_task_drafts 补 bargain_count 独立列（修 D5），
         并把旧草案 JSON 内混入的 bargain_count / _draft_commit_valid 剥离。"""
         cur.execute("PRAGMA table_info(session_task_drafts)")
@@ -309,32 +321,47 @@ class MemoryStore:
     # 会话
     # ------------------------------------------------------------------
 
-    def create_session_sync(self, npc_name: str, title: str) -> SessionInfo:
+    def create_session_sync(self, npc_name: str, title: str, slot_key: str | None = None) -> SessionInfo:
+        """建会话并记当前存档作用域（B2-5）；slot_key=None＝standalone。"""
         npc_name = npc_name.strip()
         title = title.strip()
         if not npc_name:
             raise ValueError("npc_name 不能为空。")
         if not title:
             raise ValueError("title 不能为空。")
-        info = SessionInfo(session_id=str(uuid.uuid4()), npc_name=npc_name, title=title, created_at=time.time())
+        slot_key = str(slot_key).strip() if slot_key is not None else None
+        slot_key = slot_key or None
+        info = SessionInfo(
+            session_id=str(uuid.uuid4()), npc_name=npc_name, title=title,
+            created_at=time.time(), slot_key=slot_key,
+        )
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "INSERT INTO sessions (session_id, npc_name, title, created_at) VALUES (?, ?, ?, ?)",
-                (info.session_id, info.npc_name, info.title, info.created_at),
+                "INSERT INTO sessions (session_id, npc_name, title, created_at, slot_key) VALUES (?, ?, ?, ?, ?)",
+                (info.session_id, info.npc_name, info.title, info.created_at, info.slot_key),
             )
             self._conn.commit()
         return info
 
-    def list_sessions_sync(self) -> list[SessionInfo]:
+    def list_sessions_sync(self, slot_key: str | None = None) -> list[SessionInfo]:
+        """按存档作用域过滤（B2-5）：slot_key=None→只回 standalone（NULL）会话。"""
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "SELECT session_id, npc_name, title, created_at FROM sessions ORDER BY created_at DESC, session_id ASC"
+                """
+                SELECT session_id, npc_name, title, created_at, slot_key FROM sessions
+                WHERE slot_key IS ? ORDER BY created_at DESC, session_id ASC
+                """,
+                (slot_key,),
             )
             rows = cur.fetchall()
         return [
-            SessionInfo(session_id=str(r["session_id"]), npc_name=str(r["npc_name"]), title=str(r["title"]), created_at=float(r["created_at"]))
+            SessionInfo(
+                session_id=str(r["session_id"]), npc_name=str(r["npc_name"]), title=str(r["title"]),
+                created_at=float(r["created_at"]),
+                slot_key=str(r["slot_key"]) if r["slot_key"] is not None else None,
+            )
             for r in rows
         ]
 
@@ -348,7 +375,7 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "SELECT session_id, npc_name, title, created_at FROM sessions WHERE session_id = ?",
+                "SELECT session_id, npc_name, title, created_at, slot_key FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
             row = cur.fetchone()
@@ -361,6 +388,7 @@ class MemoryStore:
             npc_name=str(row["npc_name"]),
             title=title,
             created_at=float(row["created_at"]),
+            slot_key=str(row["slot_key"]) if row["slot_key"] is not None else None,
         )
 
     def delete_session_sync(self, session_id: str) -> None:

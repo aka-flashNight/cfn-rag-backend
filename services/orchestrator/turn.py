@@ -617,6 +617,7 @@ class TurnOrchestrator:
             favorability=ctx.favorability,
             relationship_level=ctx.relationship_level,
             pending_draft_summary=ctx.pending_draft_summary if has_pending_draft else "",
+            save_info=ctx.save_info,
         )
         return [
             {"role": "system", "content": system},

@@ -80,6 +80,31 @@ def test_bind_switch_slot(state):
     assert client.get("/integration/status").json()["bound_slot"] == "slot_b"
 
 
+def test_bind_calls_ensure_agent_save_files(state, monkeypatch):
+    """B2-4 接线：bind 成功后按槽位键调 ensure（落盘行为见 tests/test_startup_ensure.py）。"""
+    from api import integration_api
+
+    calls: list[str] = []
+    monkeypatch.setattr(integration_api, "ensure_agent_save_files", calls.append)
+
+    resp = _make_client().post("/integration/bind", json={"slot_key": "slot_ensure"})
+    assert resp.status_code == 200
+    assert calls == ["slot_ensure"]
+
+
+def test_bind_and_unbind_trigger_index_refresh(state, monkeypatch):
+    """B2-7 接线：bind / unbind 后检查语料刷新（后台重建行为见 tests/retrieval/test_refresh.py）。"""
+    from api import integration_api
+
+    calls: list[int] = []
+    monkeypatch.setattr(integration_api, "refresh_index_if_stale", lambda: calls.append(1))
+
+    client = _make_client()
+    assert client.post("/integration/bind", json={"slot_key": "slot_refresh"}).status_code == 200
+    assert client.post("/integration/unbind").status_code == 200
+    assert calls == [1, 1]
+
+
 @pytest.mark.parametrize("bad", ["", "../x", "a/b", "a\\b", "a" * 129, "a b", "存档"])
 def test_bind_rejects_invalid_slot_key(state, bad):
     client = _make_client()

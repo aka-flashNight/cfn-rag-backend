@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from services.game_data.paths import find_resources_directory
+from services.integration.save_paths import agent_save_task_paths
+from services.integration.state import is_valid_slot_key
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +92,18 @@ def _copy_backup_file_if_missing(*, target_path: Path, backup_rel_path: Path) ->
     return True
 
 
-def _ensure_json_file(*, target_path: Path, default_obj: Any, backup_rel_path: Path) -> None:
-    """确保 JSON 文件存在：目标优先 → 备份 → 最小骨架。"""
+def _ensure_json_file(
+    *,
+    target_path: Path,
+    default_obj: Any,
+    backup_rel_path: Path | None,
+) -> None:
+    """确保 JSON 文件存在：目标优先 → 备份 → 最小骨架（backup_rel_path=None 跳过备份源）。"""
     if target_path.exists():
         return
-    if _copy_backup_file_if_missing(target_path=target_path, backup_rel_path=backup_rel_path):
+    if backup_rel_path is not None and _copy_backup_file_if_missing(
+        target_path=target_path, backup_rel_path=backup_rel_path,
+    ):
         return
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(json.dumps(default_obj, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -172,6 +181,26 @@ def ensure_npc_state_db() -> bool:
         return True
     logger.warning("npc_state_db.json 不存在，将由 NPCManager 从对话数据初始化: %s", path)
     return False
+
+
+def ensure_agent_save_files(slot_key: str) -> None:
+    """为指定槽位建按存档增量目录与空文件（B2-4；bind 后按需调用，best-effort）。
+
+    - 只补缺：目录/文件已存在一律跳过，不覆盖既有内容；
+    - **不**碰 list.xml：按存档文件在结构上无法登记（条目名正则不含路径分隔符），
+      游戏侧由 AS2 显式增载、宿主由 G2-5 的额外源文件入口读取；
+    - 任何失败只记日志，不阻断调用方（读不到该存档增量时游戏侧静默跳过）。
+    """
+    if not is_valid_slot_key(slot_key):
+        logger.warning("槽位键非法（%r），跳过按存档目录 ensure", slot_key)
+        return
+    try:
+        data_root = find_resources_directory() / "data"
+        tasks_path, text_path = agent_save_task_paths(data_root, slot_key)
+        _ensure_json_file(target_path=tasks_path, default_obj={"tasks": []}, backup_rel_path=None)
+        _ensure_json_file(target_path=text_path, default_obj={}, backup_rel_path=None)
+    except Exception as exc:
+        logger.warning("按存档目录 ensure 失败（忽略，不影响 bind）: slot=%s err=%s", slot_key, exc)
 
 
 # ---------------------------------------------------------------------------

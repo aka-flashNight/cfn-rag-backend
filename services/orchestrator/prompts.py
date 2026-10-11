@@ -14,7 +14,7 @@ description 里，本文件的 build_routing_guide 只讲跨工具的公共规�
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 from services.game_progress import StageConfig
 from services.llm import meta_prompt_block
@@ -295,6 +295,17 @@ def _rag_block(retrieved_context: str) -> str:
     )
 
 
+def _save_player_name_line(save_info: Any) -> str:
+    """绑定存档投影里的玩家名字行（B2-1）；未绑定/投影缺名字＝空串。"""
+    if not isinstance(save_info, dict):
+        return ""
+    character = save_info.get("character")
+    if not isinstance(character, dict):
+        return ""
+    name = str(character.get("name") or "").strip()
+    return f"玩家的名字是「{name}」。" if name else ""
+
+
 def build_session_state_block(
     *,
     player_identity: str = "",
@@ -302,10 +313,14 @@ def build_session_state_block(
     favorability: int = 0,
     relationship_level: str = "陌生",
     pending_draft_summary: str = "",
+    save_info: Any = None,
 ) -> str:
     parts: list[str] = []
     if player_identity:
         parts.append(f"玩家的身份是：{player_identity}")
+    player_name_line = _save_player_name_line(save_info)
+    if player_name_line:
+        parts.append(player_name_line)
     if progress_desc:
         parts.append(progress_desc)
     parts.append(f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。")
@@ -329,6 +344,7 @@ def build_user_shared_core(
     favorability: int = 0,
     relationship_level: str = "陌生",
     pending_draft_summary: str = "",
+    save_info: Any = None,
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
@@ -344,6 +360,7 @@ def build_user_shared_core(
         favorability=favorability,
         relationship_level=relationship_level,
         pending_draft_summary=pending_draft_summary,
+        save_info=save_info,
     )
     if session_block:
         parts.append(session_block)

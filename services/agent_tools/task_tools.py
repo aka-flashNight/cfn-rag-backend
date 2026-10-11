@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.game_data.registry import GameDataRegistry
+from services.integration.save_paths import resolve_task_write_paths, shared_task_paths
+from services.retrieval.refresh import refresh_index_if_stale
 
 # 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
 MAX_MAINLINE_TASK_PROGRESS: int = 77
@@ -307,34 +309,14 @@ def _dialogue_entry_to_agent_text_item(
     return {"name": name, "title": title, "char": char, "text": text}
 
 
-def write_confirmed_agent_task_files(
-    *,
-    draft: Dict[str, Any],
-    npc_name_fallback: str,
-    game_data: GameDataRegistry,
-) -> tuple[str, int]:
-    """
-    将已确认的任务草案写入：
-    - resources/data/task/agent_tasks.json
-    - resources/data/task/text/agent_text.json
-
-    在锁内根据磁盘上已有 agent 任务的最大 ID 分配新 ID（避免内存 TaskRegistry 未重载时重复 ID 覆盖旧任务）。
-
-    返回 (写入描述字符串, 分配的任务 ID)。
-    """
-    with _WRITE_LOCK:
-        data_root = game_data.data_root
-        agent_tasks_path = (data_root / "task" / "agent_tasks.json").resolve()
-        agent_text_path = (data_root / "task" / "text" / "agent_text.json").resolve()
-
-        tasks_doc = _read_json(agent_tasks_path, default={"tasks": []})
-        if not isinstance(tasks_doc, dict):
-            tasks_doc = {"tasks": []}
-        tasks = tasks_doc.get("tasks", [])
+def _max_agent_task_id(scan_paths: List[Path]) -> int:
+    """扫描给定任务文件中 200001–300000 段的现有最大 id（B2-3：共享 ∪ 本存档）。"""
+    max_agent = 200000
+    for path in scan_paths:
+        doc = _read_json(path, default={"tasks": []})
+        tasks = doc.get("tasks", []) if isinstance(doc, dict) else []
         if not isinstance(tasks, list):
-            tasks = []
-
-        max_agent = 200000
+            continue
         for t in tasks:
             if not isinstance(t, dict):
                 continue
@@ -344,8 +326,42 @@ def write_confirmed_agent_task_files(
                 continue
             if 200001 <= tid <= 300000 and tid > max_agent:
                 max_agent = tid
+    return max_agent
 
-        task_id_int = max_agent + 1
+
+def write_confirmed_agent_task_files(
+    *,
+    draft: Dict[str, Any],
+    npc_name_fallback: str,
+    game_data: GameDataRegistry,
+) -> tuple[str, int]:
+    """
+    将已确认的任务草案写入（B2-2 按绑定分流）：
+    - bind → data/rag/agent_saves/<slotKey>/agent_tasks.json + agent_text.json
+      （文件级隔离：每存档一份完整文件，只含该存档自己发布的任务）；
+    - 未 bind → 共享 data/task/agent_tasks.json + data/task/text/agent_text.json（现状）。
+
+    在锁内根据磁盘上已有 agent 任务的最大 ID 分配新 ID（扫描范围＝共享 ∪ 本存档，B2-3，
+    避免内存 TaskRegistry 未重载时重复 ID 覆盖旧任务）。
+
+    返回 (写入描述字符串, 分配的任务 ID)。
+    """
+    with _WRITE_LOCK:
+        data_root = game_data.data_root
+        agent_tasks_path, agent_text_path, _slot_key = resolve_task_write_paths(data_root)
+
+        tasks_doc = _read_json(agent_tasks_path, default={"tasks": []})
+        if not isinstance(tasks_doc, dict):
+            tasks_doc = {"tasks": []}
+        tasks = tasks_doc.get("tasks", [])
+        if not isinstance(tasks, list):
+            tasks = []
+
+        shared_tasks_path, _shared_text_path = shared_task_paths(data_root)
+        scan_paths = [shared_tasks_path]
+        if agent_tasks_path != shared_tasks_path:
+            scan_paths.append(agent_tasks_path)
+        task_id_int = _max_agent_task_id(scan_paths) + 1
         draft["id"] = task_id_int
 
         get_npc = (
@@ -497,5 +513,8 @@ def write_confirmed_agent_task_files(
             )
         else:
             msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
-        return msg, task_id_int
+
+    # B2-7：锁外触发语料刷新（新任务台词应立即可检索；引擎未就绪时天然 no-op）
+    refresh_index_if_stale()
+    return msg, task_id_int
 
