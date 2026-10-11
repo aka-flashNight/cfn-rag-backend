@@ -54,6 +54,30 @@ def _format_items_with_price(
     return parts
 
 
+def _stage_monster_text(
+    game_data: Optional[GameDataRegistry], stage_name: str,
+) -> str:
+    """关卡怪物块（B8-3）：查不到关卡/怪物或任何异常时返回空串。"""
+    if game_data is None:
+        return ""
+    try:
+        from services.game_entity_prompts import (
+            format_stage_monster_block,
+            get_stage_info_for_name,
+        )
+
+        si = get_stage_info_for_name(game_data.stages, stage_name)
+        if si is None:
+            return ""
+        enemy_reg = getattr(game_data, "enemy_registry", None)
+        if enemy_reg is None:
+            return ""
+        spawns = game_data.stages.get_enemy_spawns(si.area, si.name)
+        return format_stage_monster_block(enemy_reg.monsters_for_spawns(spawns))
+    except Exception:
+        return ""
+
+
 def _build_draft_entity_context_lines(
     draft: dict[str, Any],
     game_data: Optional[GameDataRegistry],
@@ -63,6 +87,7 @@ def _build_draft_entity_context_lines(
     """
     与本轮检索上下文中的【玩家可能提到的物品类型】【玩家可能提到的关卡】按名称去重：
     已在 RAG 块出现过的实体不再重复；未出现的实体给出与 RAG 相同格式的完整说明（另附草案数量/难度等）。
+    选关类任务（不含切磋）在每个 [关卡] 行后追加关卡怪物块（B8-3；逐关卡各出一段）。
     """
     if game_data is None:
         return []
@@ -75,6 +100,7 @@ def _build_draft_entity_context_lines(
     )
 
     already_items, already_stages = parse_rag_game_entity_mentions(rag_context_text)
+    need_monsters = str(draft.get("task_type") or "").strip() != "切磋"
 
     lines: list[str] = []
     seen_stage: set[str] = set()
@@ -85,7 +111,11 @@ def _build_draft_entity_context_lines(
         if not sn or sn in seen_stage:
             continue
         seen_stage.add(sn)
+        monster_text = _stage_monster_text(game_data, sn) if need_monsters else ""
         if sn in already_stages:
+            # 关卡详情已在前文 RAG 块出现：怪物块单独锚一行补出，不复述详情
+            if monster_text:
+                lines.append(f"[关卡] {sn}：{monster_text}")
             continue
         diff = (fr.get("difficulty") or "").strip() or None
         si = get_stage_info_for_name(game_data.stages, sn)
@@ -99,6 +129,8 @@ def _build_draft_entity_context_lines(
             if diff:
                 seg += f"；草案要求难度：{diff}"
             lines.append(f"[关卡] {seg}（未在库中解析到详情）")
+        if monster_text:
+            lines.append(monster_text)
 
     item_names: list[str] = []
 
@@ -155,7 +187,20 @@ def _detailed_draft_summary(
         lines.append(f"描述: {_desc}")
     npc_name_fallback = draft.get("npc_name") or "?"
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
-    lines.append(f"完成NPC: {draft.get('finish_npc') or npc_name_fallback}")
+    # 完成 NPC ≠ 发布 NPC 时补其所在场景（B8-3）：无驻地/查不到时不补、也不附指示句
+    finish_npc = (draft.get("finish_npc") or "").strip() or str(npc_name_fallback)
+    finish_scene = ""
+    if game_data is not None and finish_npc != npc_name_fallback:
+        map_reg = getattr(game_data, "map_registry", None)
+        if map_reg is not None:
+            from services.npc.scene_context import npc_scene_text
+
+            finish_scene = npc_scene_text(map_reg, finish_npc)
+    if finish_scene:
+        lines.append(f"完成NPC: {finish_npc}；所在场景：{finish_scene}")
+        lines.append("非同阵营npc你未必知道准确场景名，但知道大致情况，根据你的人设决定。")
+    else:
+        lines.append(f"完成NPC: {finish_npc}")
 
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:

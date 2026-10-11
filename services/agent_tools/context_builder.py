@@ -232,12 +232,14 @@ _TASK_RULES: dict[str, str] = {
         "可选当前NPC自己或其他NPC为完成NPC。奖励较少。"
         "完成任务对话内容中是完成NPC和玩家进行对话，奖励也由完成NPC提供。"
         "适合低好感度或初次对话时使用。"
+        "传话/问候任务通常要排除同场景npc，因为你可以和他们直接面对面说话。优先选择其他场景的npc。"
     ),
     "传话": (
         "传话类任务：要求玩家去找另一个NPC对话。"
         "在有理由的情况下，可选择任意NPC作为完成NPC，包括同阵营传话、不同阵营的外交等。"
         "注意，传话类任务中，完成NPC和发布NPC不同。完成NPC一定要是需要传话的NPC对象，完成任务时的对话内容也是该完成NPC和玩家对话，奖励也由完成NPC提供。"
         "奖励较少。适合推动NPC间剧情互动。"
+        "传话/问候任务通常要排除同场景npc，因为你可以和他们直接面对面说话。优先选择其他场景的npc。"
     ),
     "通关": (
         "通关类任务：要求玩家通关指定关卡。"
@@ -1147,6 +1149,13 @@ def _build_npc_list(
     current_faction = getattr(current_state, "faction", None) or ""
     allow_special_npcs = current_faction in {"成员", "彩蛋"}
 
+    map_reg = getattr(game_data, "map_registry", None)
+    scene_text_fn = None
+    if map_reg is not None:
+        from services.npc.scene_context import npc_scene_text
+
+        scene_text_fn = npc_scene_text
+
     banned_special_factions = {"成员", "彩蛋"}
     result: list[dict[str, Any]] = []
     for name, state in npc_states.items():
@@ -1163,6 +1172,10 @@ def _build_npc_list(
             "name": name,
             "faction": getattr(state, "faction", None) or "",
         }
+        if scene_text_fn is not None:
+            scene_text = scene_text_fn(map_reg, name)
+            if scene_text:
+                entry["scene"] = scene_text
         titles = getattr(state, "titles", None)
         if titles:
             entry["title"] = titles[0] if titles else ""
@@ -2296,6 +2309,19 @@ def prepare_task_context(
             npc_name,
             requirement_keywords=requirement_keywords,
         )
+        # 选人轮场景块（发布 NPC 视角，B8-2）：无驻地/加载失败时不注入
+        map_reg = getattr(game_data, "map_registry", None)
+        if map_reg is not None:
+            try:
+                from services.npc.scene_context import build_scene_block
+
+                publisher_scene = build_scene_block(
+                    map_reg=map_reg, npc_states=npc_states or {}, npc_name=npc_name,
+                )
+            except Exception:
+                publisher_scene = ""
+            if publisher_scene:
+                context["publisher_scene"] = publisher_scene
 
     elif task_type in ("通关", "清理", "挑战"):
         context["stage_list"] = _get_all_stages_for_progress(

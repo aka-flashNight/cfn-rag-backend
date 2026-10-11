@@ -54,7 +54,8 @@ prepare_task_context  ──►  draft_agent_task  ──►  （玩家回复）
 - `submit_item_candidates` / `contain_item_candidates`：可供"提交/持有"任务选择的物品
 - `reward_item_candidates`：可供奖励列表选择的物品（结构化，已过滤 reward_types）
 - `reward_budget`：`{final_min, final_max}` 总价值上下限
-- `npc_list`（仅问候/传话）：候选完成 NPC 及其情绪/称号列表
+- `npc_list`（仅问候/传话）：候选完成 NPC 及其情绪/称号列表；有驻地者附 `scene`（所在场景）
+- `publisher_scene`（仅问候/传话，发布 NPC 有驻地时）：你所在场景与同场景 NPC 名单
 - `rule_hint`：该任务类型的人类可读规则摘要
 
 ## Step 2: draft_agent_task

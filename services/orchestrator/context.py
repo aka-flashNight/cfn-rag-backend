@@ -114,6 +114,24 @@ def same_faction_npcs_block(
     return "同阵营角色（设定供参考，不要替他们发言）：\n" + "\n".join(result)
 
 
+def _same_faction_names(
+    current_npc: str,
+    current_faction: Optional[str],
+    all_states: dict[str, NPCState],
+) -> set[str]:
+    """同阵营角色名集合（条件与 same_faction_npcs_block 一致，不含排除判定）。"""
+    if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
+        return set()
+    out: set[str] = set()
+    for name, state in all_states.items():
+        if name == current_npc:
+            continue
+        if (state.faction or "").strip() != current_faction.strip():
+            continue
+        out.add(name)
+    return out
+
+
 def forbidden_other_chars(all_states: dict[str, NPCState]) -> set[str]:
     """彩蛋/成员阵营角色名（小写），检索时从「其他 NPC」池排除。"""
     out: set[str] = set()
@@ -282,6 +300,8 @@ class TurnContext:
     pending_draft_row: Optional[TaskDraftRow] = None
     pending_draft_summary: str = ""
     same_faction_block: str = ""
+    scene_block: str = ""
+    scene_supplement: str = ""
     has_shop: bool = False
     shop_reward_types: list[str] = field(default_factory=list)
     player_can_challenge: bool = False  # 玩家当前能否挑战该 NPC（与 prepare 切磋判定同源）
@@ -346,6 +366,30 @@ async def assemble_context(
     same_faction_block = same_faction_npcs_block(
         npc_name, npc_state.faction, npc_states, mentioned_names,
     )
+
+    # 场景块与场景补充（B8-1）：map_definition.json 缺载/异常时整体降级为空串
+    scene_block = ""
+    scene_supplement = ""
+    map_reg = getattr(game_data, "map_registry", None)
+    if map_reg is not None:
+        try:
+            from services.npc.scene_context import (
+                build_scene_block,
+                build_scene_supplement,
+            )
+
+            scene_block = build_scene_block(
+                map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+            )
+            covered = set(mentioned_names) | _same_faction_names(
+                npc_name, npc_state.faction, npc_states,
+            )
+            scene_supplement = build_scene_supplement(
+                map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+                exclude_names=covered,
+            )
+        except Exception as exc:
+            logger.warning("场景块/场景补充装配失败，降级为空: %s", exc)
 
     titles = list(npc_state.titles or [])
     last_npc_message = next(
@@ -449,6 +493,8 @@ async def assemble_context(
         pending_draft_row=draft_row,
         pending_draft_summary=pending_draft_summary,
         same_faction_block=same_faction_block,
+        scene_block=scene_block,
+        scene_supplement=scene_supplement,
         has_shop=has_shop,
         shop_reward_types=shop_reward_types,
         player_can_challenge=player_can_challenge,

@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from services.game_progress import stage_root_region_hint
 
-from services.game_data.models import Item, StageInfo
+from services.game_data.models import Item, StageMonster, StageInfo
 
 # RAG 中与草案去重共用的块标题（与 game_rag_service 输出一致）
 _RE_ITEM_SECTION_HDR = re.compile(r"【玩家可能提到的物品类型[^】]*】\s*", re.MULTILINE)
@@ -204,4 +204,28 @@ def get_stage_info_for_name(stage_registry: Any, stage_name: str) -> Optional[St
 
 def iter_all_stage_infos(stage_registry: Any) -> list[StageInfo]:
     return [si for si in stage_registry._stage_infos.values()]
+
+
+def format_stage_monster_block(monsters: list[StageMonster]) -> str:
+    """关卡怪物块（B8-3，§8.1-④ 逐字格式）：只出现 displayname；
+    数量最多并列全列并附约数句；强度最高只统计有阶段×档次系数者，全无则省该句。
+    """
+    if not monsters:
+        return ""
+    names = "，".join(m.displayname for m in monsters)
+    parts = [f"该关卡有以下怪物：{names}。"]
+    q_max = max(m.quantity for m in monsters)
+    top_by_q = [m.displayname for m in monsters if m.quantity == q_max]
+    parts.append(f"其中数量最多的是{'、'.join(top_by_q)}，大致数量约{q_max}个。")
+    graded = [m for m in monsters if m.strength is not None]
+    if graded:
+        s_max = max(m.strength for m in graded)
+        top_by_s = [m.displayname for m in graded if m.strength == s_max]
+        parts.append(f"强度最高的是{'、'.join(top_by_s)}。")
+    parts.append(
+        "根据你的身份，你可能知道也可能不知道这个关卡的详情，"
+        "但绝对不要编造信息，要么表现的不清楚，要么根据实际信息去说话，"
+        "不能编造未提供的信息。"
+    )
+    return "".join(parts)
 

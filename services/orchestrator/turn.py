@@ -44,6 +44,7 @@ from services.llm.errors import LLMError
 from services.memory.store import MemoryStore, PRECISE_MEMORY_OPTIONS, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
+from services.npc.task_publish_policy import is_task_publish_disabled
 from services.orchestrator.context import TurnContext, assemble_context
 from services.portraits import build_image_message_content
 from services.orchestrator.events import (
@@ -240,6 +241,8 @@ class TurnOrchestrator:
 
         agent_enabled=False 时本回合只做纯聊天：不下发任何路由工具、
         prompt 不含路由说明、模型仍硬发的路由调用一律忽略。
+        任务发布临时关闭名单内的 NPC（services/npc/task_publish_policy.py）
+        不论 agent_enabled 一律同走纯聊天闸门，prompt 换成不可派活约束。
         summarize_interval 是前端「精确短期记忆长度」档位（10/30/100/500，对应
         短/中/长/几乎无限）；非白名单值一律按未提供处理，回落到服务端默认。
         """
@@ -252,6 +255,7 @@ class TurnOrchestrator:
         self.llm_config = llm_config or LLMConfig()
         self.send_image = send_image
         self.agent_enabled = agent_enabled
+        self.task_publish_disabled = is_task_publish_disabled(npc_name)
         self.precise_memory_limit = (
             summarize_interval if summarize_interval in PRECISE_MEMORY_OPTIONS else None
         )
@@ -284,6 +288,11 @@ class TurnOrchestrator:
 
     def _resolve_deps(self) -> OrchestratorDeps:
         return self.deps if self.deps is not None else default_deps()
+
+    @property
+    def _routing_enabled(self) -> bool:
+        """本回合是否允许路由（Agent 能力开启，且该 NPC 不在任务发布关闭名单）。"""
+        return self.agent_enabled and not self.task_publish_disabled
 
     # ------------------------------------------------------------------
     # 状态机
@@ -346,13 +355,13 @@ class TurnOrchestrator:
             ]
 
             # 聊天 Agent 的工具表 = 路由表（判据写在工具描述里，见 services/tools/route/）。
-            # Agent 能力关闭时不下发任何工具：模型连路由入口都没有。
+            # Agent 能力关闭或任务发布临时关闭时不下发任何工具：模型连路由入口都没有。
             chat_tools = (
                 self._routing_tools(
                     deps.registry,
-                    has_pending_draft=self.agent_enabled and ctx.pending_draft_row is not None,
+                    has_pending_draft=self._routing_enabled and ctx.pending_draft_row is not None,
                 )
-                if self.agent_enabled else []
+                if self._routing_enabled else []
             )
 
             stream = llm.chat_stream(ChatRequest(
@@ -373,9 +382,9 @@ class TurnOrchestrator:
             tool_sink: list[dict[str, Any]] = []
             async for ev in self._forward_body(events, collected_text, tool_sink=tool_sink):
                 yield ev
-            # Agent 能力关闭时即便模型硬发路由调用也一律忽略：本回合只有纯聊天。
+            # 路由闸门关闭时即便模型硬发路由调用也一律忽略：本回合只有纯聊天。
             # （工具表已经没下发路由工具，这里是防越权的第二道闸。）
-            route = _parse_route(tool_sink) if self.agent_enabled else None
+            route = _parse_route(tool_sink) if self._routing_enabled else None
             route_kind = route.kind if route is not None else None
             spoken_text = "".join(collected_text)
 
@@ -384,7 +393,7 @@ class TurnOrchestrator:
                     "会话 %s：路由轮（%s）仍输出了台词 %.60s——提示词要求该轮只路由不说话",
                     self.session_id, route.kind, spoken_text,
                 )
-            if route is None and self.agent_enabled and ctx.pending_draft_row is not None:
+            if route is None and self._routing_enabled and ctx.pending_draft_row is not None:
                 # 观测点：有草案时玩家常在「接/不接」，模型漏发路由会导致草案静默过期，
                 # 玩家侧只看到「过期的委托草案已取消」，必须留痕便于排查
                 logger.warning(
@@ -397,8 +406,10 @@ class TurnOrchestrator:
                 # ---- 纯聊天路径：正文已直发，无后台动作 ----
                 if tool_sink:
                     names = [tc.get("function", {}).get("name") for tc in tool_sink]
-                    if self.agent_enabled:
+                    if self._routing_enabled:
                         logger.info("纯聊天轮出现非路由工具调用，忽略: %s", names)
+                    elif self.agent_enabled:
+                        logger.warning("该 NPC 任务发布已临时关闭，模型仍硬发路由调用，忽略: %s", names)
                     else:
                         logger.warning("Agent 能力已关闭，模型仍硬发路由调用，忽略: %s", names)
 
@@ -579,18 +590,21 @@ class TurnOrchestrator:
         self, ctx: TurnContext, *, dialogue_limit: int,
     ) -> list[dict[str, Any]]:
         """[system 静态, user shared core]（前缀缓存对齐；tail 与玩家话在末条 user）。"""
-        # Agent 能力关闭时待确认草案不进 prompt：模型既无法确认也无法取消，
+        # 路由闸门关闭时待确认草案不进 prompt：模型既无法确认也无法取消，
         # 摆在它面前只会诱导它空口答应。草案仍照常装配，交给过期计数清理。
-        has_pending_draft = self.agent_enabled and ctx.pending_draft_row is not None
+        has_pending_draft = self._routing_enabled and ctx.pending_draft_row is not None
         system = build_static_system(
             npc_name=self.npc_name,
             state=ctx.npc_state,
             same_faction_npcs=ctx.same_faction_block,
+            scene_block=ctx.scene_block,
+            scene_supplement=ctx.scene_supplement,
             has_shop=ctx.has_shop,
             shop_reward_types=ctx.shop_reward_types,
             player_can_challenge=ctx.player_can_challenge,
             has_pending_draft=has_pending_draft,
             agent_enabled=self.agent_enabled,
+            task_publish_disabled=self.task_publish_disabled,
         )
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,

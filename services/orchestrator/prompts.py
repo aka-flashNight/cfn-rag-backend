@@ -194,15 +194,19 @@ def build_static_system(
     npc_name: str,
     state: NPCState,
     same_faction_npcs: str = "",
+    scene_block: str = "",
+    scene_supplement: str = "",
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
     player_can_challenge: Optional[bool] = None,
     has_pending_draft: bool = False,
     agent_enabled: bool = True,
+    task_publish_disabled: bool = False,
 ) -> str:
     """system 分层（前缀缓存对齐，从稳定到易变）：
     层1 跨 NPC 一致（世界观、输出规则、说话方式）→ 层2 单 NPC 一致
-    （扮演约束、meta 协议、同阵营表、路由指南、商店/切磋可行性、appearance）。
+    （扮演约束、meta 协议、场景块、同阵营表与场景补充、路由指南、
+    商店/切磋可行性、appearance）。
 
     v3 再次重构后层1 不再含任务选型指南（那 1229 字整体移交任务 Agent），
     因此层1 对全部 NPC 与全部回合恒定，前缀缓存命中率只受层2 影响。
@@ -213,7 +217,12 @@ def build_static_system(
     白占 token 并诱导模型承诺做不到的事；改为注入 NO_AGENT_CONSTRAINT，让 NPC
     以人设口吻婉拒而不是空口答应；玩家坚持要活时，还要引导他去终端打开接取
     委托的权限（v2 同名提示的口径）。
+
+    task_publish_disabled=True（无驻地 NPC 名单，临时措施）时同样不注入任务
+    相关块，但换成 NO_TASK_PUBLISH_CONSTRAINT：以人设口吻直接婉拒，不引导
+    玩家去改终端权限（玩家侧没有可开的闸）。
     """
+    can_publish = agent_enabled and not task_publish_disabled
     emotions_str = "、".join(state.emotions or ["普通"])
     tagline = format_npc_role_tagline(
         npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
@@ -232,12 +241,18 @@ def build_static_system(
         "未处于任务委派、描述介绍、事件回忆等特殊语境的日常闲聊中，每次对话长度不必太长，但也不要因此而强行缩写语句或词语，而是保持正常聊天口语的自然流畅的前提下正常说话，不要啰嗦。",
         "绝对不要自己脑补不存在的设定，一切没有提供给你的信息，你都不能有任何提及或暗示。"
         "无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。例如，如果前文没有说某个人在什么地点，或者某个地点有什么东西，你不要擅自脑补，对话中绝对不能自己造信息。只允许依据准确已知信息来表述。",
-        meta_prompt_block(state.emotions or ["普通"], agent_enabled=agent_enabled),
+        meta_prompt_block(state.emotions or ["普通"], agent_enabled=can_publish),
     ])
+    scene = (scene_block or "").strip()
+    if scene:
+        parts.append(scene)
     same = (same_faction_npcs or "").strip()
     if same:
         parts.append(f"【同阵营角色】\n{same}")
-    if agent_enabled:
+    supplement = (scene_supplement or "").strip()
+    if supplement:
+        parts.append(supplement)
+    if can_publish:
         parts.append(build_routing_guide(has_pending_draft=has_pending_draft))
         parts.append("【任务发布硬约束（具体怎么拟由后台任务系统负责，你只决定要不要派、往哪个方向派）】")
         parts.append(
@@ -251,6 +266,8 @@ def build_static_system(
         parts.append(build_challenge_hint(
             bool(state.challenge), player_can_challenge,
         ))
+    elif task_publish_disabled:
+        parts.append(NO_TASK_PUBLISH_CONSTRAINT)
     else:
         parts.append(NO_AGENT_CONSTRAINT)
     appearance = build_appearance_block(state)
@@ -391,6 +408,14 @@ NO_AGENT_CONSTRAINT = """\
 若玩家坚持要接活，则提醒他：得先在自己那台终端上把接取委托的权限打开，你这边才派得出去。
 这类提醒同样要用角色口吻说（例：「你那终端的委托权限还关着呢，打开了我才好给你派活」），
 不要用界面或系统术语（面板、开关、勾选、参数名之类），也不要把它说成系统故障。
+"""
+
+
+NO_TASK_PUBLISH_CONSTRAINT = """\
+【当前无法派发委托】
+你不能给玩家派发任何委托、代办或差事，也查不了外部情报——只能凭自己已知的设定交谈。
+因此：不要答应「我去安排」「回头给你派个活」这类承诺，也不要编造具体任务内容或报酬数字。
+玩家索要任务/委托时，以符合你身份和当前关系的口吻婉拒（如手头没活、时机不合适、不放心交给他）。
 """
 
 

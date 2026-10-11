@@ -137,3 +137,44 @@ class KShopItem(BaseModel):
     price: int = 0
     raw: Optional[dict[str, Any]] = None
 
+
+class MapScene(BaseModel):
+    """地图场景（map_definition.json 的 locations 条目；场景名口径＝label（linkage））。"""
+
+    location_id: str
+    label: str = Field(..., description="场景显示名（locations[].label，如 基地大厅）")
+    linkage: str = Field(
+        default="",
+        description="场景绑定名（locations[].sceneBinding.linkage，如 基地场景-基地1层；缺失容忍）",
+    )
+
+
+class MapNpc(BaseModel):
+    """地图 NPC（map_definition.json 的 npcs 条目）。"""
+
+    key: str = Field(..., description="npcs 内部键（npc_<hex>）")
+    label: str = Field(..., description="地图 NPC 名（label）")
+    norm_names: set[str] = Field(
+        default_factory=set,
+        description="归一匹配名集合（label/runtimeNames/aliases，小写去空白），跨库名对齐用",
+    )
+
+
+class EnemySpawn(BaseModel):
+    """关卡 XML 的 <Enemy> 条目（Type 为空的条目在解析时已跳过）。"""
+
+    unit_type: str = Field(..., description="兵种 Type（形如 兵种61）")
+    quantity: int = Field(default=0, description="<Quantity> 数值（缺失按 0）")
+
+
+class StageMonster(BaseModel):
+    """按 displayname 聚合后的关卡怪物。
+
+    数量＝该 displayname 在关卡内 Quantity 求和；强度＝阶段×档次系数（缺一为 None，
+    不参与强度比较但仍进名单）。
+    """
+
+    displayname: str
+    quantity: int = 0
+    strength: Optional[float] = None
+
