@@ -131,9 +131,10 @@ def test_session_slot_scope_filtering(store):
 
     assert s2.slot_key == "slot_a"
     assert s4.slot_key is None
-    assert [x.session_id for x in store.list_sessions_sync(None)] == sorted(
-        [s1.session_id, s4.session_id]
-    )
+    # 只断言作用域集合：两会话创建时刻可能不同刻，列表顺序（created_at DESC）不作断言
+    assert {x.session_id for x in store.list_sessions_sync(None)} == {
+        s1.session_id, s4.session_id,
+    }
     assert [x.session_id for x in store.list_sessions_sync("slot_a")] == [s2.session_id]
     assert [x.session_id for x in store.list_sessions_sync("slot_b")] == [s3.session_id]
     assert store.list_sessions_sync("slot_c") == []

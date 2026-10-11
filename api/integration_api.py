@@ -27,6 +27,7 @@ from services.integration.state import (
     get_integration_state,
     request_process_shutdown,
 )
+from services.game_progress import derive_progress_stage, get_progress_stage_name
 from services.retrieval.refresh import refresh_index_if_stale
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ async def bind(payload: BindRequest) -> BindResponse:
         slot_key=payload.slot_key,
         character=payload.character.model_dump() if payload.character else None,
         progress=payload.progress.model_dump() if payload.progress else None,
+        scene=payload.scene.model_dump() if payload.scene else None,
+        player=payload.player,
     )
     # B2-4：按需建槽目录与空文件（best-effort，失败不影响 bind）
     ensure_agent_save_files(payload.slot_key)
@@ -63,6 +66,7 @@ async def unbind() -> UnbindResponse:
 async def status() -> IntegrationStatusResponse:
     state = get_integration_state()
     snapshot = state.snapshot()
+    stage = derive_progress_stage(snapshot["progress"], snapshot["player"])
     return IntegrationStatusResponse(
         mode=snapshot["mode"],
         launch_mode=snapshot["launch_mode"],
@@ -70,6 +74,10 @@ async def status() -> IntegrationStatusResponse:
         frontend_url=frontend_url_for(snapshot["mode"]),
         character=snapshot["character"],
         progress=snapshot["progress"],
+        scene=snapshot["scene"],
+        player=snapshot["player"],
+        stage=stage,
+        stage_name=get_progress_stage_name(stage),
     )
 
 

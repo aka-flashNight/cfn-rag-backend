@@ -306,6 +306,24 @@ def _save_player_name_line(save_info: Any) -> str:
     return f"玩家的名字是「{name}」。" if name else ""
 
 
+def _save_scene_line(save_info: Any) -> str:
+    """绑定存档投影里的玩家场景行；未绑定/场景段缺失＝空串。
+
+    战斗中给关卡名（stageName 非战斗时是残留值，须以 inCombat 门控）；
+    非战斗给地图名——优先归一后的 label，缺标签回落帧标签（stageFlag）原文。
+    """
+    if not isinstance(save_info, dict):
+        return ""
+    scene = save_info.get("scene")
+    if not isinstance(scene, dict):
+        return ""
+    stage_name = str(scene.get("stageName") or "").strip()
+    if scene.get("inCombat") is True and stage_name:
+        return f"玩家当前正在关卡「{stage_name}」中战斗。"
+    label = str(scene.get("label") or "").strip() or str(scene.get("stageFlag") or "").strip()
+    return f"玩家当前所在场景：{label}。" if label else ""
+
+
 def build_session_state_block(
     *,
     player_identity: str = "",
@@ -321,6 +339,9 @@ def build_session_state_block(
     player_name_line = _save_player_name_line(save_info)
     if player_name_line:
         parts.append(player_name_line)
+    scene_line = _save_scene_line(save_info)
+    if scene_line:
+        parts.append(scene_line)
     if progress_desc:
         parts.append(progress_desc)
     parts.append(f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。")

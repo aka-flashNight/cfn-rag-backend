@@ -1,7 +1,7 @@
 """游戏内嵌集成协议 schema（`/api/integration/*`，见开发计划 §附 B）。
 
-阶段一只记录槽位投影（内存态）；character/progress 字段已按最终形状冻结，
-阶段二由编排/任务/记忆层消费。
+槽位投影（内存态）由编排/任务/记忆/提示词层消费；
+character/progress/scene 字段已按最终形状冻结，player 为开放段（深层形状归后端消费方按需取用）。
 """
 
 from __future__ import annotations
@@ -30,10 +30,29 @@ class BindProgress(BaseModel):
     task_chains_progress: dict[str, Any] = Field(default_factory=dict)
 
 
+class BindScene(BaseModel):
+    """场景投影（只读）：玩家当前所处地图/关卡。
+
+    非战斗时 stageName 是上一次战斗关卡的残留值，消费方须用 inCombat 门控；
+    stageFlag 为帧标签（与 map_definition locations[].sceneName 对齐）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    stageFlag: str = ""
+    stageName: str = ""
+    entrance: str = ""
+    inCombat: bool = False
+
+
 class BindRequest(BaseModel):
     slot_key: str = Field(..., pattern=SLOT_KEY_PATTERN, description="当前存档槽位标识")
     character: BindCharacter | None = Field(default=None, description="角色信息投影")
     progress: BindProgress | None = Field(default=None, description="进度投影")
+    scene: BindScene | None = Field(default=None, description="场景投影")
+    player: dict[str, Any] | None = Field(
+        default=None, description="玩家段投影（开放段：等级/称号/技能/装备/基建等，按需取用）"
+    )
 
 
 class BindResponse(BaseModel):
@@ -60,3 +79,9 @@ class IntegrationStatusResponse(BaseModel):
     frontend_url: str
     character: dict | None = None
     progress: dict | None = None
+    scene: dict | None = None
+    player: dict | None = None
+    stage: int | None = Field(
+        default=None, description="由绑定存档投影推导的主线阶段（1-7）；不可判定＝null"
+    )
+    stage_name: str | None = Field(default=None, description="阶段名（废城/堕落城/…）；同上")

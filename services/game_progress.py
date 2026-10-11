@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -182,5 +182,76 @@ def stage_root_region_hint(stage_root: str) -> str:
     - 黑铁会总部、诺亚前线基地深处、雪山、副本任务、试炼场深处等返回目录名本身。
     """
     return _STAGE_ROOT_REGION_HINT_EXTRA.get(stage_root, stage_root)
+
+
+# ---------------------------------------------------------------------------
+# 存档投影 → 阶段推导（存档绑定时自动判定，不再依赖前端手选）
+# ---------------------------------------------------------------------------
+# 口径来源（游戏仓 tasks1.json 实证，2026-10-11 核实）：
+# task_chains_progress["主线"] ＝ 最后一个已完成主线任务的 chain 值，只增不减；
+# 节点任务完成后链值即跳到下一节点值，按「完成该任务后进入下一节点」的界读。
+
+#: 主线链值终点：末任务「挫其锋芒」（id 77，目标关卡「深入禁区」）完成后链值为 780。
+#: 主线扩篇时需同步此值与其后的等级档判定。
+MAINLINE_CHAIN_COMPLETE = 780
+
+#: 主线链值 → 阶段 的节点边界（升序，含端点）：链值未超过该界＝停在该节点。
+#: （21/27/36/67 分别为节点任务链值减一，即任务未完成时的峰值链值。）
+MAINLINE_STAGE_BOUNDARIES: tuple[tuple[int, int], ...] = (
+    (21, 1),  # 未完成「一劳永逸」（id 21，地铁站）＝废城
+    (27, 2),  # 未完成「狂野的玫瑰」（id 27，摇滚公园）＝堕落城
+    (36, 3),  # 未完成「不安之影」（id 36，军阀前线基地）＝军阀
+    (67, 4),  # 未完成「不败传说的破灭！」（id 67，黑铁会总堂）＝黑铁会总堂
+)
+
+
+def _mainline_chain_value(progress: Any) -> Optional[int]:
+    """从进度投影取主线链值；段缺失/非数值/负数＝不可判（None）。"""
+    if not isinstance(progress, dict):
+        return None
+    chains = progress.get("task_chains_progress")
+    if not isinstance(chains, dict):
+        return None
+    raw = chains.get("主线")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = int(raw)
+    return value if value >= 0 else None
+
+
+def _player_level(player: Any) -> Optional[int]:
+    """从玩家投影取等级；段缺失/非数值/非正数＝不可判（None）。"""
+    if not isinstance(player, dict):
+        return None
+    raw = player.get("level")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    level = int(raw)
+    return level if level > 0 else None
+
+
+def derive_progress_stage(progress: Any, player: Any = None) -> Optional[int]:
+    """
+    由绑定存档投影推导主线阶段（1-7）；数据不足以判定时返回 None（由调用方回落请求值）。
+
+    - 主线未完成（链值 < 780）：按节点边界归入 1-4，超过 67 未到终点＝诺亚(5)；
+    - 主线已全完成（链值 ≥ 780）：按等级模拟——<40 诺亚(5)、40-49 雪山(6)、≥50 已通关(7)；
+      等级缺失按 5（诺亚）保守回落。
+    """
+    chain = _mainline_chain_value(progress)
+    if chain is None:
+        return None
+    if chain >= MAINLINE_CHAIN_COMPLETE:
+        level = _player_level(player)
+        if level is None or level < 40:
+            return 5
+        if level < 50:
+            return 6
+        return 7
+    for bound, stage in MAINLINE_STAGE_BOUNDARIES:
+        if chain <= bound:
+            return stage
+    return 5  # 68 ≤ 链值 < 780：诺亚段（直至「深入禁区」完成）
+
 
 

@@ -37,6 +37,7 @@ class MapRegistry:
 
         self._npcs: dict[str, MapNpc] = {}
         self._scenes: dict[str, MapScene] = {}
+        self._scenes_by_name: dict[str, MapScene] = {}
         self._npcs_by_location: dict[str, list[str]] = {}
         self._scenes_by_npc: dict[str, list[str]] = {}
         self._norm_index: dict[str, str] = {}
@@ -47,6 +48,7 @@ class MapRegistry:
             raise ValueError(f"map_definition.json 结构异常（非对象）: {self._file}")
 
         scenes: dict[str, MapScene] = {}
+        scenes_by_name: dict[str, MapScene] = {}
         for loc_id, item in (raw.get("locations") or {}).items():
             if not isinstance(item, dict) or item.get("enabled") is False:
                 continue
@@ -57,9 +59,14 @@ class MapRegistry:
             linkage = ""
             if isinstance(binding, dict):
                 linkage = str(binding.get("linkage") or "").strip()
-            scenes[str(loc_id)] = MapScene(
+            scene = MapScene(
                 location_id=str(loc_id), label=label, linkage=linkage,
+                scene_name=str(item.get("sceneName") or "").strip(),
             )
+            scenes[str(loc_id)] = scene
+            if scene.scene_name:
+                # 帧标签理论唯一；万一冲突以先到者为准
+                scenes_by_name.setdefault(_norm(scene.scene_name), scene)
 
         npcs: dict[str, MapNpc] = {}
         norm_index: dict[str, str] = {}
@@ -100,6 +107,7 @@ class MapRegistry:
 
         self._npcs = npcs
         self._scenes = scenes
+        self._scenes_by_name = scenes_by_name
         self._npcs_by_location = npcs_by_location
         self._scenes_by_npc = scenes_by_npc
         self._norm_index = norm_index
@@ -122,3 +130,8 @@ class MapRegistry:
             for k in self._npcs_by_location.get(str(location_id), [])
             if k in self._npcs
         ]
+
+    def label_for_scene_name(self, scene_name: str) -> str:
+        """帧标签（＝locations[].sceneName，运行时「关卡标志」）→ 地图 label；查不到/空＝空串。"""
+        scene = self._scenes_by_name.get(_norm(scene_name or ""))
+        return scene.label if scene is not None else ""

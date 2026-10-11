@@ -147,6 +147,10 @@ class MapScene(BaseModel):
         default="",
         description="场景绑定名（locations[].sceneBinding.linkage，如 基地场景-基地1层；缺失容忍）",
     )
+    scene_name: str = Field(
+        default="",
+        description="游戏内帧标签（locations[].sceneName，如 基地1层；与运行时「关卡标志」对齐）",
+    )
 
 
 class MapNpc(BaseModel):

@@ -60,3 +60,27 @@ def test_scene_list_includes_npcs_outside_state_db(game_data):
     # 武器大师无 db 记录但要在名单里
     gym = [n.label for n in game_data.map_registry.npcs_in_scene("gym")]
     assert gym == ["武器大师"]
+
+
+def test_label_for_scene_name_resolves_frame_labels(game_data):
+    """帧标签（运行时「关卡标志」）→ 地图 label：与 sceneName 对齐，含与 label 不同名者。"""
+    reg = game_data.map_registry
+    assert reg.label_for_scene_name("基地1层") == "基地大厅"
+    assert reg.label_for_scene_name("地图-食堂") == "食堂"
+    assert reg.label_for_scene_name("地图-摇滚公园") == "摇滚公园"
+    # 同名场景原样返回
+    assert reg.label_for_scene_name("佣兵酒吧") == "佣兵酒吧"
+    # 大小写/空白按归一匹配
+    assert reg.label_for_scene_name(" 基地1层 ") == "基地大厅"
+
+
+def test_label_for_scene_name_unknown_or_empty(game_data):
+    reg = game_data.map_registry
+    assert reg.label_for_scene_name("") == ""
+    assert reg.label_for_scene_name("不存在的帧标签") == ""
+    assert reg.label_for_scene_name(None) == ""
+
+
+def test_scene_name_field_loaded(game_data):
+    scenes = game_data.map_registry.scenes_for_npc("冷兵器商人")
+    assert scenes[0].scene_name == "基地车库"

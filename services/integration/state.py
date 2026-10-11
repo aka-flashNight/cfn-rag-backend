@@ -47,6 +47,8 @@ class IntegrationState:
         self._slot_key: str | None = None
         self._character: dict | None = None
         self._progress: dict | None = None
+        self._scene: dict | None = None
+        self._player: dict | None = None
 
     @property
     def mode(self) -> str:
@@ -69,12 +71,19 @@ class IntegrationState:
         slot_key: str,
         character: dict | None = None,
         progress: dict | None = None,
+        scene: dict | None = None,
+        player: dict | None = None,
     ) -> None:
-        """绑定/刷新当前存档投影（幂等：同槽位覆盖式刷新，换槽位等价 re-bind）。"""
+        """绑定/刷新当前存档投影（幂等：同槽位覆盖式刷新，换槽位等价 re-bind）。
+
+        覆盖式语义：缺省段＝置空，刷新发送方须自带其已知的全部投影段。
+        """
         with self._lock:
             self._slot_key = slot_key
             self._character = character
             self._progress = progress
+            self._scene = scene
+            self._player = player
 
     def unbind(self) -> None:
         """解除绑定（回标题/无存档状态）；数据行为退化为 standalone。"""
@@ -82,6 +91,8 @@ class IntegrationState:
             self._slot_key = None
             self._character = None
             self._progress = None
+            self._scene = None
+            self._player = None
 
     def snapshot(self) -> dict:
         """一次性快照（health/status 与后续阶段消费）。"""
@@ -92,6 +103,8 @@ class IntegrationState:
                 "bound_slot": self._slot_key,
                 "character": self._character,
                 "progress": self._progress,
+                "scene": self._scene,
+                "player": self._player,
             }
 
 

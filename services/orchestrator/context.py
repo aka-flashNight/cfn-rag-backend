@@ -5,7 +5,8 @@ Tier-1 检索（≤3 变体单次嵌入，经 to_thread）/ 提及 NPC 子串匹
 立绘（07 §4）：仅 purpose=chat 且模型 Profile 允许视觉（vision 非 False）且该模型
 未被标记图像不支持时，按 current_emotion（上回合 meta emo；空则「普通」）取图，
 结果放 TurnContext.image_data_url；立绘不可用/任何失败 → None，纯文本不报错。
-save_info 填入集成层绑定投影 {slot_key, character, progress}（B2-1）；未绑定＝None。
+save_info 填入集成层绑定投影 {slot_key, character, progress, scene, player}（B2-1）；
+未绑定＝None。阶段判定：绑定存档可推导时以此为准，否则用请求携带的 progress_stage。
 """
 
 from __future__ import annotations
@@ -15,7 +16,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from services.game_progress import StageConfig, get_progress_stage_config
+from services.game_progress import (
+    StageConfig,
+    derive_progress_stage,
+    get_progress_stage_config,
+)
 from services.integration.state import get_integration_state
 from services.llm import LLMConfig
 from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
@@ -307,7 +312,7 @@ class TurnContext:
     shop_reward_types: list[str] = field(default_factory=list)
     player_can_challenge: bool = False  # 玩家当前能否挑战该 NPC（与 prepare 切磋判定同源）
     forbidden: set[str] = field(default_factory=set)
-    save_info: Any = None  # 绑定存档投影 {slot_key, character, progress}（B2-1）；未绑定＝None
+    save_info: Any = None  # 绑定存档投影 {slot_key, character, progress, scene, player}（B2-1）；未绑定＝None
     retrieve_fn: Optional[Callable[[str], str]] = None
     llm_config: LLMConfig = field(default_factory=LLMConfig)
     # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
@@ -348,6 +353,22 @@ async def assemble_context(
     send_image: bool = True,
 ) -> TurnContext:
     """并行装配一轮上下文（03 §7；检索/取图经 to_thread，目标 ≤300ms）。"""
+    # 绑定存档投影（B2-1）：未绑定＝None，standalone 行为与现状一致（FR-9）。
+    # 阶段以绑定存档推导值为准：能推导时覆盖请求携带的 progress_stage（前端手选退居兜底）。
+    snap = get_integration_state().snapshot()
+    save_info: Any = None
+    if snap["bound_slot"] is not None:
+        save_info = {
+            "slot_key": snap["bound_slot"],
+            "character": snap["character"],
+            "progress": snap["progress"],
+            "scene": snap["scene"],
+            "player": snap["player"],
+        }
+        derived_stage = derive_progress_stage(snap["progress"], snap["player"])
+        if derived_stage is not None:
+            progress_stage = derived_stage
+
     stage_cfg = get_progress_stage_config(progress_stage) if progress_stage else None
 
     npc_state_task = npc_manager.get(npc_name)
@@ -372,6 +393,19 @@ async def assemble_context(
     scene_block = ""
     scene_supplement = ""
     map_reg = getattr(game_data, "map_registry", None)
+    # 场景段补显示标签：stageFlag（帧标签）→ map_definition label；查不到保持空串，
+    # 提示词侧回落 stageFlag 原文。拷贝后附加，不污染绑定状态里的原始投影。
+    if save_info is not None and isinstance(save_info.get("scene"), dict):
+        scene = dict(save_info["scene"])
+        label = ""
+        scene_name = str(scene.get("stageFlag") or "")
+        if map_reg is not None and scene_name:
+            try:
+                label = map_reg.label_for_scene_name(scene_name)
+            except Exception:
+                label = ""
+        scene["label"] = label
+        save_info["scene"] = scene
     if map_reg is not None:
         try:
             from services.npc.scene_context import (
@@ -479,16 +513,6 @@ async def assemble_context(
     image_data_url: Optional[str] = None
     if send_image and should_send_image(llm_config):
         image_data_url = await asyncio.to_thread(load_portrait_image_url, npc_name, current_emotion)
-
-    # 绑定存档投影（B2-1）：未绑定＝None，standalone 行为与现状一致（FR-9）
-    snap = get_integration_state().snapshot()
-    save_info: Any = None
-    if snap["bound_slot"] is not None:
-        save_info = {
-            "slot_key": snap["bound_slot"],
-            "character": snap["character"],
-            "progress": snap["progress"],
-        }
 
     return TurnContext(
         npc_name=npc_name,

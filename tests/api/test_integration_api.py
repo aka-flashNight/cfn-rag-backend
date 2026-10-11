@@ -34,6 +34,8 @@ def test_bind_status_unbind_flow(state):
         "slot_key": "cf7_0123456789abcdef0123456789ab",
         "character": {"name": "林三", "level": 12},
         "progress": {"tasks_finished": [200001], "task_chains_progress": {"主线甲": 3}},
+        "scene": {"stageFlag": "基地1层", "stageName": "", "entrance": "出生地", "inCombat": False},
+        "player": {"gender": "男", "level": 12, "title": {"final": "契约者"}},
     }
 
     resp = client.post("/integration/bind", json=payload)
@@ -47,7 +49,12 @@ def test_bind_status_unbind_flow(state):
     assert st["bound_slot"] == payload["slot_key"]
     assert st["character"]["name"] == "林三"
     assert st["progress"]["tasks_finished"] == [200001]
+    assert st["scene"] == payload["scene"]
+    assert st["player"] == payload["player"]
     assert st["mode"] == "embedded"
+    # 非「主线」链值不可判 → stage 空（前端手选退居兜底）
+    assert st["stage"] is None
+    assert st["stage_name"] is None
 
     resp = client.post("/integration/unbind")
     assert resp.status_code == 200
@@ -55,7 +62,46 @@ def test_bind_status_unbind_flow(state):
     st2 = client.get("/integration/status").json()
     assert st2["bound_slot"] is None
     assert st2["character"] is None
+    assert st2["scene"] is None
+    assert st2["player"] is None
     assert st2["frontend_url"] == "http://127.0.0.1:7077/"
+
+
+def test_status_derives_stage_from_mainline_and_level(state):
+    """阶段推导接线：主线链值定 1-5，全完成后按等级模拟 5/6/7；解绑后回到 null。"""
+    client = _make_client()
+
+    def stage_with(chain: int, level: int):
+        client.post("/integration/bind", json={
+            "slot_key": "slot_stage",
+            "progress": {"tasks_finished": [], "task_chains_progress": {"主线": chain}},
+            "player": {"level": level},
+        })
+        st = client.get("/integration/status").json()
+        return st["stage"], st["stage_name"]
+
+    assert stage_with(21, 10) == (1, "废城")
+    assert stage_with(22, 10) == (2, "堕落城")
+    assert stage_with(36, 15) == (3, "荒漠军阀")
+    assert stage_with(37, 20) == (4, "黑铁会总堂")
+    assert stage_with(68, 30) == (5, "诺亚")
+    assert stage_with(780, 39) == (5, "诺亚")
+    assert stage_with(780, 45) == (6, "雪山")
+    assert stage_with(780, 55) == (7, "已通关")
+
+    client.post("/integration/unbind")
+    st = client.get("/integration/status").json()
+    assert st["stage"] is None
+    assert st["stage_name"] is None
+
+
+def test_bind_scene_defaults_when_partial(state):
+    """scene 段字段缺省容忍（Host 侧已验证形状；此处保证对缺键对象的兼容）。"""
+    client = _make_client()
+    resp = client.post("/integration/bind", json={"slot_key": "slot_scene", "scene": {}})
+    assert resp.status_code == 200
+    st = client.get("/integration/status").json()
+    assert st["scene"] == {"stageFlag": "", "stageName": "", "entrance": "", "inCombat": False}
 
 
 def test_bind_same_slot_is_idempotent_refresh(state):
