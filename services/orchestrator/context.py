@@ -431,6 +431,7 @@ async def assemble_context(
 
             pending_draft_summary = _detailed_draft_summary(
                 draft_row.draft, game_data, rag_context_text=rag_context_text,
+                npc_states=npc_states,
             )
         except Exception:
             pending_draft_summary = ""

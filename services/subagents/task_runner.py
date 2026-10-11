@@ -359,7 +359,9 @@ class TaskRunner(SubagentBase):
                 npc_challenge=npc_challenge,
                 player_progress=ctx.player_progress,
                 progress_desc=progress_desc,
-                draft_summary=_detailed_draft_summary(pending_draft or {}, game_data),
+                draft_summary=_detailed_draft_summary(
+                    pending_draft or {}, game_data, npc_states=npc_states,
+                ),
                 player_note=note or "",
             )
         else:

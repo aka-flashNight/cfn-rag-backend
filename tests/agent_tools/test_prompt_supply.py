@@ -1,8 +1,8 @@
 """B8-2 / B8-3 子 Agent 提示词信息供给测试：
 
 - 传话/问候候选轮：发布 NPC 视角场景块（publisher_scene）＋候选条目 scene 字段＋规则句；
-- 草案摘要：完成NPC≠发布NPC 时补「所在场景」行与指示句；
-- 选关类草案逐关卡追加怪物块（切磋不附）；RAG 已出现的关卡改锚一行。
+- 草案摘要：完成NPC≠发布NPC 时补其属性（性别/阵营/身份或称呼）与「所在场景」行及指示句；
+- 选关类草案逐关卡追加怪物块（切磋不附）；RAG 已出现的关卡改锚一行；数量最多句附相对强度档位。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ TIETIE_MONSTER_BLOCK = (
     "该关卡有以下怪物：黄衣僵尸，金发女僵尸，红衣僵尸，小儿麻痹僵尸，胖僵尸，"
     "眼镜僵尸，光头军人僵尸，狂暴僵尸，防暴僵尸，特战僵尸，狂躁僵尸，"
     "裸体兽化僵尸，兽化僵尸，巨型僵尸。"
-    "其中数量最多的是兽化僵尸，大致数量约16个。强度最高的是巨型僵尸。"
+    "其中数量最多的是兽化僵尸，大致数量约16个，强度较强。强度最高的是巨型僵尸。"
     "根据你的身份，你可能知道也可能不知道这个关卡的详情，但绝对不要编造信息，"
     "要么表现的不清楚，要么根据实际信息去说话，不能编造未提供的信息。"
 )
@@ -118,32 +118,48 @@ def _draft(**over) -> dict:
     return base
 
 
-def test_finish_npc_gets_scene_line_and_instruction(game_data):
-    text = _detailed_draft_summary(_draft(finish_npc="武器大师"), game_data)
+def test_finish_npc_gets_attrs_scene_and_instruction(game_data):
+    text = _detailed_draft_summary(
+        _draft(finish_npc="武器大师"), game_data, npc_states=STATES,
+    )
     assert (
-        "完成NPC: 武器大师；所在场景："
+        "完成NPC: 武器大师（性别：男）（阵营：闲杂人等）（身份或称呼：武器大师）；所在场景："
         "健身房（基地场景-健身房）、第一防线（地图-第一防线防区）"
     ) in text
     assert FINISH_NPC_HINT in text
 
 
 def test_finish_npc_same_as_publisher_or_missing_gets_plain_line(game_data):
-    same = _detailed_draft_summary(_draft(finish_npc="Pig"), game_data)
-    assert "完成NPC: Pig" in same
+    same = _detailed_draft_summary(_draft(finish_npc="Pig"), game_data, npc_states=STATES)
+    assert "完成NPC: Pig" in same.splitlines()
     assert "所在场景" not in same
     assert FINISH_NPC_HINT not in same
 
-    missing = _detailed_draft_summary(_draft(), game_data)
-    assert "完成NPC: Pig" in missing
+    missing = _detailed_draft_summary(_draft(), game_data, npc_states=STATES)
+    assert "完成NPC: Pig" in missing.splitlines()
     assert "所在场景" not in missing
     assert FINISH_NPC_HINT not in missing
 
 
-def test_finish_npc_without_location_gets_no_scene_or_instruction(game_data):
-    text = _detailed_draft_summary(_draft(finish_npc="lochan"), game_data)
-    assert "完成NPC: lochan" in text
+def test_finish_npc_without_location_gets_attrs_only(game_data):
+    text = _detailed_draft_summary(_draft(finish_npc="lochan"), game_data, npc_states=STATES)
+    assert "完成NPC: lochan（性别：女）（阵营：闲杂人等）（身份或称呼：谜之兔女郎）" in text.splitlines()
     assert "所在场景" not in text
     assert FINISH_NPC_HINT not in text
+
+
+def test_finish_npc_without_record_or_states_gets_plain_name(game_data):
+    no_record = _detailed_draft_summary(
+        _draft(finish_npc="无名路人"), game_data, npc_states=STATES,
+    )
+    assert "完成NPC: 无名路人" in no_record.splitlines()
+
+    # 未传 npc_states（旧调用）与传空字典行为一致：属性片段整体省略
+    no_states = _detailed_draft_summary(_draft(finish_npc="武器大师"), game_data)
+    assert (
+        "完成NPC: 武器大师；所在场景："
+        "健身房（基地场景-健身房）、第一防线（地图-第一防线防区）"
+    ) in no_states
 
 
 # ---------------------------------------------------------------------------

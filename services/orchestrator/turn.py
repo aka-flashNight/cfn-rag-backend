@@ -465,6 +465,7 @@ class TurnOrchestrator:
                         npc_affinity=ctx.favorability,
                         game_data=deps.game_data,
                         rag_context_text=ctx.rag_context_text,
+                        npc_states=ctx.npc_states,
                     )
                     if outcome.payload.get("status") == "confirmed":
                         draft_touched = True
@@ -750,6 +751,7 @@ class TurnOrchestrator:
         draft = draft_row.draft
         summary = _detailed_draft_summary(
             draft, game_data, rag_context_text=ctx.rag_context_text,
+            npc_states=ctx.npc_states,
         )
         user_prompt = (
             CONFIRM_ARGS_SYSTEM + "\n\n"

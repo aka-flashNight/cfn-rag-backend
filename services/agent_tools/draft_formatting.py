@@ -171,6 +171,7 @@ def _detailed_draft_summary(
     game_data: Optional[GameDataRegistry] = None,
     *,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     生成包含完整字段和物品单价的草案摘要，
@@ -187,20 +188,23 @@ def _detailed_draft_summary(
         lines.append(f"描述: {_desc}")
     npc_name_fallback = draft.get("npc_name") or "?"
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
-    # 完成 NPC ≠ 发布 NPC 时补其所在场景（B8-3）：无驻地/查不到时不补、也不附指示句
+    # 完成 NPC ≠ 发布 NPC 时补其属性与所在场景（B8-3）：无记录/查不到时对应片段省略、不附指示句
     finish_npc = (draft.get("finish_npc") or "").strip() or str(npc_name_fallback)
+    finish_attrs = ""
     finish_scene = ""
-    if game_data is not None and finish_npc != npc_name_fallback:
-        map_reg = getattr(game_data, "map_registry", None)
-        if map_reg is not None:
-            from services.npc.scene_context import npc_scene_text
+    if finish_npc != npc_name_fallback:
+        from services.npc.scene_context import npc_attributes_text, npc_scene_text
 
-            finish_scene = npc_scene_text(map_reg, finish_npc)
+        finish_attrs = npc_attributes_text(npc_states, finish_npc)
+        if game_data is not None:
+            map_reg = getattr(game_data, "map_registry", None)
+            if map_reg is not None:
+                finish_scene = npc_scene_text(map_reg, finish_npc)
     if finish_scene:
-        lines.append(f"完成NPC: {finish_npc}；所在场景：{finish_scene}")
+        lines.append(f"完成NPC: {finish_npc}{finish_attrs}；所在场景：{finish_scene}")
         lines.append("非同阵营npc你未必知道准确场景名，但知道大致情况，根据你的人设决定。")
     else:
-        lines.append(f"完成NPC: {finish_npc}")
+        lines.append(f"完成NPC: {finish_npc}{finish_attrs}")
 
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:

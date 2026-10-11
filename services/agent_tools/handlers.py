@@ -117,6 +117,7 @@ def _failed_payload(
     game_data: Optional[GameDataRegistry],
     *,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
     extra: Optional[dict[str, Any]] = None,
     repaired_notes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
@@ -128,7 +129,7 @@ def _failed_payload(
     if repaired_notes:
         payload["auto_repaired"] = repaired_notes
     payload["draft_summary"] = _detailed_draft_summary(
-        draft, game_data, rag_context_text=rag_context_text,
+        draft, game_data, rag_context_text=rag_context_text, npc_states=npc_states,
     )
     if extra:
         payload.update(extra)
@@ -190,6 +191,7 @@ def execute_draft_agent_task(
     bargain_count: int = 0,
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     if game_data is None:
         game_data = get_game_data_registry()
@@ -226,7 +228,7 @@ def execute_draft_agent_task(
         return DraftOpOutcome(
             result_json=json.dumps(
                 _failed_payload(report, draft, game_data, rag_context_text=rag_context_text,
-                                repaired_notes=notes),
+                                npc_states=npc_states, repaired_notes=notes),
                 ensure_ascii=False,
             ),
             draft=draft,
@@ -238,7 +240,9 @@ def execute_draft_agent_task(
     if notes:
         draft["repaired_notes"] = notes
 
-    detailed = _detailed_draft_summary(draft, game_data, rag_context_text=rag_context_text)
+    detailed = _detailed_draft_summary(
+        draft, game_data, rag_context_text=rag_context_text, npc_states=npc_states,
+    )
     payload: dict[str, Any] = {
         "status": "draft_created",
         "draft_id": draft_id,
@@ -278,6 +282,7 @@ def execute_update_task_draft(
     draft_commit_valid: bool = False,
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     if pending_draft is None:
         return DraftOpOutcome(result_json=json.dumps({
@@ -321,6 +326,7 @@ def execute_update_task_draft(
                     "draft_id": pending_draft.get("draft_id", ""),
                     "draft_summary": _detailed_draft_summary(
                         pending_draft, game_data, rag_context_text=rag_context_text,
+                        npc_states=npc_states,
                     ),
                 }, ensure_ascii=False), draft=pending_draft,
                     draft_commit_valid=draft_commit_valid, bargain_count=bargain_count)
@@ -346,7 +352,7 @@ def execute_update_task_draft(
         return DraftOpOutcome(
             result_json=json.dumps(
                 _failed_payload(report, working, game_data, rag_context_text=rag_context_text,
-                                repaired_notes=notes),
+                                npc_states=npc_states, repaired_notes=notes),
                 ensure_ascii=False,
             ),
             draft=working,
@@ -362,7 +368,9 @@ def execute_update_task_draft(
     if is_bargain and reward_actually_changed and draft_commit_valid:
         new_bargain_count = bargain_count + 1
 
-    detailed = _detailed_draft_summary(working, game_data, rag_context_text=rag_context_text)
+    detailed = _detailed_draft_summary(
+        working, game_data, rag_context_text=rag_context_text, npc_states=npc_states,
+    )
     payload: dict[str, Any] = {
         "status": "draft_updated",
         "draft_id": working.get("draft_id", ""),
@@ -400,6 +408,7 @@ def execute_confirm_agent_task(
     npc_affinity: int = 0,
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     if pending_draft is None:
         return DraftOpOutcome(result_json=json.dumps({
@@ -490,6 +499,7 @@ def execute_confirm_agent_task(
 
     detailed = _detailed_draft_summary(
         draft_for_commit, game_data, rag_context_text=rag_context_text,
+        npc_states=npc_states,
     )
     confirm_payload: dict[str, Any] = {
         "status": "confirmed",
@@ -575,7 +585,9 @@ def execute_fallback_draft(
             "message": f"兜底草案构造失败：{e}",
         }, ensure_ascii=False))
 
-    detailed = _detailed_draft_summary(draft, game_data, rag_context_text=rag_context_text)
+    detailed = _detailed_draft_summary(
+        draft, game_data, rag_context_text=rag_context_text, npc_states=npc_states,
+    )
     payload = {
         "status": "draft_created",
         "draft_id": draft.get("draft_id", ""),

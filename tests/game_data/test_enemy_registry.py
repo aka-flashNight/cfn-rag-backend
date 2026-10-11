@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from services.game_entity_prompts import format_stage_monster_block
+from services.game_data.models import StageMonster
+from services.game_entity_prompts import _relative_strength_tier, format_stage_monster_block
 
 
 def test_unit_type_maps_to_spritename(game_data):
@@ -48,17 +49,59 @@ def test_block_verbatim_text_for_stage(game_data):
         "该关卡有以下怪物：黄衣僵尸，金发女僵尸，红衣僵尸，小儿麻痹僵尸，胖僵尸，"
         "眼镜僵尸，光头军人僵尸，狂暴僵尸，防暴僵尸，特战僵尸，狂躁僵尸，"
         "裸体兽化僵尸，兽化僵尸，巨型僵尸。"
-        "其中数量最多的是兽化僵尸，大致数量约16个。强度最高的是巨型僵尸。"
+        "其中数量最多的是兽化僵尸，大致数量约16个，强度较强。强度最高的是巨型僵尸。"
         "根据你的身份，你可能知道也可能不知道这个关卡的详情，但绝对不要编造信息，"
         "要么表现的不清楚，要么根据实际信息去说话，不能编造未提供的信息。"
     )
 
 
 def test_block_lists_quantity_ties_with_approx_count(game_data):
-    """数量并列全列，并附「大致数量约X个」（X＝求和值）。"""
+    """数量并列全列，并附「大致数量约X个」（X＝求和值）；组内档位一致取该档（跳蚤、铁拳均中等）。"""
     spawns = game_data.stages.get_enemy_spawns("基地车库", "堕落城深处")
     block = format_stage_monster_block(game_data.enemy_registry.monsters_for_spawns(spawns))
-    assert "其中数量最多的是跳蚤、铁拳，大致数量约8个。" in block
+    assert "其中数量最多的是跳蚤、铁拳，大致数量约8个，强度中等。" in block
+
+
+def test_relative_strength_tier_thirds_boundaries():
+    """严格低于占比≥2/3→较强；严格高于占比≥2/3→较弱；[1,2,3] 三档各就其位。"""
+    known = [1.0, 2.0, 3.0]
+    assert _relative_strength_tier(3.0, known) == "较强"
+    assert _relative_strength_tier(2.0, known) == "中等"
+    assert _relative_strength_tier(1.0, known) == "较弱"
+
+
+def test_relative_strength_tier_ties_prefer_middle():
+    """并列跨段/全相等/单点一律落中档（最不易误导）。"""
+    assert _relative_strength_tier(2.0, [1.0, 2.0, 2.0]) == "中等"
+    assert _relative_strength_tier(1.0, [1.0, 1.0, 2.0]) == "中等"
+    assert _relative_strength_tier(2.0, [1.0, 1.0, 2.0]) == "较强"
+    assert _relative_strength_tier(5.0, [5.0, 5.0]) == "中等"
+    assert _relative_strength_tier(5.0, [5.0]) == "中等"
+
+
+def test_block_tier_clause_variants():
+    """数量最多组：档位混合→中等；含无强度者→中等；全部无强度→省该片段。"""
+    mixed = [
+        StageMonster(displayname="甲", quantity=10, strength=1.0),
+        StageMonster(displayname="乙", quantity=10, strength=3.0),
+        StageMonster(displayname="丙", quantity=5, strength=2.0),
+    ]
+    assert "大致数量约10个，强度中等。" in format_stage_monster_block(mixed)
+
+    partial = [
+        StageMonster(displayname="甲", quantity=10, strength=3.0),
+        StageMonster(displayname="乙", quantity=10, strength=None),
+        StageMonster(displayname="丙", quantity=5, strength=1.0),
+        StageMonster(displayname="丁", quantity=5, strength=2.0),
+    ]
+    assert "大致数量约10个，强度中等。" in format_stage_monster_block(partial)
+
+    ungraded = [
+        StageMonster(displayname="甲", quantity=10, strength=None),
+        StageMonster(displayname="乙", quantity=5, strength=2.0),
+    ]
+    assert "大致数量约10个。" in format_stage_monster_block(ungraded)
+    assert "大致数量约10个，强度" not in format_stage_monster_block(ungraded)
 
 
 def test_block_keeps_ungraded_monsters_but_excludes_from_strength(game_data):

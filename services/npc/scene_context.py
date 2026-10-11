@@ -99,8 +99,8 @@ def build_scene_block(
     return "\n".join(lines)
 
 
-def _fmt_npc(db_name: str, state: NPCState) -> str:
-    parts = [f"「{db_name}」"]
+def _fmt_attrs(state: NPCState) -> str:
+    parts: list[str] = []
     if state.sex:
         parts.append(f"（性别：{state.sex}）")
     if state.faction:
@@ -108,6 +108,23 @@ def _fmt_npc(db_name: str, state: NPCState) -> str:
     if state.titles:
         parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
     return "".join(parts)
+
+
+def _fmt_npc(db_name: str, state: NPCState) -> str:
+    return f"「{db_name}」" + _fmt_attrs(state)
+
+
+def npc_attributes_text(
+    npc_states: Optional[dict[str, NPCState]], npc_name: str,
+) -> str:
+    """NPC 属性后缀文本（（性别：X）（阵营：Y）（身份或称呼：Z））；无记录返回空串。"""
+    if not npc_states or not npc_name:
+        return ""
+    target = _norm(npc_name)
+    for db_name, state in npc_states.items():
+        if _norm(db_name) == target:
+            return _fmt_attrs(state)
+    return ""
 
 
 def build_scene_supplement(

@@ -206,18 +206,46 @@ def iter_all_stage_infos(stage_registry: Any) -> list[StageInfo]:
     return [si for si in stage_registry._stage_infos.values()]
 
 
+def _relative_strength_tier(target: float, known: list[float]) -> Optional[str]:
+    """目标强度在本图已知强度中的相对档位（较弱/中等/较强）。
+
+    口径：严格低于目标的占比 ≥2/3 → 较强；严格高于目标的占比 ≥2/3 → 较弱；
+    其余（并列跨段、全相等、单点）→ 中等（优先落中档，最不易误导）。
+    """
+    n = len(known)
+    below = sum(1 for s in known if s < target - 1e-9)
+    above = sum(1 for s in known if s > target + 1e-9)
+    if below / n >= 2 / 3:
+        return "较强"
+    if above / n >= 2 / 3:
+        return "较弱"
+    return "中等"
+
+
 def format_stage_monster_block(monsters: list[StageMonster]) -> str:
     """关卡怪物块（B8-3，§8.1-④ 逐字格式）：只出现 displayname；
-    数量最多并列全列并附约数句；强度最高只统计有阶段×档次系数者，全无则省该句。
+    数量最多并列全列并附约数句＋相对强度档位；强度最高只统计有阶段×档次系数者，全无则省该句。
     """
     if not monsters:
         return ""
     names = "，".join(m.displayname for m in monsters)
     parts = [f"该关卡有以下怪物：{names}。"]
     q_max = max(m.quantity for m in monsters)
-    top_by_q = [m.displayname for m in monsters if m.quantity == q_max]
-    parts.append(f"其中数量最多的是{'、'.join(top_by_q)}，大致数量约{q_max}个。")
+    top_by_q = [m for m in monsters if m.quantity == q_max]
     graded = [m for m in monsters if m.strength is not None]
+    known = [m.strength for m in graded]
+    tier = ""
+    top_graded = [m for m in top_by_q if m.strength is not None]
+    if top_graded:
+        tiers = {_relative_strength_tier(m.strength, known) for m in top_graded}
+        if len(tiers) == 1 and len(top_graded) == len(top_by_q):
+            tier = tiers.pop()
+        else:
+            tier = "中等"
+    q_clause = f"其中数量最多的是{'、'.join(m.displayname for m in top_by_q)}，大致数量约{q_max}个"
+    if tier:
+        q_clause += f"，强度{tier}"
+    parts.append(q_clause + "。")
     if graded:
         s_max = max(m.strength for m in graded)
         top_by_s = [m.displayname for m in graded if m.strength == s_max]
