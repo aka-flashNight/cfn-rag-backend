@@ -4,6 +4,12 @@
 - 保留「达到间隔触发滚动摘要」逻辑；改为有界队列 + 单 worker 串行执行
   （并发上限 1，带超时 60s，失败重试 1 次后放弃本轮）；
 - LLM 调用走统一 LLMClient（purpose="summary"，不带图）。
+
+基础长期记忆与摘要同轮产出（B3-2）：long_term_scope 非空时，同一次调用里
+把长期记忆作为独立块给出（含「不参与摘要撰写」的隔离说明）并下发
+set_base_long_term_memory 工具——摘要正文照旧从 content 取，基础印象从
+tool_calls 取，模型认为无需修改时不发调用即为「不改」。作用域键在提交时
+就已解析好，worker 延后执行期间玩家换存档也不会写错作用域。
 """
 
 from __future__ import annotations
@@ -13,6 +19,12 @@ import logging
 from dataclasses import dataclass
 
 from services.llm import ChatRequest, LLMClient, LLMConfig
+from services.memory.long_term import (
+    apply_summary_tool,
+    build_summary_tool,
+    format_summary_block,
+    load_snapshot,
+)
 from services.memory.store import ChatMessage, MemoryStore, SUMMARIZE_INTERVAL
 
 logger = logging.getLogger(__name__)
@@ -31,10 +43,15 @@ class SummaryRequest:
     session_id: str
     npc_name: str
     llm_config: LLMConfig
+    #: 非空＝本轮启用长期记忆，值是提交时已解析好的作用域键（存档槽位或 __standalone__）
+    long_term_scope: str = ""
 
 
 def _build_summary_prompt(
-    npc_name: str, recent_messages: list[ChatMessage], existing_summary: str | None
+    npc_name: str,
+    recent_messages: list[ChatMessage],
+    existing_summary: str | None,
+    long_term_block: str = "",
 ) -> str:
     """摘要 prompt（沿用旧滚动整合规则：旧摘要 + 最近对话 → 一段完整摘要）。"""
     lines = [
@@ -47,6 +64,8 @@ def _build_summary_prompt(
         "玩家提出的重要问题或请求、涉及的剧情信息和承诺。\n"
         "请用第三人称客观视角撰写，直接输出摘要文本，不要添加标题或额外格式。\n\n"
     )
+    if long_term_block:
+        base += f"{long_term_block}\n\n无论是否更新基础印象，都必须先输出摘要正文。\n\n"
     if existing_summary:
         return (
             f"以下是玩家与游戏NPC「{npc_name}」之前对话的摘要：\n"
@@ -135,21 +154,48 @@ class SummaryWorker:
                 await asyncio.sleep(0.5)
 
     async def _summarize(self, req: SummaryRequest) -> None:
-        """滚动摘要：已有摘要则整合新内容，否则生成新摘要。"""
+        """滚动摘要：已有摘要则整合新内容，否则生成新摘要。
+
+        long_term_scope 非空时同轮产出基础长期记忆（同一次调用，摘要走 content、
+        基础印象走 tool_calls）。
+        """
         recent = await self._store.get_history(req.session_id, limit=SUMMARIZE_INTERVAL)
         if not recent:
             return
+        snapshot = (
+            await load_snapshot(self._store, slot_key=req.long_term_scope, npc=req.npc_name)
+            if req.long_term_scope else None
+        )
         existing = await self._store.get_summary(req.session_id)
-        prompt = _build_summary_prompt(req.npc_name, recent, existing)
+        prompt = _build_summary_prompt(
+            req.npc_name,
+            recent,
+            existing,
+            long_term_block=format_summary_block(snapshot) if snapshot is not None else "",
+        )
 
         client = LLMClient.for_config(req.llm_config)
         result = await client.chat(
             ChatRequest(
                 messages=[{"role": "user", "content": prompt}],
+                tools=[build_summary_tool(snapshot)] if snapshot is not None else None,
                 purpose="summary",
                 send_image=False,
             )
         )
+
+        if snapshot is not None:
+            try:
+                await apply_summary_tool(
+                    self._store,
+                    result.tool_calls,
+                    slot_key=snapshot.slot_key,
+                    npc=snapshot.npc,
+                    session_id=req.session_id,
+                )
+            except Exception as exc:
+                logger.warning("会话 %s 基础长期记忆更新失败（忽略）: %s", req.session_id, exc)
+
         summary = result.content.strip()
         if not summary:
             logger.warning("会话 %s 摘要生成返回空内容，跳过保存", req.session_id)

@@ -41,6 +41,13 @@ from services.llm import (
     split_meta_events,
 )
 from services.llm.errors import LLMError
+from services.memory.long_term import (
+    CHAT_TOOL_NAME,
+    apply_chat_tool,
+    build_chat_tool,
+    format_block as format_long_term_block,
+    tool_call_name,
+)
 from services.memory.store import MemoryStore, PRECISE_MEMORY_OPTIONS, TaskDraftRow
 from services.memory.summarize import SummaryRequest, get_summary_worker, should_summarize
 from services.npc.manager import NPCManager
@@ -66,6 +73,7 @@ from services.orchestrator.prompts import (
     TASK_CANCEL_NOOP_INSTRUCTION,
     TASK_CONFIRM_MERGE_INSTRUCTION,
     build_confirm_args_user_prompt,
+    build_finished_task_block,
     build_player_message,
     build_merge_user_prompt,
     build_static_system,
@@ -234,6 +242,7 @@ class TurnOrchestrator:
         send_image: bool = True,
         agent_enabled: bool = True,
         summarize_interval: Optional[int] = None,
+        long_term_memory_enabled: Optional[bool] = None,
         deps: Optional[OrchestratorDeps] = None,
     ) -> None:
         """send_image 仅是「允许带图」开关（默认允许）；是否真带图由 07 §4 规则
@@ -245,6 +254,9 @@ class TurnOrchestrator:
         不论 agent_enabled 一律同走纯聊天闸门，prompt 换成不可派活约束。
         summarize_interval 是前端「精确短期记忆长度」档位（10/30/100/500，对应
         短/中/长/几乎无限）；非白名单值一律按未提供处理，回落到服务端默认。
+        long_term_memory_enabled 是前端每次请求带的跨对话长期记忆开关原值
+        （None＝未提供）；游戏内（embedded 口径）恒定启用、不受理关闭，
+        关闭时本回合既不注入长期记忆也不下发长期记忆工具、不写库。
         """
         self.session_id = session_id
         self.npc_name = npc_name
@@ -255,6 +267,7 @@ class TurnOrchestrator:
         self.llm_config = llm_config or LLMConfig()
         self.send_image = send_image
         self.agent_enabled = agent_enabled
+        self.long_term_memory_enabled = long_term_memory_enabled
         self.task_publish_disabled = is_task_publish_disabled(npc_name)
         self.precise_memory_limit = (
             summarize_interval if summarize_interval in PRECISE_MEMORY_OPTIONS else None
@@ -331,6 +344,7 @@ class TurnOrchestrator:
                 engine=deps.engine,
                 history_limit=history_limit,
                 send_image=self.send_image,
+                long_term_memory_enabled=self.long_term_memory_enabled,
             )
             self._ctx = ctx
 
@@ -354,8 +368,10 @@ class TurnOrchestrator:
                 {"role": "user", "content": build_image_message_content(player_message, ctx.image_data_url)},
             ]
 
-            # 聊天 Agent 的工具表 = 路由表（判据写在工具描述里，见 services/tools/route/）。
-            # Agent 能力关闭或任务发布临时关闭时不下发任何工具：模型连路由入口都没有。
+            # 聊天 Agent 的工具表 = 路由表（判据写在工具描述里，见 services/tools/route/）
+            # ＋ 长期记忆工具（B3-4：不在全局注册表里，按作用域当前状态手拼，
+            # 三形态同名不同形；关闭时既不下发也不注入）。
+            # Agent 能力关闭或任务发布临时关闭时不下发路由工具：模型连路由入口都没有。
             chat_tools = (
                 self._routing_tools(
                     deps.registry,
@@ -363,6 +379,8 @@ class TurnOrchestrator:
                 )
                 if self._routing_enabled else []
             )
+            if ctx.long_term is not None:
+                chat_tools = [*chat_tools, build_chat_tool(ctx.long_term)]
 
             stream = llm.chat_stream(ChatRequest(
                 messages=messages,
@@ -388,6 +406,10 @@ class TurnOrchestrator:
             route_kind = route.kind if route is not None else None
             spoken_text = "".join(collected_text)
 
+            # 长期记忆工具不在全局注册表里（要按作用域状态换形），这里直接落库；
+            # 与路由互不干扰——路由轮同样可以顺带更新记忆。
+            await self._apply_long_term_calls(deps, ctx, tool_sink)
+
             if route is not None and spoken_text.strip():
                 logger.warning(
                     "会话 %s：路由轮（%s）仍输出了台词 %.60s——提示词要求该轮只路由不说话",
@@ -404,8 +426,9 @@ class TurnOrchestrator:
 
             if route is None:
                 # ---- 纯聊天路径：正文已直发，无后台动作 ----
-                if tool_sink:
-                    names = [tc.get("function", {}).get("name") for tc in tool_sink]
+                stray_calls = [tc for tc in tool_sink if tool_call_name(tc) != CHAT_TOOL_NAME]
+                if stray_calls:
+                    names = [tool_call_name(tc) for tc in stray_calls]
                     if self._routing_enabled:
                         logger.info("纯聊天轮出现非路由工具调用，忽略: %s", names)
                     elif self.agent_enabled:
@@ -618,6 +641,11 @@ class TurnOrchestrator:
             relationship_level=ctx.relationship_level,
             pending_draft_summary=ctx.pending_draft_summary if has_pending_draft else "",
             save_info=ctx.save_info,
+            long_term_block=format_long_term_block(ctx.long_term) if ctx.long_term else "",
+            finished_task_block=build_finished_task_block(
+                ctx.finished_task_block,
+                has_long_term_facts=bool(ctx.long_term and ctx.long_term.facts),
+            ),
         )
         return [
             {"role": "system", "content": system},
@@ -711,6 +739,32 @@ class TurnOrchestrator:
             if tool is not None:
                 out.append(tool.to_openai_tool())
         return out
+
+    async def _apply_long_term_calls(
+        self, deps: OrchestratorDeps, ctx: TurnContext, tool_sink: list[dict[str, Any]],
+    ) -> None:
+        """落库本轮聊天 Agent 的长期记忆调用（工具不在注册表里，这里直接执行）。
+
+        写库失败不阻断回合：记忆是附加能力，玩家这轮的对话必须照常完成。
+        """
+        snapshot = ctx.long_term
+        if snapshot is None or not tool_sink:
+            return
+        for tool_call in tool_sink:
+            if tool_call_name(tool_call) != CHAT_TOOL_NAME:
+                continue
+            try:
+                result = await apply_chat_tool(
+                    deps.memory, tool_call, snapshot=snapshot, session_id=self.session_id,
+                )
+            except Exception as exc:
+                logger.warning("会话 %s 长期记忆写入失败（忽略）: %s", self.session_id, exc)
+                continue
+            if result:
+                logger.info(
+                    "会话 %s 长期记忆更新（作用域 %s / %s）：%s",
+                    self.session_id, snapshot.slot_key, snapshot.npc, result,
+                )
 
     def _recent_dialogue_text(
         self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
@@ -1020,10 +1074,14 @@ class TurnOrchestrator:
             worker = get_summary_worker()
             if worker is None:
                 return
+            # 作用域在本轮就解析好交给 worker：摘要延后执行期间玩家换存档/解绑，
+            # 基础长期记忆也不会写进另一个作用域。
+            snapshot = self._ctx.long_term if self._ctx is not None else None
             worker.submit(SummaryRequest(
                 session_id=self.session_id,
                 npc_name=self.npc_name,
                 llm_config=self.llm_config,
+                long_term_scope=snapshot.slot_key if snapshot is not None else "",
             ))
         except Exception as exc:  # 摘要不阻断回合
             logger.warning("摘要提交失败（忽略）: %s", exc)

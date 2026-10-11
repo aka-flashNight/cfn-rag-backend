@@ -55,7 +55,9 @@ def _load_character_faction_map() -> dict[str, str]:
     out: dict[str, str] = {}
     if not isinstance(raw, dict):
         return out
-    for name, item in raw.items():
+    # 阵营属于 NPC 设定，只存 global 作用域；文件仍是旧版平铺结构时整个顶层就是 global
+    entries = raw.get("global") if isinstance(raw.get("global"), dict) else raw
+    for name, item in entries.items():
         if not isinstance(item, dict):
             continue
         fac = str(item.get("faction") or "").strip()

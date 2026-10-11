@@ -7,6 +7,15 @@
 - 进程退出前 flush；
 - 条目新增可选字段 appearance（形象描述，07 使用），读取缺省容忍，
   写回保留未知字段（forward-compatible）。
+
+按存档作用域（B3-1）：文件结构为 {"global": {…}, "saves": {"<slotKey>": {…}}}。
+静态身份字段（sex/faction/titles/emotions/challenge/appearance 与未知字段）只存
+global——它们是 NPC 设定，不随存档变化，整条复制到每个存档会让新存档里的 NPC
+丢掉阵营与头衔（同阵营提示词块与情绪白名单都会跟着退化）。只有 PER_SAVE_FIELDS
+（好感度与关系等级）按存档隔离：绑定存档时写入 saves.<slotKey>，未绑定时写 global。
+读取时合并——绑定存档下某 NPC 没有存档内记录＝该存档里好感为初始值，不继承 global。
+加载时若检测到旧版平铺结构（顶层直接是 NPC 名），整体视为 global 读入，
+下一次落盘自然写成新结构，不做额外迁移/回填。
 """
 
 from __future__ import annotations
@@ -22,10 +31,23 @@ from pathlib import Path
 from typing import Any
 
 from services.game_data.paths import find_resources_directory
+from services.integration.state import get_integration_state
 
 logger = logging.getLogger(__name__)
 
 AUTOSAVE_DEBOUNCE_S = 5.0
+
+#: 文件结构的两个顶层键
+GLOBAL_KEY = "global"
+SAVES_KEY = "saves"
+
+#: 按存档隔离的字段；其余字段一律只在 global 里维护
+PER_SAVE_FIELDS = ("favorability", "relationship_level")
+
+
+def _empty_state() -> "NPCState":
+    """作用域内查无此 NPC 时的初始状态（好感 0／陌生／只允许「普通」情绪）。"""
+    return NPCState(favorability=0, relationship_level="陌生", emotions=["普通"])
 
 
 def get_npc_state_path(resources_dir: Path | None = None) -> Path:
@@ -51,10 +73,18 @@ class NPCState:
 
 
 class NPCManager:
-    """NPC 好感度与关系等级的本地状态（单例 + 单锁）。"""
+    """NPC 好感度与关系等级的本地状态（单例 + 单锁 + 按存档作用域）。"""
 
-    def __init__(self, state: dict[str, NPCState], state_path: Path | None = None) -> None:
-        self._state: dict[str, NPCState] = state
+    def __init__(
+        self,
+        state: dict[str, NPCState],
+        state_path: Path | None = None,
+        saves: dict[str, dict[str, NPCState]] | None = None,
+    ) -> None:
+        #: global 作用域：NPC 全量设定 ＋ 未绑定存档时的好感度
+        self._global: dict[str, NPCState] = state
+        #: saves.<slotKey> 作用域：只含 PER_SAVE_FIELDS
+        self._saves: dict[str, dict[str, NPCState]] = dict(saves or {})
         self._path = state_path or get_npc_state_path()
         self._lock = asyncio.Lock()
         self._dirty = False
@@ -69,25 +99,49 @@ class NPCManager:
     async def load(cls, state_path: Path | None = None) -> "NPCManager":
         """从本地 JSON 初始化（一次全量读入内存）。文件不存在时从对话数据初始化 NPC 列表。"""
         path = state_path or get_npc_state_path()
-        raw_data: dict[str, dict[str, Any]] = {}
+        raw_global: dict[str, dict[str, Any]] = {}
+        raw_saves: dict[str, dict[str, dict[str, Any]]] = {}
         if path.exists():
             try:
                 text = await asyncio.to_thread(path.read_text, "utf-8")
                 parsed = json.loads(text) if text.strip() else {}
                 if isinstance(parsed, dict):
-                    raw_data = {k: v for k, v in parsed.items() if isinstance(v, dict)}
+                    raw_global, raw_saves = cls._split_scopes(parsed)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.error("npc_state_db.json 读取失败，按空状态启动: %s", exc)
 
-        state: dict[str, NPCState] = {}
-        for name, item in raw_data.items():
-            state[name] = cls._state_from_item(item)
+        state = {name: cls._state_from_item(item) for name, item in raw_global.items()}
+        saves = {
+            slot: {name: cls._state_from_item(item) for name, item in entries.items()}
+            for slot, entries in raw_saves.items()
+        }
 
-        manager = cls(state=state, state_path=path)
+        manager = cls(state=state, state_path=path, saves=saves)
         if not path.exists():
             await manager._init_from_dialogues()
             await manager.flush()
         return manager
+
+    @staticmethod
+    def _split_scopes(
+        parsed: dict[str, Any],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
+        """拆出 (global 条目, saves 条目)。
+
+        顶层带 global/saves 键＝新结构；否则是旧版平铺结构（顶层直接是 NPC 名），
+        整体视为 global 读入，下次落盘自然写成新结构。
+        """
+        def _entries(raw: Any) -> dict[str, dict[str, Any]]:
+            return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+        if isinstance(parsed.get(GLOBAL_KEY), dict) or isinstance(parsed.get(SAVES_KEY), dict):
+            saves_raw = parsed.get(SAVES_KEY)
+            saves = (
+                {str(slot): _entries(entries) for slot, entries in saves_raw.items()}
+                if isinstance(saves_raw, dict) else {}
+            )
+            return _entries(parsed.get(GLOBAL_KEY)), saves
+        return _entries(parsed), {}
 
     @staticmethod
     def _state_from_item(item: dict[str, Any]) -> NPCState:
@@ -156,13 +210,39 @@ class NPCManager:
 
             npc_names = await asyncio.to_thread(_collect)
             for npc_name in sorted(npc_names):
-                self._state.setdefault(
-                    npc_name,
-                    NPCState(favorability=0, relationship_level="陌生", emotions=["普通"]),
-                )
+                self._global.setdefault(npc_name, _empty_state())
             logger.info("从对话数据初始化了 %d 个 NPC", len(npc_names))
         except Exception as exc:
             logger.error("从对话数据初始化 NPC 失败（不影响启动）: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 作用域（B3-1）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _current_slot() -> str | None:
+        """当前存档槽位；未绑定＝None（读写都落 global 作用域）。"""
+        return get_integration_state().slot_key
+
+    def _scoped_locked(self, npc_name: str, slot: str | None) -> NPCState:
+        """合并出该作用域下的 NPC 状态：设定取 global，好感度取作用域内记录。
+
+        绑定存档但作用域内没有该 NPC 的记录＝这个存档里好感为初始值，
+        不继承 global（global 的好感度属于未绑定存档时那一份）。
+        """
+        base = self._global.get(npc_name)
+        if slot is None:
+            return base if base is not None else _empty_state()
+        override = self._saves.get(slot, {}).get(npc_name)
+        if base is None:
+            return override if override is not None else _empty_state()
+        if override is None:
+            return replace(base, favorability=0, relationship_level="陌生")
+        return replace(
+            base,
+            favorability=override.favorability,
+            relationship_level=override.relationship_level,
+        )
 
     # ------------------------------------------------------------------
     # 读取 / 更新（全部经 asyncio.Lock）
@@ -170,33 +250,37 @@ class NPCManager:
 
     async def get(self, npc_name: str) -> NPCState:
         async with self._lock:
-            return self._state.get(
-                npc_name.strip(), NPCState(favorability=0, relationship_level="陌生", emotions=["普通"])
-            )
+            return self._scoped_locked(npc_name.strip(), self._current_slot())
 
     async def all_states(self) -> dict[str, NPCState]:
+        """当前作用域下的全量 NPC 状态（设定来自 global，好感度按作用域合并）。"""
         async with self._lock:
-            return dict(self._state)
+            slot = self._current_slot()
+            return {name: self._scoped_locked(name, slot) for name in self._global}
 
     async def update_favorability(self, npc_name: str, change_value: int) -> NPCState:
         """更新好感度（内存 + 置 dirty，防抖落盘）；区间映射自动刷新关系等级。
 
         - 0-20 陌生 / 20-50 熟悉 / 50-80 朋友 / 80-100 生死之交
+
+        写入落到当前作用域：绑定存档→saves.<slotKey>（只存好感度与关系等级），
+        未绑定→global（整条设定一起写回）。
         """
         npc_name = npc_name.strip()
         if not npc_name:
             raise ValueError("npc_name 不能为空。")
         async with self._lock:
-            current = self._state.get(
-                npc_name, NPCState(favorability=0, relationship_level="陌生", emotions=["普通"])
-            )
+            slot = self._current_slot()
+            current = self._scoped_locked(npc_name, slot)
             new_fav = max(0, min(100, current.favorability + int(change_value)))
-            updated = replace(
-                current,
-                favorability=new_fav,
-                relationship_level=self._compute_relationship_level(new_fav),
-            )
-            self._state[npc_name] = updated
+            new_level = self._compute_relationship_level(new_fav)
+            updated = replace(current, favorability=new_fav, relationship_level=new_level)
+            if slot is None:
+                self._global[npc_name] = updated
+            else:
+                self._saves.setdefault(slot, {})[npc_name] = NPCState(
+                    favorability=new_fav, relationship_level=new_level,
+                )
             self._mark_dirty_locked()
             return updated
 
@@ -241,8 +325,17 @@ class NPCManager:
 
     async def _write_file(self) -> None:
         async with self._lock:
-            snapshot = {
-                name: self._serialize_item(state) for name, state in self._state.items()
+            snapshot: dict[str, Any] = {
+                GLOBAL_KEY: {
+                    name: self._serialize_item(state) for name, state in self._global.items()
+                },
+                SAVES_KEY: {
+                    slot: {
+                        name: {key: getattr(state, key) for key in PER_SAVE_FIELDS}
+                        for name, state in entries.items()
+                    }
+                    for slot, entries in self._saves.items()
+                },
             }
         await asyncio.to_thread(self._atomic_write, snapshot)
 
@@ -268,7 +361,7 @@ class NPCManager:
         item.update(state.extra)
         return item
 
-    def _atomic_write(self, snapshot: dict[str, dict[str, Any]]) -> None:
+    def _atomic_write(self, snapshot: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
         os.close(fd)

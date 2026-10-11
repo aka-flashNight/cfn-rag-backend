@@ -1,4 +1,5 @@
-"""NPCManager 测试（06 §1.1/§5）：并发好感度无丢失更新、防抖落盘、appearance/未知字段 forward-compatible。"""
+"""NPCManager 测试（06 §1.1/§5）：并发好感度无丢失更新、防抖落盘、appearance/未知字段 forward-compatible、
+按存档作用域隔离（B3-1）。"""
 
 from __future__ import annotations
 
@@ -7,12 +8,26 @@ import json
 
 import pytest
 
+from services.integration.state import get_integration_state
 from services.npc.manager import NPCManager, NPCState
 
 
 def _write_state(path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.fixture
+def bound_slot():
+    """绑定一个存档槽位，用例结束后解绑（NPC 状态作用域随绑定切换）。"""
+    state = get_integration_state()
+
+    def _bind(slot_key: str):
+        state.bind(slot_key)
+        return slot_key
+
+    yield _bind
+    state.unbind()
 
 
 async def test_load_existing_state(tmp_path):
@@ -73,7 +88,7 @@ async def test_debounce_flush_writes_file(tmp_path):
     await manager.flush()
 
     raw = json.loads(state_path.read_text(encoding="utf-8"))
-    assert raw["铁匠"]["favorability"] == 15
+    assert raw["global"]["铁匠"]["favorability"] == 15
     # 防抖任务应已空闲（dirty 已清）
     assert manager._dirty is False
 
@@ -84,7 +99,7 @@ async def test_stop_flushes_pending_writes(tmp_path):
     await manager.update_favorability("铁匠", 7)
     await manager.stop()  # 进程退出前 flush
     raw = json.loads(state_path.read_text(encoding="utf-8"))
-    assert raw["铁匠"]["favorability"] == 7
+    assert raw["global"]["铁匠"]["favorability"] == 7
 
 
 async def test_appearance_and_unknown_fields_forward_compatible(tmp_path):
@@ -105,9 +120,9 @@ async def test_appearance_and_unknown_fields_forward_compatible(tmp_path):
     await manager.update_favorability("铁匠", 1)
     await manager.flush()
     raw = json.loads(state_path.read_text(encoding="utf-8"))
-    assert raw["铁匠"]["appearance"] == "络腮胡，满脸煤灰的中年铁匠"
-    assert raw["铁匠"]["custom_future_field"] == {"keep": True}
-    assert raw["铁匠"]["favorability"] == 31
+    assert raw["global"]["铁匠"]["appearance"] == "络腮胡，满脸煤灰的中年铁匠"
+    assert raw["global"]["铁匠"]["custom_future_field"] == {"keep": True}
+    assert raw["global"]["铁匠"]["favorability"] == 31
 
 
 async def test_init_from_missing_file_creates_state(tmp_path, monkeypatch):
@@ -139,3 +154,121 @@ async def test_corrupted_file_starts_empty(tmp_path):
     state_path.write_text("{broken json", encoding="utf-8")
     manager = await NPCManager.load(state_path=state_path)
     assert isinstance(manager, NPCManager)
+
+
+# ---------------------------------------------------------------------------
+# 按存档作用域（B3-1）：只有好感度与关系等级隔离，NPC 设定仍来自 global
+# ---------------------------------------------------------------------------
+
+async def test_bound_slot_starts_fresh_but_keeps_npc_settings(tmp_path, bound_slot):
+    """新存档不继承 global 好感；阵营/头衔/性别等设定照旧（同阵营块与情绪白名单不退化）。"""
+    state_path = tmp_path / "s.json"
+    _write_state(state_path, {
+        "铁匠": {
+            "favorability": 85,
+            "relationship_level": "生死之交",
+            "sex": "男",
+            "faction": "A兵团",
+            "titles": ["大师铁匠"],
+            "emotions": ["普通", "微笑"],
+        }
+    })
+    manager = await NPCManager.load(state_path=state_path)
+
+    bound_slot("slot_1")
+    st = await manager.get("铁匠")
+    assert st.favorability == 0
+    assert st.relationship_level == "陌生"
+    assert st.sex == "男"
+    assert st.faction == "A兵团"
+    assert st.titles == ["大师铁匠"]
+    assert st.emotions == ["普通", "微笑"]
+
+
+async def test_two_slots_do_not_share_favorability(tmp_path, bound_slot):
+    state_path = tmp_path / "s.json"
+    manager = await NPCManager.load(state_path=state_path)
+
+    bound_slot("slot_1")
+    await manager.update_favorability("铁匠", 60)
+    bound_slot("slot_2")
+    await manager.update_favorability("铁匠", 10)
+
+    bound_slot("slot_1")
+    st1 = await manager.get("铁匠")
+    assert st1.favorability == 60 and st1.relationship_level == "朋友"
+    bound_slot("slot_2")
+    st2 = await manager.get("铁匠")
+    assert st2.favorability == 10 and st2.relationship_level == "陌生"
+
+    await manager.flush()
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["saves"]["slot_1"]["铁匠"] == {"favorability": 60, "relationship_level": "朋友"}
+    assert raw["saves"]["slot_2"]["铁匠"] == {"favorability": 10, "relationship_level": "陌生"}
+    # 存档侧只落这两个字段，设定不重复存
+    assert set(raw["saves"]["slot_1"]["铁匠"]) == {"favorability", "relationship_level"}
+
+
+async def test_unbound_writes_global_and_bound_leaves_it_alone(tmp_path, bound_slot):
+    """未绑定存档＝独立那一份，写 global；绑定存档的改动不污染 global。"""
+    state_path = tmp_path / "s.json"
+    manager = await NPCManager.load(state_path=state_path)
+
+    await manager.update_favorability("铁匠", 25)
+    bound_slot("slot_1")
+    await manager.update_favorability("铁匠", 90)
+    await manager.flush()
+
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["global"]["铁匠"]["favorability"] == 25
+    assert raw["global"]["铁匠"]["relationship_level"] == "熟悉"
+    assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 90
+
+
+async def test_all_states_follows_current_scope(tmp_path, bound_slot):
+    state_path = tmp_path / "s.json"
+    _write_state(state_path, {"铁匠": {"favorability": 70}, "药师": {"favorability": 40}})
+    manager = await NPCManager.load(state_path=state_path)
+
+    assert (await manager.all_states())["铁匠"].favorability == 70
+
+    bound_slot("slot_1")
+    states = await manager.all_states()
+    assert set(states) == {"铁匠", "药师"}
+    assert all(st.favorability == 0 and st.relationship_level == "陌生" for st in states.values())
+
+
+async def test_legacy_flat_file_read_as_global(tmp_path, bound_slot):
+    """旧版平铺结构整体视为 global 读入，不做额外迁移；下次落盘自然写成新结构。"""
+    state_path = tmp_path / "s.json"
+    _write_state(state_path, {"铁匠": {"favorability": 55, "relationship_level": "朋友", "faction": "王国"}})
+    manager = await NPCManager.load(state_path=state_path)
+
+    st = await manager.get("铁匠")
+    assert st.favorability == 55 and st.faction == "王国"
+
+    await manager.flush()
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["global"]["铁匠"]["favorability"] == 55
+    assert raw["saves"] == {}
+
+
+async def test_new_structure_roundtrip_preserves_both_scopes(tmp_path, bound_slot):
+    state_path = tmp_path / "s.json"
+    _write_state(state_path, {
+        "global": {"铁匠": {"favorability": 30, "relationship_level": "熟悉", "faction": "A兵团"}},
+        "saves": {"slot_1": {"铁匠": {"favorability": 80, "relationship_level": "生死之交"}}},
+    })
+    manager = await NPCManager.load(state_path=state_path)
+
+    bound_slot("slot_1")
+    st = await manager.get("铁匠")
+    assert st.favorability == 80 and st.relationship_level == "生死之交"
+    assert st.faction == "A兵团"
+
+    await manager.update_favorability("铁匠", -100)
+    await manager.flush()
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 0
+    assert raw["global"]["铁匠"]["favorability"] == 30
+    assert raw["global"]["铁匠"]["faction"] == "A兵团"

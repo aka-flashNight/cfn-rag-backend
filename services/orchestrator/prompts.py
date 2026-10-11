@@ -354,6 +354,20 @@ def build_session_state_block(
     return "\n".join(parts)
 
 
+#: 已完成委托块尾部的长期记忆更新指引（仅在长期记忆已有关键记录时拼接）
+LTM_TASK_DONE_HINT = "长期记忆里若仍记着上述委托处于「已发布」，把它更新为「已完成」。"
+
+
+def build_finished_task_block(raw_block: str, *, has_long_term_facts: bool) -> str:
+    """已完成委托块（阶段三）：raw_block 由上下文装配直读磁盘拼好，这里只补一句
+    长期记忆更新指引——仅在长期记忆已有关键记录时补，否则这句无可执行对象。"""
+    if not raw_block:
+        return ""
+    if not has_long_term_facts:
+        return raw_block
+    return f"{raw_block}\n{LTM_TASK_DONE_HINT}"
+
+
 def build_user_shared_core(
     *,
     retrieved_context: str = "",
@@ -366,13 +380,15 @@ def build_user_shared_core(
     relationship_level: str = "陌生",
     pending_draft_summary: str = "",
     save_info: Any = None,
+    long_term_block: str = "",
+    finished_task_block: str = "",
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
-    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ RAG/提及 NPC
-    （跨轮全变、轮内不变）→ 早期摘要 → 近期对话（对话记录整体下放：摘要比对话
-    稳定放前面；对话跨轮追加，同回合内过渡话产生后还会追加——轮内有变化但不
-    高频，放最下方使追加不破坏块内前缀）。
+    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ 已完成委托 →
+    长期记忆（跨窗口，改动稀疏）→ RAG/提及 NPC（跨轮全变、轮内不变）→ 早期摘要
+    → 近期对话（对话记录整体下放：摘要比对话稳定放前面；对话跨轮追加，同回合内
+    过渡话产生后还会追加——轮内有变化但不高频，放最下方使追加不破坏块内前缀）。
     """
     parts: list[str] = []
     session_block = build_session_state_block(
@@ -385,6 +401,12 @@ def build_user_shared_core(
     )
     if session_block:
         parts.append(session_block)
+    done = (finished_task_block or "").strip()
+    if done:
+        parts.append(done)
+    long_term = (long_term_block or "").strip()
+    if long_term:
+        parts.append(long_term)
     rag = _rag_block(retrieved_context)
     if rag:
         parts.append(rag)

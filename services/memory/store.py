@@ -1,4 +1,4 @@
-"""会话存储（SQLite 单连接 + WAL，修 E4）：消息 / 会话 / 摘要 / 任务草案 / ask 计数。
+"""会话存储（SQLite 单连接 + WAL，修 E4）：消息 / 会话 / 摘要 / 任务草案 / ask 计数 / 长期记忆。
 
 对应 docs/v3-developer/06-存储启动与打包瘦身.md §1.2：
 - 单连接 sqlite3.connect(check_same_thread=False) + threading.Lock + WAL，不再每操作新建连接；
@@ -6,6 +6,11 @@
 - 草案过期：连续 N 次 ask 未触碰任务工具即删除，N 由 draft_keep_turns 配置；
 - bargain_count 独立成列，不再混进草案 JSON（修 D5），内部字段 _draft_commit_valid 同样不入库；
 - sessions.slot_key 存档作用域列（B2-5）：创建时记录当前绑定槽位，缺省 NULL＝standalone，不做迁移回填。
+
+长期记忆（B3-2）：long_term_memory 表按 (slot_key, npc) 作用域存两类条目——
+kind='base'（每个作用域唯一一条基础长期记忆，entry_no 为 NULL）与
+kind='fact'（追加的关键记录，entry_no 是作用域内单调递增编号，永不复用或重排）。
+未绑定存档时用固定作用域键 STANDALONE_SCOPE，与各存档互不混淆。
 """
 
 from __future__ import annotations
@@ -37,6 +42,18 @@ SUMMARIZE_INTERVAL = 30
 # 与 SUMMARIZE_INTERVAL 是两回事——档位决定「多少条近期对话逐字进 prompt」，
 # 摘要间隔决定「多久把近期对话压成一段永久模糊记忆」，后者不随档位变化。
 PRECISE_MEMORY_OPTIONS = (10, 30, 100, 500)
+
+# 长期记忆（B3-2）：未绑定存档时的独立作用域键（与各存档互不混淆）
+STANDALONE_SCOPE = "__standalone__"
+
+# 追加长期记忆（kind='fact'）条数上限；达到上限后聊天侧只保留调整能力
+LTM_MAX_FACT_ENTRIES = 20
+
+# 单条长期记忆入库长度上限（超出截断）；提示词侧的期望长度更短，见 long_term.py
+LTM_MAX_CHARS = 500
+
+LTM_KIND_BASE = "base"
+LTM_KIND_FACT = "fact"
 
 # 不允许混入草案 JSON 的内部/业务分离字段（修 D5）
 _DRAFT_INTERNAL_FIELDS = ("bargain_count", "_draft_commit_valid")
@@ -99,6 +116,21 @@ class SessionInfo:
     title: str
     created_at: float
     slot_key: str | None = None
+
+
+@dataclass
+class LongTermEntry:
+    """一条长期记忆。kind='base' 时 entry_no 为 None；kind='fact' 时是作用域内编号。"""
+
+    id: int
+    slot_key: str
+    npc: str
+    kind: str
+    content: str
+    entry_no: int | None = None
+    source_session_id: str | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
 
 class MemoryStore:
@@ -183,9 +215,26 @@ class MemoryStore:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS long_term_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slot_key TEXT NOT NULL,
+                    npc TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    entry_no INTEGER,
+                    content TEXT NOT NULL,
+                    source_session_id TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ltm_scope ON long_term_memory(slot_key, npc, kind)"
+            )
             self._migrate_legacy_schema(cur)
             self._conn.commit()
-
     def _migrate_legacy_schema(self, cur: sqlite3.Cursor) -> None:
         """旧库升级：草案补 bargain_count 独立列（修 D5）＋ sessions 补 slot_key（B2-5）。"""
         self._migrate_draft_bargain_count(cur)
@@ -629,10 +678,164 @@ class MemoryStore:
             )
             self._conn.commit()
 
+    # ------------------------------------------------------------------
+    # 长期记忆（B3-2）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ltm_row_to_entry(row: sqlite3.Row) -> LongTermEntry:
+        return LongTermEntry(
+            id=int(row["id"]),
+            slot_key=str(row["slot_key"]),
+            npc=str(row["npc"]),
+            kind=str(row["kind"]),
+            content=str(row["content"]),
+            entry_no=int(row["entry_no"]) if row["entry_no"] is not None else None,
+            source_session_id=(
+                str(row["source_session_id"]) if row["source_session_id"] is not None else None
+            ),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    _LTM_SELECT_COLS = (
+        "id, slot_key, npc, kind, entry_no, content, source_session_id, created_at, updated_at"
+    )
+
+    def ltm_list_sync(self, slot_key: str, npc: str) -> list[LongTermEntry]:
+        """作用域内全部长期记忆：基础记忆在前，追加记忆按编号升序。"""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"""
+                SELECT {self._LTM_SELECT_COLS} FROM long_term_memory
+                WHERE slot_key = ? AND npc = ?
+                ORDER BY CASE kind WHEN 'base' THEN 0 ELSE 1 END, entry_no ASC, id ASC
+                """,
+                (slot_key, npc),
+            )
+            rows = cur.fetchall()
+        return [self._ltm_row_to_entry(r) for r in rows]
+
+    def ltm_get_base_sync(self, slot_key: str, npc: str) -> str | None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT content FROM long_term_memory WHERE slot_key = ? AND npc = ? AND kind = 'base'",
+                (slot_key, npc),
+            )
+            row = cur.fetchone()
+        return str(row["content"]) if row else None
+
+    def ltm_fact_count_sync(self, slot_key: str, npc: str) -> int:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM long_term_memory WHERE slot_key = ? AND npc = ? AND kind = 'fact'",
+                (slot_key, npc),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def ltm_save_base_sync(
+        self, slot_key: str, npc: str, content: str, source_session_id: str | None = None,
+    ) -> LongTermEntry:
+        """写入/覆盖基础长期记忆（每个作用域唯一一条）。"""
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                UPDATE long_term_memory
+                SET content = ?, source_session_id = ?, updated_at = ?
+                WHERE slot_key = ? AND npc = ? AND kind = 'base'
+                """,
+                (content, source_session_id, now, slot_key, npc),
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    """
+                    INSERT INTO long_term_memory
+                        (slot_key, npc, kind, entry_no, content, source_session_id, created_at, updated_at)
+                    VALUES (?, ?, 'base', NULL, ?, ?, ?, ?)
+                    """,
+                    (slot_key, npc, content, source_session_id, now, now),
+                )
+            self._conn.commit()
+            cur.execute(
+                f"SELECT {self._LTM_SELECT_COLS} FROM long_term_memory"
+                " WHERE slot_key = ? AND npc = ? AND kind = 'base'",
+                (slot_key, npc),
+            )
+            row = cur.fetchone()
+        return self._ltm_row_to_entry(row)
+
+    def ltm_append_fact_sync(
+        self, slot_key: str, npc: str, content: str, source_session_id: str | None = None,
+    ) -> LongTermEntry:
+        """追加一条关键长期记忆；编号＝作用域内最大值 +1（永不复用、不重排）。"""
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(MAX(entry_no), 0) FROM long_term_memory"
+                " WHERE slot_key = ? AND npc = ? AND kind = 'fact'",
+                (slot_key, npc),
+            )
+            row = cur.fetchone()
+            entry_no = int(row[0]) + 1
+            cur.execute(
+                """
+                INSERT INTO long_term_memory
+                    (slot_key, npc, kind, entry_no, content, source_session_id, created_at, updated_at)
+                VALUES (?, ?, 'fact', ?, ?, ?, ?, ?)
+                """,
+                (slot_key, npc, entry_no, content, source_session_id, now, now),
+            )
+            new_id = cur.lastrowid
+            self._conn.commit()
+            cur.execute(
+                f"SELECT {self._LTM_SELECT_COLS} FROM long_term_memory WHERE id = ?",
+                (new_id,),
+            )
+            inserted = cur.fetchone()
+        return self._ltm_row_to_entry(inserted)
+
+    def ltm_update_fact_sync(
+        self,
+        slot_key: str,
+        npc: str,
+        entry_no: int,
+        content: str,
+        source_session_id: str | None = None,
+    ) -> LongTermEntry | None:
+        """按编号调整一条关键长期记忆；编号不存在＝None（不改任何数据）。"""
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                UPDATE long_term_memory
+                SET content = ?, source_session_id = ?, updated_at = ?
+                WHERE slot_key = ? AND npc = ? AND kind = 'fact' AND entry_no = ?
+                """,
+                (content, source_session_id, now, slot_key, npc, entry_no),
+            )
+            if cur.rowcount == 0:
+                self._conn.commit()
+                return None
+            self._conn.commit()
+            cur.execute(
+                f"SELECT {self._LTM_SELECT_COLS} FROM long_term_memory"
+                " WHERE slot_key = ? AND npc = ? AND kind = 'fact' AND entry_no = ?",
+                (slot_key, npc, entry_no),
+            )
+            row = cur.fetchone()
+        return self._ltm_row_to_entry(row)
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
-
 
 # ---------------------------------------------------------------------------
 # asyncio 包装（API 层 await 调用）
@@ -663,6 +866,12 @@ for _name in [
     "get_rounds_without_task",
     "increment_rounds_without_task",
     "reset_rounds_without_task",
+    "ltm_list",
+    "ltm_get_base",
+    "ltm_fact_count",
+    "ltm_save_base",
+    "ltm_append_fact",
+    "ltm_update_fact",
 ]:
     setattr(MemoryStore, _name, _make_async(f"{_name}_sync"))
 

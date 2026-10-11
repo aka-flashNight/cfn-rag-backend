@@ -73,6 +73,7 @@ IDLE
   残留的待确认草案不进 prompt（模型既无法确认也无法取消，摆着只会诱导它承诺做不到的事），
   但仍照常装配以累计 `draft_keep_turns` 计数被自然清理。
 - `summarize_interval`：精确短期记忆档位，见 §7.1。
+- `long_term_memory_enabled`：跨对话长期记忆开关（前端每请求带），见 §7.2。
 
 ## 3. 后台子 Agent 基座（base.py）
 
@@ -274,6 +275,55 @@ class SearchRunner(SubagentBase):
   玩家反而会在 500 条之前彻底失去模糊记忆，与承诺相反。
   （字段名 `summarize_interval` 是 v2 遗留——当年它同时驱动摘要间隔与历史长度，
   v3 恢复时只保留了后者，名字为兼容已发布前端而未改。）
+
+### 7.2 跨对话长期记忆（long_term_memory_enabled，2026-10-12 阶段三）
+
+与 §7.1 的「精确短期记忆」和滚动摘要是三套不同的东西：短期记忆是逐字进 prompt 的最近若干条；
+摘要按**会话**存、只总结对话内容；长期记忆按 **(作用域, NPC)** 存，跨会话与跨对话窗口保留。
+实现集中在 `services/memory/long_term.py`，表在既有的 `tools/memory.db` 里（`long_term_memory`）。
+
+**开关**：`NPCChatRequest.long_term_memory_enabled`。判定在 `resolve_enabled()`——
+embedded 口径（`--embedded` 启动或已被 bind）**恒定启用、不受理关闭**，前端在游戏内也不给这个复选框；
+standalone 按字段值，不传＝关闭。**不落后端库**：玩家的选择由前端 localStorage 记住，每请求带一次即可。
+
+**作用域**：绑定存档＝槽位键，每存档一份；未绑定＝ `store.STANDALONE_SCOPE`（`__standalone__`），
+与各存档互不混淆。摘要 worker 延后执行，所以作用域键在**提交时**就解析好存进
+`SummaryRequest.long_term_scope`，执行期间玩家换存档也不会写错地方。
+
+**内容**：一条 `kind='base'`（基础长期记忆＝玩家与 NPC 的整体关系情况＋NPC 对玩家的整体印象，
+提示词口径 300 字）＋至多 `LTM_MAX_FACT_ENTRIES`（20）条 `kind='fact'`（关键事件或信息，提示词口径 100 字）。
+入库统一截断到 `LTM_MAX_CHARS`（500）。`fact` 的 `entry_no` 是作用域内该 NPC 的直观编号，
+取最大值 +1，**永不复用、不重排**（改写不换号，所以提示词里的编号跨轮稳定可引用）。
+
+**注入**：`context.py` 一轮读一次快照进 `TurnContext.long_term`，`prompts.build_user_shared_core`
+把它拼成独立块。块序＝会话态 → 已完成委托 → 长期记忆 → RAG/提及 NPC → 摘要 → 近期对话
+（按前缀缓存从稳定到易变；长期记忆改动稀疏，放在每轮全变的 RAG 之前）。
+作用域内一条都没有＝整块不注入，不留空壳。摘要轮另有 `format_summary_block()`，
+块尾写明「长期记忆不参与对话摘要的撰写」——摘要只总结本次给出的对话记录。
+
+**工具（关键设计约束）**：聊天侧永远只有一个工具名 `update_long_term_memory`，
+schema 与描述按作用域当前状态**三选一**；摘要侧另有 `set_base_long_term_memory`（只在摘要那次调用下发）。
+两个工具都**不进 `ToolRegistry`**——注册表的 `description`/`parameters_schema` 是类属性字面量，
+做不到同名按状态换形；改由 `turn.py` 手拼 tool dict，并在新方法 `_apply_long_term_calls()` 里就地执行。
+写库失败只记警告，**不阻断本轮对话**（记忆是附加能力，玩家这句话必须照常答完）。
+
+| 作用域当前状态 | 参数 | 模型看到的语义 |
+| -------------- | ---- | -------------- |
+| 尚无基础长期记忆 | `base_content*` + `content*` | 记录时必须同时给出基础印象与一条关键记录 |
+| 有基础印象、关键记录未满 20 | `entry_no?` + `content*` | 与既有记录相关就填编号融合改写，无关才留空新记一条 |
+| 关键记录满 20 | `entry_no*` + `content*` | **只有改写能力** |
+
+满 20 条那一形态是硬约束：模型视角下**完全感知不到"留空即可新记一条"这个分支**，
+所以该形态的工具名、描述、参数表里零处出现「追加」「新记一条」「留空」等字样
+（`tests/orchestrator/test_long_term_memory.py` 与 `tests/memory/test_long_term.py` 各有禁词锁）。
+业务上仍能记新事＝把不重要的那条**改写**成新的。
+
+**任务发布→完成**：`services/agent_tools/finished_tasks.py` 每轮实时算「本 NPC 发布、
+且当前存档已完成」的委托，把完成对话原文拼进 prompt（一轮最多 3 条，按 id 从新到旧）。
+只能直读磁盘：`TaskRegistry` 看不到 `data/rag/agent_saves/<slotKey>/` 覆盖层，
+玩家台词也不进检索语料。该 NPC 已有关键记录时，块尾再追加一句
+`prompts.LTM_TASK_DONE_HINT`，要求把仍记着「已发布」的那条改成「已完成」；
+没有关键记录时这句不拼（没有可执行对象）。
 
 ## 8. 新旧行为对照（必须做到的改善）
 

@@ -100,6 +100,9 @@ async def ask(
         # agent_enabled 缺省（None）按启用处理，即老客户端行为不变
         agent_enabled=payload.agent_enabled is not False,
         summarize_interval=payload.summarize_interval,
+        # 跨对话长期记忆开关按请求生效；游戏内（embedded 口径）由后端强制启用，
+        # 这里的原值只在非游戏打开时决定开关（缺省＝关闭）
+        long_term_memory_enabled=payload.long_term_memory_enabled,
         # send_image 不显式关：是否带图由编排层按 07 §4 判定
         #（vision Profile + 未被标记图像不支持 + 立绘资产可用，否则纯文本不报错）
     )

@@ -1,7 +1,8 @@
 """/api/game/ask 的请求级设置项转发测试。
 
-只验一件事：NPCChatRequest 的 agent_enabled / summarize_interval 确实被送进
-TurnOrchestrator（编排层的行为语义在 tests/orchestrator/test_settings_switches.py）。
+只验一件事：NPCChatRequest 的 agent_enabled / summarize_interval /
+long_term_memory_enabled 确实被送进 TurnOrchestrator（编排层的行为语义在
+tests/orchestrator/test_settings_switches.py 与 test_long_term_memory.py）。
 用桩替换 orchestrator，不触发任何 LLM 调用与真实 NPC 状态文件读写。
 """
 
@@ -54,6 +55,8 @@ def test_omitted_settings_keep_agent_on_and_no_tier(client):
     assert body["reply"] == "嗯。"
     assert _StubOrchestrator.kwargs["agent_enabled"] is True
     assert _StubOrchestrator.kwargs["summarize_interval"] is None
+    # 长期记忆不传＝原值 None（是否启用由编排层按 embedded 口径判定，API 层不替它拿主意）
+    assert _StubOrchestrator.kwargs["long_term_memory_enabled"] is None
 
 
 def test_explicit_settings_are_forwarded(client):
@@ -72,3 +75,12 @@ def test_out_of_whitelist_tier_still_reaches_orchestrator(client):
     """白名单收敛在编排层做（非法值回落默认），API 层不静默改写请求。"""
     _ask(client, summarize_interval=7)
     assert _StubOrchestrator.kwargs["summarize_interval"] == 7
+
+
+def test_long_term_memory_switch_is_forwarded(client):
+    """非游戏打开时的开关原样转发；游戏内的恒定启用由编排层判定，不在 API 层改写。"""
+    _ask(client, long_term_memory_enabled=True)
+    assert _StubOrchestrator.kwargs["long_term_memory_enabled"] is True
+
+    _ask(client, long_term_memory_enabled=False)
+    assert _StubOrchestrator.kwargs["long_term_memory_enabled"] is False

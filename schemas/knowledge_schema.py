@@ -62,6 +62,15 @@ class NPCChatRequest(BaseModel):
             "注意：档位只影响精确短期记忆，会话的滚动摘要（永久模糊记忆）节奏不受其影响。"
         ),
     )
+    long_term_memory_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "是否启用跨对话长期记忆（按存档作用域保留 NPC 对玩家的基础印象与关键记录）。"
+            "游戏内（embedded 口径）恒定启用，本字段不受理关闭；"
+            "非游戏打开时按本字段生效，不传按关闭处理。"
+            "关闭时后端既不注入长期记忆、不下发长期记忆工具，也不写库。"
+        ),
+    )
 
 
 class NPCChatResponse(BaseModel):
