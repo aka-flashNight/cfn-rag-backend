@@ -257,8 +257,10 @@ async def test_finished_task_block_reaches_prompt(env, bound_slot, monkeypatch):
 
     assert orch._ctx.finished_task_block.startswith("【你发布的委托已被玩家完成】")
     core = _shared_core(env)
-    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n以下对话已经发生：" in core
-    assert "玩家：带回来了。" in core
+    assert (
+        "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n"
+        "任务达成内容（玩家达成）：无\n任务后：\n玩家：带回来了。"
+    ) in core
     # 已有关键记录时才要求把「已发布」改成「已完成」
     assert LTM_TASK_DONE_HINT not in core
 

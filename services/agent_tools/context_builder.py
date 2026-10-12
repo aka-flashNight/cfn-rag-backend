@@ -1036,6 +1036,9 @@ def _group_stage_rows_by_area(
                 "difficulties": r.get("difficulties") or [],
                 "is_dungeon": bool(r.get("is_dungeon")),
             }
+            desc = str(r.get("description") or "").strip()
+            if desc:
+                item["description"] = desc
             if r.get("recommended_level") is not None:
                 item["recommended_level"] = r.get("recommended_level")
             if r.get("challenge_modes"):
@@ -1128,6 +1131,8 @@ def _get_all_stages_for_progress(
                 keywords=kw,
             ),
         }
+        if si.description:
+            row["description"] = si.description
         if below_progress:
             row["below_progress"] = True
         rows.append(row)
@@ -1982,6 +1987,8 @@ def _build_stage_loot_list(
                 equipment_mods,
             ),
         }
+        if si.description:
+            row["description"] = si.description
         if below_progress:
             row["below_progress"] = True
         rows.append(row)

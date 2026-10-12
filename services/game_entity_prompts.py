@@ -164,10 +164,9 @@ def format_stage_detail_line(si: StageInfo) -> str:
         f"所在区域：{si.area}",
         f"区域说明：{stage_root_region_hint(si.area)}",
     ]
+    # 空描述整段省略（不写「（无）」占位，免得模型把占位当信息）
     if si.description:
         parts.insert(1, f"关卡描述：{si.description}")
-    else:
-        parts.insert(1, "关卡描述：（无）")
     if si.unlock_condition is not None:
         parts.append(f"解锁主线ID：{si.unlock_condition}")
     return "；".join(parts)

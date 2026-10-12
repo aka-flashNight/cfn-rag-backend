@@ -1,7 +1,7 @@
 """「本 NPC 发布的 Agent 委托已被玩家完成」的实时拼接（阶段三·任务发布→完成）。
 
 只能直读磁盘：TaskRegistry 看不到按存档的 data/rag/agent_saves/<slotKey>/ 覆盖层，
-而玩家台词不进检索语料，完成对话原文只能从 agent_text.json 取。
+而玩家台词不进检索语料，接取与完成对话原文只能从 agent_text.json 取。
 读取范围＝共享文件 ∪ 本存档文件，按 id 合并（存档优先），与语料加载口径一致。
 
 无状态：每轮按当前存档投影里的 tasks_finished 实时算，不做「已通知」记账——
@@ -73,20 +73,25 @@ def _dialogue_lines(items: Any) -> list[str]:
     return lines
 
 
-def _item_phrase(values: Any, prefix: str) -> str:
-    """["物品名#数量"] → 「prefix：物品名×数量、…」；只呈现，不参与判定。"""
+def _item_text(values: Any) -> str:
+    """["物品名#数量"] → 「物品名×数量、…」；无有效项返回空串。"""
     parts: list[str] = []
     for raw in values if isinstance(values, list) else []:
         name, _, count = str(raw or "").strip().partition("#")
         if not name.strip():
             continue
         parts.append(f"{name.strip()}×{count.strip()}" if count.strip() else name.strip())
-    joined = "、".join(parts)
+    return "、".join(parts)
+
+
+def _item_phrase(values: Any, prefix: str) -> str:
+    """物品短语带前缀；只呈现，不参与判定。"""
+    joined = _item_text(values)
     return f"{prefix}：{joined}" if joined else ""
 
 
-def _stage_phrase(values: Any, prefix: str) -> str:
-    """["关卡名#难度"] → 「prefix：关卡名（难度）」——难度套上 × 会被读成数量。"""
+def _stage_text(values: Any) -> str:
+    """["关卡名#难度"] → 「关卡名（难度）、…」——难度套上 × 会被读成数量。"""
     parts: list[str] = []
     for raw in values if isinstance(values, list) else []:
         name, _, difficulty = str(raw or "").strip().partition("#")
@@ -94,18 +99,23 @@ def _stage_phrase(values: Any, prefix: str) -> str:
             continue
         tail = difficulty.strip()
         parts.append(f"{name.strip()}（{tail}）" if tail else name.strip())
-    joined = "、".join(parts)
-    return f"{prefix}：{joined}" if joined else ""
+    return "、".join(parts)
 
 
-def _demand_phrase(record: dict) -> str:
-    """任务要求行：落盘记录里没有 task_type（只存在于草案），按需求字段原样列出。"""
-    parts = [
-        _item_phrase(record.get("finish_submit_items"), "需要玩家提交"),
-        _item_phrase(record.get("finish_contain_items"), "需要玩家收集"),
-        _stage_phrase(record.get("finish_requirements"), "需要玩家通过关卡"),
-    ]
-    return "；".join(p for p in parts if p)
+def _completion_phrase(record: dict) -> str:
+    """任务达成内容一行：提交给谁／获取（不提交）／通关；落盘无需求字段时写「无」。"""
+    parts: list[str] = []
+    submit = _item_text(record.get("finish_submit_items"))
+    contain = _item_text(record.get("finish_contain_items"))
+    stages = _stage_text(record.get("finish_requirements"))
+    if submit:
+        # 落盘记录的 finish_npc 恒非空（缺省时回退为发布 NPC），不必再防「给谁」缺失
+        parts.append(f"提交{submit}给{str(record.get('finish_npc') or '').strip()}")
+    if contain:
+        parts.append(f"获取{contain}（不提交）")
+    if stages:
+        parts.append(f"通关{stages}")
+    return "任务达成内容（玩家达成）：" + ("；".join(parts) if parts else "无")
 
 
 def build_finished_task_block(
@@ -147,13 +157,18 @@ def build_finished_task_block(
         description = str(texts.get(f"$AGENT_DESCRIPTION_{task_id}") or "").strip()
         if description:
             lines.append(f"任务说明：{description}")
-        demand = _demand_phrase(record)
-        if demand:
-            lines.append(demand)
-        dialogue = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
-        if dialogue:
-            lines.append("以下对话已经发生：")
-            lines.extend(dialogue)
+        reward = _item_phrase(record.get("rewards"), "报酬")
+        if reward:
+            lines.append(reward)
+        get_dialogue = _dialogue_lines(texts.get(f"$AGENT_GET_{task_id}"))
+        if get_dialogue:
+            lines.append("任务前：")
+            lines.extend(get_dialogue)
+        lines.append(_completion_phrase(record))
+        finish_dialogue = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
+        if finish_dialogue:
+            lines.append("任务后：")
+            lines.extend(finish_dialogue)
         sections.append("\n".join(lines))
 
     if not sections:

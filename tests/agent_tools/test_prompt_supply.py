@@ -2,19 +2,25 @@
 
 - 传话/问候候选轮：发布 NPC 视角场景块（publisher_scene）＋候选条目 scene 字段＋规则句；
 - 草案摘要：完成NPC≠发布NPC 时补其属性（性别/阵营/身份或称呼）与「所在场景」行及指示句；
-- 选关类草案逐关卡追加怪物块（切磋不附）；RAG 已出现的关卡改锚一行；数量最多句附相对强度档位。
+- 选关类草案逐关卡追加怪物块（切磋不附）；RAG 已出现的关卡改锚一行；数量最多句附相对强度档位；
+- 关卡候选行逐字带关卡描述（第三批），空描述整段省略不留占位。
 """
 
 from __future__ import annotations
 
 import json
 
-from services.agent_tools.context_builder import _TASK_RULES, prepare_task_context
+from services.agent_tools.context_builder import (
+    _TASK_RULES,
+    _group_stage_rows_by_area,
+    prepare_task_context,
+)
 from services.agent_tools.draft_formatting import (
     _build_draft_entity_context_lines,
     _detailed_draft_summary,
 )
 from services.agent_tools.schemas import normalize_reward_types_for_prepare_context
+from services.game_entity_prompts import format_stage_detail_line, get_stage_info_for_name
 from services.npc.manager import NPCState
 
 # 与 game_data 侧测试同源的逐字块（地铁站，含无 displayname 兵种 293 的跳过）
@@ -206,3 +212,69 @@ def test_stage_already_in_rag_anchors_single_monster_line(game_data):
     rag = "【玩家可能提到的关卡】\n关卡名称：地铁站；所在区域：基地门口"
     lines = _build_draft_entity_context_lines(draft, game_data, rag_context_text=rag)
     assert lines == [f"[关卡] 地铁站：{TIETIE_MONSTER_BLOCK}"]
+
+
+# ---------------------------------------------------------------------------
+# 第三批：关卡描述进候选行／进草案 [关卡] 行
+# ---------------------------------------------------------------------------
+
+def test_prepare_stage_candidates_carry_description_verbatim(game_data):
+    """通关／通关并收集的候选行：注册表有描述就逐字带上，没有就不出这个键。"""
+    for task_type, key in (("通关", "stage_list"), ("通关并收集", "stage_loot_list")):
+        ctx = _prepare(game_data, task_type, "Pig", STATES)
+        rows = [(b["area"], s) for b in ctx[key] for s in b["stages"]]
+        assert rows, f"{key} 应有候选行"
+        for area, row in rows:
+            si = game_data.stages._stage_infos[(area, row["name"])]
+            expected = str(si.description or "").strip()
+            assert ("description" in row) == bool(expected), row["name"]
+            if expected:
+                assert row["description"] == expected
+
+
+def test_group_stage_rows_strips_and_omits_empty_description():
+    """分组装配：描述去空白后才有键；纯空白与缺字段一律整段省略，不落占位。"""
+    rows = [
+        {"area": "甲区", "name": "带描述", "description": "  一段描述  ",
+         "difficulties": [], "is_dungeon": False, "unlock_id": 1},
+        {"area": "甲区", "name": "纯空白", "description": "   ",
+         "difficulties": [], "is_dungeon": False, "unlock_id": 1},
+        {"area": "甲区", "name": "无描述",
+         "difficulties": [], "is_dungeon": False, "unlock_id": 1},
+    ]
+    stages = _group_stage_rows_by_area(rows, stage=1)[0]["stages"]
+    assert stages[0]["description"] == "一段描述"
+    assert "description" not in stages[1]
+    assert "description" not in stages[2]
+
+
+def test_draft_stage_line_keeps_description_when_present(game_data):
+    lines = _build_draft_entity_context_lines(
+        _draft(task_type="通关", finish_requirements=[
+            {"stage_name": "地铁站", "difficulty": "简单"},
+        ]),
+        game_data,
+    )
+    assert (
+        "[关卡] 关卡名称：地铁站；关卡描述：僵尸喜爱黑暗的环境，"
+        "于是地铁站成为了整个废城最为凶险的地区，"
+        "没人知道这地狱的洞窟里隐藏了多少僵尸 这里可以获得一些中级材料；"
+        "所在区域：基地门口"
+    ) in lines[0]
+
+
+def test_draft_stage_line_omits_empty_description_without_placeholder(game_data):
+    """无描述关卡的 [关卡] 行：整段省略，不再写「关卡描述：（无）」。"""
+    stage_name = "外交-第一防线防区"
+    assert not get_stage_info_for_name(game_data.stages, stage_name).description
+    assert "关卡描述" not in format_stage_detail_line(
+        get_stage_info_for_name(game_data.stages, stage_name),
+    )
+    lines = _build_draft_entity_context_lines(
+        _draft(task_type="通关", finish_requirements=[
+            {"stage_name": stage_name, "difficulty": "简单"},
+        ]),
+        game_data,
+    )
+    assert lines[0].startswith(f"[关卡] 关卡名称：{stage_name}；所在区域：")
+    assert "（无）" not in lines[0]

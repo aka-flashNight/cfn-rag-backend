@@ -28,6 +28,7 @@ from services.llm import LLMConfig
 from services.memory.long_term import LongTermSnapshot, load_snapshot, resolve_enabled
 from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
 from services.npc.manager import NPCManager, NPCState
+from services.npc.scene_context import npc_scene_text
 from services.orchestrator.prompts import (
     FACTION_ALIASES,
     PC_CHAR_PLACEHOLDER,
@@ -45,10 +46,20 @@ def _normalize_text(text: str) -> str:
     return "".join(str(text).lower().split())
 
 
+def _scene_suffix(map_reg: Any, name: str) -> str:
+    """行尾的所在场景片段；无驻地或地图缺载时返回空串（有才补，没有不补）。
+
+    结尾带句号：有些模型不把换行当句子边界，缺终止符会把下一行读成同一句。
+    """
+    scene_text = npc_scene_text(map_reg, name)
+    return f"；所在场景：{scene_text}。" if scene_text else ""
+
+
 def find_mentioned_npcs(
     query: str,
     current_npc: str,
     all_states: dict[str, NPCState],
+    map_reg: Any = None,
 ) -> tuple[list[str], set[str]]:
     """从玩家输入中发现提及的其他角色（名称/阵营/头衔子串匹配，保留资产）。
 
@@ -85,6 +96,7 @@ def find_mentioned_npcs(
                 parts.append(f"（阵营：{state.faction}）")
             if state.titles:
                 parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+            parts.append(_scene_suffix(map_reg, name))
             mentioned.append("".join(parts))
     return mentioned, mentioned_names
 
@@ -94,6 +106,7 @@ def same_faction_npcs_block(
     current_faction: Optional[str],
     all_states: dict[str, NPCState],
     exclude_names: set[str],
+    map_reg: Any = None,
 ) -> str:
     """同阵营角色表（system 静态区，保留资产；阵营名完全一致才视为同阵营）。"""
     if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
@@ -109,6 +122,7 @@ def same_faction_npcs_block(
             parts.append(f"（阵营：{state.faction}）")
         if state.titles:
             parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+        parts.append(_scene_suffix(map_reg, name))
         return "".join(parts)
 
     for name, state in all_states.items():
@@ -396,19 +410,21 @@ async def assemble_context(
         npc_state_task, states_task, history_task, summary_task, draft_task, long_term_task,
     )
 
-    mentioned, mentioned_names = find_mentioned_npcs(player_query, npc_name, npc_states)
+    map_reg = getattr(game_data, "map_registry", None)
+    mentioned, mentioned_names = find_mentioned_npcs(
+        player_query, npc_name, npc_states, map_reg,
+    )
     mentioned_npcs_str = ""
     if mentioned:
         mentioned_npcs_str = "【对话中提到的其他角色（设定供参考）】\n" + "\n".join(mentioned)
     forbidden = forbidden_other_chars(npc_states)
     same_faction_block = same_faction_npcs_block(
-        npc_name, npc_state.faction, npc_states, mentioned_names,
+        npc_name, npc_state.faction, npc_states, mentioned_names, map_reg,
     )
 
     # 场景块与场景补充（B8-1）：map_definition.json 缺载/异常时整体降级为空串
     scene_block = ""
     scene_supplement = ""
-    map_reg = getattr(game_data, "map_registry", None)
     # 场景段补显示标签：stageFlag（帧标签）→ map_definition label；查不到保持空串，
     # 提示词侧回落 stageFlag 原文。拷贝后附加，不污染绑定状态里的原始投影。
     if save_info is not None and isinstance(save_info.get("scene"), dict):

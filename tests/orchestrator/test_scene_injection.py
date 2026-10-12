@@ -2,7 +2,9 @@
 
 - 场景块进 messages[0]（system），位于同阵营块之前；
 - 场景补充（同阵营块未覆盖的同场景 db 记录）紧跟在同阵营块之后；
-- 无驻地 NPC（lochan）不拼场景块；map_registry 缺失时整体降级为空。
+- 无驻地 NPC（lochan）不拼场景块；map_registry 缺失时整体降级为空；
+- 同阵营块与「对话中提到的其他角色」块每行行尾补「；所在场景：…。」（句号收尾，
+  免得弱模型把下一行接读成同一句），有驻地才补、无驻地不补（第三批）。
 """
 
 from __future__ import annotations
@@ -20,6 +22,21 @@ GARAGE_STATES = {
     "冷兵器商人": NPCState(sex="男", faction="商人", titles=["传统卫道士"]),
 }
 
+# 同阵营取样：Boy 有驻地、lochan 无驻地（场景后缀「有才补」的两端）。
+# 阵营必须非「闲杂人等」——那是 SKIP_FACTION_SAME_CAMP，同阵营块整体不出。
+SAME_CAMP_STATES = {
+    "Pig": NPCState(sex="男", faction="A兵团元老", titles=["BPK战队-右前锋"]),
+    "Boy": NPCState(sex="男", faction="A兵团元老", titles=["BPK战队-队长"]),
+    "lochan": NPCState(sex="女", faction="A兵团元老", titles=["谜之兔女郎"]),
+}
+
+# 提及取样：武器大师双驻地、lochan 无驻地
+MENTION_STATES = {
+    **GARAGE_STATES,
+    "武器大师": NPCState(sex="男", faction="闲杂人等", titles=["武器大师"]),
+    "lochan": NPCState(sex="女", faction="闲杂人等", titles=["谜之兔女郎"]),
+}
+
 
 class _NoMapRegistry:
     """包装真实注册表但隐藏 map_registry（模拟地图数据缺失的降级路径）。"""
@@ -32,18 +49,41 @@ class _NoMapRegistry:
         return getattr(self._inner, name)
 
 
-async def _system_prompt_of(env, npc_name: str, states: dict[str, NPCState]) -> str:
-    """换 NPC 管理器与发布会话，跑一轮纯聊天，返回请求 #1 的 system 文本。"""
+async def _messages_of(
+    env, npc_name: str, states: dict[str, NPCState], query: str = "你好",
+) -> list[dict]:
+    """换 NPC 管理器与发布会话，跑一轮纯聊天，返回请求 #1 的 messages。"""
     env.deps.npc_manager = NPCManager(
         state=dict(states), state_path=env.tmp_path / "scene_state.json",
     )
     session = env.store.create_session_sync(npc_name=npc_name, title="场景注入测试")
     env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     orch = TurnOrchestrator(
-        session_id=session.session_id, npc_name=npc_name, query="你好", deps=env.deps,
+        session_id=session.session_id, npc_name=npc_name, query=query, deps=env.deps,
     )
     await collect(orch)
-    return env.fake.stream_requests[0].messages[0]["content"]
+    return env.fake.stream_requests[0].messages
+
+
+async def _system_prompt_of(
+    env, npc_name: str, states: dict[str, NPCState], query: str = "你好",
+) -> str:
+    """请求 #1 的 system 文本（静态区：场景块／同阵营块／场景补充）。"""
+    return (await _messages_of(env, npc_name, states, query))[0]["content"]
+
+
+async def _shared_core_of(
+    env, npc_name: str, states: dict[str, NPCState], query: str = "你好",
+) -> str:
+    """请求 #1 的 user 共享核文本（提及 NPC 块在其中，玩家当轮发言不在）。"""
+    return (await _messages_of(env, npc_name, states, query))[1]["content"]
+
+
+def _only_line(text: str, prefix: str) -> str:
+    """取 text 中唯一以 prefix 开头的整行，用于行级逐字口径校验。"""
+    hits = [line for line in text.splitlines() if line.startswith(prefix)]
+    assert len(hits) == 1, f"{prefix!r} 命中 {len(hits)} 行，期望 1 行"
+    return hits[0]
 
 
 async def test_scene_block_and_supplement_order(env):
@@ -55,12 +95,18 @@ async def test_scene_block_and_supplement_order(env):
 
     same_hdr = "同阵营角色（设定供参考，不要替他们发言）："
     assert same_hdr in system
-    assert "「Boy」（性别：男）（阵营：A兵团元老）（身份或称呼：BPK战队-队长）" in system
-    assert "「King」（性别：女）（阵营：A兵团元老）（身份或称呼：BPK战队-左前锋）" in system
+    assert _only_line(system, "「Boy」") == (
+        "「Boy」（性别：男）（阵营：A兵团元老）（身份或称呼：BPK战队-队长）"
+        "；所在场景：基地车库（基地场景-基地车库）。"
+    )
+    assert _only_line(system, "「King」") == (
+        "「King」（性别：女）（阵营：A兵团元老）（身份或称呼：BPK战队-左前锋）"
+        "；所在场景：基地车库（基地场景-基地车库）。"
+    )
 
-    # 不同阵营的同场景 NPC 走场景补充（同阵营块正下方）
+    # 不同阵营的同场景 NPC 走场景补充（同阵营块正下方）；补充行不加场景后缀
     supp_line = "「冷兵器商人」（性别：男）（阵营：商人）（身份或称呼：传统卫道士）"
-    assert supp_line in system
+    assert _only_line(system, "「冷兵器商人」") == supp_line
 
     scene_idx = system.index("你所在场景：")
     same_idx = system.index(same_hdr)
@@ -112,3 +158,34 @@ async def test_missing_map_registry_degrades_without_scene_block(env, monkeypatc
     system = await _system_prompt_of(env, "Pig", GARAGE_STATES)
     assert "你所在场景" not in system
     assert "同场景" not in system
+    # 地图缺载时同阵营行同样不带场景后缀
+    assert _only_line(system, "「Boy」") == (
+        "「Boy」（性别：男）（阵营：A兵团元老）（身份或称呼：BPK战队-队长）"
+    )
+
+
+async def test_same_faction_rows_carry_scene_only_when_residence_known(env):
+    """同阵营块：有驻地的行尾补「；所在场景：…」，无驻地的行原样收在称呼括号。"""
+    system = await _system_prompt_of(env, "Pig", SAME_CAMP_STATES)
+    assert _only_line(system, "「Boy」") == (
+        "「Boy」（性别：男）（阵营：A兵团元老）（身份或称呼：BPK战队-队长）"
+        "；所在场景：基地车库（基地场景-基地车库）。"
+    )
+    assert _only_line(system, "「lochan」") == (
+        "「lochan」（性别：女）（阵营：A兵团元老）（身份或称呼：谜之兔女郎）"
+    )
+
+
+async def test_mentioned_npc_rows_carry_scene_only_when_residence_known(env):
+    """提及 NPC 块（user 共享核）同样逐行补场景；无驻地者不加。"""
+    core = await _shared_core_of(
+        env, "Pig", MENTION_STATES, query="武器大师和 lochan 最近有消息吗？",
+    )
+    assert "【对话中提到的其他角色（设定供参考）】" in core
+    assert _only_line(core, "「武器大师」") == (
+        "「武器大师」（性别：男）（阵营：闲杂人等）（身份或称呼：武器大师）；所在场景："
+        "健身房（基地场景-健身房）、第一防线（地图-第一防线防区）。"
+    )
+    assert _only_line(core, "「lochan」") == (
+        "「lochan」（性别：女）（阵营：闲杂人等）（身份或称呼：谜之兔女郎）"
+    )
