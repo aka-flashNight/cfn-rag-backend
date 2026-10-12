@@ -180,12 +180,21 @@ def _tool(name: str, description: str, properties: dict[str, Any], required: lis
     }
 
 
+# 三形态共用的说话要求。措辞刻意对着路由轮的「调用路由工具的那一轮……只发工具调用」
+# 反着写：模型会把那条规则套到本工具上，发完调用就一个字台词都不给，玩家侧只剩空气泡。
+CHAT_TOOL_SPEECH_REQUIREMENT = (
+    "调用本工具的那一轮：第一行 meta JSON 之后照常输出台词正文，"
+    "绝不能只发这个调用、不写台词。"
+)
+
+
 def build_chat_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
     """按作用域当前状态给出聊天侧工具（三形态，同名不同形）。"""
     if not snapshot.base:
         return _tool(
             CHAT_TOOL_NAME,
             (
+                f"{CHAT_TOOL_SPEECH_REQUIREMENT}"
                 "记录你对这个玩家的长期记忆（跨对话窗口保留）。调用时必须同时给出两项："
                 "base_content＝玩家与你的整体关系情况、你对玩家的整体印象的总结式状态描述"
                 "（必须精简，如果当前对话中有效信息较少，可以只输出一句简短的总结，例如15字以内。"
@@ -210,6 +219,7 @@ def build_chat_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
         return _tool(
             CHAT_TOOL_NAME,
             (
+                f"{CHAT_TOOL_SPEECH_REQUIREMENT}"
                 "维护你对这个玩家的长期记忆（跨对话窗口保留）。长期记忆分两部分：一条基础印象"
                 "（玩家与你的整体关系情况和你对玩家的整体印象），以及 "
                 f"{LTM_MAX_FACT_ENTRIES} 条关键记录（重要、重大、影响明显的事件或信息），"
@@ -234,6 +244,7 @@ def build_chat_tool(snapshot: LongTermSnapshot) -> dict[str, Any]:
     return _tool(
         CHAT_TOOL_NAME,
         (
+            f"{CHAT_TOOL_SPEECH_REQUIREMENT}"
             "维护你对这个玩家的长期记忆（跨对话窗口保留）。长期记忆分两部分：一条基础印象"
             "（玩家与你的整体关系情况和你对玩家的整体印象），以及若干条关键记录"
             "（重要、重大、影响明显的事件或信息），编号见提示词中的长期记忆块。"

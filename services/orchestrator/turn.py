@@ -16,7 +16,8 @@ services/tools/route/ 下的五个路由声明，不再持有 prepare_task_conte
 - 过渡语只说一次、只说方向不报数字（merge.py）；
 - confirm 失败 → system_notice 真实原因 + 1 次补救回复；
 - 同会话并发请求经会话级锁串行；新回合取消旧子 Agent（fire-and-steer）；
-- LLM 预算：聊天主 Agent ≤3 次（#1 + 过渡/动作后回复 + 汇合 #2），
+- LLM 预算：聊天主 Agent ≤3 次（#1 + 过渡/动作后回复 + 汇合 #2；纯聊天轮台词为空时
+  的兜底调用占「+1」那一格），
   TaskRunner ≤4 轮、SearchRunner ≤3 轮。
 """
 
@@ -46,6 +47,8 @@ from services.memory.long_term import (
     apply_chat_tool,
     build_chat_tool,
     format_block as format_long_term_block,
+    normalize_content,
+    parse_arguments,
     tool_call_name,
 )
 from services.memory.store import MemoryStore, PRECISE_MEMORY_OPTIONS, TaskDraftRow
@@ -69,10 +72,12 @@ from services.orchestrator.merge import MergeCoordinator
 from services.orchestrator.prompts import (
     CONFIRM_ARGS_SYSTEM,
     CONFIRM_FAIL_INSTRUCTION,
+    EMPTY_REPLY_FALLBACK_TEXT,
     TASK_CANCEL_MERGE_INSTRUCTION,
     TASK_CANCEL_NOOP_INSTRUCTION,
     TASK_CONFIRM_MERGE_INSTRUCTION,
     build_confirm_args_user_prompt,
+    build_empty_reply_user_prompt,
     build_finished_task_block,
     build_player_message,
     build_merge_user_prompt,
@@ -135,6 +140,17 @@ def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
         query = str(args.get("query") or "").strip()[:_ROUTE_QUERY_MAX_CHARS]
         return Route(kind=name[len(_ROUTE_PREFIX):], note=note, query=query)
     return None
+
+
+def _long_term_record_line(result: str, tool_call: dict[str, Any]) -> str:
+    """落库结果 + 真正写进去的内容（兜底轮要告诉 NPC 它刚刚记下了什么）。"""
+    args = parse_arguments(tool_call)
+    content = normalize_content(args.get("content"))
+    base_content = normalize_content(args.get("base_content"))
+    line = f"{result}「{content}」" if content else result
+    if base_content:
+        line += f"，基础印象「{base_content}」"
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +424,7 @@ class TurnOrchestrator:
 
             # 长期记忆工具不在全局注册表里（要按作用域状态换形），这里直接落库；
             # 与路由互不干扰——路由轮同样可以顺带更新记忆。
-            await self._apply_long_term_calls(deps, ctx, tool_sink)
+            recorded = await self._apply_long_term_calls(deps, ctx, tool_sink)
 
             if route is not None and spoken_text.strip():
                 logger.warning(
@@ -435,6 +451,14 @@ class TurnOrchestrator:
                         logger.warning("该 NPC 任务发布已临时关闭，模型仍硬发路由调用，忽略: %s", names)
                     else:
                         logger.warning("Agent 能力已关闭，模型仍硬发路由调用，忽略: %s", names)
+                if not spoken_text.strip():
+                    # 一个字台词都没出（只落库、或直接空返），玩家侧只剩空气泡。
+                    # 补一次不带任何工具的调用：长期记忆工具不再注册、prompt 里也只给
+                    # 落库结果——从根上断掉「发工具调用就不说话」这条路径。
+                    async for ev in self._empty_reply_rescue(
+                        llm, base_messages, meta, collected_text, recorded,
+                    ):
+                        yield ev
 
             elif route.kind in ("task_confirm", "task_cancel"):
                 # ---- SYNC_ACTION：路由轮按契约不说话，后端办完再让 NPC 开口 ----
@@ -752,14 +776,16 @@ class TurnOrchestrator:
 
     async def _apply_long_term_calls(
         self, deps: OrchestratorDeps, ctx: TurnContext, tool_sink: list[dict[str, Any]],
-    ) -> None:
+    ) -> list[str]:
         """落库本轮聊天 Agent 的长期记忆调用（工具不在注册表里，这里直接执行）。
 
         写库失败不阻断回合：记忆是附加能力，玩家这轮的对话必须照常完成。
+        返回「结果＋写进去的内容」逐条列表，供空正文兜底轮告诉 NPC 已经记了什么。
         """
         snapshot = ctx.long_term
         if snapshot is None or not tool_sink:
-            return
+            return []
+        recorded: list[str] = []
         for tool_call in tool_sink:
             if tool_call_name(tool_call) != CHAT_TOOL_NAME:
                 continue
@@ -775,6 +801,8 @@ class TurnOrchestrator:
                     "会话 %s 长期记忆更新（作用域 %s / %s）：%s",
                     self.session_id, snapshot.slot_key, snapshot.npc, result,
                 )
+                recorded.append(_long_term_record_line(result, tool_call))
+        return recorded
 
     def _recent_dialogue_text(
         self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
@@ -956,6 +984,33 @@ class TurnOrchestrator:
             raise
         except Exception as exc:
             logger.warning("流式回复调用失败: %s", exc)
+
+    async def _empty_reply_rescue(
+        self,
+        llm: LLMClient,
+        base_messages: list[dict[str, Any]],
+        meta: Meta,
+        sink: list[str],
+        recorded: list[str],
+    ) -> AsyncIterator[SSEEvent]:
+        """空正文兜底：纯聊天轮没说出一个字时，再开一次**不带任何工具**的调用。
+
+        模型会把「调用路由工具的那一轮不要写台词」套到长期记忆工具上，发完调用
+        就静默。这里复用的 _stream_simple 不下发 tools，记忆工具连定义都不在，
+        模型没有可调的东西，只能开口；已落库的结果用文字告诉它，免得它重复记。
+        生成失败或还是空回复时给静态收场话，玩家侧不能留空白。
+        """
+        prompt = build_empty_reply_user_prompt(
+            player_query=self.query,
+            emotion=meta.emotion,
+            recorded="；".join(recorded),
+        )
+        before = len(sink)
+        async for ev in self._stream_simple(llm, base_messages, prompt, sink):
+            yield ev
+        if len(sink) == before:
+            sink.append(EMPTY_REPLY_FALLBACK_TEXT)
+            yield content_event(EMPTY_REPLY_FALLBACK_TEXT)
 
     # ------------------------------------------------------------------
     # 子 Agent 启动

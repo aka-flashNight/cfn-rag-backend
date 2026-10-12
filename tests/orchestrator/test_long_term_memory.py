@@ -15,8 +15,18 @@ import pytest
 
 from services.integration.save_paths import shared_task_paths
 from services.integration.state import get_integration_state
-from services.memory.long_term import CHAT_TOOL_NAME
-from services.memory.store import LTM_MAX_FACT_ENTRIES, STANDALONE_SCOPE
+from services.memory.long_term import (
+    CHAT_TOOL_SPEECH_REQUIREMENT,
+    CHAT_TOOL_NAME,
+    LongTermSnapshot,
+    build_chat_tool,
+)
+from services.memory.store import (
+    LTM_MAX_FACT_ENTRIES,
+    STANDALONE_SCOPE,
+    LongTermEntry,
+)
+from services.orchestrator.prompts import EMPTY_REPLY_FALLBACK_TEXT
 from services.orchestrator.prompts import LTM_TASK_DONE_HINT
 from services.orchestrator.prompts import build_finished_task_block as wrap_done_block
 from services.orchestrator.prompts import build_user_shared_core
@@ -223,6 +233,106 @@ async def test_write_failure_does_not_break_the_turn(env, monkeypatch):
     )
     events = await collect(_orch(env, "你好", long_term_memory_enabled=True))
     assert "".join(contents_of(events)) == "话还是要说完。"
+
+
+# ---------------------------------------------------------------------------
+# 只发调用不说话：工具描述硬要求＋空正文兜底轮
+# ---------------------------------------------------------------------------
+
+def _snap(*, base: str = "", fact_count: int = 0) -> LongTermSnapshot:
+    facts = [
+        LongTermEntry(
+            id=i, slot_key=STANDALONE_SCOPE, npc=NPC_NAME, kind="fact",
+            content=f"事件{i}", entry_no=i,
+        )
+        for i in range(1, fact_count + 1)
+    ]
+    return LongTermSnapshot(slot_key=STANDALONE_SCOPE, npc=NPC_NAME, base=base, facts=facts)
+
+
+def test_three_tool_forms_all_require_dialogue():
+    """三形态说明都逐字带同轮必须给台词正文的要求：模型会把路由轮「只发工具调用」
+    那条规则套到本工具上，发完调用就一个字不说。"""
+    for snapshot in (
+        _snap(),
+        _snap(base=BASE_TEXT),
+        _snap(base=BASE_TEXT, fact_count=LTM_MAX_FACT_ENTRIES),
+    ):
+        assert CHAT_TOOL_SPEECH_REQUIREMENT in build_chat_tool(snapshot)["function"]["description"]
+
+
+def _tool_names(request) -> list[str]:
+    return [t["function"]["name"] for t in (request.tools or [])]
+
+
+async def test_silent_memory_call_gets_tool_free_rescue(env):
+    """只落库、正文为空 → 再开一次不带任何工具的调用，并把话说完。"""
+    env.fake.add_stream(
+        meta='{"emo":"普通","fav":0}', text="",
+        tool_calls=[tc(CHAT_TOOL_NAME, {"base_content": BASE_TEXT, "content": FACT_TEXT})],
+    )
+    env.fake.add_stream(text="这锤子的事我记着呢。")
+    events = await collect(_orch(env, "铁锤帮你找回来了", long_term_memory_enabled=True))
+
+    assert CHAT_TOOL_NAME in _tool_names(env.fake.stream_requests[0])
+    # 兜底轮彻底没有工具：记忆工具连定义都不在，模型只能开口
+    assert env.fake.stream_requests[1].tools is None
+    assert "".join(contents_of(events)) == "这锤子的事我记着呢。"
+    # 落库结果随兜底 prompt 交给模型，避免它重复记
+    rescue_prompt = env.fake.stream_requests[1].messages[-1]["content"]
+    assert f"【已记下】已记录关键记录 1「{FACT_TEXT}」" in rescue_prompt
+    assert BASE_TEXT in rescue_prompt
+    assert await env.store.ltm_get_base(STANDALONE_SCOPE, NPC_NAME) == BASE_TEXT
+
+
+async def test_rescue_text_lands_in_history(env):
+    """兜底台词进短期记忆：下一轮的历史块里能看到，不留只有玩家发言的空档。"""
+    env.fake.add_stream(
+        meta='{"emo":"普通","fav":0}', text="",
+        tool_calls=[tc(CHAT_TOOL_NAME, {"content": FACT_TEXT})],
+    )
+    env.fake.add_stream(text="记下了。")
+    await collect(_orch(env, "铁锤找回来了", long_term_memory_enabled=True))
+
+    history = await env.store.get_history(env.session_id, limit=10)
+    assert [m.role for m in history] == ["user", "assistant"]
+    assert history[1].content == "记下了。"
+
+
+async def test_rescue_empty_output_uses_static_line(env):
+    """兜底轮也没能生成台词：给静态收场话，玩家侧不能留空白。"""
+    env.fake.add_stream(
+        meta='{"emo":"普通","fav":0}', text="",
+        tool_calls=[tc(CHAT_TOOL_NAME, {"content": FACT_TEXT})],
+    )
+    env.fake.add_stream(text="")
+    events = await collect(_orch(env, "记一下这事", long_term_memory_enabled=True))
+
+    assert "".join(contents_of(events)) == EMPTY_REPLY_FALLBACK_TEXT
+    history = await env.store.get_history(env.session_id, limit=10)
+    assert [m.content for m in history][-1] == EMPTY_REPLY_FALLBACK_TEXT
+
+
+async def test_empty_round_without_any_call_is_rescued(env):
+    """没调工具也一个字没说（模型直接空返）同样兜底；此时 prompt 不提【已记下】。"""
+    env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="")
+    env.fake.add_stream(text="我在听，你说。")
+    events = await collect(_orch(env, "你好"))
+
+    assert "".join(contents_of(events)) == "我在听，你说。"
+    assert "【已记下】" not in env.fake.stream_requests[1].messages[-1]["content"]
+
+
+async def test_spoken_round_gets_no_rescue_call(env):
+    """正常同轮又说又调：不触发兜底，一轮只有一次调用。"""
+    env.fake.add_stream(
+        meta='{"emo":"微笑","fav":0}', text="这事我记下了。",
+        tool_calls=[tc(CHAT_TOOL_NAME, {"content": FACT_TEXT})],
+    )
+    events = await collect(_orch(env, "铁锤找回来了", long_term_memory_enabled=True))
+
+    assert len(env.fake.stream_requests) == 1
+    assert "".join(contents_of(events)) == "这事我记下了。"
 
 
 # ---------------------------------------------------------------------------
