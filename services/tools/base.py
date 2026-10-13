@@ -79,6 +79,13 @@ class ToolContext:
     rag_context_text: Optional[str] = None
     # list_skills / read_skill / read_skill_file 三个元工具运行时需要 skill 注册表
     skill_registry: Optional["SkillRegistry"] = None
+    # 对话修改子 Agent：最近一次查询的编号映射（search_npc_dialogues 写入，
+    # edit_npc_dialogues 消费，跨轮经 _inherit_ctx 传递）
+    dialogue_index: Optional[list[dict[str, Any]]] = None
+    # 对话修改的触发来源（委派方注入，edit_npc_dialogues 只透传给覆盖层条目）
+    dialogue_reason: str = ""
+    dialogue_source_task_id: Optional[int] = None
+    dialogue_source_trigger: str = ""
 
 
 @dataclass
@@ -91,6 +98,8 @@ class ToolResult:
     # draft/update 工具回传的草案业务状态（None = 未触碰）
     bargain_count: Optional[int] = None
     draft_commit_valid: Optional[bool] = None
+    # search_npc_dialogues 回传的编号映射（None = 未触碰）
+    dialogue_index: Optional[list[dict[str, Any]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +305,7 @@ def _inherit_ctx(ctx: ToolContext, res: ToolResult) -> ToolContext:
         res.updated_pending_draft is None
         and res.bargain_count is None
         and res.draft_commit_valid is None
+        and res.dialogue_index is None
     ):
         return ctx
     import dataclasses
@@ -307,6 +317,8 @@ def _inherit_ctx(ctx: ToolContext, res: ToolResult) -> ToolContext:
         updates["bargain_count"] = res.bargain_count
     if res.draft_commit_valid is not None:
         updates["draft_commit_valid"] = res.draft_commit_valid
+    if res.dialogue_index is not None:
+        updates["dialogue_index"] = res.dialogue_index
     return dataclasses.replace(ctx, **updates)
 
 
@@ -342,7 +354,9 @@ _TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
     "search_knowledge": 15,
     "search_stages": 16,
     "search_items": 17,
+    "search_npc_dialogues": 18,
     "draft_agent_task": 20,
+    "edit_npc_dialogues": 25,
     "update_task_draft": 30,
     "confirm_agent_task": 40,
     "cancel_agent_task": 50,
