@@ -4,7 +4,7 @@
 槽目录下文件平铺——阶段二两个：`agent_tasks.json`、`agent_text.json`；
 阶段四两个覆盖层：`dialogue_overrides.json`、`task_text_overrides.json`。
 共享侧（standalone）对照落点：`data/task/agent_tasks.json` + `data/task/text/agent_text.json`。
-覆盖层**没有**共享侧落点（未绑定存档即无处可写，见 resolve_override_paths）。
+覆盖层**没有**共享侧落点（未绑定存档即无处可写，见 DialogueView.override_paths）。
 
 data_root 口径与 `GameDataRegistry.data_root` 一致＝`<resources>/data`。
 """
@@ -53,21 +53,6 @@ def agent_save_override_paths(data_root: Path, slot_key: str) -> tuple[Path, Pat
         (slot_dir / DIALOGUE_OVERRIDES_FILENAME).resolve(),
         (slot_dir / TASK_TEXT_OVERRIDES_FILENAME).resolve(),
     )
-
-
-def resolve_override_paths(data_root: Path) -> tuple[Path, Path, str]:
-    """按当前绑定解析覆盖层落点，返回 (对话覆盖层, 任务文本覆盖层, slot_key)。
-
-    覆盖层是**按存档**数据，没有共享落点：未绑定存档时无处可写 → ValueError
-    （fail-closed，与 resolve_task_write_paths 同一口径，绝不回退到全存档可见的位置）。
-    """
-    slot_key = get_integration_state().slot_key
-    if slot_key is None:
-        raise ValueError("未绑定存档，对话覆盖层无处落盘")
-    if not is_valid_slot_key(slot_key):
-        raise ValueError(f"存档槽位键非法，拒绝写盘: {slot_key!r}")
-    dialogue_path, text_path = agent_save_override_paths(data_root, slot_key)
-    return dialogue_path, text_path, slot_key
 
 
 def resolve_task_write_paths(data_root: Path) -> tuple[Path, Path, str | None]:

@@ -11,6 +11,11 @@
 kind='base'（每个作用域唯一一条基础长期记忆，entry_no 为 NULL）与
 kind='fact'（追加的关键记录，entry_no 是作用域内单调递增编号，永不复用或重排）。
 未绑定存档时用固定作用域键 STANDALONE_SCOPE，与各存档互不混淆。
+
+对话修改委派（阶段四 B4-1）：dialogue_jobs 表记一条委派的全生命周期状态机，
+并按 (slot_key, task_id) 建部分唯一索引做**硬幂等**——重要任务只在首次收到完成
+事件时委派一次，重复事件在数据库层就被挡掉，不依赖调用方自查。
+session_dialogue_hints 表存好感度跨档后的待提示文案与剩余轮数（触发二，跨轮持续）。
 """
 
 from __future__ import annotations
@@ -54,6 +59,32 @@ LTM_MAX_CHARS = 500
 
 LTM_KIND_BASE = "base"
 LTM_KIND_FACT = "fact"
+
+# 对话修改委派记录（阶段四 B4-1）的状态机。链路：
+#   received（收到信号）→ judging（初判中）→ delegated（已入队，delegated_at 落时戳）
+#                                        ↘ dismissed（不够格/非绑定槽位/频率限制/重复）
+#   delegated → generating（worker 开始执行）→ written（覆盖层已落盘）
+#                                            ↘ skipped（子 Agent 判断不动或轮限耗尽）
+#                                            ↘ failed（异常/超时）
+DIALOGUE_JOB_RECEIVED = "received"
+DIALOGUE_JOB_JUDGING = "judging"
+DIALOGUE_JOB_DELEGATED = "delegated"
+DIALOGUE_JOB_DISMISSED = "dismissed"
+DIALOGUE_JOB_GENERATING = "generating"
+DIALOGUE_JOB_WRITTEN = "written"
+DIALOGUE_JOB_SKIPPED = "skipped"
+DIALOGUE_JOB_FAILED = "failed"
+
+DIALOGUE_JOB_STATUSES = (
+    DIALOGUE_JOB_RECEIVED,
+    DIALOGUE_JOB_JUDGING,
+    DIALOGUE_JOB_DELEGATED,
+    DIALOGUE_JOB_DISMISSED,
+    DIALOGUE_JOB_GENERATING,
+    DIALOGUE_JOB_WRITTEN,
+    DIALOGUE_JOB_SKIPPED,
+    DIALOGUE_JOB_FAILED,
+)
 
 # 不允许混入草案 JSON 的内部/业务分离字段（修 D5）
 _DRAFT_INTERNAL_FIELDS = ("bargain_count", "_draft_commit_valid")
@@ -131,6 +162,34 @@ class LongTermEntry:
     source_session_id: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+
+
+@dataclass
+class DialogueJobRow:
+    """一条对话修改委派记录。task_id 为 None＝非重要任务触发（不参与幂等）。"""
+
+    job_id: str
+    slot_key: str
+    npc: str
+    trigger: str
+    status: str
+    task_id: int | None = None
+    session_id: str | None = None
+    reason: str = ""
+    instruction: str = ""
+    detail: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    delegated_at: float | None = None
+
+
+@dataclass
+class DialogueHint:
+    """好感度跨档后待提示的对话修改建议（阶段四触发二，持续 rounds_left 轮）。"""
+
+    session_id: str
+    hint: str
+    rounds_left: int = 0
 
 
 class MemoryStore:
@@ -232,6 +291,50 @@ class MemoryStore:
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ltm_scope ON long_term_memory(slot_key, npc, kind)"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dialogue_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL UNIQUE,
+                    slot_key TEXT NOT NULL,
+                    npc TEXT NOT NULL,
+                    trigger TEXT NOT NULL DEFAULT '',
+                    task_id INTEGER,
+                    session_id TEXT,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    instruction TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    delegated_at REAL
+                )
+                """
+            )
+            # 部分唯一索引＝重要任务的硬幂等：同存档同任务只允许一条委派记录。
+            # task_id 为 NULL 的记录（关系/态度/关键信息触发）不受此约束。
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dialogue_job_task"
+                " ON dialogue_jobs(slot_key, task_id) WHERE task_id IS NOT NULL"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dialogue_job_scope"
+                " ON dialogue_jobs(slot_key, npc, delegated_at)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dialogue_job_session"
+                " ON dialogue_jobs(session_id)"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_dialogue_hints (
+                    session_id TEXT NOT NULL PRIMARY KEY,
+                    hint TEXT NOT NULL DEFAULT '',
+                    rounds_left INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+                """
             )
             self._migrate_legacy_schema(cur)
             self._conn.commit()
@@ -349,6 +452,19 @@ class MemoryStore:
             row = cur.fetchone()
         return str(row["summary"]) if row else None
 
+    def get_summary_message_count_sync(self, session_id: str) -> int:
+        """摘要覆盖到第几条消息（0＝没有摘要）；「摘要之后的原文」据此切片。"""
+        session_id = session_id.strip()
+        if not session_id:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT message_count FROM session_summaries WHERE session_id = ?", (session_id,),
+            )
+            row = cur.fetchone()
+        return int(row["message_count"]) if row else 0
+
     def save_summary_sync(self, session_id: str, summary: str, message_count: int) -> None:
         ts = time.time()
         with self._lock:
@@ -454,6 +570,7 @@ class MemoryStore:
             cur.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
             cur.execute("DELETE FROM session_task_drafts WHERE session_id = ?", (session_id,))
             cur.execute("DELETE FROM session_ask_counters WHERE session_id = ?", (session_id,))
+            cur.execute("DELETE FROM session_dialogue_hints WHERE session_id = ?", (session_id,))
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -833,6 +950,209 @@ class MemoryStore:
             row = cur.fetchone()
         return self._ltm_row_to_entry(row)
 
+    # ------------------------------------------------------------------
+    # 对话修改委派记录（阶段四 B4-1）
+    # ------------------------------------------------------------------
+
+    _DIALOGUE_JOB_COLS = (
+        "job_id, slot_key, npc, trigger, task_id, session_id, status,"
+        " reason, instruction, detail, created_at, updated_at, delegated_at"
+    )
+
+    @classmethod
+    def _dialogue_job_row(cls, row: sqlite3.Row) -> DialogueJobRow:
+        return DialogueJobRow(
+            job_id=str(row["job_id"]),
+            slot_key=str(row["slot_key"]),
+            npc=str(row["npc"]),
+            trigger=str(row["trigger"] or ""),
+            task_id=int(row["task_id"]) if row["task_id"] is not None else None,
+            session_id=str(row["session_id"]) if row["session_id"] is not None else None,
+            status=str(row["status"]),
+            reason=str(row["reason"] or ""),
+            instruction=str(row["instruction"] or ""),
+            detail=str(row["detail"] or ""),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            delegated_at=float(row["delegated_at"]) if row["delegated_at"] is not None else None,
+        )
+
+    def dialogue_job_create_sync(
+        self,
+        *,
+        slot_key: str,
+        npc: str,
+        trigger: str,
+        reason: str = "",
+        instruction: str = "",
+        task_id: int | None = None,
+        session_id: str | None = None,
+        status: str = DIALOGUE_JOB_RECEIVED,
+        detail: str = "",
+    ) -> DialogueJobRow | None:
+        """新建一条委派记录。
+
+        带 task_id 时按 (slot_key, task_id) 硬幂等：已存在记录＝返回 None，
+        调用方据此「静默跳过」（重要任务只在首次完成事件时委派一次）。
+        """
+        if status not in DIALOGUE_JOB_STATUSES:
+            raise ValueError(f"未知的委派状态：{status}")
+        now = time.time()
+        job_id = uuid.uuid4().hex
+        with self._lock:
+            cur = self._conn.cursor()
+            if task_id is not None:
+                existing = self._dialogue_job_find(cur, slot_key, task_id)
+                if existing is not None:
+                    return None
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO dialogue_jobs
+                        (job_id, slot_key, npc, trigger, task_id, session_id, status,
+                         reason, instruction, detail, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (job_id, slot_key, npc, trigger, task_id, session_id, status,
+                     reason, instruction, detail, now, now),
+                )
+            except sqlite3.IntegrityError:
+                # 另一个进程（开发服务与 exe 同用一个 memory.db）已抢先写入同一任务
+                self._conn.rollback()
+                return None
+            self._conn.commit()
+            cur.execute(
+                f"SELECT {self._DIALOGUE_JOB_COLS} FROM dialogue_jobs WHERE job_id = ?",
+                (job_id,),
+            )
+            row = cur.fetchone()
+        return self._dialogue_job_row(row)
+
+    def _dialogue_job_find(
+        self, cur: sqlite3.Cursor, slot_key: str, task_id: int,
+    ) -> sqlite3.Row | None:
+        cur.execute(
+            f"SELECT {self._DIALOGUE_JOB_COLS} FROM dialogue_jobs"
+            " WHERE slot_key = ? AND task_id = ?",
+            (slot_key, task_id),
+        )
+        return cur.fetchone()
+
+    def dialogue_job_find_by_task_sync(self, slot_key: str, task_id: int) -> DialogueJobRow | None:
+        """查某存档某任务的既有委派记录（触发侧「只有首次传有效」的自查口径）。"""
+        with self._lock:
+            row = self._dialogue_job_find(self._conn.cursor(), slot_key, task_id)
+        return self._dialogue_job_row(row) if row else None
+
+    def dialogue_job_set_status_sync(
+        self, job_id: str, status: str, *, detail: str = "",
+    ) -> DialogueJobRow | None:
+        """推进状态机；job_id 不存在＝None。转入 delegated 时落一次 delegated_at。"""
+        if status not in DIALOGUE_JOB_STATUSES:
+            raise ValueError(f"未知的委派状态：{status}")
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                UPDATE dialogue_jobs
+                SET status = ?, detail = ?, updated_at = ?,
+                    delegated_at = COALESCE(delegated_at, ?)
+                WHERE job_id = ?
+                """,
+                (status, detail, now, now if status == DIALOGUE_JOB_DELEGATED else None, job_id),
+            )
+            if cur.rowcount == 0:
+                self._conn.commit()
+                return None
+            self._conn.commit()
+            cur.execute(
+                f"SELECT {self._DIALOGUE_JOB_COLS} FROM dialogue_jobs WHERE job_id = ?",
+                (job_id,),
+            )
+            row = cur.fetchone()
+        return self._dialogue_job_row(row)
+
+    def dialogue_job_delegated_since_sync(self, slot_key: str, npc: str, since: float) -> int:
+        """冷却窗口内该存档该 NPC 已委派的次数（频率限制口径，dismissed 不计）。"""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM dialogue_jobs"
+                " WHERE slot_key = ? AND npc = ? AND delegated_at IS NOT NULL AND delegated_at >= ?",
+                (slot_key, npc, since),
+            )
+            return int(cur.fetchone()[0])
+
+    def dialogue_job_session_delegated_sync(self, session_id: str) -> int:
+        """该会话累计委派次数（每会话上限口径，dismissed 不计）。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM dialogue_jobs"
+                " WHERE session_id = ? AND delegated_at IS NOT NULL",
+                (session_id,),
+            )
+            return int(cur.fetchone()[0])
+
+    # ------------------------------------------------------------------
+    # 好感度跨档提示（阶段四触发二）
+    # ------------------------------------------------------------------
+
+    def dialogue_hint_read_sync(self, session_id: str) -> DialogueHint | None:
+        """待提示的跨档文案；没有该会话、轮数用完或文案为空＝None。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT session_id, hint, rounds_left FROM session_dialogue_hints"
+                " WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        hint = str(row["hint"] or "").strip()
+        rounds_left = int(row["rounds_left"])
+        if not hint or rounds_left <= 0:
+            return None
+        return DialogueHint(session_id=str(row["session_id"]), hint=hint, rounds_left=rounds_left)
+
+    def dialogue_hint_write_sync(self, session_id: str, hint: str, rounds_left: int) -> None:
+        """写入/更新跨档提示；rounds_left<=0 或 hint 为空＝删除该行（提示已用完或已调用）。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            if rounds_left <= 0 or not (hint or "").strip():
+                cur.execute(
+                    "DELETE FROM session_dialogue_hints WHERE session_id = ?", (session_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO session_dialogue_hints (session_id, hint, rounds_left, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        hint = excluded.hint,
+                        rounds_left = excluded.rounds_left,
+                        updated_at = excluded.updated_at
+                    """,
+                    (session_id, hint.strip(), rounds_left, now),
+                )
+            self._conn.commit()
+
+    def dialogue_hint_clear_sync(self, session_id: str) -> None:
+        """清掉跨档提示：模型已经调用过委派，不再提示（§4.0.2-2）。"""
+        self.dialogue_hint_write_sync(session_id, "", 0)
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -855,6 +1175,7 @@ for _name in [
     "get_history",
     "get_summary",
     "save_summary",
+    "get_summary_message_count",
     "create_session",
     "list_sessions",
     "update_session_title",
@@ -872,6 +1193,14 @@ for _name in [
     "ltm_save_base",
     "ltm_append_fact",
     "ltm_update_fact",
+    "dialogue_job_create",
+    "dialogue_job_find_by_task",
+    "dialogue_job_set_status",
+    "dialogue_job_delegated_since",
+    "dialogue_job_session_delegated",
+    "dialogue_hint_read",
+    "dialogue_hint_write",
+    "dialogue_hint_clear",
 ]:
     setattr(MemoryStore, _name, _make_async(f"{_name}_sync"))
 

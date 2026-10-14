@@ -86,6 +86,8 @@ class ToolContext:
     dialogue_reason: str = ""
     dialogue_source_task_id: Optional[int] = None
     dialogue_source_trigger: str = ""
+    # 存档槽位（委派受理当刻钉死；空＝由工具回落到当前绑定）
+    slot_key: str = ""
 
 
 @dataclass

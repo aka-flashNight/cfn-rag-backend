@@ -183,10 +183,19 @@ class DialogueView:
         return dialogue_path, text_path
 
     def override_paths(self) -> tuple[Path, Path]:
-        """写侧路径：未绑定存档 → ValueError（覆盖层是按存档数据，无共享落点）。"""
-        from services.integration.save_paths import resolve_override_paths
+        """写侧路径：与读侧同一个槽位；没有槽位 → ValueError（覆盖层无共享落点）。
 
-        dialogue_path, text_path, _slot = resolve_override_paths(self.data_root)
+        必须用视图自己的 ``slot_key`` 而不是重读全局绑定：对话修改子 Agent 最长跑
+        900 秒，期间玩家换档会把 A 档的改动写进 B 档的覆盖层（静默串档）。
+        """
+        from services.integration.save_paths import agent_save_override_paths
+        from services.integration.state import is_valid_slot_key
+
+        if not self.slot_key:
+            raise ValueError("未绑定存档，对话覆盖层无处落盘")
+        if not is_valid_slot_key(self.slot_key):
+            raise ValueError(f"存档槽位键非法，拒绝写盘: {self.slot_key!r}")
+        dialogue_path, text_path = agent_save_override_paths(self.data_root, self.slot_key)
         return dialogue_path, text_path
 
     # --- 日常对话 -------------------------------------------------------
@@ -527,8 +536,14 @@ def reset_sources_cache() -> None:
     _SOURCES_CACHE.clear()
 
 
-def build_view(game_data: Any = None) -> DialogueView:
-    """按当前绑定存档构造视图；未绑定＝只读基础数据（写入会被 fail-closed 拒绝）。"""
+def build_view(game_data: Any = None, *, slot_key: str | None = None) -> DialogueView:
+    """构造视图；不给 slot_key＝按当前绑定存档（未绑定＝只读基础数据，写入被拒）。
+
+    ``slot_key`` 把一次委派钉死在受理当刻的存档上：对话修改子 Agent 最长跑 900 秒，
+    期间玩家换档时覆盖层的读与写都必须仍指向原存档，否则改动会串进别的存档。
+    已完成任务投影只有当前绑定存档那一份，钉死场景下沿用当前投影——它只影响候选
+    筛选（哪些任务对话可改），不影响写盘落点。
+    """
     from services.integration.state import get_integration_state
 
     data_root = getattr(game_data, "data_root", None)
@@ -542,7 +557,7 @@ def build_view(game_data: Any = None) -> DialogueView:
     return DialogueView(
         data_root=Path(data_root),
         game_data=game_data,
-        slot_key=snapshot.get("bound_slot"),
+        slot_key=(slot_key or "").strip() or snapshot.get("bound_slot"),
         finished_ids=progress.get("tasks_finished") if isinstance(progress, dict) else None,
         sources=shared_sources(Path(data_root)),
     )

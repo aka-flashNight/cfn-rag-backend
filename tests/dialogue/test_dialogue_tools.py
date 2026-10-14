@@ -113,6 +113,8 @@ def test_scope_description_verbatim():
         "不推荐。除非是非常重大的关系变化、导致所有对话都必须全部修改时，"
         "才选中任务全量；否则不建议选。"
     ) in blob
+    # 定义与冲突口径也要给全：光写「不推荐」会让模型觉得这个选项莫名其妙
+    assert "该 NPC 说话的全部未完成任务对话组；与 task_recent 冲突，两者都选时采用 task_recent。" in blob
     edit_blob = json.dumps(edit_tool.to_openai_tool(), ensure_ascii=False)
     assert "不需要改的行请原样抄回，不能删除原有信息" in edit_blob
     assert "只提供、也只允许修改 npc 名和对话两项" in edit_blob

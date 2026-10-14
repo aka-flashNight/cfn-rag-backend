@@ -4,7 +4,8 @@
 调 ``apply()``（写入侧唯一入口，全部打回守卫都在 editor 里，本工具不重复实现）；
 打回原因原文作为工具结果回给模型，模型据此修正后重新提交。
 
-触发来源（reason / source_task_id / source_trigger）由委派方经 ctx 注入，本工具只透传。
+触发来源（reason / source_task_id / source_trigger）与存档槽位由委派方经 ctx 注入，
+本工具只透传：槽位钉死在委派受理当刻，子 Agent 跑完 900 秒也不会写进别的存档。
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ class EditNpcDialoguesTool(BaseTool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         npc = (ctx.npc_name or "").strip()
-        view = build_view(game_data=ctx.game_data)
+        view = build_view(game_data=ctx.game_data, slot_key=ctx.slot_key)
         editor = DialogueEditor(view, ctx.dialogue_index or [])
         outcome = editor.apply(
             npc=npc,

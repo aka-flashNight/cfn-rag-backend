@@ -9,6 +9,8 @@
 - **总时限到＝连子 Agent 一起收掉**（``_execute`` 的 finally）：子 Agent 是独立任务，
   只取消等待方会留下孤儿在「已放弃本次」之后继续落盘，且 running 已复位＝串行上限
   与注册闸一起被打穿（同存档两个写者后写抹掉先写，静默丢内容）。
+- 状态回写接手受理侧：``dialogue_jobs`` 里受理侧只记到 delegated，之后由这里推
+  generating → written / skipped / failed，排查时能看出卡在哪一步（回写失败只记日志）。
 
 NPC 资料与长期记忆在任务执行当刻装配（复用聊天侧的装配件：
 ``format_npc_role_tagline`` / ``build_appearance_block`` / ``long_term.load_snapshot``），
@@ -24,6 +26,12 @@ from typing import Any
 
 from services.llm import LLMClient, LLMConfig
 from services.memory.long_term import load_snapshot
+from services.memory.store import (
+    DIALOGUE_JOB_FAILED,
+    DIALOGUE_JOB_GENERATING,
+    DIALOGUE_JOB_SKIPPED,
+    DIALOGUE_JOB_WRITTEN,
+)
 from services.orchestrator.prompts import build_appearance_block, format_npc_role_tagline
 from services.subagents.dialogue_runner import DialogueRunner
 
@@ -43,18 +51,37 @@ class DialogueJob:
 
     npc_name: str
     llm_config: LLMConfig
+    #: dialogue_jobs 里的记录 id（状态回写用；空＝不落库的直连委派，测试与手工调用）
+    job_id: str = ""
+    #: 受理当刻绑定的存档槽位：整条链路（长期记忆、覆盖层读写）都钉在它上面
+    slot_key: str = ""
     #: 触发类型：关系变化 / 态度变化 / 关键信息 / 重要任务（§4.0.4 必传）
     source_trigger: str = ""
     #: 发生了什么（相关事实）
     reason: str = ""
     #: 重写指示（触发一发布任务时挂的指示；其余触发可空，由模型自行判断）
     instruction: str = ""
-    #: 重要任务必传任务 id（只有首次传有效，后续静默跳过——跳过逻辑属下一批触发侧）
+    #: 重要任务必传任务 id（只有首次传有效，后续静默跳过——由受理侧的硬幂等保证）
     source_task_id: int | None = None
     #: 任务详情与对话（如有）
     task_block: str = ""
     #: 发布那场对话的摘要＋摘要后精确对话（如有）
     publish_block: str = ""
+
+
+async def _set_status(job_id: str, status: str, *, detail: str = "") -> None:
+    """把委派状态推进到 dialogue_jobs（无 job_id＝不落库的直连委派，跳过）。
+
+    回写失败只记日志：状态是给人事后排查用的，绝不能因为它把委派本身弄崩。
+    """
+    if not job_id:
+        return
+    try:
+        from services.memory.store import get_memory_store
+
+        await get_memory_store().dialogue_job_set_status(job_id, status, detail=detail)
+    except Exception as exc:
+        logger.warning("对话修改委派状态回写失败（不影响本次执行）: job=%s %s", job_id, exc)
 
 
 def _build_profile_block(npc_name: str, state: Any) -> str:
@@ -145,11 +172,16 @@ class DialogueWorker:
                     "对话修改委派超过总上限 %d 秒，已放弃本次: npc=%s trigger=%s",
                     DIALOGUE_JOB_TIMEOUT_S, job.npc_name, job.source_trigger,
                 )
+                await _set_status(
+                    job.job_id, DIALOGUE_JOB_FAILED,
+                    detail=f"超过总上限 {DIALOGUE_JOB_TIMEOUT_S} 秒，已放弃",
+                )
             except Exception as exc:
                 logger.error(
                     "对话修改委派执行失败（已放弃本次）: npc=%s trigger=%s: %s",
                     job.npc_name, job.source_trigger, exc, exc_info=True,
                 )
+                await _set_status(job.job_id, DIALOGUE_JOB_FAILED, detail=f"执行异常：{exc}")
             finally:
                 self._running = False
                 self._queue.task_done()
@@ -157,9 +189,20 @@ class DialogueWorker:
     # ------------------------------------------------------------------
 
     async def _execute(self, job: DialogueJob) -> None:
-        """装配材料 → 启动 DialogueRunner → 等到 final/failed（只记日志）。"""
+        """装配材料 → 启动 DialogueRunner → 等到 final/failed，并把终态回写。"""
         from services.integration.state import get_integration_state
         from services.npc.manager import get_npc_manager
+
+        bound = get_integration_state().slot_key
+        if job.slot_key and bound != job.slot_key:
+            # 排队期间玩家换了存档：材料（长期记忆、任务详情、发布对话）都是按原存档
+            # 装配的，此时继续跑等于拿 A 档的印象改 A 档的对话却看着 B 档的进度。
+            detail = f"执行时已换存档（委派 {job.slot_key}，当前 {bound}），放弃本次"
+            logger.warning("对话修改委派放弃: npc=%s %s", job.npc_name, detail)
+            await _set_status(job.job_id, DIALOGUE_JOB_FAILED, detail=detail)
+            return
+        slot_key = job.slot_key or bound
+        await _set_status(job.job_id, DIALOGUE_JOB_GENERATING)
 
         npc_manager = await get_npc_manager()
         state = await npc_manager.get(job.npc_name)
@@ -169,9 +212,7 @@ class DialogueWorker:
             from services.memory.store import get_memory_store
 
             store = get_memory_store()
-            snapshot = await load_snapshot(
-                store, slot_key=get_integration_state().slot_key, npc=job.npc_name,
-            )
+            snapshot = await load_snapshot(store, slot_key=slot_key, npc=job.npc_name)
         except Exception as exc:
             logger.warning("对话修改委派读取长期记忆失败（按无记忆继续）: %s", exc)
 
@@ -196,6 +237,7 @@ class DialogueWorker:
             task_block=job.task_block,
             publish_block=job.publish_block,
             game_data=game_data,
+            slot_key=job.slot_key,
         )
         # 任何退出路径都必须收掉子 Agent 任务：总时限触发时本协程是被取消的一方，
         # finally 照样执行。否则孤儿会在「已放弃本次」之后继续跑完三轮并落盘，
@@ -205,15 +247,25 @@ class DialogueWorker:
         finally:
             handle.cancel()
         if event.kind == "failed":
-            logger.error(
-                "对话修改子 Agent 失败: npc=%s reason=%s",
-                job.npc_name, event.payload.get("reason", ""),
+            reason = str(event.payload.get("reason", ""))
+            logger.error("对话修改子 Agent 失败: npc=%s reason=%s", job.npc_name, reason)
+            await _set_status(job.job_id, DIALOGUE_JOB_FAILED, detail=f"子 Agent 失败：{reason}")
+            return
+        if event.payload.get("changed"):
+            applied = event.payload.get("applied") or []
+            logger.info(
+                "对话修改子 Agent 落盘: npc=%s applied=%d payload=%.200s",
+                job.npc_name, len(applied), str(event.payload),
+            )
+            await _set_status(
+                job.job_id, DIALOGUE_JOB_WRITTEN, detail=f"已修改 {len(applied)} 组",
             )
             return
-        logger.info(
-            "对话修改子 Agent 完成: npc=%s changed=%s payload=%.200s",
-            job.npc_name, event.payload.get("changed"), str(event.payload),
-        )
+        note = str(event.payload.get("note") or "").strip()
+        if event.payload.get("exhausted"):
+            note = note or "三轮用尽仍无落盘"
+        logger.info("对话修改子 Agent 判断不动: npc=%s %.80s", job.npc_name, note)
+        await _set_status(job.job_id, DIALOGUE_JOB_SKIPPED, detail=note or "子 Agent 判断不需要改")
 
 
 def _tool_registry():

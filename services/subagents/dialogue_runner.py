@@ -157,12 +157,14 @@ class DialogueRunner(SubagentBase):
         task_block: str = "",
         publish_block: str = "",
         game_data: Any = None,
+        slot_key: str = "",
         max_rounds: int = DIALOGUE_MAX_ROUNDS,
     ) -> SubagentHandle:
         """构造并启动后台任务，返回 Handle。
 
         材料块（profile/relationship/task/publish）由委派方装配；触发来源
-        （reason/source_task_id/source_trigger）同时进 ctx 供 edit 工具透传给覆盖层。
+        （reason/source_task_id/source_trigger）同时进 ctx 供 edit 工具透传给覆盖层；
+        slot_key 把整条链路（查询候选＋覆盖层读写）钉在委派受理当刻的存档上。
         """
         ctx = ToolContext(
             npc_name=npc_name,
@@ -170,6 +172,7 @@ class DialogueRunner(SubagentBase):
             dialogue_reason=reason,
             dialogue_source_task_id=source_task_id,
             dialogue_source_trigger=source_trigger,
+            slot_key=slot_key,
             skill_registry=None,  # 子 Agent 不持有 skills 通道（v3 口径）
         )
         system = build_dialogue_system(
