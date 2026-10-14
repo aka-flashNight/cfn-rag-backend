@@ -3,6 +3,10 @@
 对应 docs/v3-developer/04-检索与向量模型.md §3.4。文档解析与切分逻辑照搬
 ai_engine/game_data_loader.py 的现有实现（业务行为不变），仅把 LlamaIndex
 Document 换成 retrieval.store.Node；PDF 用 pypdf、DOCX 用 python-docx 直接解析。
+
+绑定存档时两类语料都要叠加该存档的增量（B2-7 任务、B4-5 对话），否则子 Agent
+刚改完的对话在检索里仍是旧文本：任务侧走 agent_tasks.json / agent_text.json /
+task_text_overrides.json，日常对话侧走 dialogue_overrides.json。
 """
 
 from __future__ import annotations
@@ -12,10 +16,17 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable, List
+from typing import Any, Callable, List
 
+from services.dialogue import overrides as dialogue_overlay
+from services.dialogue import task_text as task_text_overlay
+from services.dialogue.models import DialogueLine, sanitize_text
 from services.game_data.paths import find_resources_directory
-from services.integration.save_paths import agent_save_task_paths
+from services.integration.save_paths import (
+    DIALOGUE_OVERRIDES_FILENAME,
+    agent_save_override_paths,
+    agent_save_task_paths,
+)
 from services.integration.state import get_integration_state
 from services.retrieval.hybrid import cjk_tokenizer
 from services.retrieval.store import Node, corpus_fingerprint
@@ -115,12 +126,18 @@ def compute_corpus_fingerprint(resources_dir: Path | None = None) -> str:
                 st = _stat_or_none(f)
                 if st is not None:
                     states.append((f.relative_to(root).as_posix(), st[0], st[1]))
-    # B2-7：当前绑定存档的任务覆盖层计入指纹（只含本槽两文件——其他槽或阶段四
-    # 对话侧文件的写入不误触发重建；agent_saves 目录本身不进 _FINGERPRINT_SOURCE_DIRS）
+    # B2-7 / B4-5：当前绑定存档的四个增量文件计入指纹（任务两文件＋对话两覆盖层）。
+    # 只含本槽文件——其他槽的写入不误触发重建；agent_saves 目录本身不进
+    # _FINGERPRINT_SOURCE_DIRS。
     bound_slot = _bound_slot_key()
     if bound_slot is not None:
         resolved_root = root.resolve()
-        for path in agent_save_task_paths(root / "data", bound_slot):
+        data_dir = root / "data"
+        slot_files = [
+            *agent_save_task_paths(data_dir, bound_slot),
+            *agent_save_override_paths(data_dir, bound_slot),
+        ]
+        for path in slot_files:
             if not path.is_file():
                 continue
             st = _stat_or_none(path)
@@ -143,7 +160,16 @@ def _stat_or_none(f: Path) -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 def load_dialogue_nodes(resources_dir: Path | None = None) -> List[Node]:
-    """读取 resources/data/dialogues 下的 NPC 日常对话 XML，每个 <Dialogue> 一条。"""
+    """读取 resources/data/dialogues 下的 NPC 日常对话 XML，每个 <Dialogue> 一条。
+
+    绑定存档时叠加该存档的 ``dialogue_overrides.json``（B4-5）：``replace`` 整组换台词、
+    ``append`` 在末尾追加新组，一律按 (块名 ``<Dialogues><Name>``, 组 id ``<Dialogue id>``)
+    定位——与游戏侧 ``QueryNpcDialogue`` 的查表口径一致，不用语料里的 ``character``
+    （实测 370 组有 14 组两者不同）。
+
+    节点 id 仍是加载序 ``dialogue-{seq}``：覆盖层只改组内台词、不动基础组的数量与
+    顺序，故既有节点 id 不漂移，新增组接在末尾。
+    """
     root_dir = Path(resources_dir) if resources_dir else _resources_dir()
     dialogues_dir = root_dir / "data" / "dialogues"
     list_path = dialogues_dir / "list.xml"
@@ -157,56 +183,134 @@ def load_dialogue_nodes(resources_dir: Path | None = None) -> List[Node]:
         if (elem.text or "").strip()
     ]
 
+    entries = _dialogue_override_entries(root_dir)
+    # 同 (块名, 组id) 有多条时后写的赢（与 overrides.merge_groups 的应用顺序一致）
+    last_entry: dict[tuple[str, str], Any] = {}
+    for entry in entries:
+        last_entry[(entry.npc, entry.group_id)] = entry
+
     nodes: List[Node] = []
+    base_keys: set[tuple[str, str]] = set()
     seq = 0
     for name in filenames:
         file_path = dialogues_dir / name
         if not file_path.exists():
             continue
         xml_root = ET.parse(file_path).getroot()
-        file_level_name_elem = xml_root.find(".//Dialogues/Name")
-        file_level_name = (
-            file_level_name_elem.text.strip() if file_level_name_elem is not None else None
-        )
-
-        for dlg in xml_root.findall(".//Dialogues/Dialogue"):
-            lines: List[str] = []
-            character_key: str | None = None
-            for sub in dlg.findall("./SubDialogue"):
-                text_elem = sub.find("Text")
-                text = (text_elem.text or "").strip() if text_elem is not None else ""
-                if not text:
+        for block in xml_root.findall(".//Dialogues"):
+            block_name = sanitize_text(block.findtext("Name"))
+            for dlg in block.findall("Dialogue"):
+                group_id = (dlg.get("id") or "").strip()
+                lines = _base_dialogue_lines(dlg)
+                key = (block_name, group_id)
+                if block_name and group_id:
+                    base_keys.add(key)
+                    entry = last_entry.get(key)
+                    if entry is not None:
+                        lines = list(entry.lines)
+                text, character_key = _dialogue_node_text(lines, block_name)
+                if not text or not character_key:
                     continue
-                sub_name = (sub.find("Name").text or "").strip() if sub.find("Name") is not None else ""
-                sub_char = (sub.find("Char").text or "").strip() if sub.find("Char") is not None else ""
-                # 跳过玩家视角的台词（$PC / $PC_TITLE / $PC_CHAR 等）
-                if sub_name == "$PC" or sub_char.startswith("$PC"):
-                    continue
-                # 角色标注使用 Name（角色名），缺省时回退文件级 Name 或 Char
-                if character_key is None:
-                    if sub_name:
-                        character_key = sub_name
-                    elif file_level_name:
-                        character_key = file_level_name
-                    elif sub_char:
-                        character_key = sub_char.split("#")[0].strip()
-                    else:
-                        character_key = "Unknown"
-                lines.append(text)
-
-            if not lines or not character_key:
-                continue
-            seq += 1
-            nodes.append(
-                Node(
-                    id=f"dialogue-{seq}",
-                    text="\n".join(lines),
-                    type="dialogue",
-                    character=character_key.strip().lower(),  # 与检索端 npc_name 过滤一致
-                    source_file=name,
+                seq += 1
+                nodes.append(
+                    Node(
+                        id=f"dialogue-{seq}",
+                        text=text,
+                        type="dialogue",
+                        character=character_key.strip().lower(),  # 与检索端 npc_name 过滤一致
+                        source_file=name,
+                    )
                 )
+
+    for key, lines in _appended_dialogue_groups(entries, base_keys).items():
+        text, character_key = _dialogue_node_text(lines, key[0])
+        if not text or not character_key:
+            continue
+        seq += 1
+        nodes.append(
+            Node(
+                id=f"dialogue-{seq}",
+                text=text,
+                type="dialogue",
+                character=character_key.strip().lower(),
+                source_file=DIALOGUE_OVERRIDES_FILENAME,
             )
+        )
     return nodes
+
+
+def _dialogue_override_entries(root_dir: Path) -> List[Any]:
+    """当前绑定存档的日常对话覆盖层条目（未绑定＝空表，只读基础数据）。"""
+    slot_key = _bound_slot_key()
+    if slot_key is None:
+        return []
+    path, _ = agent_save_override_paths(root_dir / "data", slot_key)
+    return dialogue_overlay.load_overrides(path)
+
+
+def _appended_dialogue_groups(
+    entries: List[Any], base_keys: set[tuple[str, str]],
+) -> dict[tuple[str, str], List[DialogueLine]]:
+    """覆盖层里新增的组（基础数据没有该组 id），按首次出现顺序；台词取最后一条。
+
+    只对 ``append`` 建组：引用了基础数据里不存在的组的 ``replace`` 记警告并忽略
+    （与 ``overrides.merge_groups`` 同一 fail-closed 口径）。
+    """
+    out: dict[tuple[str, str], List[DialogueLine]] = {}
+    for entry in entries:
+        key = (entry.npc, entry.group_id)
+        if key in base_keys:
+            continue
+        if entry.action != "append" and key not in out:
+            logger.warning(
+                "覆盖层引用了不存在的对话组，语料侧忽略该条: npc=%s group_id=%s",
+                entry.npc, entry.group_id,
+            )
+            continue
+        out[key] = list(entry.lines)
+    return out
+
+
+def _base_dialogue_lines(elem: ET.Element) -> List[DialogueLine]:
+    """一个 ``<Dialogue>`` 的台词行（原样保留 Name/Title/Char，空文本行丢掉）。"""
+    lines: List[DialogueLine] = []
+    for sub in elem.findall("./SubDialogue"):
+        text = sanitize_text(sub.findtext("Text"))
+        if not text:
+            continue
+        lines.append(DialogueLine(
+            name=sanitize_text(sub.findtext("Name")),
+            title=sanitize_text(sub.findtext("Title")),
+            char=sanitize_text(sub.findtext("Char")),
+            text=text,
+        ))
+    return lines
+
+
+def _dialogue_node_text(
+    lines: List[DialogueLine], block_name: str,
+) -> tuple[str, str | None]:
+    """一组台词 → (节点正文, 角色标注)；玩家视角的台词不进语料。
+
+    角色标注口径不变：首个非玩家条目的 Name，缺省时回退块名，再缺省回退 Char 的
+    ``#`` 前段。基础组与覆盖层新增组共用这一份，故改写后的组仍归到同一个 NPC 名下。
+    """
+    texts: List[str] = []
+    character_key: str | None = None
+    for line in lines:
+        if line.is_player:
+            continue
+        if character_key is None:
+            if line.name:
+                character_key = line.name
+            elif block_name:
+                character_key = block_name
+            elif line.char:
+                character_key = line.char.split("#")[0].strip()
+            else:
+                character_key = "Unknown"
+        texts.append(line.text)
+    return "\n".join(texts), character_key
 
 
 # ---------------------------------------------------------------------------
@@ -252,11 +356,12 @@ def _task_id_part(task: dict) -> str | None:
 
 
 def load_task_nodes(resources_dir: Path | None = None) -> List[Node]:
-    """任务台词：共享 *tasks*.json + text/*.json；绑定存档时叠加该存档覆盖层（B2-7）。
+    """任务台词：共享 *tasks*.json + text/*.json；绑定存档时叠加该存档覆盖层（B2-7/B4-5）。
 
-    覆盖层＝data/rag/agent_saves/<slotKey>/ 下的 agent_tasks.json + agent_text.json，
-    显式拼接路径增读（不走自动发现；文件缺失静默跳过）；槽内与共享同名文本 key 时
-    槽文本生效（覆盖层后加载，存档优先）。
+    覆盖层＝data/rag/agent_saves/<slotKey>/ 下的 agent_tasks.json + agent_text.json
+    （Agent 委托增量）与 task_text_overrides.json（子 Agent 改写的既有任务文本），
+    显式拼接路径增读（不走自动发现；文件缺失静默跳过）；同名文本 key 时后加载的
+    生效，顺序＝共享 → 槽内 agent_text → 槽内 task_text_overrides（存档优先）。
 
     节点 id 为稳定标识 task-{任务id}-{get|finish}-{台词序号}，与加载顺序无关：
     覆盖层增删或共享任务调整时，未变条目的 id 不漂移。任务缺 id 时退回用对话 key
@@ -301,6 +406,12 @@ def load_task_nodes(resources_dir: Path | None = None) -> List[Node]:
                 text_data.update(data)
         except Exception as exc:
             logger.warning("跳过任务文本 %s: %s", tpath.name, exc)
+
+    # B4-5：对话修改子 Agent 改过的既有任务文本（$KEY 级覆盖层）。排在全部文本源之后
+    # 合并＝同名 key 覆盖层生效，与 AS2 dictMerge / 宿主文本表的「后到覆盖」同口径。
+    if bound_slot is not None:
+        _, slot_override_path = agent_save_override_paths(root_dir / "data", bound_slot)
+        text_data.update(task_text_overlay.load_task_text_overrides(slot_override_path))
 
     all_tasks: List[tuple[str | None, dict]] = []
     for jpath, task_source in task_sources:
