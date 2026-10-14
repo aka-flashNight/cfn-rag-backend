@@ -71,6 +71,23 @@ class ShutdownResponse(BaseModel):
     status: str = "shutting_down"
 
 
+class TaskCompletedRequest(BaseModel):
+    """任务完成事件（阶段四触发一）：游戏侧推来，后端据此自动委派对话修改。"""
+
+    slot_key: str = Field(..., pattern=SLOT_KEY_PATTERN, description="事件所属存档槽位")
+    task_id: int = Field(..., gt=0, description="已完成任务的 id")
+    npc: str = Field(default="", description="发布该任务的 NPC 名（可空，后端从任务记录取）")
+
+
+class TaskCompletedResponse(BaseModel):
+    """受理结果。不受理也是 200＋accepted=False：游戏侧只管推，不需要区分原因。"""
+
+    ok: bool = True
+    accepted: bool = False
+    detail: str = ""
+    job_id: str = ""
+
+
 class IntegrationStatusResponse(BaseModel):
     ok: bool = True
     mode: str

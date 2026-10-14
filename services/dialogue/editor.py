@@ -246,6 +246,15 @@ class DialogueEditor:
             outcome.wrote_task_text = False
             return
 
+        from services.agent_tools.task_tools import bump_dialogue_version
+
+        try:
+            bump_dialogue_version(self.view.data_root)
+        except OSError as exc:
+            # 覆盖层已经写成了，只是通知游戏侧热失效的版本号没 bump 上去：
+            # 这里绝不能报错，否则模型会重交同一批修改、把追加行写重。
+            logger.warning("dialogue_version 更新失败（覆盖层已落盘，游戏侧下次载入生效）: %s", exc)
+
         from services.retrieval.refresh import refresh_index_if_stale
 
         refresh_index_if_stale()

@@ -350,6 +350,17 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "maxLength": 12,
             "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。",
         },
+        "dialogue_rewrite": {
+            "type": "boolean",
+            "description": (
+                "这份委托很关键、玩家完成后你的说话方式应当随之改变时填 true，否则填 false。"
+                "填 true 时后台会在玩家完成后自动派子 Agent 修改你的对话。"
+            ),
+        },
+        "dialogue_rewrite_instruction": {
+            "type": "string",
+            "description": "dialogue_rewrite 为 true 时填：你希望自己的对话怎么变（改写指示）。",
+        },
     },
     "required": ["draft_id", "title", "description", "get_dialogue", "finish_dialogue"],
     "additionalProperties": False,

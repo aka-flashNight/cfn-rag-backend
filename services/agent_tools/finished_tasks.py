@@ -6,12 +6,18 @@
 
 无状态：每轮按当前存档投影里的 tasks_finished 实时算，不做「已通知」记账——
 投影只在打开面板/读档/存档落盘/任务完成四处刷新，任务完成后这一轮就能看到。
+
+阶段四追加两件事（同一份磁盘读取里一起给出，不再读第二遍）：
+① 每条委托明确带上任务 id（§4.0.2-3：委派子 Agent 时「必须给任务 id」）；
+② 发布时挂了对话重写标记的委托，常驻提醒模型「已自动触发、勿重复调用」——
+   任务完成后把完成信息给模型时这句也一直保留，未标记的委托不加。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +27,34 @@ logger = logging.getLogger(__name__)
 
 #: 一轮里最多拼接几条已完成委托（按 id 从新到旧取，控制 token）
 MAX_FINISHED_TASKS_PER_TURN = 3
+
+#: 已挂对话重写标记的委托的常驻提醒（§4.0.2-3 兜底提醒，逐字口径）
+MARKED_TASK_HINT = "该任务已自动触发对话修改的子 Agent，请勿因该任务而重复调用。"
+
+
+@dataclass
+class FinishedTaskBlock:
+    """已完成委托块：拼好的文本＋「是否存在未挂重写标记的委托」。
+
+    后者是触发三的条件闸口径（§4.0.2-3）：仅当当轮真的拼了已完成委托、
+    且其中有未标记的重要任务时，委派工具的提示词才保留任务兜底表述；
+    否则任务相关表述整段不给（与注册闸同一精神：给了才提）。
+    """
+
+    text: str = ""
+    has_unmarked: bool = False
+
+
+@dataclass
+class TaskRewriteMaterial:
+    """触发一自动委派要的材料：任务详情与对话＋发布时挂的标记（一次读取拿全）。"""
+
+    task_id: int
+    npc: str
+    marked: bool
+    instruction: str
+    publish_session_id: str
+    detail_block: str
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -118,24 +152,54 @@ def _completion_phrase(record: dict) -> str:
     return "任务达成内容（玩家达成）：" + ("；".join(parts) if parts else "无")
 
 
+def _task_lines(task_id: int, record: dict, texts: dict[str, Any], header: str) -> list[str]:
+    """一条委托的呈现行（标题行由调用方给）；缺标题文本＝返回空列表（跳过该条）。"""
+    title = str(texts.get(f"$AGENT_TITLE_{task_id}") or "").strip()
+    if not title:
+        logger.warning("委托 %d 缺少标题文本，跳过拼接", task_id)
+        return []
+    lines = [header.format(title=title, task_id=task_id)]
+    description = str(texts.get(f"$AGENT_DESCRIPTION_{task_id}") or "").strip()
+    if description:
+        lines.append(f"任务说明：{description}")
+    reward = _item_phrase(record.get("rewards"), "报酬")
+    if reward:
+        lines.append(reward)
+    get_dialogue = _dialogue_lines(texts.get(f"$AGENT_GET_{task_id}"))
+    if get_dialogue:
+        lines.append("任务前：")
+        lines.extend(get_dialogue)
+    lines.append(_completion_phrase(record))
+    finish_dialogue = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
+    if finish_dialogue:
+        lines.append("任务后：")
+        lines.extend(finish_dialogue)
+    if record.get("dialogue_rewrite"):
+        lines.append(MARKED_TASK_HINT)
+    return lines
+
+
+_FINISHED_HEADER = "此前你发布的委托「{title}」（任务 id {task_id}）已被玩家完成。"
+
+
 def build_finished_task_block(
     *,
     data_root: Path,
     slot_key: str | None,
     npc_name: str,
     finished_ids: Any,
-) -> str:
-    """该 NPC 发布、且当前存档已完成的委托块；没有匹配项＝空串（整块不注入）。"""
+) -> FinishedTaskBlock:
+    """该 NPC 发布、且当前存档已完成的委托块；没有匹配项＝空块（整块不注入）。"""
     npc = (npc_name or "").strip()
     if not npc:
-        return ""
+        return FinishedTaskBlock()
     try:
         finished = {int(v) for v in (finished_ids or [])}
     except (TypeError, ValueError):
         logger.warning("存档投影 tasks_finished 含非整数项，跳过完成委托拼接")
-        return ""
+        return FinishedTaskBlock()
     if not finished:
-        return ""
+        return FinishedTaskBlock()
 
     tasks, texts = _merged_docs(Path(data_root), slot_key)
     matched = [
@@ -144,33 +208,49 @@ def build_finished_task_block(
         if task_id in finished and str(record.get("get_npc") or "").strip() == npc
     ]
     if not matched:
-        return ""
+        return FinishedTaskBlock()
     matched.sort(key=lambda pair: pair[0], reverse=True)
 
     sections: list[str] = []
+    has_unmarked = False
     for task_id, record in matched[:MAX_FINISHED_TASKS_PER_TURN]:
-        title = str(texts.get(f"$AGENT_TITLE_{task_id}") or "").strip()
-        if not title:
-            logger.warning("委托 %d 缺少标题文本，跳过完成拼接", task_id)
+        lines = _task_lines(task_id, record, texts, _FINISHED_HEADER)
+        if not lines:
             continue
-        lines = [f"此前你发布的委托「{title}」已被玩家完成。"]
-        description = str(texts.get(f"$AGENT_DESCRIPTION_{task_id}") or "").strip()
-        if description:
-            lines.append(f"任务说明：{description}")
-        reward = _item_phrase(record.get("rewards"), "报酬")
-        if reward:
-            lines.append(reward)
-        get_dialogue = _dialogue_lines(texts.get(f"$AGENT_GET_{task_id}"))
-        if get_dialogue:
-            lines.append("任务前：")
-            lines.extend(get_dialogue)
-        lines.append(_completion_phrase(record))
-        finish_dialogue = _dialogue_lines(texts.get(f"$AGENT_FINISH_{task_id}"))
-        if finish_dialogue:
-            lines.append("任务后：")
-            lines.extend(finish_dialogue)
         sections.append("\n".join(lines))
+        # 条件闸只看真的拼进这一轮的那些委托：没拼出来的模型也指认不了 id
+        if not record.get("dialogue_rewrite"):
+            has_unmarked = True
 
     if not sections:
-        return ""
-    return "【你发布的委托已被玩家完成】\n" + "\n\n".join(sections)
+        return FinishedTaskBlock()
+    return FinishedTaskBlock(
+        text="【你发布的委托已被玩家完成】\n" + "\n\n".join(sections),
+        has_unmarked=has_unmarked,
+    )
+
+
+_DETAIL_HEADER = "你发布的委托「{title}」（任务 id {task_id}），玩家刚刚完成。"
+
+
+def load_task_rewrite_material(
+    *, data_root: Path, slot_key: str | None, task_id: int,
+) -> TaskRewriteMaterial | None:
+    """触发一：按任务 id 取该委托的详情与对话，以及发布时挂的重写标记。
+
+    任务不存在（或该存档看不到它）＝None，调用方据此记 dismissed。
+    """
+    tasks, texts = _merged_docs(Path(data_root), slot_key)
+    record = tasks.get(int(task_id))
+    if not isinstance(record, dict):
+        return None
+    lines = _task_lines(int(task_id), record, texts, _DETAIL_HEADER)
+    return TaskRewriteMaterial(
+        task_id=int(task_id),
+        npc=str(record.get("get_npc") or "").strip(),
+        marked=bool(record.get("dialogue_rewrite")),
+        instruction=str(record.get("dialogue_rewrite_instruction") or "").strip(),
+        publish_session_id=str(record.get("publish_session_id") or "").strip(),
+        detail_block="\n".join(lines),
+    )
+

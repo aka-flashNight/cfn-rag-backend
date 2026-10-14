@@ -365,10 +365,10 @@ async def test_finished_task_block_reaches_prompt(env, bound_slot, monkeypatch):
     orch = _orch(env, "铁锤给你", long_term_memory_enabled=True)
     await collect(orch)
 
-    assert orch._ctx.finished_task_block.startswith("【你发布的委托已被玩家完成】")
+    assert orch._ctx.finished_task_block.text.startswith("【你发布的委托已被玩家完成】")
     core = _shared_core(env)
     assert (
-        "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n"
+        "此前你发布的委托「取回祖传铁锤」（任务 id 200001）已被玩家完成。\n"
         "任务达成内容（玩家达成）：无\n任务后：\n玩家：带回来了。"
     ) in core
     # 已有关键记录时才要求把「已发布」改成「已完成」
@@ -401,7 +401,7 @@ async def test_no_finished_projection_leaves_block_empty(env, bound_slot, monkey
     orch = _orch(env, "你好")
     await collect(orch)
 
-    assert orch._ctx.finished_task_block == ""
+    assert orch._ctx.finished_task_block.text == ""
     assert "已被玩家完成" not in _shared_core(env)
 
 

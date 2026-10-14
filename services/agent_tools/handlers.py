@@ -409,7 +409,13 @@ def execute_confirm_agent_task(
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
     npc_states: Optional[dict[str, Any]] = None,
+    publish_session_id: str = "",
 ) -> DraftOpOutcome:
+    """校验并写入任务文件。
+
+    ``publish_session_id``＝发布这场对话的会话 id：只在 args 挂了对话重写标记时写进
+    任务记录，玩家完成后据此把「发布当时的对话」作为材料交给对话修改子 Agent。
+    """
     if pending_draft is None:
         return DraftOpOutcome(result_json=json.dumps({
             "status": "error",
@@ -486,6 +492,9 @@ def execute_confirm_agent_task(
             draft=draft_for_commit,
             npc_name_fallback=npc_name or str(pending_draft.get("npc_name") or ""),
             game_data=game_data,
+            dialogue_rewrite=bool(args.get("dialogue_rewrite")),
+            dialogue_rewrite_instruction=str(args.get("dialogue_rewrite_instruction") or ""),
+            publish_session_id=publish_session_id,
         )
     except Exception as e:
         logger.exception("任务写入失败")

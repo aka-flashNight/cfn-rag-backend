@@ -11,6 +11,7 @@ import json
 import pytest
 
 from services.agent_tools.finished_tasks import (
+    MARKED_TASK_HINT,
     MAX_FINISHED_TASKS_PER_TURN,
     build_finished_task_block,
 )
@@ -22,6 +23,11 @@ NPC = "铁匠"
 def _write(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _block(**kwargs) -> str:
+    """拼接结果的文本部分（``FinishedTaskBlock.text``）——下面的断言都针对这段字。"""
+    return build_finished_task_block(**kwargs).text
 
 
 def _task(task_id: int, get_npc: str = NPC, finish_npc: str = NPC) -> dict:
@@ -51,12 +57,12 @@ def data_root(tmp_path):
 
 
 def test_block_contains_title_and_dialogue(data_root):
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
     assert block == (
         "【你发布的委托已被玩家完成】\n"
-        "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n"
+        "此前你发布的委托「取回祖传铁锤」（任务 id 200001）已被玩家完成。\n"
         "任务达成内容（玩家达成）：无\n"
         "任务后：\n"
         "玩家：铁锤给你带回来了。\n"
@@ -83,7 +89,7 @@ def test_block_splits_get_and_finish_dialogue_and_carries_reward(data_root):
         "$AGENT_FINISH_200001": [{"name": NPC, "text": "干得漂亮。"}],
     })
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
     assert (
@@ -112,7 +118,7 @@ def test_block_carries_description_and_requirements(data_root):
         "$AGENT_FINISH_200001": [{"name": "$PC", "text": "铁锤给你带回来了。"}],
     })
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
     assert "任务说明：把落在堕落城的祖传铁锤找回来。" in block
@@ -130,38 +136,38 @@ def test_completion_phrase_carry_phrase_for_contain_only(data_root):
     }]})
     _write(text_path, {"$AGENT_TITLE_200001": "取回祖传铁锤"})
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
     assert block == (
         "【你发布的委托已被玩家完成】\n"
-        "此前你发布的委托「取回祖传铁锤」已被玩家完成。\n"
+        "此前你发布的委托「取回祖传铁锤」（任务 id 200001）已被玩家完成。\n"
         "任务达成内容（玩家达成）：获取兽皮×3（不提交）"
     )
 
 
 def test_empty_when_nothing_finished_or_no_match(data_root):
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[],
     ) == ""
     # 完成了但不是这个 NPC 发布的
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name="药师", finished_ids=[200001],
     ) == ""
     # 这个 NPC 发布的但还没完成
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[299999],
     ) == ""
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name="", finished_ids=[200001],
     ) == ""
 
 
 def test_malformed_finished_ids_degrades_to_empty(data_root):
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=["abc"],
     ) == ""
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=None,
     ) == ""
 
@@ -176,7 +182,7 @@ def test_slot_overlay_wins_over_shared(data_root):
         "$AGENT_FINISH_200002": [{"name": "$PC", "text": "送到了。"}],
     })
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key="slot_1", npc_name=NPC,
         finished_ids=[200001, 200002],
     )
@@ -191,10 +197,10 @@ def test_slot_tasks_invisible_to_other_slots(data_root):
     _write(tasks_path, {"tasks": [_task(200005)]})
     _write(text_path, {"$AGENT_TITLE_200005": "只有存档一有的委托"})
 
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key="slot_1", npc_name=NPC, finished_ids=[200005],
     ) != ""
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key="slot_2", npc_name=NPC, finished_ids=[200005],
     ) == ""
 
@@ -204,7 +210,7 @@ def test_missing_title_text_skips_entry(data_root):
     tasks_path, _ = shared_task_paths(data_root)
     _write(tasks_path, {"tasks": [_task(200001), _task(200003)]})
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001, 200003],
     )
     assert "取回祖传铁锤" in block
@@ -215,10 +221,10 @@ def test_finish_without_dialogue_uses_short_form(data_root):
     _, text_path = shared_task_paths(data_root)
     _write(text_path, {"$AGENT_TITLE_200001": "取回祖传铁锤", "$AGENT_FINISH_200001": []})
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     )
-    assert "此前你发布的委托「取回祖传铁锤」已被玩家完成。" in block
+    assert "此前你发布的委托「取回祖传铁锤」（任务 id 200001）已被玩家完成。" in block
     assert "任务前" not in block
     assert "任务后" not in block
 
@@ -230,7 +236,7 @@ def test_capped_at_max_per_turn_newest_first(data_root):
     _write(tasks_path, {"tasks": [_task(i) for i in ids]})
     _write(text_path, {f"$AGENT_TITLE_{i}": f"委托{i}" for i in ids})
 
-    block = build_finished_task_block(
+    block = _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=ids,
     )
     kept = ids[-MAX_FINISHED_TASKS_PER_TURN:]
@@ -245,12 +251,53 @@ def test_capped_at_max_per_turn_newest_first(data_root):
 def test_corrupt_files_degrade_to_empty(data_root):
     tasks_path, _ = shared_task_paths(data_root)
     tasks_path.write_text("{broken json", encoding="utf-8")
-    assert build_finished_task_block(
+    assert _block(
         data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
     ) == ""
 
 
 def test_missing_files_degrade_to_empty(tmp_path):
-    assert build_finished_task_block(
+    assert _block(
         data_root=tmp_path / "data", slot_key="slot_1", npc_name=NPC, finished_ids=[200001],
     ) == ""
+
+
+def test_marked_task_carries_no_duplicate_call_hint(data_root):
+    """发布时挂了对话重写标记＝后台已自动委派，常驻提醒模型别因这条委托重复调用；
+    未挂标记的委托不给这句，且只有它才让委派工具保留任务兜底表述（has_unmarked）。"""
+    tasks_path, text_path = shared_task_paths(data_root)
+    _write(tasks_path, {"tasks": [_task(200001), {**_task(200002), "dialogue_rewrite": True}]})
+    _write(text_path, {
+        "$AGENT_TITLE_200001": "取回祖传铁锤",
+        "$AGENT_TITLE_200002": "护送商队",
+    })
+
+    marked = build_finished_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200002],
+    )
+    assert MARKED_TASK_HINT in marked.text
+    assert marked.has_unmarked is False
+
+    unmarked = build_finished_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
+    )
+    assert MARKED_TASK_HINT not in unmarked.text
+    assert unmarked.has_unmarked is True
+
+
+def test_has_unmarked_only_counts_tasks_actually_in_block(data_root):
+    """条件闸只看真的拼进这一轮的委托：被每轮上限砍掉的委托模型也指认不了 id。"""
+    ids = list(range(200001, 200001 + MAX_FINISHED_TASKS_PER_TURN + 1))
+    tasks_path, text_path = shared_task_paths(data_root)
+    # 最旧那条没挂标记，但它排在截断之外（按 id 从新到旧取）
+    _write(tasks_path, {"tasks": [
+        _task(ids[0]),
+        *[{**_task(i), "dialogue_rewrite": True} for i in ids[1:]],
+    ]})
+    _write(text_path, {f"$AGENT_TITLE_{i}": f"委托{i}" for i in ids})
+
+    block = build_finished_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=ids,
+    )
+    assert f"委托{ids[0]}" not in block.text
+    assert block.has_unmarked is False

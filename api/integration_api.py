@@ -3,6 +3,8 @@
 - `bind`：游戏 Host 推送存档投影（幂等；同槽位重复 bind＝投影刷新）；
 - `unbind`：解除绑定（回标题/无存档状态）；
 - `status`：当前模式与绑定快照（前端/联调查询用）；
+- `task-completed`：任务完成事件（阶段四触发一），挂了对话重写标记的重要任务据此
+  自动委派后台对话修改子 Agent；同存档同任务只受理一次（幂等在数据层）；
 - `shutdown`：游戏退出时请求终端进程优雅退出（仅限本进程由 `--embedded` 启动）。
 
 阶段一只落内存态；任务/记忆/NPC 状态的作用域切换在阶段二、三接通。
@@ -20,8 +22,11 @@ from schemas.integration_schema import (
     BindResponse,
     IntegrationStatusResponse,
     ShutdownResponse,
+    TaskCompletedRequest,
+    TaskCompletedResponse,
     UnbindResponse,
 )
+from services.dialogue.delegation import handle_task_completed
 from services.integration.state import (
     frontend_url_for,
     get_integration_state,
@@ -78,6 +83,29 @@ async def status() -> IntegrationStatusResponse:
         player=snapshot["player"],
         stage=stage,
         stage_name=get_progress_stage_name(stage),
+    )
+
+
+@router.post(
+    "/task-completed",
+    response_model=TaskCompletedResponse,
+    summary="任务完成事件（阶段四触发一）",
+)
+async def task_completed(payload: TaskCompletedRequest) -> TaskCompletedResponse:
+    """受理任务完成事件：发布时挂了对话重写标记的重要任务→自动委派对话修改。
+
+    委派是后台链路，本接口不等结果；幂等由数据层保证（同存档同任务只受理一次，
+    重复推送静默跳过）。槽位与当前绑定不符／未挂标记／频率限制命中都是 accepted=False。
+    """
+    outcome = await handle_task_completed(
+        slot_key=payload.slot_key, task_id=payload.task_id, npc=payload.npc,
+    )
+    logger.info(
+        "[integration] task-completed slot=%s task_id=%s accepted=%s detail=%s",
+        payload.slot_key, payload.task_id, outcome.accepted, outcome.detail,
+    )
+    return TaskCompletedResponse(
+        accepted=outcome.accepted, detail=outcome.detail, job_id=outcome.job_id,
     )
 
 

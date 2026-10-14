@@ -126,15 +126,15 @@ def _sync_state_path(data_root: Path) -> Path:
     return (Path(data_root).resolve() / "rag" / "sync_state.json").resolve()
 
 
-def _bump_task_publish_version(sync_path: Path) -> None:
+def _bump_sync_version(sync_path: Path, key: str) -> None:
     """
-    任务成功落盘后更新 task_publish_version：
-    - 文件不存在：写入 {"task_publish_version": 1}
+    sync_state.json 里某个版本号 +1（调用方须持 _WRITE_LOCK）：
+    - 文件不存在：写入 {key: 1}
     - 已存在：若有该键则 +1；若无该键则置为 1；其它键原样保留。
     """
     sync_path.parent.mkdir(parents=True, exist_ok=True)
     if not sync_path.exists():
-        _atomic_write_text(sync_path, _dump_json({"task_publish_version": 1}))
+        _atomic_write_text(sync_path, _dump_json({key: 1}))
         return
     try:
         raw = sync_path.read_text(encoding="utf-8")
@@ -143,15 +143,30 @@ def _bump_task_publish_version(sync_path: Path) -> None:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    if "task_publish_version" not in data:
-        data["task_publish_version"] = 1
+    if key not in data:
+        data[key] = 1
     else:
         try:
-            cur = int(data["task_publish_version"])
+            cur = int(data[key])
         except (TypeError, ValueError):
             cur = 0
-        data["task_publish_version"] = cur + 1
+        data[key] = cur + 1
     _atomic_write_text(sync_path, _dump_json(data))
+
+
+def _bump_task_publish_version(sync_path: Path) -> None:
+    """任务成功落盘后更新 task_publish_version。"""
+    _bump_sync_version(sync_path, "task_publish_version")
+
+
+def bump_dialogue_version(data_root: Path) -> None:
+    """对话覆盖层落盘后更新 dialogue_version（阶段四 B4-2-4）。
+
+    与任务版本号同一文件、同一把 _WRITE_LOCK，防两条写链撞车；
+    游戏侧轮询该键变化后使对话覆盖层缓存失效（G4-5）。
+    """
+    with _WRITE_LOCK:
+        _bump_sync_version(_sync_state_path(data_root), "dialogue_version")
 
 
 def _reward_items_to_expr(items: Any) -> List[str]:
@@ -334,6 +349,9 @@ def write_confirmed_agent_task_files(
     draft: Dict[str, Any],
     npc_name_fallback: str,
     game_data: GameDataRegistry,
+    dialogue_rewrite: bool = False,
+    dialogue_rewrite_instruction: str = "",
+    publish_session_id: str = "",
 ) -> tuple[str, int]:
     """
     将已确认的任务草案写入（B2-2 按绑定分流）：
@@ -343,6 +361,10 @@ def write_confirmed_agent_task_files(
 
     在锁内根据磁盘上已有 agent 任务的最大 ID 分配新 ID（扫描范围＝共享 ∪ 本存档，B2-3，
     避免内存 TaskRegistry 未重载时重复 ID 覆盖旧任务）。
+
+    对话重写标记（阶段四触发一，§4.0.2-1）：模型在发布时判定「这个任务很重要」即挂
+    dialogue_rewrite 与它的重写指示，外加发布那场对话的会话 id——三者一起落进任务记录，
+    任务完成事件推来时据此自动委派对话修改子 Agent。未标记的任务记录形状与现状逐字一致。
 
     返回 (写入描述字符串, 分配的任务 ID)。
     """
@@ -470,24 +492,27 @@ def write_confirmed_agent_task_files(
         # 防止重复写入同 id
         tasks = [t for t in tasks if not (isinstance(t, dict) and str(t.get("id")) == str(task_id_int))]
 
-        tasks.append(
-            {
-                "id": task_id_int,
-                "title": f"$AGENT_TITLE_{task_id_int}",
-                "description": f"$AGENT_DESCRIPTION_{task_id_int}",
-                "get_requirements": get_req_list,
-                "get_conversation": f"$AGENT_GET_{task_id_int}",
-                "get_npc": get_npc,
-                "finish_requirements": finish_reqs,
-                "finish_submit_items": finish_submit,
-                "finish_contain_items": finish_contain,
-                "finish_conversation": f"$AGENT_FINISH_{task_id_int}",
-                "finish_npc": finish_npc,
-                "rewards": rewards,
-                "announcement": "",
-                "chain": "委托",
-            }
-        )
+        record = {
+            "id": task_id_int,
+            "title": f"$AGENT_TITLE_{task_id_int}",
+            "description": f"$AGENT_DESCRIPTION_{task_id_int}",
+            "get_requirements": get_req_list,
+            "get_conversation": f"$AGENT_GET_{task_id_int}",
+            "get_npc": get_npc,
+            "finish_requirements": finish_reqs,
+            "finish_submit_items": finish_submit,
+            "finish_contain_items": finish_contain,
+            "finish_conversation": f"$AGENT_FINISH_{task_id_int}",
+            "finish_npc": finish_npc,
+            "rewards": rewards,
+            "announcement": "",
+            "chain": "委托",
+        }
+        if dialogue_rewrite:
+            record["dialogue_rewrite"] = True
+            record["dialogue_rewrite_instruction"] = (dialogue_rewrite_instruction or "").strip()
+            record["publish_session_id"] = (publish_session_id or "").strip()
+        tasks.append(record)
         new_tasks_doc = {"tasks": tasks}
 
         # -------- agent_text.json --------

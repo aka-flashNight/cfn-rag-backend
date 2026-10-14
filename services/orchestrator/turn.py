@@ -34,6 +34,13 @@ from services.agent_tools.handlers import (
     execute_cancel_agent_task,
     execute_confirm_agent_task,
 )
+from services.dialogue.delegation import (
+    DELEGATE_TOOL_NAME,
+    RELATIONSHIP_HINT_ROUNDS,
+    apply_delegate_calls,
+    build_relationship_hint,
+    delegate_tool_or_none,
+)
 from services.llm import (
     ChatRequest,
     LLMClient,
@@ -366,11 +373,25 @@ class TurnOrchestrator:
 
             llm = deps.llm_factory(self.llm_config)
 
+            # 触发三：委派工具按注册闸下发（后台有子 Agent 在跑 / 未绑定存档＝完全不注册）；
+            # 任务兜底表述按条件闸二选一——仅当当轮真的拼了已完成委托、且其中有未挂
+            # 重写标记的委托时才给，否则任务相关表述一个字都不出现（§4.0.2-3）。
+            delegate_tool = delegate_tool_or_none(
+                include_task_fallback=ctx.finished_task_block.has_unmarked,
+            )
+            # 触发二：关系跨档提示只在工具真的下发那一轮注入（不注册就完全不提），
+            # 注入即扣一轮；工具没下发时原样留着，等能下发的那一轮再给。
+            relationship_hint = (
+                await self._take_relationship_hint(memory) if delegate_tool is not None else ""
+            )
+
             # ---- BURST_STREAMING（调用 #1）----
             # system 分层（从稳定到易变）：世界观 → 输出规则/路由说明（跨 NPC）
             # → 单 NPC 扮演块（含 meta 协议）；user1 = 历史 → 会话态 → RAG（同回合
             # 多次调用共享）；user2 = 玩家当轮话 + 立绘说明/情绪连贯提示（+图片 part 在尾）。
-            base_messages = self._build_base_messages(ctx, dialogue_limit=dialogue_limit)
+            base_messages = self._build_base_messages(
+                ctx, dialogue_limit=dialogue_limit, relationship_hint=relationship_hint,
+            )
             player_message = build_player_message(
                 self.query,
                 npc_name=self.npc_name,
@@ -386,7 +407,8 @@ class TurnOrchestrator:
 
             # 聊天 Agent 的工具表 = 路由表（判据写在工具描述里，见 services/tools/route/）
             # ＋ 长期记忆工具（B3-4：不在全局注册表里，按作用域当前状态手拼，
-            # 三形态同名不同形；关闭时既不下发也不注入）。
+            # 三形态同名不同形；关闭时既不下发也不注入）
+            # ＋ 对话修改委派工具（同样手拼，注册闸不通过时既不下发也不提示）。
             # Agent 能力关闭或任务发布临时关闭时不下发路由工具：模型连路由入口都没有。
             chat_tools = (
                 self._routing_tools(
@@ -397,6 +419,8 @@ class TurnOrchestrator:
             )
             if ctx.long_term is not None:
                 chat_tools = [*chat_tools, build_chat_tool(ctx.long_term)]
+            if delegate_tool is not None:
+                chat_tools = [*chat_tools, delegate_tool]
 
             stream = llm.chat_stream(ChatRequest(
                 messages=messages,
@@ -425,6 +449,10 @@ class TurnOrchestrator:
             # 长期记忆工具不在全局注册表里（要按作用域状态换形），这里直接落库；
             # 与路由互不干扰——路由轮同样可以顺带更新记忆。
             recorded = await self._apply_long_term_calls(deps, ctx, tool_sink)
+            # 对话修改委派同理（工具是手拼的、不进全局注册表），受理即入队后台子 Agent
+            delegated = await self._apply_delegate_calls(
+                deps, tool_sink, registered=delegate_tool is not None,
+            )
 
             if route is not None and spoken_text.strip():
                 logger.warning(
@@ -442,7 +470,12 @@ class TurnOrchestrator:
 
             if route is None:
                 # ---- 纯聊天路径：正文已直发，无后台动作 ----
-                stray_calls = [tc for tc in tool_sink if tool_call_name(tc) != CHAT_TOOL_NAME]
+                # 两个手拼工具不算「越权路由调用」：记忆工具由 _apply_long_term_calls 落库，
+                # 委派工具由 _apply_delegate_calls 受理（未下发时那边已单独留痕）。
+                stray_calls = [
+                    tc for tc in tool_sink
+                    if tool_call_name(tc) not in (CHAT_TOOL_NAME, DELEGATE_TOOL_NAME)
+                ]
                 if stray_calls:
                     names = [tool_call_name(tc) for tc in stray_calls]
                     if self._routing_enabled:
@@ -453,10 +486,10 @@ class TurnOrchestrator:
                         logger.warning("Agent 能力已关闭，模型仍硬发路由调用，忽略: %s", names)
                 if not spoken_text.strip():
                     # 一个字台词都没出（只落库、或直接空返），玩家侧只剩空气泡。
-                    # 补一次不带任何工具的调用：长期记忆工具不再注册、prompt 里也只给
-                    # 落库结果——从根上断掉「发工具调用就不说话」这条路径。
+                    # 补一次不带任何工具的调用：手拼工具不再注册、prompt 里只给
+                    # 落库与已派出的结果——从根上断掉「发工具调用就不说话」这条路径。
                     async for ev in self._empty_reply_rescue(
-                        llm, base_messages, meta, collected_text, recorded,
+                        llm, base_messages, meta, collected_text, recorded, delegated,
                     ):
                         yield ev
 
@@ -513,6 +546,7 @@ class TurnOrchestrator:
                         game_data=deps.game_data,
                         rag_context_text=ctx.rag_context_text,
                         npc_states=ctx.npc_states,
+                        publish_session_id=self.session_id,
                     )
                     if outcome.payload.get("status") == "confirmed":
                         draft_touched = True
@@ -635,9 +669,13 @@ class TurnOrchestrator:
     # ------------------------------------------------------------------
 
     def _build_base_messages(
-        self, ctx: TurnContext, *, dialogue_limit: int,
+        self, ctx: TurnContext, *, dialogue_limit: int, relationship_hint: str = "",
     ) -> list[dict[str, Any]]:
-        """[system 静态, user shared core]（前缀缓存对齐；tail 与玩家话在末条 user）。"""
+        """[system 静态, user shared core]（前缀缓存对齐；tail 与玩家话在末条 user）。
+
+        ``relationship_hint`` 是触发二的好感度跨档提示：只在委派工具真的下发那一轮
+        注入，且只在模型尚未调用委派期间持续 RELATIONSHIP_HINT_ROUNDS 轮。
+        """
         # 路由闸门关闭时待确认草案不进 prompt：模型既无法确认也无法取消，
         # 摆在它面前只会诱导它空口答应。草案仍照常装配，交给过期计数清理。
         has_pending_draft = self._routing_enabled and ctx.pending_draft_row is not None
@@ -665,9 +703,10 @@ class TurnOrchestrator:
             relationship_level=ctx.relationship_level,
             pending_draft_summary=ctx.pending_draft_summary if has_pending_draft else "",
             save_info=ctx.save_info,
+            relationship_hint=relationship_hint,
             long_term_block=format_long_term_block(ctx.long_term) if ctx.long_term else "",
             finished_task_block=build_finished_task_block(
-                ctx.finished_task_block,
+                ctx.finished_task_block.text,
                 has_long_term_facts=bool(ctx.long_term and ctx.long_term.facts),
             ),
         )
@@ -738,10 +777,17 @@ class TurnOrchestrator:
 
     async def _emit_meta(self, meta: Meta, deps: OrchestratorDeps) -> SSEEvent:
         if meta.favorability_change:
+            old_level = self._ctx.npc_state.relationship_level
             state = await deps.npc_manager.update_favorability(
                 self.npc_name, meta.favorability_change,
             )
             self._ctx.npc_state = state
+            if state.relationship_level and state.relationship_level != old_level:
+                # 触发二：跨档提示只能作用于下一轮——本轮的工具表与请求都已经发出去了，
+                # 落库后由 _take_relationship_hint 在下轮取用。
+                await self._store_relationship_hint(
+                    deps.memory, old_level, state.relationship_level,
+                )
         else:
             state = self._ctx.npc_state
         return meta_event(
@@ -803,6 +849,76 @@ class TurnOrchestrator:
                 )
                 recorded.append(_long_term_record_line(result, tool_call))
         return recorded
+
+    async def _apply_delegate_calls(
+        self,
+        deps: OrchestratorDeps,
+        tool_sink: list[dict[str, Any]],
+        *,
+        registered: bool,
+    ) -> list[str]:
+        """落地本轮的对话修改委派（触发二、三共用同一个工具，不在全局注册表里）。
+
+        注册闸不通过时一律不受理：工具没下发却硬发调用属于越权，只留痕。
+        受理过就清掉跨档提示——§4.0.2-2 要求「一旦调用立刻去掉提示词」。
+        返回逐条结果文本，供空正文兜底轮告诉 NPC 已经派了什么；
+        任何失败只记日志，绝不阻断本轮对话（§4.0.1 独立链路）。
+        """
+        calls = [tc for tc in tool_sink if tool_call_name(tc) == DELEGATE_TOOL_NAME]
+        if not calls:
+            return []
+        if not registered:
+            logger.warning(
+                "会话 %s：委派工具本轮未下发（注册闸不通过），模型仍硬发调用，忽略",
+                self.session_id,
+            )
+            return []
+        try:
+            results = await apply_delegate_calls(
+                calls,
+                npc_name=self.npc_name,
+                session_id=self.session_id,
+                llm_config=self.llm_config,
+            )
+        except Exception as exc:
+            logger.warning("会话 %s 对话修改委派执行失败（忽略）: %s", self.session_id, exc)
+            return []
+        try:
+            await deps.memory.dialogue_hint_clear(self.session_id)
+        except Exception as exc:
+            logger.warning("会话 %s 跨档提示清除失败（忽略）: %s", self.session_id, exc)
+        return results
+
+    async def _take_relationship_hint(self, memory: MemoryStore) -> str:
+        """取本会话待提示的好感度跨档文案并扣掉一轮（触发二）。
+
+        只在委派工具真的下发那一轮调用：注册闸不通过时既不注入也不扣轮，
+        否则三轮会在模型手上根本没有工具的情况下白白烧掉。
+        """
+        try:
+            hint = await memory.dialogue_hint_read(self.session_id)
+            if hint is None:
+                return ""
+            await memory.dialogue_hint_write(
+                self.session_id, hint.hint, hint.rounds_left - 1,
+            )
+            return hint.hint
+        except Exception as exc:
+            logger.warning("会话 %s 跨档提示读取失败（本轮不提示）: %s", self.session_id, exc)
+            return ""
+
+    async def _store_relationship_hint(
+        self, memory: MemoryStore, old_level: str, new_level: str,
+    ) -> None:
+        """落一条跨档提示，持续 RELATIONSHIP_HINT_ROUNDS 轮，模型调用过即清除。"""
+        try:
+            await memory.dialogue_hint_write(
+                self.session_id,
+                build_relationship_hint(old_level, new_level),
+                RELATIONSHIP_HINT_ROUNDS,
+            )
+        except Exception as exc:
+            logger.warning("会话 %s 跨档提示写入失败（忽略）: %s", self.session_id, exc)
 
     def _recent_dialogue_text(
         self, ctx: TurnContext, spoken_text: str, *, limit: int = SUBAGENT_RECENT_MESSAGES,
@@ -874,7 +990,10 @@ class TurnOrchestrator:
         return args
 
     def _sanitize_confirm_args(self, args: dict[str, Any] | None) -> dict[str, Any] | None:
-        """宽松归一化（不硬打回）：字符串化 + 空对话补占位，优先保住 LLM 的产出。"""
+        """宽松归一化（不硬打回）：字符串化 + 空对话补占位，优先保住 LLM 的产出。
+
+        对话重写标记一并归一：布尔化，标记为假时清空指示（避免留下半截标记）。
+        """
         if not isinstance(args, dict):
             return None
         out: dict[str, Any] = {}
@@ -906,6 +1025,11 @@ class TurnOrchestrator:
 
         out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。")
         out["finish_dialogue"] = _dlg("finish_dialogue", "干得漂亮，报酬一分不少。")
+        rewrite = bool(args.get("dialogue_rewrite"))
+        out["dialogue_rewrite"] = rewrite
+        out["dialogue_rewrite_instruction"] = (
+            str(args.get("dialogue_rewrite_instruction") or "").strip() if rewrite else ""
+        )
         return out
 
     @staticmethod
@@ -992,18 +1116,21 @@ class TurnOrchestrator:
         meta: Meta,
         sink: list[str],
         recorded: list[str],
+        delegated: list[str],
     ) -> AsyncIterator[SSEEvent]:
         """空正文兜底：纯聊天轮没说出一个字时，再开一次**不带任何工具**的调用。
 
         模型会把「调用路由工具的那一轮不要写台词」套到长期记忆工具上，发完调用
-        就静默。这里复用的 _stream_simple 不下发 tools，记忆工具连定义都不在，
-        模型没有可调的东西，只能开口；已落库的结果用文字告诉它，免得它重复记。
+        就静默。这里复用的 _stream_simple 不下发 tools，工具连定义都不在，
+        模型没有可调的东西，只能开口；已经落库/已经派出的结果用文字告诉它，
+        免得它重复记或重复派。
         生成失败或还是空回复时给静态收场话，玩家侧不能留空白。
         """
         prompt = build_empty_reply_user_prompt(
             player_query=self.query,
             emotion=meta.emotion,
             recorded="；".join(recorded),
+            delegated="；".join(delegated),
         )
         before = len(sink)
         async for ev in self._stream_simple(llm, base_messages, prompt, sink):

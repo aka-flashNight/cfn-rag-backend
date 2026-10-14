@@ -389,6 +389,7 @@ def build_user_shared_core(
     progress_desc: str = "",
     favorability: int = 0,
     relationship_level: str = "陌生",
+    relationship_hint: str = "",
     pending_draft_summary: str = "",
     save_info: Any = None,
     long_term_block: str = "",
@@ -396,7 +397,8 @@ def build_user_shared_core(
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
-    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ 已完成委托 →
+    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ 关系跨档提示
+    （只在委派工具真的下发那一轮出现）→ 已完成委托 →
     长期记忆（跨窗口，改动稀疏）→ 早期摘要（同为跨轮稀疏，紧跟长期记忆）→
     RAG/提及 NPC（跨轮全变、轮内不变）→ 近期对话（对话跨轮追加，同回合内过渡话
     产生后还会追加——轮内有变化但不高频，放最下方使追加不破坏块内前缀）。
@@ -412,6 +414,9 @@ def build_user_shared_core(
     )
     if session_block:
         parts.append(session_block)
+    hint = (relationship_hint or "").strip()
+    if hint:
+        parts.append(hint)
     done = (finished_task_block or "").strip()
     if done:
         parts.append(done)
@@ -578,15 +583,19 @@ CONFIRM_FAIL_INSTRUCTION = (
 # 空正文兜底轮（台词一个字都没出时补的一次开口调用）
 # ---------------------------------------------------------------------------
 
-def build_empty_reply_user_prompt(*, player_query: str, emotion: str, recorded: str = "") -> str:
-    """空正文兜底轮的 user 消息：带上本轮已落库的长期记忆结果，只要 NPC 开口。
+def build_empty_reply_user_prompt(
+    *, player_query: str, emotion: str, recorded: str = "", delegated: str = "",
+) -> str:
+    """空正文兜底轮的 user 消息：带上本轮已落库的长期记忆与已派出的对话修改，只要 NPC 开口。
 
-    这一轮的调用**不带任何工具**（长期记忆工具不再注册），所以这里只交代结果、
-    不提记录这件事本身，避免给模型留一个无处可点的指代。
+    这一轮的调用**不带任何工具**（长期记忆工具与委派工具都不再注册），所以这里只交代
+    结果、不提记录与委派这两件事本身，避免给模型留一个无处可点的指代。
     """
     parts = [f"玩家刚才说：{player_query}"]
     if recorded:
         parts.append(f"【已记下】{recorded}")
+    if delegated:
+        parts.append(f"【已派出】{delegated}")
     parts.append(
         f"【本轮你的情绪】{emotion}（保持一致，不要改变语气基调）。"
         "不要输出第一行 meta JSON，直接输出台词本身。"
@@ -640,6 +649,8 @@ CONFIRM_ARGS_SYSTEM = (
     "2. 玩家条目 name 用 $PC、title 用 $PC_TITLE，不要写死玩家名字；"
     "NPC 条目用你的名字与称号。"
     "3. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
+    "4. dialogue_rewrite 填这份委托是否很关键、玩家完成后你的说话方式应当随之改变"
+    "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
 )
 
 
@@ -659,7 +670,8 @@ def build_confirm_args_user_prompt(
         )
     parts.append(f"【待发布任务详情】\n{draft_summary}")
     parts.append(
-        "现在以你的身份生成发布文本 JSON（title/description/get_dialogue/finish_dialogue）。"
+        "现在以你的身份生成发布文本 JSON（title/description/get_dialogue/finish_dialogue/"
+        "dialogue_rewrite/dialogue_rewrite_instruction）。"
         "对话中的玩家条目 name 用 $PC。"
     )
     return "\n\n".join(parts)

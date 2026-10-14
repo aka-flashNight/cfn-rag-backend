@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from services.agent_tools.finished_tasks import FinishedTaskBlock
 from services.game_progress import (
     StageConfig,
     derive_progress_stage,
@@ -332,7 +333,8 @@ class TurnContext:
     save_info: Any = None  # 绑定存档投影 {slot_key, character, progress, scene, player}（B2-1）；未绑定＝None
     long_term_enabled: bool = False  # 本回合是否启用跨对话长期记忆（B3-3）
     long_term: Optional[LongTermSnapshot] = None  # 启用时的作用域快照；关闭＝None
-    finished_task_block: str = ""  # 本 NPC 发布且当前存档已完成的委托（含完成对话原文）
+    # 本 NPC 发布且当前存档已完成的委托（含完成对话原文）；has_unmarked 供触发三的条件闸
+    finished_task_block: FinishedTaskBlock = field(default_factory=FinishedTaskBlock)
     retrieve_fn: Optional[Callable[[str], str]] = None
     llm_config: LLMConfig = field(default_factory=LLMConfig)
     # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
@@ -464,8 +466,8 @@ async def assemble_context(
     )
 
     # 本 NPC 发布、当前存档已完成的委托（含完成对话原文）：直读磁盘，缺 data_root
-    # 或读取异常一律降级为空串，不影响本轮对话。
-    finished_task_block = ""
+    # 或读取异常一律降级为空块，不影响本轮对话。
+    finished_task_block = FinishedTaskBlock()
     data_root = getattr(game_data, "data_root", None)
     if save_info is not None and data_root is not None:
         try:
