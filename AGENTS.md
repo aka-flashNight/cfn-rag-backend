@@ -13,7 +13,7 @@
 - 当前已固定、不得更改的名字（括号内为定义位置）：
   - 向量索引目录 `vector_index_v3`；索引文件 `vectors.npy` / `meta.json` / `fingerprint.json` / `bm25.pkl.gz`（`services/retrieval/store.py`、`services/retrieval/hybrid.py`）
   - 运行时状态 `tools/memory.db`（`services/memory/store.py`）、`data/rag/npc_state_db.json`（`services/npc/manager.py`）、`data/task/agent_tasks.json` 与 `data/task/text/agent_text.json`（`services/agent_tools/task_tools.py`）
-  - 按存档的 Agent 增量目录 `data/rag/agent_saves/<slotKey>/`（平铺 `agent_tasks.json` / `agent_text.json`；目录名 `AGENT_SAVES_DIRNAME` 与槽目录构造在 `services/integration/save_paths.py`，写盘在 `services/agent_tools/task_tools.py`），整目录已被游戏仓 `.gitignore` 忽略
+  - 按存档的 Agent 增量目录 `data/rag/agent_saves/<slotKey>/`（平铺 `agent_tasks.json` / `agent_text.json` / `dialogue_overrides.json` / `task_text_overrides.json`；目录名 `AGENT_SAVES_DIRNAME` 与槽目录构造在 `services/integration/save_paths.py`，任务写盘在 `services/agent_tools/task_tools.py`，两个覆盖层写盘在 `services/dialogue/editor.py`），整目录已被游戏仓 `.gitignore` 忽略
   - 启动种子 `backup_resources/` 下的 `npc_state_db.json` / `agent_tasks.json` / `agent_text.json`
   - 同级旧格式索引 `vector_index`（LlamaIndex 遗留）与 `vector_index_v3` 并存，两者都不得改名或增删版本后缀。
 - 改名的代价：用户与游戏侧已有文件立即失效并被重复生成，且必须同轮修改游戏仓库 `CrazyFlashNight/.gitignore`，否则生成物会被误提交。
