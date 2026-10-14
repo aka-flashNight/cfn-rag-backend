@@ -649,7 +649,7 @@ CONFIRM_ARGS_SYSTEM = (
     "2. 玩家条目 name 用 $PC、title 用 $PC_TITLE，不要写死玩家名字；"
     "NPC 条目用你的名字与称号。"
     "3. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
-    "4. dialogue_rewrite 填这份委托是否很关键、玩家完成后你的说话方式应当随之改变"
+    "4. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
     "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
 )
 

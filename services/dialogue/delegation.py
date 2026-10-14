@@ -90,7 +90,7 @@ class DelegationOutcome:
 def build_relationship_hint(old_level: str, new_level: str) -> str:
     """好感度跨档提示（§4.0.2-2 逐字口径，上升下降都用这一句）。"""
     return (
-        f"你的关系从 {old_level} 变为了 {new_level}（不管是上升还是下降），"
+        f"你的关系从 {old_level} 变为了 {new_level}，"
         "可以考虑调用对话修改的子 Agent，调整你的对话措辞。"
     )
 
