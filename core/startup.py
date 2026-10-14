@@ -260,6 +260,15 @@ async def _init_memory_and_summary() -> None:
     logger.info("会话存储（SQLite/WAL）就绪，摘要 worker 已启动")
 
 
+async def _init_dialogue_worker() -> None:
+    from services.dialogue.worker import DialogueWorker, set_dialogue_worker
+
+    worker = DialogueWorker()
+    worker.start()
+    set_dialogue_worker(worker)
+    logger.info("对话修改后台 worker 已启动")
+
+
 async def _init_game_data() -> None:
     def _load() -> None:
         from services.game_data.registry import init_game_data_registry
@@ -292,6 +301,7 @@ async def run_startup_tasks() -> None:
         _init_retrieval(),
         _init_npc_manager(),
         _init_memory_and_summary(),
+        _init_dialogue_worker(),
         _init_game_data(),
     )
 

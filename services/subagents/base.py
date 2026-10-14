@@ -21,8 +21,8 @@ from services.llm.errors import LLMError, is_tools_unsupported_error
 
 logger = logging.getLogger(__name__)
 
-SubagentKind = Literal["task_draft", "task_update", "search"]
-AgentLabel = Literal["task", "search"]
+SubagentKind = Literal["task_draft", "task_update", "search", "dialogue"]
+AgentLabel = Literal["task", "search", "dialogue"]
 
 
 @dataclass
@@ -173,6 +173,14 @@ class SubagentBase:
         """
         return []
 
+    def _before_round(self, messages: list[dict[str, Any]]) -> None:
+        """子类覆盖：本轮 LLM 调用前就地调整消息表。
+
+        用途：DialogueRunner 在查询用满两次后把 system 整体换成无查询表述的版本
+        （流程要求「摘掉查询后模型可见的 system 里不得再有查询/范围相关表述」，
+        追加消息做不到这一点，必须换头）。
+        """
+
     def _final_from_text(self, text: str) -> dict[str, Any]:
         """子类覆盖：模型停止调用工具时，把文本转成 final payload。"""
         return {"findings": text}
@@ -190,6 +198,7 @@ class SubagentBase:
         try:
             for _round in range(self.max_rounds):
                 self.rounds_used = _round + 1
+                self._before_round(messages)
                 # 每轮动态取工具表（TaskRunner 的 prepare→draft 收窄依赖此）
                 tools = self._tools_schema()
                 result = await self.llm.chat(ChatRequest(
@@ -251,7 +260,12 @@ class SubagentBase:
 
 
 # ---------------------------------------------------------------------------
-# 会话级子 Agent 登记（每会话最多 1 TaskRunner + 1 SearchRunner，01 §4）
+# 会话级子 Agent 登记（每会话最多 1 TaskRunner + 1 SearchRunner + 1 DialogueRunner，01 §4）
+#
+# dialogue 槽位的特别约定（阶段四 §4.0.1 硬口径）：对话修改子 Agent 是完全派出去的
+# 独立链路，由全局串行 worker 驱动、自管生命周期，**不注册进会话桶**——否则玩家
+# 每发一条新消息（回合开头的 cancel_unfinished）就会把它取消，违反「绝不影响
+# 主链路」。第三槽仅为结构完整与测试可观测而留，本批没有注册方。
 # ---------------------------------------------------------------------------
 
 class SessionSubagents:
@@ -260,11 +274,12 @@ class SessionSubagents:
     def __init__(self) -> None:
         self.task: Optional[SubagentHandle] = None
         self.search: Optional[SubagentHandle] = None
+        self.dialogue: Optional[SubagentHandle] = None
 
     def cancel_unfinished(self) -> list[SubagentKind]:
         """取消所有未完成的子 Agent，返回被取消的 kind 列表。"""
         cancelled: list[SubagentKind] = []
-        for attr in ("task", "search"):
+        for attr in ("task", "search", "dialogue"):
             handle: Optional[SubagentHandle] = getattr(self, attr)
             if handle is not None and not handle.done:
                 handle.cancel()
@@ -275,6 +290,8 @@ class SessionSubagents:
     def register(self, handle: SubagentHandle) -> None:
         if handle.agent == "task":
             self.task = handle
+        elif handle.agent == "dialogue":
+            self.dialogue = handle
         else:
             self.search = handle
 
@@ -301,7 +318,7 @@ def count_pending_subagent_tasks() -> int:
     """测试断言用：全进程未完成的子 Agent 任务数。"""
     n = 0
     for bucket in _SESSION_SUBAGENTS.values():
-        for handle in (bucket.task, bucket.search):
+        for handle in (bucket.task, bucket.search, bucket.dialogue):
             if handle is not None and not handle.done:
                 n += 1
     return n

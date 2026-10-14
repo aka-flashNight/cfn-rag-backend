@@ -321,3 +321,96 @@ def search_runner_user_prompt(
     if player_query:
         lines.append(f"【玩家当轮发言（供理解意图）】{player_query}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 对话修改子 Agent（DialogueRunner，阶段四 B4-2）
+#
+# 定位：模型扮演 NPC 本人，在幕后修订自己的台词。提示词的核心目标是
+# 「判断克制 + 口吻保真」——大多数事不值得改对话；要改也只动该动的几句，
+# 玩家从语气里觉出变化，而不是看到一段宣告（伪人感的两个主要来源正是
+# 逢事必改与改写腔过重）。
+#
+# allow_search=False 的版本用于查询次数用满之后整体换头（流程硬口径：
+# 摘掉查询后模型可见的 system 里不得再出现任何查询/范围相关表述），
+# 两版本的身份块与台词写法逐字一致，只有工作流程段不同。
+# ---------------------------------------------------------------------------
+
+_DIALOGUE_STYLE_BLOCK = """\
+【台词写法】
+- 每一句都要像你随口说出的话：怎么称呼他、爱用什么字眼、句子多长，都向你的既有台词看齐。
+- 改动要克制。玩家只该从你的语气里觉出变化，而不是读到一段宣告；\
+绝不写「因为你做了什么」「鉴于我们的关系」这类把缘由摆上台面的话。
+- 有话才添，没话不凑。一句到位胜过三句客套。"""
+
+
+def build_dialogue_system(
+    *,
+    npc_name: str,
+    profile_block: str = "",
+    relationship_block: str = "",
+    allow_search: bool = True,
+) -> str:
+    """对话修改子 Agent 的 system。
+
+    材料（profile_block / relationship_block）由委派方装配好后传入；
+    allow_search=False 时不含任何查询/范围相关表述（查询用满后换头用）。
+    """
+    parts = [f"你是游戏角色「{npc_name}」本人。"]
+    if profile_block.strip():
+        parts.append(profile_block.strip())
+    if relationship_block.strip():
+        parts.append(f"【你和这个玩家的关系】\n{relationship_block.strip()}")
+    parts.append(
+        "【你在做什么】\n"
+        "玩家在世界里与你搭话时看到的台词，出自你平日的说话方式。现在发生了一件事"
+        "（详情见本次委派），你要判断它是否值得改变你今后对他说话的方式，"
+        "并在值得时亲手修订这些台词。"
+    )
+    if allow_search:
+        parts.append(
+            "【工作流程】\n"
+            "1. 先判断要不要改。日常琐碎、听过就算的事不值得动笔；只有真正影响你对他的态度、"
+            "或他必须从你口中亲耳听到的事，才值得改。判断不需要改，"
+            "就用一两句话说明理由，本次到此为止。\n"
+            "2. 要改，先调用 search_npc_dialogues 看你的现有台词"
+            "（范围可多选，通常日常全量加几个关键词就够），最多查两次。"
+            "看台词时留意自己平时的口气。\n"
+            "3. 看清之后调用 edit_npc_dialogues 按编号提交修改：只交需要改的组，"
+            "组里不需要动的行原样抄回；可以改某几句，也可以在组尾添一两句。"
+            "被打回就按返回的原因修正后重新提交。"
+        )
+    else:
+        parts.append(
+            "【工作流程】\n"
+            "调用 edit_npc_dialogues 按编号提交你的修改：只交需要改的组，"
+            "组里不需要动的行原样抄回；可以改某几句，也可以在组尾添一两句。"
+            "被打回就按返回的原因修正后重新提交。"
+        )
+    parts.append(_DIALOGUE_STYLE_BLOCK)
+    return "\n\n".join(parts)
+
+
+def build_dialogue_user(
+    *,
+    source_trigger: str = "",
+    reason: str = "",
+    instruction: str = "",
+    task_block: str = "",
+    publish_block: str = "",
+) -> str:
+    """对话修改子 Agent 的 user（本次委派的全部材料；没有的块整块不出现）。"""
+    lines = ["【本次委派】"]
+    if source_trigger.strip():
+        lines.append(f"触发类型：{source_trigger.strip()}")
+    if reason.strip():
+        lines.append(f"发生了什么：{reason.strip()}")
+    if instruction.strip():
+        lines.append(f"改写的方向指示：{instruction.strip()}")
+    if task_block.strip():
+        lines.append("")
+        lines.append(f"【相关任务】\n{task_block.strip()}")
+    if publish_block.strip():
+        lines.append("")
+        lines.append(f"【发布该任务时的对话记录】\n{publish_block.strip()}")
+    return "\n".join(lines)
