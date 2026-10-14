@@ -1,7 +1,8 @@
 """DialogueWorker 后台串行 worker 测试（阶段四 B4-2，§4.0.1 独立链路）。
 
 覆盖：串行执行、失败只记日志不影响后续委派与主链路、running 标志的置位与复位、
-**总时限触发时子 Agent 任务被真取消**（不留孤儿）、以及 `_execute` 的真实装配路径
+**总时限触发时子 Agent 任务被真取消**（不留孤儿）、资料块装配（世界观＋场景＋同阵营，
+与聊天主 Agent 同源；缺载只少一块）、以及 `_execute` 的真实装配路径
 （NPC 资料＋长期记忆→子 Agent 材料块）。
 
 worker 本体行为是被测对象：LLM、落盘、游戏数据一律打桩，不碰真实存档槽位。
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 
 import services.dialogue.worker as worker_module
+from services.game_data.models import MapNpc, MapScene
+from services.orchestrator.prompts import worldview_block
 from services.dialogue.worker import (
     DialogueJob,
     DialogueWorker,
@@ -130,6 +133,69 @@ async def test_submit_when_queue_full_drops_with_log(worker, caplog):
 
 
 # ---------------------------------------------------------------------------
+# 资料块装配（与聊天主 Agent 同源：世界观＋检索＋场景＋同阵营）
+# ---------------------------------------------------------------------------
+
+
+class _FakeMapReg:
+    """最小地图注册表：铁匠驻「铁匠铺」，同场景有同阵营的帮工与别阵营的路人。"""
+
+    def __init__(self) -> None:
+        self._scene = MapScene(location_id="shop", label="铁匠铺", linkage="铁匠铺场景")
+        self._npcs = [
+            MapNpc(key="npc_a", label="铁匠", norm_names={"铁匠"}),
+            MapNpc(key="npc_b", label="帮工", norm_names={"帮工"}),
+            MapNpc(key="npc_c", label="路人", norm_names={"路人"}),
+        ]
+
+    def scenes_for_npc(self, npc_name: str):
+        return [self._scene] if npc_name == "铁匠" else []
+
+    def npcs_in_scene(self, location_id: str):
+        return list(self._npcs)
+
+
+def _other_states() -> dict[str, SimpleNamespace]:
+    return {
+        "铁匠": _fake_state(),
+        "帮工": SimpleNamespace(sex="男", faction="铁匠铺", titles=[]),
+        "路人": SimpleNamespace(sex="女", faction="贫民窟", titles=[]),
+    }
+
+
+async def test_setting_block_reuses_chat_assembly(monkeypatch):
+    """资料块＝世界观＋场景块＋同阵营表＋场景补充，一句不另写；同阵营人不列两遍。"""
+    monkeypatch.setattr(worker_module, "get_retrieval_engine", lambda: None)
+
+    block = await worker_module._build_setting_block(
+        npc_name="铁匠", state=_fake_state(), npc_states=_other_states(),
+        game_data=SimpleNamespace(map_registry=_FakeMapReg()),
+        query="他把丢的龙鳞找回来了",
+    )
+    assert worldview_block() in block
+    assert "你所在场景：铁匠铺（铁匠铺场景）。" in block
+    assert "同场景npc（均在你视线范围内）：帮工，路人。" in block
+    assert "【同阵营角色】" in block
+    assert "「帮工」（性别：男）（阵营：铁匠铺）" in block
+    # 场景补充把同阵营块没覆盖的人补出来；两处不重复列同一个人
+    assert "「路人」（性别：女）（阵营：贫民窟）" in block
+    assert block.count("「帮工」") == 1
+    assert block.count("「路人」") == 1
+    # 检索为空时不给聊天侧那句「可以自由发挥」兜底：摆在改对话的 Agent 面前等于授权造设定
+    assert "自由发挥" not in block
+
+
+async def test_setting_block_degrades_to_worldview_only(monkeypatch):
+    """地图与检索都缺载＝只剩世界观一块，委派照常跑（资料缺失不放弃整条委派）。"""
+    monkeypatch.setattr(worker_module, "get_retrieval_engine", lambda: None)
+
+    block = await worker_module._build_setting_block(
+        npc_name="铁匠", state=_fake_state(), npc_states={}, game_data=None, query="",
+    )
+    assert block == worldview_block()
+
+
+# ---------------------------------------------------------------------------
 # _execute 真实路径（装配 + 终态 + 超时收柄）
 # ---------------------------------------------------------------------------
 
@@ -145,7 +211,10 @@ def _fake_state() -> SimpleNamespace:
 def _patch_assembly(monkeypatch) -> None:
     """打桩 _execute 的外部依赖（NPC 状态、库、游戏数据），装配代码本身照跑。"""
     async def _get_npc_manager():
-        return SimpleNamespace(get=lambda npc_name: _async_value(_fake_state()))
+        return SimpleNamespace(
+            get=lambda npc_name: _async_value(_fake_state()),
+            all_states=lambda: _async_value({"铁匠": _fake_state()}),
+        )
 
     async def _load_snapshot(store, *, slot_key, npc):
         return SimpleNamespace(
@@ -209,6 +278,8 @@ async def test_execute_assembles_materials_and_completes(worker, monkeypatch):
     assert "当前好感度 42 / 100，关系「信赖」。" in call["relationship_block"]
     assert "你对他的基础印象：手艺人，认死理" in call["relationship_block"]
     assert "1. 他替我找回了丢失的龙鳞" in call["relationship_block"]
+    # 资料块走的是聊天侧同一批装配件，缺地图时只剩世界观，不阻断委派
+    assert worldview_block() in call["setting_block"]
 
 
 async def test_total_timeout_cancels_runner_task(worker, monkeypatch, caplog):

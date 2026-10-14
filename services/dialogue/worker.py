@@ -12,9 +12,12 @@
 - 状态回写接手受理侧：``dialogue_jobs`` 里受理侧只记到 delegated，之后由这里推
   generating → written / skipped / failed，排查时能看出卡在哪一步（回写失败只记日志）。
 
-NPC 资料与长期记忆在任务执行当刻装配（复用聊天侧的装配件：
+NPC 资料与长期记忆在任务执行当刻装配（复用聊天侧的装配件：``worldview_block`` /
+``rag_block`` + Tier-1 检索 / ``build_scene_block`` / ``same_faction_npcs_block`` /
 ``format_npc_role_tagline`` / ``build_appearance_block`` / ``long_term.load_snapshot``），
 委派方只需给触发材料（原因、指示、任务详情、发布对话记录）。
+资料块与聊天主 Agent 同源：改对话的那个 Agent 得知道世界设定、这人住在哪、身边有谁，
+否则它只能在既有台词里猜，最容易造出设定外的地名与人物。
 """
 
 from __future__ import annotations
@@ -32,7 +35,21 @@ from services.memory.store import (
     DIALOGUE_JOB_SKIPPED,
     DIALOGUE_JOB_WRITTEN,
 )
-from services.orchestrator.prompts import build_appearance_block, format_npc_role_tagline
+from services.npc.scene_context import build_scene_block, build_scene_supplement
+from services.orchestrator.context import (
+    forbidden_other_chars,
+    retrieve_tier1,
+    same_faction_names,
+    same_faction_npcs_block,
+)
+from services.orchestrator.prompts import (
+    build_appearance_block,
+    format_npc_role_tagline,
+    rag_block,
+    worldview_block,
+)
+from services.retrieval import format_retrieval_context
+from services.retrieval.hybrid import get_retrieval_engine
 from services.subagents.dialogue_runner import DialogueRunner
 
 logger = logging.getLogger(__name__)
@@ -96,6 +113,74 @@ def _build_profile_block(npc_name: str, state: Any) -> str:
     if appearance:
         parts.append(appearance)
     return "\n".join(parts)
+
+
+async def _build_setting_block(
+    *, npc_name: str, state: Any, npc_states: dict[str, Any], game_data: Any, query: str,
+) -> str:
+    """资料块：世界观＋检索设定＋所在场景＋同阵营角色。
+
+    文本一律复用聊天主 Agent 的同一批装配件（``worldview_block`` / ``rag_block`` /
+    ``build_scene_block`` / ``same_faction_npcs_block``），不另写一份，两处改不到一起。
+
+    两点刻意不同于聊天侧：
+    - 检索为空时**不给**那句「没有检索到上下文，可以自由发挥」的兜底——它是为防闲聊
+      退回套话而写的，摆在改对话的 Agent 面前等于授权它造设定；
+    - 玩家当轮提到的其他角色（聊天侧的「提及 NPC」块）这里没有玩家发言可匹配，不给。
+
+    任何一环缺载就少一块，整块装配失败只记警告：没有资料时子 Agent 仍能凭自己的
+    既有台词改稿，不该因为装资料失败而放弃整条委派。检索走 to_thread——本 worker 与
+    前台聊天同一个事件循环，同步嵌入查询会卡住玩家那轮的首字。
+    """
+    parts: list[str] = [worldview_block()]
+
+    def _retrieve_text() -> str:
+        if not query.strip():
+            return ""
+        forbidden = forbidden_other_chars(npc_states)
+        bundle = retrieve_tier1(
+            engine=get_retrieval_engine(),
+            user_query=query,
+            npc_name=npc_name,
+            npc_titles=list(getattr(state, "titles", None) or []),
+            npc_faction=getattr(state, "faction", None),
+            npc_last_message=None,
+            forbidden=forbidden,
+        )
+        if bundle is None or bundle.is_empty:
+            return ""
+        return format_retrieval_context(bundle, forbidden)
+
+    try:
+        text = await asyncio.to_thread(_retrieve_text)
+        if text.strip():
+            parts.append(rag_block(text))
+    except Exception as exc:
+        logger.warning("对话修改委派检索装配失败（按无检索设定继续）: %s", exc)
+
+    map_reg = getattr(game_data, "map_registry", None)
+    if map_reg is None:
+        return "\n\n".join(parts)
+    faction = getattr(state, "faction", None)
+    try:
+        scene = build_scene_block(
+            map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+        )
+        if scene.strip():
+            parts.append(scene.strip())
+        same = same_faction_npcs_block(npc_name, faction, npc_states, set(), map_reg)
+        if same.strip():
+            parts.append(f"【同阵营角色】\n{same.strip()}")
+        # 补充描述排除已列过的同阵营角色，与聊天侧同一条件（两个块不重复列同一人）
+        supplement = build_scene_supplement(
+            map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+            exclude_names=same_faction_names(npc_name, faction, npc_states),
+        )
+        if supplement.strip():
+            parts.append(supplement.strip())
+    except Exception as exc:
+        logger.warning("对话修改委派场景/同阵营装配失败（按无场景继续）: %s", exc)
+    return "\n\n".join(parts)
 
 
 def _build_relationship_block(state: Any, snapshot: Any) -> str:
@@ -224,12 +309,26 @@ class DialogueWorker:
             logger.warning("对话修改委派读取游戏数据失败（工具按降级口径继续）: %s", exc)
             game_data = None
 
+        try:
+            npc_states = await npc_manager.all_states()
+        except Exception as exc:
+            logger.warning("对话修改委派读取全量 NPC 状态失败（按无场景/同阵营继续）: %s", exc)
+            npc_states = {}
+        setting_block = await _build_setting_block(
+            npc_name=job.npc_name,
+            state=state,
+            npc_states=npc_states,
+            game_data=game_data,
+            query=f"{job.reason}\n{job.instruction}".strip(),
+        )
+
         handle = DialogueRunner.launch(
             llm=LLMClient.for_config(job.llm_config),
             registry=_tool_registry(),
             npc_name=job.npc_name,
             profile_block=_build_profile_block(job.npc_name, state),
             relationship_block=_build_relationship_block(state, snapshot),
+            setting_block=setting_block,
             source_trigger=job.source_trigger,
             reason=job.reason,
             instruction=job.instruction,

@@ -229,7 +229,7 @@ def build_static_system(
     )
     # ---- 层1：跨 NPC 一致 ----
     parts = [
-        f"【世界观背景概要】\n{WORLD_BACKGROUND}",
+        worldview_block(),
         DIALOGUE_FORMAT_RULES,
         SPEECH_STYLE_RULES,
     ]
@@ -239,8 +239,7 @@ def build_static_system(
         f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。请选择其中最合适的一种作为你当前的情绪立绘。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文回答玩家本次的发言。",
         "未处于任务委派、描述介绍、事件回忆等特殊语境的日常闲聊中，每次对话长度不必太长，但也不要因此而强行缩写语句或词语，而是保持正常聊天口语的自然流畅的前提下正常说话，不要啰嗦。",
-        "绝对不要自己脑补不存在的设定，一切没有提供给你的信息，你都不能有任何提及或暗示。"
-        "无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。例如，如果前文没有说某个人在什么地点，或者某个地点有什么东西，你不要擅自脑补，对话中绝对不能自己造信息。只允许依据准确已知信息来表述。",
+        ANTI_HALLUCINATION_RULE,
         meta_prompt_block(state.emotions or ["普通"], agent_enabled=can_publish),
     ])
     scene = (scene_block or "").strip()
@@ -286,13 +285,28 @@ def build_static_system(
 RAG_EMPTY_FALLBACK = "（当前没有检索到任何上下文，你可以根据自己的设定自由发挥，但要保持合理。）"
 
 
-def _rag_block(retrieved_context: str) -> str:
+def rag_block(retrieved_context: str) -> str:
+    """检索设定块（聊天主 Agent 与对话修改子 Agent 共用同一份文本）。"""
     body = (retrieved_context or "").strip() or RAG_EMPTY_FALLBACK
     return (
         "下面是可能与你相关的检索设定和你的过往台词片段"
         "（仅用于保持设定与说话风格，请不要逐字复读原文）：\n"
         f"{body}"
     )
+
+
+def worldview_block() -> str:
+    """世界观概要块（层1 第一条；对话修改子 Agent 用同一份，故抽成函数）。"""
+    return f"【世界观背景概要】\n{WORLD_BACKGROUND}"
+
+
+#: 脑补禁令（聊天主 Agent 层2 与对话修改子 Agent 共用同一份文本）
+ANTI_HALLUCINATION_RULE = (
+    "绝对不要自己脑补不存在的设定，一切没有提供给你的信息，你都不能有任何提及或暗示。"
+    "无法把握的模糊地带可以略过或转移话题，不要自己乱加设定，以免出戏。例如，如果前文没有说"
+    "某个人在什么地点，或者某个地点有什么东西，你不要擅自脑补，对话中绝对不能自己造信息。"
+    "只允许依据准确已知信息来表述。"
+)
 
 
 def _save_player_name_line(save_info: Any) -> str:
@@ -426,7 +440,7 @@ def build_user_shared_core(
     summary = (summary_str or "").strip()
     if summary:
         parts.append(summary)
-    rag = _rag_block(retrieved_context)
+    rag = rag_block(retrieved_context)
     if rag:
         parts.append(rag)
     men = (mentioned_npcs_str or "").strip()

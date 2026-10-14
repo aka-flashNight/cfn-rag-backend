@@ -150,6 +150,7 @@ class DialogueRunner(SubagentBase):
         npc_name: str,
         profile_block: str = "",
         relationship_block: str = "",
+        setting_block: str = "",
         source_trigger: str = "",
         reason: str = "",
         instruction: str = "",
@@ -162,7 +163,7 @@ class DialogueRunner(SubagentBase):
     ) -> SubagentHandle:
         """构造并启动后台任务，返回 Handle。
 
-        材料块（profile/relationship/task/publish）由委派方装配；触发来源
+        材料块（setting/profile/relationship/task/publish）由委派方装配；触发来源
         （reason/source_task_id/source_trigger）同时进 ctx 供 edit 工具透传给覆盖层；
         slot_key 把整条链路（查询候选＋覆盖层读写）钉在委派受理当刻的存档上。
         """
@@ -179,12 +180,14 @@ class DialogueRunner(SubagentBase):
             npc_name=npc_name,
             profile_block=profile_block,
             relationship_block=relationship_block,
+            setting_block=setting_block,
             allow_search=True,
         )
         edit_only_system = build_dialogue_system(
             npc_name=npc_name,
             profile_block=profile_block,
             relationship_block=relationship_block,
+            setting_block=setting_block,
             allow_search=False,
         )
         user = build_dialogue_user(

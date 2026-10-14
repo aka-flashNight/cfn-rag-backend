@@ -349,14 +349,23 @@ def build_dialogue_system(
     npc_name: str,
     profile_block: str = "",
     relationship_block: str = "",
+    setting_block: str = "",
     allow_search: bool = True,
 ) -> str:
     """对话修改子 Agent 的 system。
 
-    材料（profile_block / relationship_block）由委派方装配好后传入；
-    allow_search=False 时不含任何查询/范围相关表述（查询用满后换头用）。
+    材料（setting_block / profile_block / relationship_block）由委派方装配好后传入，
+    资料内容与聊天主 Agent 同源（世界观、检索设定、场景、同阵营、说话方式、脑补禁令）；
+    allow_search=False 时不含任何查询流程表述（查询用满后换头用）。
     """
+    # 函数级导入：services.orchestrator 的包初始化会经 merge 回到本模块，
+    # 放在模块顶部就是循环导入（orchestrator.prompts 里的这两份文本才是权威）。
+    from services.orchestrator.prompts import ANTI_HALLUCINATION_RULE, SPEECH_STYLE_RULES
+
     parts = [f"你是游戏角色「{npc_name}」本人。"]
+    setting = (setting_block or "").strip()
+    if setting:
+        parts.append(setting)
     if profile_block.strip():
         parts.append(profile_block.strip())
     if relationship_block.strip():
@@ -387,7 +396,9 @@ def build_dialogue_system(
             "组里不需要动的行原样抄回；可以改某几句，也可以在组尾添一两句。"
             "被打回就按返回的原因修正后重新提交。"
         )
+    parts.append(SPEECH_STYLE_RULES.rstrip())
     parts.append(_DIALOGUE_STYLE_BLOCK)
+    parts.append(ANTI_HALLUCINATION_RULE)
     return "\n\n".join(parts)
 
 

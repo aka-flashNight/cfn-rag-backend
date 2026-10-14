@@ -11,6 +11,8 @@
 ① 每条委托明确带上任务 id（§4.0.2-3：委派子 Agent 时「必须给任务 id」）；
 ② 发布时挂了对话重写标记的委托，常驻提醒模型「已自动触发、勿重复调用」——
    任务完成后把完成信息给模型时这句也一直保留，未标记的委托不加。
+   这句只进聊天主 Agent 的已完成委托块；触发一装配给对话修改子 Agent 的任务详情不带它
+   （子 Agent 正是被派来改对话的那一个，提醒对它是自我指涉的干扰）。
 """
 
 from __future__ import annotations
@@ -152,8 +154,15 @@ def _completion_phrase(record: dict) -> str:
     return "任务达成内容（玩家达成）：" + ("；".join(parts) if parts else "无")
 
 
-def _task_lines(task_id: int, record: dict, texts: dict[str, Any], header: str) -> list[str]:
-    """一条委托的呈现行（标题行由调用方给）；缺标题文本＝返回空列表（跳过该条）。"""
+def _task_lines(
+    task_id: int, record: dict, texts: dict[str, Any], header: str,
+    *, include_marked_hint: bool = True,
+) -> list[str]:
+    """一条委托的呈现行（标题行由调用方给）；缺标题文本＝返回空列表（跳过该条）。
+
+    ``include_marked_hint=False`` 给对话修改子 Agent 用：那句提醒是拦聊天主 Agent
+    重复派发的，被派来改对话的那个 Agent 读到它只会自我怀疑。
+    """
     title = str(texts.get(f"$AGENT_TITLE_{task_id}") or "").strip()
     if not title:
         logger.warning("委托 %d 缺少标题文本，跳过拼接", task_id)
@@ -174,7 +183,7 @@ def _task_lines(task_id: int, record: dict, texts: dict[str, Any], header: str) 
     if finish_dialogue:
         lines.append("任务后：")
         lines.extend(finish_dialogue)
-    if record.get("dialogue_rewrite"):
+    if include_marked_hint and record.get("dialogue_rewrite"):
         lines.append(MARKED_TASK_HINT)
     return lines
 
@@ -239,12 +248,15 @@ def load_task_rewrite_material(
     """触发一：按任务 id 取该委托的详情与对话，以及发布时挂的重写标记。
 
     任务不存在（或该存档看不到它）＝None，调用方据此记 dismissed。
+    这是给对话修改子 Agent 的材料，不拼「勿重复调用」那句聊天侧提醒。
     """
     tasks, texts = _merged_docs(Path(data_root), slot_key)
     record = tasks.get(int(task_id))
     if not isinstance(record, dict):
         return None
-    lines = _task_lines(int(task_id), record, texts, _DETAIL_HEADER)
+    lines = _task_lines(
+        int(task_id), record, texts, _DETAIL_HEADER, include_marked_hint=False,
+    )
     return TaskRewriteMaterial(
         task_id=int(task_id),
         npc=str(record.get("get_npc") or "").strip(),

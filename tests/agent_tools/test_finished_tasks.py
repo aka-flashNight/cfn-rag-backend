@@ -14,6 +14,7 @@ from services.agent_tools.finished_tasks import (
     MARKED_TASK_HINT,
     MAX_FINISHED_TASKS_PER_TURN,
     build_finished_task_block,
+    load_task_rewrite_material,
 )
 from services.integration.save_paths import agent_save_task_paths, shared_task_paths
 
@@ -283,6 +284,31 @@ def test_marked_task_carries_no_duplicate_call_hint(data_root):
     )
     assert MARKED_TASK_HINT not in unmarked.text
     assert unmarked.has_unmarked is True
+
+
+def test_rewrite_material_drops_chat_only_hint(data_root):
+    """同一份委托：聊天侧完成块保留「勿重复调用」提醒，子 Agent 的材料里不留这句。
+
+    被派来改对话的那个 Agent 读到「已自动触发对话修改子 Agent」只会自我怀疑，
+    这句只服务于聊天主 Agent 的重复派发判断。
+    """
+    tasks_path, _ = shared_task_paths(data_root)
+    _write(tasks_path, {"tasks": [{**_task(200001), "dialogue_rewrite": True,
+                                  "dialogue_rewrite_instruction": "语气更敬重些"}]})
+
+    material = load_task_rewrite_material(
+        data_root=data_root, slot_key=None, task_id=200001,
+    )
+    assert material is not None
+    assert material.marked is True
+    assert material.instruction == "语气更敬重些"
+    assert MARKED_TASK_HINT not in material.detail_block
+    assert "你发布的委托「取回祖传铁锤」（任务 id 200001），玩家刚刚完成。" in material.detail_block
+
+    chat_block = build_finished_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, finished_ids=[200001],
+    )
+    assert MARKED_TASK_HINT in chat_block.text
 
 
 def test_has_unmarked_only_counts_tasks_actually_in_block(data_root):

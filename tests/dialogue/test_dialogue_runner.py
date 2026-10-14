@@ -1,7 +1,8 @@
 """DialogueRunner 三轮固定流程测试（阶段四 B4-2）。
 
 覆盖：三轮工具表逐轮收窄、查询用满后换头且 system 无查询残留、
-判断不动即结束、编辑打回后的修正轮、提示词纯净（edit-only 版无查询表述、
+判断不动即结束、编辑打回后的修正轮、角色扮演资料（说话方式／脑补禁令进 system，
+聊天专用的输出协议不进）、提示词纯净（edit-only 版无查询表述、
 委派材料空块不出现）。
 """
 
@@ -75,11 +76,13 @@ async def test_three_round_flow_and_search_removal(dialogue_env, bound_slot):
     assert _tool_names(reqs[0]) == ["search_npc_dialogues"]
     assert _tool_names(reqs[1]) == ["search_npc_dialogues", "edit_npc_dialogues"]
     assert _tool_names(reqs[2]) == ["edit_npc_dialogues"]
-    # 摘掉查询后：system 里不得再出现任何查询/范围相关表述
+    # 摘掉查询后：system 里不得再出现查询流程的成串原文。不用裸词「范围」——
+    # 说话方式第 4 条（「合理范围内话多」）本身就含这两字。
     system_r3 = reqs[2].messages[0]["content"]
     assert "search_npc_dialogues" not in system_r3
     assert "查询" not in system_r3
-    assert "范围" not in system_r3
+    for word in ("范围可多选", "最多查两次", "日常全量"):
+        assert word not in system_r3
     # 第 1/2 轮的 system 含查询流程（注册与提示词同步）
     assert "search_npc_dialogues" in reqs[0].messages[0]["content"]
 
@@ -153,8 +156,11 @@ def test_edit_only_system_has_no_search_wording():
     stripped = build_dialogue_system(
         npc_name=NPC, profile_block="资料块", relationship_block="关系块", allow_search=False,
     )
+    # 断言用查询流程里的成串原文，不用裸词「范围」：说话方式第 4 条（「合理范围内话多」）
+    # 与场景块（「均在你视线范围内」）都含这两字，裸词判不了「查询表述已摘除」。
     assert "search_npc_dialogues" in full
-    for word in ("search_npc_dialogues", "查询", "范围"):
+    assert "范围可多选" in full and "最多查两次" in full
+    for word in ("search_npc_dialogues", "查询", "范围可多选", "最多查两次", "日常全量"):
         assert word not in stripped
     # 身份块与台词写法两版本逐字一致
     assert "资料块" in stripped and "关系块" in stripped
@@ -162,6 +168,26 @@ def test_edit_only_system_has_no_search_wording():
     style_full = full.split("【台词写法】")[1]
     style_stripped = stripped.split("【台词写法】")[1]
     assert style_full == style_stripped
+
+
+def test_dialogue_system_carries_roleplay_material():
+    """角色扮演资料补齐：世界观/说话方式/脑补禁令都在，且与聊天主 Agent 同一份文本。"""
+    from services.orchestrator.prompts import (
+        ANTI_HALLUCINATION_RULE,
+        SPEECH_STYLE_RULES,
+    )
+
+    setting = "【世界观背景概要】占位\n你所在场景：武器店。"
+    built = build_dialogue_system(
+        npc_name=NPC, profile_block="资料块", relationship_block="关系块",
+        setting_block=setting,
+    )
+    assert setting in built
+    assert SPEECH_STYLE_RULES.rstrip() in built
+    assert ANTI_HALLUCINATION_RULE in built
+    # 只属于聊天主 Agent 的输出协议（meta JSON / 工具）不进来
+    assert "【对话输出规则】" not in built
+    assert "meta JSON" not in built
 
 
 def test_user_prompt_omits_empty_blocks():

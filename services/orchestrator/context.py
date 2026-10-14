@@ -138,7 +138,7 @@ def same_faction_npcs_block(
     return "同阵营角色（设定供参考，不要替他们发言）：\n" + "\n".join(result)
 
 
-def _same_faction_names(
+def same_faction_names(
     current_npc: str,
     current_faction: Optional[str],
     all_states: dict[str, NPCState],
@@ -450,7 +450,7 @@ async def assemble_context(
             scene_block = build_scene_block(
                 map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
             )
-            covered = set(mentioned_names) | _same_faction_names(
+            covered = set(mentioned_names) | same_faction_names(
                 npc_name, npc_state.faction, npc_states,
             )
             scene_supplement = build_scene_supplement(
