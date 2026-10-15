@@ -205,3 +205,91 @@ def test_shutdown_without_callback_unavailable(state):
     state.launch_mode = "embedded"
     resp = _make_client().post("/integration/shutdown")
     assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# task-completed：与游戏 Host 的线格式对齐（阶段四触发一）
+# ---------------------------------------------------------------------------
+
+# C# 侧 RagTerminalService.NotifyTaskCompletedAsync 实际发出的字节（JObject 键序＋Formatting.None），
+# 见 launcher/tests/RagTerminal/RagTerminalServiceTests.cs::TaskCompletedPostsSingleEventAndToleratesFailure。
+HOST_WIRE_BODY = '{"slot_key":"save1","task_id":213501,"npc":"Andy Law"}'
+
+
+def test_task_completed_forwards_host_wire_body(state, monkeypatch):
+    """跨仓线格式锁：Host 原样发出的 body 必须被解析成同一组字段，并回 Host 认识的响应形状。"""
+    from types import SimpleNamespace
+
+    from api import integration_api
+
+    calls: list[dict] = []
+
+    async def _recorder(*, slot_key, task_id, npc):
+        calls.append({"slot_key": slot_key, "task_id": task_id, "npc": npc})
+        return SimpleNamespace(accepted=True, detail="已受理", job_id="job-1")
+
+    monkeypatch.setattr(integration_api, "handle_task_completed", _recorder)
+
+    resp = _make_client().post(
+        "/integration/task-completed",
+        content=HOST_WIRE_BODY,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "accepted": True, "detail": "已受理", "job_id": "job-1"}
+    assert calls == [{"slot_key": "save1", "task_id": 213501, "npc": "Andy Law"}]
+
+
+def test_task_completed_npc_defaults_to_empty(state, monkeypatch):
+    """npc 缺省＝空串（Host 侧读不到发布 NPC 时发空；后端以任务记录的 get_npc 为权威）。"""
+    from types import SimpleNamespace
+
+    from api import integration_api
+
+    calls: list[dict] = []
+
+    async def _recorder(*, slot_key, task_id, npc):
+        calls.append({"slot_key": slot_key, "task_id": task_id, "npc": npc})
+        return SimpleNamespace(accepted=False, detail="未挂标记", job_id="")
+
+    monkeypatch.setattr(integration_api, "handle_task_completed", _recorder)
+
+    resp = _make_client().post(
+        "/integration/task-completed",
+        content='{"slot_key":"save1","task_id":213501}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert calls == [{"slot_key": "save1", "task_id": 213501, "npc": ""}]
+
+
+def test_task_completed_unbound_slot_is_not_accepted(state):
+    """未绑定槽位时走真处理器：200＋accepted=False，且不触碰委派存储（换档后旧事件一律忽略）。"""
+    resp = _make_client().post(
+        "/integration/task-completed",
+        content=HOST_WIRE_BODY,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["accepted"] is False
+    assert body["job_id"] == ""
+    assert "槽位" in body["detail"]
+
+
+@pytest.mark.parametrize("payload", [
+    '{"slot_key":"a/b","task_id":213501}',      # 槽位键含路径分隔符
+    '{"slot_key":"","task_id":213501}',         # 空槽位
+    '{"slot_key":"save1","task_id":0}',         # 非正整数 id
+    '{"slot_key":"save1","task_id":"abc"}',     # id 非数字（"213501" 会被 pydantic 强转，不算畸形）
+    '{"slot_key":"save1"}',                    # 缺 task_id
+    '{"task_id":213501}',                      # 缺 slot_key
+])
+def test_task_completed_rejects_invalid_shape(state, payload):
+    resp = _make_client().post(
+        "/integration/task-completed",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
