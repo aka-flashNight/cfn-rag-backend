@@ -45,9 +45,17 @@ venv.bak/
 .env.*.local
 
 # Database files (保留目录但忽略db文件)
+# 库文件由程序首启自建（tools/memory.db 等），不随仓库分发；
+# 附属文件按 SQLite 规则＝库文件名后加 -wal / -shm / -journal，同样一律忽略。
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 
 # Logs
 *.log
