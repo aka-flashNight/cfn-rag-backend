@@ -976,7 +976,6 @@ class TurnOrchestrator:
             result = await llm.chat(ChatRequest(
                 messages=[*base_messages, {"role": "user", "content": user_prompt}],
                 purpose="subagent",
-                max_tokens=1600,
             ))
             self._usage = accumulate_usage(self._usage, result.usage)
             args = self._sanitize_confirm_args(parse_confirm_args(result.content))
