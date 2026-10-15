@@ -194,12 +194,9 @@ async def test_idempotency_index_is_scoped_per_slot_and_ignores_null_task(db_pat
     assert len(_rows(db_path)) == 4
 
 
-async def test_dismissed_row_occupies_the_task_index(task_root, db_path, store, fake_worker, bound_slot):
-    """当前口径：为同一任务留痕的 dismissed 记录同样占住唯一索引，此后该任务在本存档
-    内不再有任何委派机会——**包括聊天侧「发布时漏标记」的兜底调用**。
-
-    这条与「任务只兜发布时漏标记的遗漏」的口径存在张力（兜底恰好要用于漏标记的任务）。
-    本用例只如实钉住现状，改不改属机制取舍，已登记待裁定。
+async def test_dismissed_task_can_still_take_the_chat_fallback(task_root, db_path, store, fake_worker, bound_slot):
+    """漏标记被驳回只留下「为什么没改」的痕迹，不占住该任务的委派名额：
+    聊天侧那条专为漏标记任务准备的兜底调用照常受理。
     """
     bound_slot()
     unmarked = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID + 1, npc=NPC)
@@ -210,9 +207,111 @@ async def test_dismissed_row_occupies_the_task_index(task_root, db_path, store, 
         npc_name=NPC, trigger=TRIGGER_IMPORTANT_TASK,
         reason="玩家说他把那委托做完了", task_id=TASK_ID + 1, session_id="sess_chat",
     )
+    assert fallback.accepted is True and "已受理" in fallback.detail
+    assert len(fake_worker.jobs) == 1                                    # 兜底真的派了出去
+    assert fake_worker.jobs[0].source_task_id == TASK_ID + 1
+
+    rows = _rows(db_path)
+    assert len(rows) == 2                                                 # 一条驳回留痕＋一条已委派
+    by_job = {row["job_id"]: row for row in rows}
+    assert by_job[fallback.job_id]["status"] == DIALOGUE_JOB_DELEGATED
+    assert by_job[fallback.job_id]["task_id"] == TASK_ID + 1
+    assert [row["status"] for row in rows] == [DIALOGUE_JOB_DISMISSED, DIALOGUE_JOB_DELEGATED]
+
+
+async def test_delegated_task_still_silently_skips_repeat_events(task_root, db_path, store, fake_worker, bound_slot):
+    """占位仍然生效：任务已派出去后，重复完成事件与聊天兜底都拿到「已委派过，静默跳过」，
+    不会为同一任务起第二个子 Agent，也不会多写一行。
+    """
+    bound_slot()
+    first = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID, npc=NPC)
+    assert first.accepted is True
+
+    repeat = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID, npc=NPC)
+    fallback = await submit_delegation(
+        npc_name=NPC, trigger=TRIGGER_IMPORTANT_TASK,
+        reason="玩家又提了一次", task_id=TASK_ID, session_id="sess_chat",
+    )
+    assert repeat.accepted is False and "已委派过，静默跳过" in repeat.detail
     assert fallback.accepted is False and "已委派过，静默跳过" in fallback.detail
-    assert fake_worker.jobs == []
-    assert len(_rows(db_path)) == 1                                     # 兜底那次连留痕都写不进去
+    assert len(fake_worker.jobs) == 1
+    assert len(_rows(db_path)) == 1
+
+
+async def test_cooldown_blocked_task_is_not_claimed_forever(task_root, db_path, store, fake_worker, bound_slot):
+    """冷却窗挡下的那一次不占位：窗过后同一任务仍能被兜底调用派出。
+
+    被挡的记录会从中途状态被推到 dismissed，因此它也不占用冷却计时（delegated_at 为空）。
+    """
+    bound_slot()
+    unrelated = await submit_delegation(npc_name=NPC, trigger=TRIGGER_KEY_INFO, reason="他知道了我的旧事")
+    assert unrelated.accepted is True                                    # 同 NPC 的委派把冷却窗占住
+
+    blocked = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID, npc=NPC)
+    assert blocked.accepted is False and "冷却窗内" in blocked.detail
+    assert _row_by_job(db_path, blocked.job_id)["status"] == DIALOGUE_JOB_DISMISSED
+    assert len(fake_worker.jobs) == 1
+
+    _backdate_delegated(db_path, unrelated.job_id, time.time() - DIALOGUE_DELEGATE_COOLDOWN_S - 1)
+    retry = await submit_delegation(
+        npc_name=NPC, trigger=TRIGGER_IMPORTANT_TASK,
+        reason="冷却窗过了，玩家说委托做完了", task_id=TASK_ID, session_id="sess_chat",
+    )
+    assert retry.accepted is True
+    assert len(fake_worker.jobs) == 2
+    assert len(_rows(db_path)) == 3                                      # 无关触发＋被挡留痕＋本次派出
+
+
+async def test_failed_delegation_can_be_retried_for_the_same_task(task_root, db_path, store, fake_worker, bound_slot):
+    """没派出去（队列满）或派出后跑坏都不占位：同一任务日后还能再委派一次。
+
+    这是刻意取舍——重试成本由冷却窗与每会话上限封住，不靠幂等索引来省。
+    """
+    bound_slot()
+    fake_worker.accept = False
+    dropped = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID, npc=NPC)
+    assert dropped.accepted is False and "后台队列已满" in dropped.detail
+    assert _row_by_job(db_path, dropped.job_id)["status"] == DIALOGUE_JOB_FAILED
+
+    fake_worker.accept = True
+    retry = await submit_delegation(
+        npc_name=NPC, trigger=TRIGGER_IMPORTANT_TASK,
+        reason="队列空了，再派一次", task_id=TASK_ID, session_id="sess_chat",
+    )
+    assert retry.accepted is True
+    assert len(fake_worker.jobs) == 1
+    assert [(row["status"], row["delegated_at"] is not None) for row in _rows(db_path)] == [
+        (DIALOGUE_JOB_FAILED, False), (DIALOGUE_JOB_DELEGATED, True),
+    ]
+
+
+async def test_only_claimed_statuses_occupy_the_task_slot(db_path, store):
+    """库层口径钉子：占住 (存档, 任务) 名额的是「派出去过或在途」那六个状态，
+    dismissed / failed 两个都不占位。写死状态名而不是引用产品常量，改错集合这条就红。
+    """
+    blocking = ("received", "judging", "delegated", "generating", "written", "skipped")
+    for status in blocking:
+        created = await store.dialogue_job_create(
+            slot_key=SLOT, npc=NPC, trigger=TRIGGER_IMPORTANT_TASK, task_id=TASK_ID, status=status,
+        )
+        assert created is not None, status
+        assert await store.dialogue_job_create(
+            slot_key=SLOT, npc=NPC, trigger=TRIGGER_IMPORTANT_TASK, task_id=TASK_ID,
+        ) is None, status
+        await store.dialogue_job_set_status(created.job_id, DIALOGUE_JOB_FAILED)
+        assert len(_rows(db_path)) == blocking.index(status) + 1
+
+    for offset, status in enumerate((DIALOGUE_JOB_DISMISSED, DIALOGUE_JOB_FAILED)):
+        task = TASK_ID + 100 + offset                                    # 各用各的任务号，互不干扰
+        left = await store.dialogue_job_create(
+            slot_key=SLOT, npc=NPC, trigger=TRIGGER_IMPORTANT_TASK, task_id=task, status=status,
+        )
+        assert left is not None, status
+        assert _row_by_job(db_path, left.job_id)["status"] == status        # 留痕仍可反查
+        retry = await store.dialogue_job_create(
+            slot_key=SLOT, npc=NPC, trigger=TRIGGER_IMPORTANT_TASK, task_id=task,
+        )
+        assert retry is not None, status                                    # 但不占位
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +379,24 @@ async def test_unmarked_task_is_dismissed(task_root, db_path, store, fake_worker
     assert row.npc == NPC and row.trigger == TRIGGER_IMPORTANT_TASK
     assert row.delegated_at is None                                     # 没真委派就不占用冷却
     assert row.detail == outcome.detail
+
+
+async def test_dismissal_uses_the_task_record_npc_when_event_omits_it(
+    task_root, db_path, store, fake_worker, bound_slot,
+):
+    """完成事件只带任务 id 时，驳回留痕也写得下去，且 NPC 名取任务记录里的权威发布人。
+
+    留痕行按 (存档, NPC) 才查得到，早退那步若名字为空就整行写不下去——
+    所以权威名字必须在判标记之前就落地，否则「为什么没改」凭空消失。
+    """
+    bound_slot()
+    outcome = await handle_task_completed(slot_key=SLOT, task_id=TASK_ID + 1)
+
+    assert outcome.accepted is False and "没挂对话重写标记" in outcome.detail
+    row = await store.dialogue_job_find_by_task(SLOT, TASK_ID + 1)
+    assert row is not None and row.status == DIALOGUE_JOB_DISMISSED
+    assert row.npc == NPC
+    assert len(_rows(db_path)) == 1
 
 
 async def test_event_from_another_slot_is_dropped_before_recording(task_root, db_path, store, fake_worker, bound_slot):

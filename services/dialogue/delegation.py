@@ -11,7 +11,9 @@
 成本控制全放在初判与频率限制上（§4.0.1「委派上限放宽一点」＋§4.0.4）：
 
 - **硬幂等**：同存档同任务只委派一次，由 ``dialogue_jobs`` 的部分唯一索引在库层挡住
-  （「只有首次传有效，后续静默跳过」）；
+  （「只有首次传有效，后续静默跳过」）；占位的只有派出去过或在途的记录，
+  驳回（漏标记、任务记录读不到、冷却窗内已委派过）与失败（队列满、子 Agent 跑坏）
+  都留痕而不占位，聊天侧的漏标记兜底与日后重试才走得通；
 - **冷却窗**：同 ``(slot_key, npc)`` 在窗内已委派过即 dismissed；
 - **每会话上限**：同一聊天会话累计委派到顶即 dismissed；
 - **覆盖层无处落盘即不受理**：未绑定存档 / 非 embedded 一律 dismissed（写侧 fail-closed）。
@@ -246,9 +248,10 @@ async def submit_delegation(
         material = await _load_task_material(task_id)
         if material is None:
             return await _reject(f"任务 {task_id} 的记录读不到")
+        # 权威发布 NPC 先落地再判标记：完成事件可以只带任务 id，此时留痕行靠它才写得下去。
+        npc = material.npc or npc
         if require_marker and not material.marked:
             return await _reject(f"任务 {task_id} 发布时没挂对话重写标记")
-        npc = material.npc or npc
         task_block = material.detail_block
         instruction = instruction or material.instruction
         reason = reason or f"玩家完成了你发布的委托（任务 id {task_id}）。"
@@ -273,7 +276,7 @@ async def submit_delegation(
         status=DIALOGUE_JOB_RECEIVED,
     )
     if row is None:
-        # 部分唯一索引命中：该存档该任务已委派过（首次有效，后续静默跳过）
+        # 已有占位记录（派出去过或在途）：首次有效，后续静默跳过
         logger.info("任务 %s 已委派过，静默跳过本次触发", task_id)
         return DelegationOutcome(accepted=False, detail=f"任务 {task_id} 已委派过，静默跳过")
     await store.dialogue_job_set_status(row.job_id, DIALOGUE_JOB_JUDGING)

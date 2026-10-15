@@ -86,6 +86,24 @@ DIALOGUE_JOB_STATUSES = (
     DIALOGUE_JOB_FAILED,
 )
 
+# 「占位」状态：这条记录已经把该存档该任务的委派名额用掉了（派出去过或正在派出途中）。
+# 刻意不含 dismissed（不够格，从没派出过）与 failed（没派出去 / 派出后跑坏）——
+# 两者都不该挡掉后来的重试机会：漏标记的任务要靠聊天侧兜底调用改写，跑坏的任务要能重派。
+# 重试成本由冷却窗（同存档同 NPC）与每会话上限封住，两者都只数 delegated_at，dismissed 不计。
+DIALOGUE_JOB_CLAIMED_STATUSES = (
+    DIALOGUE_JOB_RECEIVED,
+    DIALOGUE_JOB_JUDGING,
+    DIALOGUE_JOB_DELEGATED,
+    DIALOGUE_JOB_GENERATING,
+    DIALOGUE_JOB_WRITTEN,
+    DIALOGUE_JOB_SKIPPED,
+)
+
+#: 占位条件的 SQL 片段：部分唯一索引的 WHERE 谓词与插入前预检查都从这里拼，两处不会漂移
+DIALOGUE_JOB_CLAIMED_SQL = (
+    "status IN (" + ", ".join(f"'{status}'" for status in DIALOGUE_JOB_CLAIMED_STATUSES) + ")"
+)
+
 # 不允许混入草案 JSON 的内部/业务分离字段（修 D5）
 _DRAFT_INTERNAL_FIELDS = ("bargain_count", "_draft_commit_valid")
 
@@ -312,11 +330,13 @@ class MemoryStore:
                 )
                 """
             )
-            # 部分唯一索引＝重要任务的硬幂等：同存档同任务只允许一条委派记录。
-            # task_id 为 NULL 的记录（关系/态度/关键信息触发）不受此约束。
+            # 部分唯一索引＝重要任务的硬幂等：同存档同任务只允许一条「占位」记录
+            # （派出去过或正在派出途中）。task_id 为 NULL 的记录（关系/态度/关键信息触发）
+            # 与 dismissed / failed 的留痕都不进索引，因此不会挡掉后来的委派机会。
             cur.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_dialogue_job_task"
-                " ON dialogue_jobs(slot_key, task_id) WHERE task_id IS NOT NULL"
+                " ON dialogue_jobs(slot_key, task_id)"
+                f" WHERE task_id IS NOT NULL AND {DIALOGUE_JOB_CLAIMED_SQL}"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dialogue_job_scope"
@@ -992,8 +1012,9 @@ class MemoryStore:
     ) -> DialogueJobRow | None:
         """新建一条委派记录。
 
-        带 task_id 时按 (slot_key, task_id) 硬幂等：已存在记录＝返回 None，
-        调用方据此「静默跳过」（重要任务只在首次完成事件时委派一次）。
+        带 task_id 时按 (slot_key, task_id) 硬幂等：**已有占位记录**（派出去过或正在派出
+        途中）＝返回 None，调用方据此「静默跳过」。既有记录都是 dismissed / failed 时
+        不占位，本次照常新建——漏标记的任务留给聊天侧兜底，跑坏的任务允许重派。
         """
         if status not in DIALOGUE_JOB_STATUSES:
             raise ValueError(f"未知的委派状态：{status}")
@@ -1002,7 +1023,7 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.cursor()
             if task_id is not None:
-                existing = self._dialogue_job_find(cur, slot_key, task_id)
+                existing = self._dialogue_job_find(cur, slot_key, task_id, claimed_only=True)
                 if existing is not None:
                     return None
             try:
@@ -1029,19 +1050,33 @@ class MemoryStore:
         return self._dialogue_job_row(row)
 
     def _dialogue_job_find(
-        self, cur: sqlite3.Cursor, slot_key: str, task_id: int,
+        self,
+        cur: sqlite3.Cursor,
+        slot_key: str,
+        task_id: int,
+        *,
+        claimed_only: bool,
     ) -> sqlite3.Row | None:
-        cur.execute(
+        """按 (存档, 任务) 查既有委派记录。
+
+        ``claimed_only=True`` 只看占位记录（幂等判定用）；``False`` 时任意状态都算
+        （事后核查「为什么没改」要能读到 dismissed / failed 的留痕）。
+        """
+        sql = (
             f"SELECT {self._DIALOGUE_JOB_COLS} FROM dialogue_jobs"
-            " WHERE slot_key = ? AND task_id = ?",
-            (slot_key, task_id),
+            " WHERE slot_key = ? AND task_id = ?"
         )
+        if claimed_only:
+            sql = f"{sql} AND {DIALOGUE_JOB_CLAIMED_SQL}"
+        cur.execute(sql, (slot_key, task_id))
         return cur.fetchone()
 
     def dialogue_job_find_by_task_sync(self, slot_key: str, task_id: int) -> DialogueJobRow | None:
-        """查某存档某任务的既有委派记录（触发侧「只有首次传有效」的自查口径）。"""
+        """查某存档某任务的既有委派记录（任意状态，含驳回与失败留痕）。"""
         with self._lock:
-            row = self._dialogue_job_find(self._conn.cursor(), slot_key, task_id)
+            row = self._dialogue_job_find(
+                self._conn.cursor(), slot_key, task_id, claimed_only=False,
+            )
         return self._dialogue_job_row(row) if row else None
 
     def dialogue_job_set_status_sync(
