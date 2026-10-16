@@ -575,6 +575,20 @@ def test_task_fallback_wording_appears_only_with_task_context():
         [TRIGGER_RELATIONSHIP, TRIGGER_ATTITUDE, TRIGGER_KEY_INFO]
 
 
+def test_instruction_stays_optional_and_unforced():
+    """`instruction` 是可选参数（作者定稿口径）：required 里没有它，描述也不催模型给改写指示。
+
+    机制闸＝`required`；措辞闸＝本用例，防止日后有人把「只有非常必要的时候才给」改回「并给出指示」。
+    """
+    for include_task_fallback in (True, False):
+        tool = build_delegate_tool(include_task_fallback=include_task_fallback)
+        params = tool["function"]["parameters"]
+        assert params["required"] == ["change_type", "reason"]
+        text = json.dumps(tool, ensure_ascii=False)
+        assert "并给出指示" not in text
+        assert "只有非常必要的时候才给" in text
+
+
 # ---------------------------------------------------------------------------
 # 委派材料（触发装配给子 Agent 的那几块）
 # ---------------------------------------------------------------------------
