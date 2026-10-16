@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from services.npc.manager import NPCState
 from services.orchestrator.prompts import (
+    CONFIRM_ARGS_SYSTEM,
     DIALOGUE_FORMAT_RULES,
     RAG_EMPTY_FALLBACK,
     SPEECH_STYLE_RULES,
@@ -225,6 +226,19 @@ def test_emotion_hint_skips_default_and_blank():
     assert build_emotion_hint("普通") == ""
     assert build_emotion_hint(None) == ""
     assert build_emotion_hint("   ") == ""
+
+
+def test_confirm_args_prompt_requires_per_line_emotion():
+    """发布文本的情绪口径：逐条各填，不是整段共用一个。
+
+    聊天层那句情绪白名单写的是「选择其中最合适的一种作为你当前的情绪立绘」（单数），
+    confirm 轮复用同一份 system，不补这句就会被带成整段对话同一个情绪。
+    """
+    assert "emotion 逐条各填：每句话都有自己的情绪，随这段对话的推进换，不要整段共用同一个。" in CONFIRM_ARGS_SYSTEM
+    # 对话条目不再有称号字段，任务级 title 仍在
+    assert '每条格式 {"name","emotion","text"}' in CONFIRM_ARGS_SYSTEM
+    assert '"title"' not in CONFIRM_ARGS_SYSTEM.split("撰写规则")[1]
+    assert "title（任务标题，简洁）" in CONFIRM_ARGS_SYSTEM
 
 
 def test_player_message_tail_order_and_omission():
