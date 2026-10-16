@@ -144,7 +144,7 @@ def build_delegate_tool(*, include_task_fallback: bool) -> dict[str, Any]:
         },
         "instruction": {
             "type": "string",
-            "description": "你希望自己的对话怎么变（改写指示，可留空）",
+            "description": "你希望自己的对话怎么变（大体方向的改写指示）",
         },
     }
     description = _DELEGATE_BASE_DESCRIPTION
