@@ -67,6 +67,35 @@ def test_tools_unsupported_requires_keyword_not_bare_400():
     assert is_tools_unsupported_error(_status_err(400, msg))
 
 
+# --- 中文错误体（2026-10-16 智谱 glm-5.3-flash 实测口径）---------------------
+# 国产端点回中文且不点名参数名，特征表只写英文就会漏判、整轮硬失败。
+
+def test_zh_param_error_real_zhipu_wording():
+    """实测智谱 400：不点名参数，只说「始终思考，不支持关闭思考」。"""
+    exc = _status_err(400, "该模型始终思考，不支持关闭思考；请使用 low、high 或 max")
+    assert is_param_error(exc)
+    assert not is_tools_unsupported_error(exc)
+
+
+def test_zh_image_error_content_type_restricted_to_text():
+    """纯文本档把 content 类型收窄到 'text'，整条消息不出现 image 字样。"""
+    exc = _status_err(400, "messages.content.type 参数非法，取值范围 ['text']")
+    assert is_image_unsupported_error(exc)
+    assert not is_param_error(exc)
+
+
+def test_zh_image_and_tools_error():
+    assert is_image_unsupported_error(_status_err(400, "该模型不支持图片输入"))
+    assert is_tools_unsupported_error(_status_err(400, "该部署不支持工具调用"))
+    assert is_tools_unsupported_error(_status_err(400, "无法识别函数调用参数"))
+
+
+def test_zh_generic_400_is_still_not_param_error():
+    """中文但与被剥参数无关的 400 不能算参数错（避免把模型名写错也当降级）。"""
+    assert not is_param_error(_status_err(400, "模型不存在，请检查模型名称"))
+    assert not is_image_unsupported_error(_status_err(400, "模型不存在，请检查模型名称"))
+
+
 def test_wrap_auth_and_quota():
     assert isinstance(wrap_http_error(_status_err(401, "invalid api key")), LLMAuthError)
     assert isinstance(wrap_http_error(_status_err(403, "forbidden")), LLMAuthError)

@@ -1,6 +1,7 @@
 """LLMClient 降级链测试（02 §6.3，mock 客户端）：
 思考参数 400→剥离重试成功；剥离后仍 400→裸请求；图像 400→去图重试且后续不再带图；
-其他 400→上抛真实错误；401→不重试；usage 回收。
+剥后同码同文→上抛原始错误不再裸请求；没发过思考参数的 400→一次调用后上抛真实错误；
+401→不重试；usage 回收。
 """
 
 from __future__ import annotations
@@ -103,7 +104,49 @@ async def test_image_error_strips_image_and_marks_model():
 
 
 async def test_other_400_raises_real_error_no_silent_degrade():
-    """其他 400 → 直接上抛真实错误（修 A1：不再静默降级）。"""
+    """没发过思考参数的 400 → 一次调用后直接上抛真实错误（修 A1：不再静默降级）。"""
+    def handler(kwargs):
+        raise make_status_error(400, "model `no-such-model` does not exist")
+
+    llm, fake = _make_client(handler)  # 默认 Profile：不带 extra_body
+    with pytest.raises(Exception) as excinfo:
+        await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}]))
+    assert "no-such-model" in str(excinfo.value)
+    assert len(fake.chat.completions.calls) == 1  # 无参数可剥，不重试
+
+
+async def test_zh_thinking_400_strips_and_retries():
+    """实测智谱中文 400「该模型始终思考，不支持关闭思考」→ 剥参重试成功，不再整轮失败。"""
+    def handler(kwargs):
+        if "extra_body" in kwargs:
+            raise make_status_error(400, "该模型始终思考，不支持关闭思考；请使用 low、high 或 max")
+        return FakeResponse(content="好的。")
+
+    llm, fake = _make_client(handler, profile=_THINK_PROFILE)
+    result = await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}]))
+    assert result.content == "好的。"
+    assert len(fake.chat.completions.calls) == 2
+    assert "extra_body" not in fake.chat.completions.calls[1]
+
+
+async def test_unreadable_400_strips_thinking_once_and_succeeds():
+    """措辞完全不可判读的 400：只要本次发过 extra_body 就先剥一次再判成败。
+
+    降级链不再依赖错误措辞能被特征表认出——判读只作日志线索，认不出也照剥。
+    """
+    def handler(kwargs):
+        if "extra_body" in kwargs:
+            raise make_status_error(400, "请求内容未通过安全审计")
+        return FakeResponse(content="好的。")
+
+    llm, fake = _make_client(handler, profile=_THINK_PROFILE)
+    result = await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}]))
+    assert result.content == "好的。"
+    assert len(fake.chat.completions.calls) == 2
+
+
+async def test_unreadable_400_stops_after_strip_when_failure_identical():
+    """剥参后同码同文 → 刚剥的参数不是原因，上抛原始错误且不再裸请求浪费第三次。"""
     def handler(kwargs):
         raise make_status_error(400, "model `no-such-model` does not exist")
 
@@ -111,7 +154,9 @@ async def test_other_400_raises_real_error_no_silent_degrade():
     with pytest.raises(Exception) as excinfo:
         await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}]))
     assert "no-such-model" in str(excinfo.value)
-    assert len(fake.chat.completions.calls) == 1  # 不重试
+    assert len(fake.chat.completions.calls) == 2
+    assert "extra_body" in fake.chat.completions.calls[0]
+    assert "extra_body" not in fake.chat.completions.calls[1]
 
 
 async def test_401_no_retry_raises_auth():

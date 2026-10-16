@@ -38,7 +38,11 @@ class LLMNetworkError(LLMError):
 
 
 class LLMParamError(LLMError):
-    """400/422 且错误体命中「未知/非法参数」特征：剥离思考参数后重试。"""
+    """错误体命中「未知/非法参数」特征（is_param_error）。
+
+    降级链的剥参已不以它为闸门（见 client.py：发过思考参数即先剥一次），
+    判读结果只作日志线索用。
+    """
 
     retryable = False
 
@@ -95,8 +99,35 @@ THINKING_PARAM_NAMES = (
     "thinking_level",
 )
 
-# 「未知/非法参数」特征：结构化字段点名参数名，或消息含 unknown/unsupported/invalid + 参数名
-_PARAM_FEATURE_WORDS = ("unknown", "unsupported", "unrecognized", "invalid", "unexpected")
+# 报错措辞里指向「思考」的说法。国产端点回中文且不点名参数（实测智谱：
+# 「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」），只匹配英文参数名会漏判。
+THINKING_MESSAGE_HINTS = THINKING_PARAM_NAMES + (
+    "reasoning",
+    "思考",
+    "思维链",
+    "推理强度",
+)
+
+# 「未知/非法参数」特征：结构化字段点名参数名，或消息含「不被接受」类措辞＋思考相关提示。
+# 中英两套措辞都要有：漏一种就是整轮硬失败（见 client.py §3.2 降级链）。
+_PARAM_FEATURE_WORDS = (
+    "unknown",
+    "unsupported",
+    "unrecognized",
+    "invalid",
+    "unexpected",
+    "not supported",
+    "does not support",
+    "do not support",
+    "不支持",
+    "无法识别",
+    "未知",
+    "非法",
+    "无效",
+    "只能是",
+    "仅支持",
+    "只接受",
+)
 
 
 def _error_param_names(exc: BaseException) -> set[str]:
@@ -136,11 +167,29 @@ def is_param_error(exc: BaseException) -> bool:
     msg = _lower(exc)
     if not any(w in msg for w in _PARAM_FEATURE_WORDS):
         return False
-    return any(p in msg for p in THINKING_PARAM_NAMES)
+    return any(p in msg for p in THINKING_MESSAGE_HINTS)
 
 
-# 「图像不支持」特征：先查结构化字段，最后才关键词嗅探（S8 已知风险，记录在案）
-_IMAGE_KEYWORDS = ("image_url", "image", "vision", "multimodal", "multimodal")
+# 「图像不支持」特征：先查结构化字段，再关键词嗅探，最后看「content 类型白名单被收窄到
+# text」这种整条消息不出现 image 字样的写法（S8 已知风险，记录在案）。
+_IMAGE_KEYWORDS = ("image_url", "image", "vision", "multimodal", "图片", "图像", "视觉", "多模态")
+_IMAGE_NEGATION_WORDS = (
+    "not support",
+    "unsupported",
+    "does not support",
+    "do not support",
+    "不支持",
+    "无法识别",
+    "非法",
+    "无效",
+)
+# content 类型只允许 text 的措辞。我们只发过 text 与 image_url 两种 part，出现这种收窄
+# 只可能是图 part 被拒（实测智谱纯文本档：「messages.content.type 参数非法，取值范围 ['text']」）。
+_ONLY_TEXT_MARKERS = ("取值范围", "仅支持", "只能是", "只接受", "only", "allowed", "must be")
+
+
+def _content_type_restricted_to_text(msg: str) -> bool:
+    return "content" in msg and "'text'" in msg and any(m in msg for m in _ONLY_TEXT_MARKERS)
 
 
 def is_image_unsupported_error(exc: BaseException) -> bool:
@@ -156,19 +205,27 @@ def is_image_unsupported_error(exc: BaseException) -> bool:
     named = _error_param_names(exc)
     if any("image" in n for n in named):
         return True
-    for kw in ("vision", "multimodal", "image"):
-        if kw in msg and (
-            "not support" in msg
-            or "unsupported" in msg
-            or "does not support" in msg
-            or "do not support" in msg
-        ):
+    if _content_type_restricted_to_text(msg):
+        return True
+    for kw in _IMAGE_KEYWORDS:
+        if kw in msg and any(neg in msg for neg in _IMAGE_NEGATION_WORDS):
             return True
     return False
 
 
 # 「工具不支持」特征：仅关键词探测（修 A1 的「一刀切判 400/422」）
-_TOOLS_KEYWORDS = ("tool", "function_call", "function call", "function calling")
+_TOOLS_KEYWORDS = ("tool", "function_call", "function call", "function calling", "工具", "函数调用")
+_TOOLS_NEGATION_WORDS = (
+    "not support",
+    "unsupported",
+    "does not support",
+    "do not support",
+    "invalid",
+    "不支持",
+    "无法识别",
+    "非法",
+    "无效",
+)
 
 
 def is_tools_unsupported_error(exc: BaseException) -> bool:
@@ -178,13 +235,7 @@ def is_tools_unsupported_error(exc: BaseException) -> bool:
     code = exc_status_code(exc)
     msg = _lower(exc)
     for kw in _TOOLS_KEYWORDS:
-        if kw in msg and (
-            "not support" in msg
-            or "unsupported" in msg
-            or "does not support" in msg
-            or "do not support" in msg
-            or "invalid" in msg
-        ):
+        if kw in msg and any(neg in msg for neg in _TOOLS_NEGATION_WORDS):
             return True
     # 部分平台对未知参数 tools 直接报未知参数错（405/501 少见，400 常见）
     if code in (400, 404, 422) and ("tools" in msg) and any(w in msg for w in _PARAM_FEATURE_WORDS):

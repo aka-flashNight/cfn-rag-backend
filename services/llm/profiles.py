@@ -27,7 +27,7 @@ PROFILES: tuple[ModelProfile, ...] = (
         match="glm-5.3-flash",
         vision=True,
         thinking_body={"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
-        note="思考不能关（disabled 会报错）；强度参数名以官方文档为准，报错走降级链",
+        note="思考不能关（disabled 会报错）；reasoning_effort 名已按官方文档复核，报错由 §3.2.b 剥掉整个 extra_body 重试",
     ),
     ModelProfile(
         match="glm-5.3",

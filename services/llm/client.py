@@ -23,6 +23,7 @@ from pydantic import BaseModel, model_validator
 
 from core.config import get_settings
 from services.llm.errors import (
+    exc_message,
     exc_status_code,
     is_image_unsupported_error,
     is_param_error,
@@ -146,7 +147,7 @@ def strip_image_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-# session 级标记：该模型曾返回「图像不支持」，后续回合直接不发图（02 §3.2.c）
+# session 级标记：该模型曾返回「图像不支持」，后续回合直接不发图（02 §3.2.a）
 _IMAGE_UNSUPPORTED_MODELS: set[str] = set()
 _IMAGE_UNSUPPORTED_LOCK = threading.Lock()
 
@@ -159,6 +160,11 @@ def mark_image_unsupported(model_name: str) -> None:
 def is_image_unsupported_model(model_name: str) -> bool:
     with _IMAGE_UNSUPPORTED_LOCK:
         return (model_name or "").strip().lower() in _IMAGE_UNSUPPORTED_MODELS
+
+
+def _same_failure(first: BaseException, second: BaseException) -> bool:
+    """同状态码且同错误文本：说明刚剥掉的那个参数不是失败原因，降级到此为止（省一次调用）。"""
+    return exc_status_code(first) == exc_status_code(second) and exc_message(first) == exc_message(second)
 
 
 class LLMClient:
@@ -371,24 +377,7 @@ class LLMClient:
         if code not in (400, 422):
             raise wrap_http_error(first_exc) from first_exc
 
-        # a. 思考参数不被识别 → 剥离思考参数重试（仅 1 次）
-        if is_param_error(first_exc) and kwargs.get("extra_body"):
-            no_think = {k: v for k, v in kwargs.items() if k != "extra_body"}
-            logger.warning("模型 %s 拒绝思考参数，剥离后重试: %s", self.config.model_name, first_exc)
-            try:
-                return await self._call_once(no_think, retry_network=False)
-            except Exception as second_exc:
-                # b. 剥离后仍 400/422 → 只留 model/messages/stream[/tools]，最后重试 1 次
-                if exc_status_code(second_exc) in (400, 422):
-                    bare = self._bare_kwargs(no_think)
-                    logger.warning("模型 %s 剥参后仍报错，裸请求重试: %s", self.config.model_name, second_exc)
-                    try:
-                        return await self._call_once(bare, retry_network=False)
-                    except Exception as third_exc:
-                        raise wrap_http_error(third_exc) from third_exc
-                raise wrap_http_error(second_exc) from second_exc
-
-        # c. 图像不支持 → 去图重试，并给该模型打标记（后续回合直接不发图）
+        # a. 图像不支持 → 去图重试，并给该模型打标记（后续回合直接不发图，02 §3.2.a）
         if is_image_unsupported_error(first_exc) and has_images:
             mark_image_unsupported(self.config.model_name)
             no_img = {**kwargs, "messages": strip_image_parts(kwargs["messages"])}
@@ -398,7 +387,37 @@ class LLMClient:
             except Exception as second_exc:
                 raise wrap_http_error(second_exc) from second_exc
 
-        # d. 其他 400/422 → 直接上抛真实错误（禁止旧式「一律当不支持工具」，修 A1）
+        # b. 400/422 且本次请求发过思考参数 → 一律先剥掉重试一次，不判断错误措辞。
+        #    措辞判读只当日志线索用：国产端点回中文且不点名参数（实测智谱 400
+        #    「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」），
+        #    靠 is_param_error 的特征表会把「本可自动退化」的轮次报成整轮失败。
+        if kwargs.get("extra_body"):
+            no_think = {k: v for k, v in kwargs.items() if k != "extra_body"}
+            logger.warning(
+                "模型 %s 返回 HTTP %s，剥离思考参数重试（判读：%s）: %s",
+                self.config.model_name,
+                code,
+                "思考参数不被识别" if is_param_error(first_exc) else "措辞不可判读，按可疑非标准参数处理",
+                first_exc,
+            )
+            try:
+                return await self._call_once(no_think, retry_network=False)
+            except Exception as second_exc:
+                # 剥后仍 400/422 且与首次同码同文 → 刚剥的参数不是原因，不再裸请求浪费一次
+                if exc_status_code(second_exc) in (400, 422):
+                    if _same_failure(first_exc, second_exc):
+                        raise wrap_http_error(first_exc) from first_exc
+                    # c. 仍 400/422 → 只留 model/messages/stream[/tools]，最后重试 1 次
+                    bare = self._bare_kwargs(no_think)
+                    logger.warning("模型 %s 剥参后仍报错，裸请求重试: %s", self.config.model_name, second_exc)
+                    try:
+                        return await self._call_once(bare, retry_network=False)
+                    except Exception as third_exc:
+                        raise wrap_http_error(third_exc) from third_exc
+                raise wrap_http_error(second_exc) from second_exc
+
+        # d. 其他 400/422（没发过思考参数）→ 直接上抛真实错误（禁止旧式「一律当不支持
+        #    工具」，修 A1）
         raise wrap_http_error(first_exc) from first_exc
 
     @staticmethod
