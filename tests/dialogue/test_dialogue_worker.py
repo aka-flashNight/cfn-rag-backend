@@ -204,6 +204,7 @@ def _fake_state() -> SimpleNamespace:
     return SimpleNamespace(
         sex="女", faction="铁匠铺", titles=["前治安官"],
         appearance="炉前系着烧出洞的围裙",
+        emotions=["严肃", "微笑"],
         favorability=42, relationship_level="信赖",
     )
 
@@ -275,6 +276,11 @@ async def test_execute_assembles_materials_and_completes(worker, monkeypatch):
         in call["profile_block"]
     )
     assert "【你的形象】\n炉前系着烧出洞的围裙" in call["profile_block"]
+    # 情绪标签清单进资料块：模型按它填 emotion，Char 由后端拼
+    assert (
+        "你的可用情绪标签仅限于以下这些：[严肃、微笑]。每行台词的 emotion 从这里挑。"
+        in call["profile_block"]
+    )
     assert "当前好感度 42 / 100，关系「信赖」。" in call["relationship_block"]
     assert "你对他的基础印象：手艺人，认死理" in call["relationship_block"]
     assert "1. 他替我找回了丢失的龙鳞" in call["relationship_block"]

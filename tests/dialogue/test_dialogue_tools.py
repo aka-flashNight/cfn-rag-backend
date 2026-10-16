@@ -117,7 +117,11 @@ def test_scope_description_verbatim():
     assert "该 NPC 说话的全部未完成任务对话组；与 task_recent 冲突，两者都选时采用 task_recent。" in blob
     edit_blob = json.dumps(edit_tool.to_openai_tool(), ensure_ascii=False)
     assert "不需要改的行请原样抄回，不能删除原有信息" in edit_blob
-    assert "只提供、也只允许修改 npc 名和对话两项" in edit_blob
+    assert "每行填说话人 name 与台词 text，情绪可选填 emotion" in edit_blob
+    # Char 由后端拼、Title 由后端查：模型这一侧只出现情绪标签，且必须写明可以留空
+    assert "从你的可用情绪标签里选一个；语气平实、没有表情的行留空" in edit_blob
+    assert '"title"' not in edit_blob
+    assert "char" not in edit_blob
 
 
 # ---------------------------------------------------------------------------

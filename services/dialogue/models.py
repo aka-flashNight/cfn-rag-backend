@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 #: 玩家台词的 Name 占位符（对话文本里成对出现 Title=$PC_TITLE、Char=$PC_CHAR）
 PLAYER_NAME = "$PC"
@@ -26,6 +26,31 @@ PLAYER_CHAR = "$PC_CHAR"
 def player_defaults() -> tuple[str, str]:
     """玩家行缺省的 (Title, Char)。"""
     return PLAYER_TITLE, PLAYER_CHAR
+
+
+#: 情绪标签长度上限（基础数据里的情绪都是两三字的短词）
+MAX_EMOTION_CHARS = 12
+
+
+def normalize_emotion(raw: Any, allowed: Iterable[str] | None = None) -> str:
+    """归一模型给的情绪标签；不合法＝空串（该行 Char 不带表情后缀）。
+
+    模型可能把整串 Char（``名#情绪``）或一整句话塞进 emotion，直接拼会得到
+    ``名#名#情绪`` 这类 AS2 ``split("#")`` 认不出的帧标签，故只取末段并卡长度；
+    给了白名单（NPC 设定里的 ``emotions``）就只认白名单里的标签——查不到白名单时
+    放行短标签，免得把没登记情绪的 NPC 的台词全削成无表情。
+    """
+    text = str(raw or "").strip().rsplit("#", 1)[-1].strip()
+    if not text or len(text) > MAX_EMOTION_CHARS:
+        return ""
+    pool = {str(item).strip() for item in (allowed or []) if str(item or "").strip()}
+    return text if not pool or text in pool else ""
+
+
+def compose_char(name: str, emotion: str) -> str:
+    """Char 拼接：有情绪＝``名#情绪``，没情绪＝纯名字（基础数据里的主要写法）。"""
+    return f"{name}#{emotion}" if emotion else name
+
 
 #: 单组行数上限（基础数据实测最多 10 行，留足新增余量）
 MAX_LINES_PER_GROUP = 24

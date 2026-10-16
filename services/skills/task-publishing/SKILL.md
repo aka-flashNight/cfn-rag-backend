@@ -97,10 +97,10 @@ prepare_task_context  ──►  draft_agent_task  ──►  （玩家回复）
 - `draft_id` 必须与当前 pending_draft 一致。
 - `title`：最终任务标题，会覆盖草案阶段的标题。
 - `description`：任务说明，须与最终关卡/物品/奖励一致。
-- `get_dialogue` / `finish_dialogue`：对话数组，每条 `{name, title, emotion?, text}`。
+- `get_dialogue` / `finish_dialogue`：对话数组，每条 `{name, emotion?, text}`。
   - `text` 必须是**纯对话**，**不要**包含动作/神态/旁白/`【...】`。
   - 神态/情绪放 `emotion` 字段（从可用情绪选，可为空）。
-  - 玩家条目：`name="$PC"`, `title="$PC_TITLE"`，`emotion` 可填玩家情绪。
+  - 玩家条目：`name="$PC"`，`emotion` 可填玩家情绪。
   - 数组顺序按对话发生时间排列。
   - **不要**和已有任务对话高度雷同。
 

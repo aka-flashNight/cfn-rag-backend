@@ -205,8 +205,12 @@ def build_static_system(
 ) -> str:
     """system 分层（前缀缓存对齐，从稳定到易变）：
     层1 跨 NPC 一致（世界观、输出规则、说话方式）→ 层2 单 NPC 一致
-    （扮演约束、meta 协议、场景块、同阵营表与场景补充、路由指南、
-    商店/切磋可行性、appearance）。
+    （扮演约束、meta 协议、场景块、appearance、发布硬约束、商店报酬）
+    → 稀疏变动（切磋可行性：随玩家等级变）→ 每轮重装配（路由指南：随草案状态变；
+    同阵营表与场景补充：随玩家这句话提到的角色变）。
+
+    层2 内部也按这个次序排：把每轮会重装配的三块压到最后，前面那段才能在
+    玩家提到别的角色、或草案出现/消失时继续命中前缀缓存。
 
     v3 再次重构后层1 不再含任务选型指南（那 1229 字整体移交任务 Agent），
     因此层1 对全部 NPC 与全部回合恒定，前缀缓存命中率只受层2 影响。
@@ -245,14 +249,10 @@ def build_static_system(
     scene = (scene_block or "").strip()
     if scene:
         parts.append(scene)
-    same = (same_faction_npcs or "").strip()
-    if same:
-        parts.append(f"【同阵营角色】\n{same}")
-    supplement = (scene_supplement or "").strip()
-    if supplement:
-        parts.append(supplement)
+    appearance = build_appearance_block(state)
+    if appearance:
+        parts.append(appearance)
     if can_publish:
-        parts.append(build_routing_guide(has_pending_draft=has_pending_draft))
         parts.append("【任务发布硬约束（具体怎么拟由后台任务系统负责，你只决定要不要派、往哪个方向派）】")
         parts.append(
             f"你作为「{npc_name}」（{state.faction or '未知阵营'}）："
@@ -262,16 +262,23 @@ def build_static_system(
             "则不要发布任务，并拒绝玩家的发布任务请求；"
         )
         parts.append(build_shop_hint(has_shop, shop_reward_types))
+        # ---- 稀疏变动：随玩家等级变（升级跨过切磋门槛时才改写） ----
         parts.append(build_challenge_hint(
             bool(state.challenge), player_can_challenge,
         ))
+        # ---- 每轮重装配：随草案状态变 ----
+        parts.append(build_routing_guide(has_pending_draft=has_pending_draft))
     elif task_publish_disabled:
         parts.append(NO_TASK_PUBLISH_CONSTRAINT)
     else:
         parts.append(NO_AGENT_CONSTRAINT)
-    appearance = build_appearance_block(state)
-    if appearance:
-        parts.append(appearance)
+    # ---- 每轮重装配：随玩家这句话提到的角色变（提到谁就把谁从这两块里剔掉） ----
+    same = (same_faction_npcs or "").strip()
+    if same:
+        parts.append(f"【同阵营角色】\n{same}")
+    supplement = (scene_supplement or "").strip()
+    if supplement:
+        parts.append(supplement)
     parts.append(f"再次强调：{tagline}")
     return "\n\n".join(parts)
 
@@ -411,13 +418,28 @@ def build_user_shared_core(
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
-    排序按前缀缓存对齐（从稳定到易变）：会话态（好感/草案）→ 关系跨档提示
-    （只在委派工具真的下发那一轮出现）→ 已完成委托 →
-    长期记忆（跨窗口，改动稀疏）→ 早期摘要（同为跨轮稀疏，紧跟长期记忆）→
-    RAG/提及 NPC（跨轮全变、轮内不变）→ 近期对话（对话跨轮追加，同回合内过渡话
-    产生后还会追加——轮内有变化但不高频，放最下方使追加不破坏块内前缀）。
+    排序按前缀缓存对齐（从稳定到易变）：已完成委托 → 长期记忆（跨窗口，改动稀疏）
+    → 早期摘要（同为跨轮稀疏，紧跟长期记忆）→ 近期对话（跨轮追加；窗口填满后
+    整块前滑，在此之前前缀是稳的）→ 会话态（玩家身份/所在场景/进度/好感度/待确认
+    草案，几乎每轮都有数字或场景在变）→ 关系跨档提示（只在委派工具真的下发那几轮
+    出现）→ RAG/提及 NPC（跨轮全变、轮内不变）。
+
+    好感度原先排在最前面，于是它每轮一变就把后面所有块的前缀缓存全部打断；
+    挪到这些块之后，稳定段才能真正复用。
     """
     parts: list[str] = []
+    done = (finished_task_block or "").strip()
+    if done:
+        parts.append(done)
+    long_term = (long_term_block or "").strip()
+    if long_term:
+        parts.append(long_term)
+    summary = (summary_str or "").strip()
+    if summary:
+        parts.append(summary)
+    hist = (history_str or "").strip()
+    if hist:
+        parts.append(hist)
     session_block = build_session_state_block(
         player_identity=player_identity,
         progress_desc=progress_desc,
@@ -431,24 +453,12 @@ def build_user_shared_core(
     hint = (relationship_hint or "").strip()
     if hint:
         parts.append(hint)
-    done = (finished_task_block or "").strip()
-    if done:
-        parts.append(done)
-    long_term = (long_term_block or "").strip()
-    if long_term:
-        parts.append(long_term)
-    summary = (summary_str or "").strip()
-    if summary:
-        parts.append(summary)
     rag = rag_block(retrieved_context)
     if rag:
         parts.append(rag)
     men = (mentioned_npcs_str or "").strip()
     if men:
         parts.append(men)
-    hist = (history_str or "").strip()
-    if hist:
-        parts.append(hist)
     return "\n\n".join(parts)
 
 
@@ -656,12 +666,11 @@ CONFIRM_ARGS_SYSTEM = (
     'title（任务标题，简洁）、description（任务说明，与任务内容一致）、'
     "get_dialogue（接取对话数组：发布 NPC 向玩家发布任务，可穿插玩家回应，建议 2~4 条），"
     "finish_dialogue（完成对话数组：玩家向 NPC 交付，NPC 验收，建议 2~4 条）。"
-    '每条格式 {"name","title","emotion","text"}，撰写规则：'
+    '每条格式 {"name","emotion","text"}，撰写规则：'
     "1. text 只能是纯对话内容——**不能包含任何动作/神态/旁白描述，不能使用【】中括号或任何括号补注**；"
     "神态一律写在 emotion 字段（从你的可用情绪中选，可为空字符串）。"
     "写入任务系统的对话会被游戏直接展示，中括号内容会被后端剥离。"
-    "2. 玩家条目 name 用 $PC、title 用 $PC_TITLE，不要写死玩家名字；"
-    "NPC 条目用你的名字与称号。"
+    "2. 玩家条目 name 用 $PC，不要写死玩家名字；NPC 条目 name 用你的名字。"
     "3. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
     "4. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
     "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
@@ -729,14 +738,13 @@ def fallback_confirm_args(draft: dict, npc_name: str) -> dict:
     if rewards:
         desc_parts.append(f"报酬：{rewards}")
     description = "；".join(desc_parts) or title
-    npc_title = npc_name
     get_text = f"这份委托就交给你了。{('要求：' + description) if description else ''}"
     finish_text = "干得漂亮，说好的报酬一分不少。"
     return {
         "title": title,
         "description": description,
-        "get_dialogue": [{"name": npc_name, "title": npc_title, "emotion": "", "text": get_text}],
-        "finish_dialogue": [{"name": npc_name, "title": npc_title, "emotion": "", "text": finish_text}],
+        "get_dialogue": [{"name": npc_name, "emotion": "", "text": get_text}],
+        "finish_dialogue": [{"name": npc_name, "emotion": "", "text": finish_text}],
     }
 
 

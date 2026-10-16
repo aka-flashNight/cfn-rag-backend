@@ -102,13 +102,18 @@ async def _set_status(job_id: str, status: str, *, detail: str = "") -> None:
 
 
 def _build_profile_block(npc_name: str, state: Any) -> str:
-    """NPC 资料块：身份一行＋形象描述（复用聊天侧装配件，口吻锚点）。"""
+    """NPC 资料块：身份一行＋可用情绪标签＋形象描述（复用聊天侧装配件，口吻锚点）。"""
     parts = [format_npc_role_tagline(
         npc_name=npc_name,
         sex=getattr(state, "sex", None) or "",
         faction=getattr(state, "faction", None) or "",
         titles=getattr(state, "titles", None),
     )]
+    # 情绪标签清单与聊天侧同一句式（那边还要挑立绘，这边只用来填 emotion）
+    emotions_str = "、".join(getattr(state, "emotions", None) or ["普通"])
+    parts.append(
+        f"你的可用情绪标签仅限于以下这些：[{emotions_str}]。每行台词的 emotion 从这里挑。"
+    )
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)

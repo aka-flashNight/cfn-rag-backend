@@ -250,6 +250,16 @@ class NPCManager:
     # 读取 / 更新（全部经 asyncio.Lock）
     # ------------------------------------------------------------------
 
+    def peek_static(self, npc_name: str) -> NPCState | None:
+        """同步只读该 NPC 的静态设定（单例内查无此 NPC＝None）。
+
+        对话写盘链路（``agent_tools.task_tools`` / ``dialogue.editor``）按
+        ``BaseTool.run`` 契约是同步的，等不到 await；而 titles 与 emotions 属加载后
+        不再变动的设定字段（改好感的 ``replace`` 只作用于 saves 作用域的副本），
+        故直接读 global 作用域，不经 asyncio 锁也不触发任何写。
+        """
+        return self._global.get((npc_name or "").strip())
+
     async def get(self, npc_name: str) -> NPCState:
         async with self._lock:
             return self._scoped_locked(npc_name.strip(), self._current_slot())
@@ -405,3 +415,8 @@ async def get_npc_manager() -> NPCManager:
 def set_npc_manager(manager: NPCManager | None) -> None:
     global _NPC_MANAGER
     _NPC_MANAGER = manager
+
+
+def peek_static(npc_name: str) -> NPCState | None:
+    """同步取该 NPC 的静态设定；单例未初始化（未走 startup 的脚本/测试）＝None。"""
+    return _NPC_MANAGER.peek_static(npc_name) if _NPC_MANAGER is not None else None

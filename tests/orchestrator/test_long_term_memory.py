@@ -409,11 +409,12 @@ async def test_no_finished_projection_leaves_block_empty(env, bound_slot, monkey
 # 块序与包装（纯函数层）
 # ---------------------------------------------------------------------------
 
-def test_block_order_session_then_finished_then_long_term():
+def test_block_order_sparse_then_history_then_session_then_rag():
     core = build_user_shared_core(
         player_identity="一名 A 兵团佣兵。",
         favorability=30,
         relationship_level="熟悉",
+        relationship_hint="【关系跨档提示】",
         finished_task_block="【已完成委托块】",
         long_term_block="【长期记忆块】",
         retrieved_context="检索到的资料",
@@ -421,10 +422,14 @@ def test_block_order_session_then_finished_then_long_term():
         history_str="玩家：你好",
     )
     assert core.index("【已完成委托块】") < core.index("【长期记忆块】")
-    # 摘要与长期记忆同属跨轮稀疏层，两块相邻；RAG 跨轮全变，排在它们之后
+    # 摘要与长期记忆同属跨轮稀疏层，两块相邻
     assert core.index("【长期记忆块】") < core.index("早期摘要")
-    assert core.index("早期摘要") < core.index("检索到的资料")
-    assert core.index("检索到的资料") < core.index("玩家：你好")
+    # 好感度每轮都在变，必须落在这些稀疏块之后，否则一变就打断后面全部前缀
+    assert core.index("早期摘要") < core.index("玩家：你好")
+    assert core.index("玩家：你好") < core.index("好感度是 30")
+    assert core.index("好感度是 30") < core.index("【关系跨档提示】")
+    # RAG 与提及 NPC 跨轮全变，排在最末尾
+    assert core.index("【关系跨档提示】") < core.index("检索到的资料")
 
 
 def test_finished_block_wrapper_appends_hint_only_with_facts():

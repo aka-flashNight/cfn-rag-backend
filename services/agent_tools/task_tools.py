@@ -7,6 +7,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.dialogue.models import (
+    PLAYER_NAME,
+    compose_char,
+    normalize_emotion,
+    player_defaults,
+)
+from services.dialogue.sources import DialogueSources, resolve_speaker_title, speaker_emotions
+from services.dialogue.view import shared_sources
 from services.game_data.registry import GameDataRegistry
 from services.integration.save_paths import resolve_task_write_paths, shared_task_paths
 from services.retrieval.refresh import refresh_index_if_stale
@@ -298,30 +306,37 @@ def _extract_leading_emotion_from_brackets(text: str) -> tuple[str, str]:
     return emotion, _strip_bracket_expressions(rest)
 
 
+def _agent_text_item(
+    name: Any, emotion: Any, text: str, sources: DialogueSources | None,
+) -> Dict[str, str]:
+    """任务文本的一条：模型只给 name/emotion/text，Title 与 Char 都由后端补齐。
+
+    Title 玩家行走 ``$PC_TITLE`` 占位符，NPC 行按四级回落查（见 ``resolve_speaker_title``）；
+    Char 只在情绪合法时拼表情后缀（玩家行挂在 ``$PC_CHAR`` 上），没情绪就是说话人名。
+    """
+    speaker = str(name or "").strip()
+    if speaker == PLAYER_NAME:
+        title, char_stem = player_defaults()
+    else:
+        title, char_stem = resolve_speaker_title(speaker, sources), speaker
+    return {
+        "name": speaker,
+        "title": title,
+        "char": compose_char(char_stem, normalize_emotion(emotion, speaker_emotions(speaker))),
+        "text": text,
+    }
+
+
 def _dialogue_entry_to_agent_text_item(
     entry: Dict[str, Any],
+    sources: DialogueSources | None,
 ) -> Dict[str, str]:
     """
     将草案 dialogue entry 映射到 agent_text.json 的单条：
     { name, title, char, text }
     """
-    name = str(entry.get("name") or "").strip()
-    title = str(entry.get("title") or "").strip()
-    emotion = str(entry.get("emotion") or "").strip()
-    text = str(entry.get("text") or "").strip()
-    text = _strip_bracket_expressions(text)
-
-    if name == "$PC":
-        title = "$PC_TITLE" if not title else title
-        char_base = "$PC_CHAR"
-        char = f"{char_base}#{emotion}" if emotion else char_base
-        return {"name": "$PC", "title": title, "char": char, "text": text}
-
-    # NPC：char 用 NPC名#emotion（可选）
-    if not title:
-        title = name
-    char = f"{name}#{emotion}" if emotion else name
-    return {"name": name, "title": title, "char": char, "text": text}
+    text = _strip_bracket_expressions(str(entry.get("text") or "").strip())
+    return _agent_text_item(entry.get("name"), entry.get("emotion"), text, sources)
 
 
 def _max_agent_task_id(scan_paths: List[Path]) -> int:
@@ -424,46 +439,34 @@ def write_confirmed_agent_task_files(
         # 生成 agent_text.json 的数组（纯对话）
         get_items: List[Dict[str, str]] = []
         finish_items: List[Dict[str, str]] = []
+        # 基础日常对话数据：写盘行的 Title 从这里查（玩家看到的铭牌取自它）
+        sources = shared_sources(Path(data_root))
 
         if isinstance(get_dialogue, list) and get_dialogue:
             for it in get_dialogue:
                 if isinstance(it, dict):
-                    get_items.append(_dialogue_entry_to_agent_text_item(it))
+                    get_items.append(_dialogue_entry_to_agent_text_item(it, sources))
         elif get_text_old:
             # 只有旧字段：为当前 get_npc 生成一条
             emo, text_clean = _extract_leading_emotion_from_brackets(get_text_old)
-            get_items = [
-                {
-                    "name": get_npc,
-                    "title": get_npc,
-                    "char": f"{get_npc}#{emo}" if emo else get_npc,
-                    "text": text_clean,
-                }
-            ]
+            get_items = [_agent_text_item(get_npc, emo, text_clean, sources)]
 
         if isinstance(finish_dialogue, list) and finish_dialogue:
             for it in finish_dialogue:
                 if isinstance(it, dict):
                     finish_items.append(
-                        _dialogue_entry_to_agent_text_item(it)
+                        _dialogue_entry_to_agent_text_item(it, sources)
                     )
         elif finish_text_old:
             emo, text_clean = _extract_leading_emotion_from_brackets(finish_text_old)
-            finish_items = [
-                {
-                    "name": finish_npc,
-                    "title": finish_npc,
-                    "char": f"{finish_npc}#{emo}" if emo else finish_npc,
-                    "text": text_clean,
-                }
-            ]
+            finish_items = [_agent_text_item(finish_npc, emo, text_clean, sources)]
 
         # 如果 LLM 没给对话数组，但有字符串字段为空，至少要给一个空对话占位
         # 避免游戏端/前端解析空数组出错
         if not get_items:
-            get_items = [{"name": get_npc, "title": get_npc, "char": get_npc, "text": ""}]
+            get_items = [_agent_text_item(get_npc, "", "", sources)]
         if not finish_items:
-            finish_items = [{"name": finish_npc, "title": finish_npc, "char": finish_npc, "text": ""}]
+            finish_items = [_agent_text_item(finish_npc, "", "", sources)]
 
         # get_req_list = _ensure_int_list(draft.get("get_requirements"))
         # # 若大模型没填 get_requirements，则由后端根据 finish_requirements 的关卡解锁条件补全。

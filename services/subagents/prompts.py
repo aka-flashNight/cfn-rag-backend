@@ -344,6 +344,23 @@ _DIALOGUE_STYLE_BLOCK = """\
 - 有话才添，没话不凑。一句到位胜过三句客套。"""
 
 
+# 改哪些、怎么改：三类触发各自的取材次序（用户裁定 2026-10-16）。
+# 全文不得出现「查询」二字——本块两个 system 头共用，而 edit-only 版
+# 摘掉查询工具后提示词里不许再有任何查询表述。
+_DIALOGUE_EDIT_STRATEGY_BLOCK = """\
+【改哪些、怎么改】
+- 态度/关系变化时进行的对话编辑中，优先调整原有对话中的语气，不改变对话信息的情况下\
+微调对话语气，符合当前你和玩家的关系或者你当前对玩家的态度。\
+当语气确实不符合当前你的态度/你们的关系时，可以较大批量地修改对话，\
+尤其是日常对话和近期任务对话。如果语气基本符合现在的情况，确实没有需要改的情况下，\
+则考虑新增合适的对话。
+- 重要信息、重要事件、重要任务的影响而进行的对话编辑中，优先找出并修改和该信息、事件、\
+任务有关联的对话，任何关联都可以，如果还是没有，则优先追加新日常对话，而不是改无关对话。\
+也可以同时改相关对话并新增新日常对话。
+- 日常对话是经常会触发的可重复对话，注意普适性，体现人物性格，不要把话说的像第一次说。\
+任务对话仅可触发一次，不会重复触发，无需担心此问题。"""
+
+
 def build_dialogue_system(
     *,
     npc_name: str,
@@ -397,6 +414,7 @@ def build_dialogue_system(
             "被打回就按返回的原因修正后重新提交。"
         )
     parts.append(SPEECH_STYLE_RULES.rstrip())
+    parts.append(_DIALOGUE_EDIT_STRATEGY_BLOCK)
     parts.append(_DIALOGUE_STYLE_BLOCK)
     parts.append(ANTI_HALLUCINATION_RULE)
     return "\n\n".join(parts)

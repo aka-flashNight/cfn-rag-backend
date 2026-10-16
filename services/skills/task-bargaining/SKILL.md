@@ -19,12 +19,12 @@ description: 任务草案已产出（pending_draft 存在）后，处理玩家�
   "title": "<与草案一致或微调后的最终标题>",
   "description": "<任务说明，150 字内，与最终关卡/物品/奖励一致>",
   "get_dialogue": [
-    {"name": "$PC", "title": "$PC_TITLE", "text": "我接这个任务。"},
-    {"name": "<NPC>", "title": "<NPC_TITLE>", "emotion": "欣慰", "text": "很好，那就拜托你了。"}
+    {"name": "$PC", "text": "我接这个任务。"},
+    {"name": "<NPC>", "emotion": "欣慰", "text": "很好，那就拜托你了。"}
   ],
   "finish_dialogue": [
-    {"name": "$PC", "title": "$PC_TITLE", "text": "任务完成。"},
-    {"name": "<NPC>", "title": "<NPC_TITLE>", "emotion": "满意", "text": "干得漂亮，这是你应得的酬劳。"}
+    {"name": "$PC", "text": "任务完成。"},
+    {"name": "<NPC>", "emotion": "满意", "text": "干得漂亮，这是你应得的酬劳。"}
   ],
   "ui_hint": "正在登记任务……"
 }
@@ -34,7 +34,7 @@ description: 任务草案已产出（pending_draft 存在）后，处理玩家�
 
 - `text` 纯对话，**不能**包含动作/神态/旁白/`【...】`。神态放 `emotion` 字段。
 - `emotion` 从当前 NPC 可用情绪集合中挑选，可为空字符串。
-- 玩家条目用 `$PC` / `$PC_TITLE` 占位，不要写死玩家名字。
+- 玩家条目用 `$PC` 占位，不要写死玩家名字。
 - 每段对话数组至少 2 条，建议 2~4 条，简短自然。
 - 不要复用其它任务的对话文本。
 

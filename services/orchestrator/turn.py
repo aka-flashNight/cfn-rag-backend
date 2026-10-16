@@ -1013,13 +1013,12 @@ class TurnOrchestrator:
                         continue
                     cleaned.append({
                         "name": str(r.get("name") or self.npc_name).strip() or self.npc_name,
-                        "title": str(r.get("title") or "").strip(),
                         "emotion": str(r.get("emotion") or "").strip(),
                         "text": text,
                     })
             if not cleaned:
                 # 对话缺失不回炉重生成：补一条占位，保证发布流程可用
-                cleaned = [{"name": self.npc_name, "title": "", "emotion": "", "text": fallback_text}]
+                cleaned = [{"name": self.npc_name, "emotion": "", "text": fallback_text}]
             return cleaned
 
         out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。")

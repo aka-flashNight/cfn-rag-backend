@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 
 from services.dialogue.models import DialogueGroup, DialogueLine, sanitize_text
@@ -37,6 +38,8 @@ class DialogueSources:
         self._fingerprint: tuple[tuple[str, tuple[int, int] | None], ...] | None = None
         self._by_npc: dict[str, list[DialogueGroup]] = {}
         self._order: list[str] = []
+        #: 说话人名 → 基础数据里出现过的 Title（按出现序，写盘行补 Title 用）
+        self._titles: dict[str, list[str]] = {}
         # 实例经 shared_sources() 进程级共享，可能被 to_thread 的调用方并发触碰
         self._lock = threading.RLock()
 
@@ -94,8 +97,17 @@ class DialogueSources:
                     if group is not None:
                         groups.append(group)
 
+        titles: dict[str, list[str]] = {}
+        for groups in by_npc.values():
+            for group in groups:
+                for line in group.lines:
+                    # 玩家行的 Title 是 $PC_TITLE 占位符，不是称号，不进表
+                    if line.name and line.title and not line.is_player:
+                        titles.setdefault(line.name, []).append(line.title)
+
         self._by_npc = by_npc
         self._order = order
+        self._titles = titles
         self._fingerprint = fingerprint
 
     @staticmethod
@@ -159,3 +171,61 @@ class DialogueSources:
             snapshot = [g for npc in self._order for g in self._by_npc.get(npc, [])]
         for group in snapshot:
             yield group.copy()
+
+    def speaker_title(self, speaker: str) -> str:
+        """该说话人在基础对话数据里的 Title（同人有多个时取出现最多的）；查不到＝空串。"""
+        key = (speaker or "").strip()
+        if not key:
+            return ""
+        with self._lock:
+            self._ensure_locked()
+            seen = list(self._titles.get(key, ()))
+        if not seen:
+            return ""
+        return Counter(seen).most_common(1)[0][0]
+
+
+# ---------------------------------------------------------------------------
+# 写盘行的 Title / 情绪白名单（日常对话与任务文本两条写入路径共用同一口径）
+# ---------------------------------------------------------------------------
+
+def resolve_speaker_title(
+    speaker: str,
+    sources: DialogueSources | None = None,
+    *,
+    own: str = "",
+) -> str:
+    """一行台词的 Title 取值（四级回落；玩家行不走这里，走 ``player_defaults``）。
+
+    1. ``own``：本次改动范围内该说话人已有的 Title——游戏里真显示过的那个，最权威；
+    2. 基础日常对话数据里该说话人的 Title；
+    3. ``npc_state_db.json`` 里该 NPC 的第一个称号；
+    4. 说话人名。
+
+    第 2 级排在第 3 级之前，是因为实测两者并不总相等：92 组 (Name, Title) 里有 8 组
+    状态库首称号与基础数据不同（如「前治安官」基础数据用「前线统筹」、状态库首称号是
+    「警长」），而玩家看到的铭牌取自基础数据。第 4 级只是不留空的保底——基础数据
+    693 行里 Title 等于 Name 的是 0 行，拿名字当称号是凭空造一个游戏里没有的显示值。
+    """
+    name = (speaker or "").strip()
+    own_title = (own or "").strip()
+    if own_title:
+        return own_title
+    if sources is not None:
+        found = sources.speaker_title(name)
+        if found:
+            return found
+    from services.npc.manager import peek_static
+
+    for title in getattr(peek_static(name), "titles", None) or []:
+        if str(title or "").strip():
+            return str(title).strip()
+    return name
+
+
+def speaker_emotions(speaker: str) -> list[str]:
+    """该说话人在 NPC 设定里的情绪白名单；查不到＝空表（情绪按短标签放行）。"""
+    from services.npc.manager import peek_static
+
+    raw = getattr(peek_static((speaker or "").strip()), "emotions", None) or []
+    return [str(item).strip() for item in raw if str(item or "").strip()]

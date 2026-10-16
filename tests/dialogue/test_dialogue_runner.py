@@ -170,6 +170,32 @@ def test_edit_only_system_has_no_search_wording():
     assert style_full == style_stripped
 
 
+def test_edit_strategy_block_verbatim_in_both_heads():
+    """「改哪些、怎么改」三条策略：两个 system 头逐字一致、排在台词写法之前、无查询表述。"""
+    full = build_dialogue_system(npc_name=NPC, allow_search=True)
+    stripped = build_dialogue_system(npc_name=NPC, allow_search=False)
+
+    def _strategy(text: str) -> str:
+        return text.split("【改哪些、怎么改】")[1].split("【台词写法】")[0]
+
+    assert _strategy(full) == _strategy(stripped)
+    assert "查询" not in _strategy(stripped)
+    # 三条策略的关键口径（用户裁定 2026-10-16）
+    for sentence in (
+        "优先调整原有对话中的语气，不改变对话信息的情况下微调对话语气，"
+        "符合当前你和玩家的关系或者你当前对玩家的态度。",
+        "当语气确实不符合当前你的态度/你们的关系时，可以较大批量地修改对话，"
+        "尤其是日常对话和近期任务对话。",
+        "如果语气基本符合现在的情况，确实没有需要改的情况下，则考虑新增合适的对话。",
+        "优先找出并修改和该信息、事件、任务有关联的对话，任何关联都可以，"
+        "如果还是没有，则优先追加新日常对话，而不是改无关对话。",
+        "也可以同时改相关对话并新增新日常对话。",
+        "日常对话是经常会触发的可重复对话，注意普适性，体现人物性格，不要把话说的像第一次说。",
+        "任务对话仅可触发一次，不会重复触发，无需担心此问题。",
+    ):
+        assert sentence in stripped
+
+
 def test_dialogue_system_carries_roleplay_material():
     """角色扮演资料补齐：世界观/说话方式/脑补禁令都在，且与聊天主 Agent 同一份文本。"""
     from services.orchestrator.prompts import (

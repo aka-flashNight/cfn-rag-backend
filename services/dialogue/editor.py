@@ -1,11 +1,14 @@
 """把子 Agent 提交的整组修改落到两个覆盖层（阶段四的写入侧唯一入口）。
 
-模型只提供「编号 + 每行的 name/text」，其余全由后端补齐：
+模型只提供「编号 + 每行的 name/text/emotion」，其余全由后端补齐：
 
-- ``Title`` 不由模型写，后端自动用该行 npc 名带入（既有条目沿用原 Title）；
-- ``Char`` 与 ``imageurl`` 等附加字段一律沿用原行；组尾新增行取同说话人在原组里
-  最后一次出现的 Char，没有就用 npc 名；玩家行缺省走 AS2 占位符
-  （``$PC_TITLE`` / ``$PC_CHAR``，写成 ``$PC`` 会让称号槽显示角色名、立绘查不到）；
+- ``Title`` 不由模型写：既有行沿用原 Title，新增行按四级回落查（本组同说话人的
+  Title → 基础对话数据 → NPC 设定的首个称号 → 说话人名，见 ``resolve_speaker_title``）；
+- ``Char`` 由后端按情绪拼（``名#情绪``，没情绪就是纯名字）：模型给了合法情绪标签
+  就用它，没给则沿用原行的 Char，组尾新增行取同说话人在原组里最后一次出现的 Char；
+  玩家行缺省走 AS2 占位符（``$PC_TITLE`` / ``$PC_CHAR``，写成 ``$PC`` 会让称号槽
+  显示角色名、立绘查不到），情绪挂在 ``$PC_CHAR`` 上；
+- ``imageurl`` 等附加字段一律沿用原行；
 - **按行序对齐**：第 i 行改第 i 行，只允许在组尾加行；
 - **不能删除原有信息**：提交行数少于原组行数即打回（任务对话与日常对话同一口径）。
 
@@ -28,9 +31,12 @@ from services.dialogue.models import (
     PLAYER_NAME,
     DialogueGroup,
     DialogueLine,
+    compose_char,
+    normalize_emotion,
     player_defaults,
     sanitize_text,
 )
+from services.dialogue.sources import resolve_speaker_title, speaker_emotions
 from services.dialogue.view import DialogueView
 
 logger = logging.getLogger(__name__)
@@ -166,7 +172,7 @@ class DialogueEditor:
     def _merge_lines(
         self,
         group: DialogueGroup | None,
-        submitted: list[tuple[str, str]],
+        submitted: list[tuple[str, str, str]],
         npc: str,
     ) -> tuple[list[DialogueLine], str]:
         """按行序对齐合并；返回 (结果行, 打回原因)——原因非空即整组不生效。"""
@@ -186,7 +192,7 @@ class DialogueEditor:
         allowed.update(line.name for line in old if line.name)
 
         merged: list[DialogueLine] = []
-        for index, (raw_name, raw_text) in enumerate(submitted):
+        for index, (raw_name, raw_text, raw_emotion) in enumerate(submitted):
             speaker = sanitize_text(raw_name) or npc
             text = sanitize_text(raw_text)
             if not text:
@@ -198,24 +204,42 @@ class DialogueEditor:
                     f"第 {index + 1} 行说话人「{speaker}」不在允许范围内"
                     f"（只能是 {npc}、{PLAYER_NAME} 或本组原有说话人）。"
                 )
-            default_title, default_char = _line_defaults(speaker, old)
-            if index < len(old):
-                origin = old[index]
-                merged.append(DialogueLine(
-                    name=speaker,
-                    title=origin.title or default_title,
-                    char=origin.char or default_char,
-                    text=text,
-                    extra=dict(origin.extra),
-                ))
-            else:
-                merged.append(DialogueLine(
-                    name=speaker,
-                    title=default_title,
-                    char=default_char,
-                    text=text,
-                ))
+            emotion = normalize_emotion(raw_emotion, speaker_emotions(speaker))
+            title, char = self._line_fields(speaker, old, index, emotion)
+            origin = old[index] if index < len(old) else None
+            merged.append(DialogueLine(
+                name=speaker,
+                title=title,
+                char=char,
+                text=text,
+                extra=dict(origin.extra) if origin is not None else {},
+            ))
         return merged, ""
+
+    def _line_fields(
+        self, speaker: str, old: list[DialogueLine], index: int, emotion: str,
+    ) -> tuple[str, str]:
+        """一行的 (Title, Char)：两样都由后端定，模型只给说话人、情绪与台词。
+
+        Title 沿用本行原值（改台词不动铭牌），新增行按四级回落查
+        （见 ``resolve_speaker_title``）。Char 只在模型给了合法情绪时才拼表情后缀；
+        没给就沿用本行原值，新增行取同说话人在原组里最后一次出现的 Char——
+        于是「原样抄回」的行既不会被削掉既有表情，也不会凭空多出表情。
+        """
+        is_player = speaker == PLAYER_NAME
+        player_title, player_char = player_defaults()
+        base_title = player_title if is_player else resolve_speaker_title(
+            speaker, self.view.sources, own=_trailing_title(old, speaker),
+        )
+        # 玩家行的表情挂在 $PC_CHAR 上（与任务文本侧同一拼法）
+        char_stem = player_char if is_player else speaker
+        base_char = player_char if is_player else _trailing_char(old, speaker)
+        origin = old[index] if index < len(old) else None
+        title = (origin.title if origin is not None else "") or base_title
+        char = compose_char(char_stem, emotion) if emotion else (
+            (origin.char if origin is not None else "") or base_char
+        )
+        return title, char
 
     def _flush(
         self,
@@ -260,13 +284,6 @@ class DialogueEditor:
         refresh_index_if_stale()
 
 
-def _line_defaults(speaker: str, old: list[DialogueLine]) -> tuple[str, str]:
-    """缺省的 (Title, Char)：玩家行走 AS2 占位符，NPC 行用名字（Char 沿用表情后缀）。"""
-    if speaker == PLAYER_NAME:
-        return player_defaults()
-    return speaker, _trailing_char(old, speaker)
-
-
 def _trailing_char(old: list[DialogueLine], speaker: str) -> str:
     """同说话人在原组里最后一次出现的 Char（带表情后缀），没有就用说话人名。"""
     for line in reversed(old):
@@ -275,7 +292,15 @@ def _trailing_char(old: list[DialogueLine], speaker: str) -> str:
     return speaker
 
 
-def _parse_edit(raw: Any) -> tuple[int | None, list[tuple[str, str]]]:
+def _trailing_title(old: list[DialogueLine], speaker: str) -> str:
+    """同说话人在原组里最后一次出现的 Title，没有就空串。"""
+    for line in reversed(old):
+        if line.name == speaker and line.title:
+            return line.title
+    return ""
+
+
+def _parse_edit(raw: Any) -> tuple[int | None, list[tuple[str, str, str]]]:
     if not isinstance(raw, dict):
         return None, []
     try:
@@ -285,13 +310,17 @@ def _parse_edit(raw: Any) -> tuple[int | None, list[tuple[str, str]]]:
     return number, _parse_lines(raw.get("lines"))
 
 
-def _parse_lines(raw: Any) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _parse_lines(raw: Any) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
     for item in raw if isinstance(raw, list) else []:
         if not isinstance(item, dict):
             continue
         text = sanitize_text(item.get("text"))
         if not text:
             continue
-        out.append((str(item.get("name") or "").strip(), text))
+        out.append((
+            str(item.get("name") or "").strip(),
+            text,
+            str(item.get("emotion") or "").strip(),
+        ))
     return out

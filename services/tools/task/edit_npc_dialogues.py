@@ -22,6 +22,10 @@ _LINE_SCHEMA: dict[str, Any] = {
     "properties": {
         "name": {"type": "string", "description": "说话人：你自己（NPC 名）或玩家。"},
         "text": {"type": "string", "description": "这行台词。"},
+        "emotion": {
+            "type": "string",
+            "description": "这行台词的情绪，从你的可用情绪标签里选一个；语气平实、没有表情的行留空。",
+        },
     },
     "required": ["name", "text"],
 }
@@ -34,7 +38,7 @@ class EditNpcDialoguesTool(BaseTool):
         "按编号整组提交你的对话修改，写进当前存档立即生效。\n"
         "- 只能按编号整组修改；不需要改的行请原样抄回，不能删除原有信息；\n"
         "- 只输出其中有需要修改的组，可以改台词，可以向后加台词；\n"
-        "- 只提供、也只允许修改 npc 名和对话两项（每行填 name 和 text）；\n"
+        "- 每行填说话人 name 与台词 text，情绪可选填 emotion；\n"
         "- 任务对话只能在本组内改台词、在组尾加台词，不能新增组；"
         "日常对话除改已有组外，可以用 new_groups 直接新增一组；\n"
         "- 修改被打回时结果里会给出原因，按原因修正后重新提交。"

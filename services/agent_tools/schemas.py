@@ -235,23 +235,20 @@ STAGE_REQUIREMENT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-TOP_NPC_EMOTION_HINT: str = "emotion：可选；用于拼接 char（NPC名#情绪 或 $PC_CHAR#情绪）。"
-
 DIALOGUE_ENTRY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "name": {"type": "string", "description": "NPC 名称或固定值 '$PC'（玩家）"},
-        "title": {"type": "string", "description": "称号（NPC 称号或 '$PC_TITLE'）"},
         "emotion": {
             "type": "string",
-            "description": TOP_NPC_EMOTION_HINT + "；允许空字符串表示默认情绪。",
+            "description": "这一行台词的情绪，从该说话人的可用情绪标签里选一个；语气平实、没有表情的行留空。",
         },
         "text": {
             "type": "string",
             "description": "纯对话内容（不要包含动作/神态/旁白/【...】）。"
         },
     },
-    "required": ["name", "title", "text"],
+    "required": ["name", "text"],
     "additionalProperties": False,
 }
 
