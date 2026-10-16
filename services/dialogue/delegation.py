@@ -105,15 +105,15 @@ _DELEGATE_BASE_DESCRIPTION = (
     f"{CHAT_TOOL_SPEECH_REQUIREMENT}"
     "派一个后台子 Agent 去修改你自己的对话（日常对话与你的任务对话），"
     "把这轮发生的长期影响落到你以后说的话上。"
-    "调用时必须给出 change_type（更改类型），reason 写清发生了什么（相关事实）；"
-    "instruction（改写指示）只有非常必要的时候才给。"
+    "调用时必须给出 change_type（更改类型），reason 写清发生了什么（相关事实），"
+    "instruction 写你希望自己的对话怎么变。"
     "只在真的发生了很重要的对话、导致产生很长期的影响时调用；如无必要，不要调用。"
 )
 
 #: 任务兜底表述（§4.0.2-3：仅在「保留任务兜底」那一版里出现，条件闸见 build_delegate_tool）
 _DELEGATE_TASK_FALLBACK = (
     "当你首次获知某任务已经完成，且该任务非常重要时，"
-    "你可以在确保说完聊天对话的同时，主动调用该子 Agent——"
+    "你可以在确保说完聊天对话的同时，主动调用该子 Agent，并给出指示——"
     "此时 change_type 选重要任务，task_id 填已完成委托块里给出的那个任务 id。"
 )
 
