@@ -90,8 +90,17 @@ def error_event(code: str, message: str, *, retryable: bool = False) -> SSEEvent
 KEEP_ALIVE = SSEEvent(event="keep_alive", data={})
 
 
+_USAGE_DETAIL_KEYS = ("prompt_tokens", "completion_tokens", "cached_tokens")
+
+
 def accumulate_usage(total: dict[str, Any] | None, incoming: dict[str, Any] | None) -> dict[str, Any] | None:
-    """跨调用累计 usage（prompt/completion/cached 求和，total 派生）。"""
+    """跨调用累计 usage（prompt/completion/cached 求和，total 派生）。
+
+    同时保留逐次明细 `calls`：一次 LLM 调用一行，便于直接看出每次调用各自的
+    `cached_tokens`（求和后的总量看不出命中率——多个调用里只有部分命中时，总量会把差异抹平）。
+    `incoming` 本身带 `calls` 时视为子流程合计（如汇合轮整段跑完后的 outcome.usage），
+    展开追加它的明细而不是把自己再记成一行，否则逐次记录会在汇合时被压成一行。
+    """
     if not incoming:
         return total
     base = dict(total or {})
@@ -101,4 +110,14 @@ def accumulate_usage(total: dict[str, Any] | None, incoming: dict[str, Any] | No
         base["cached_tokens"] = int(base.get("cached_tokens") or 0) + int(incoming["cached_tokens"])
     if base.get("prompt_tokens") or base.get("completion_tokens"):
         base["total_tokens"] = int(base.get("prompt_tokens") or 0) + int(base.get("completion_tokens") or 0)
+    detail = list(base.get("calls") or [])
+    incoming_calls = incoming.get("calls")
+    if isinstance(incoming_calls, list) and incoming_calls:
+        detail.extend(c for c in incoming_calls if isinstance(c, dict))
+    else:
+        row = {key: int(incoming[key]) for key in _USAGE_DETAIL_KEYS if incoming.get(key) is not None}
+        if row:
+            detail.append(row)
+    if detail:
+        base["calls"] = detail
     return base
