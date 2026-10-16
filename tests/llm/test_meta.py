@@ -1,4 +1,4 @@
-"""meta 行协议解析器测试（02 §6.1：正常/无 meta/半截 JSON/非法 emo/fav 越界/多行 JSON 冒充）。
+"""meta 行协议解析器测试（02 §6.1：正常/无 meta/半截 JSON/非法 emo/fav 越界/多行 JSON 冒充/同行 meta）。
 
 v3 再次重构后 meta 行只剩 emo/fav 两个字段，委派意图改由路由工具承载
 （见 tests/orchestrator/test_turn_e2e.py），故本文件不再有 act 相关断言。
@@ -114,6 +114,34 @@ async def test_over_512_chars_without_newline_is_content():
     body = await _collect_text(rest)
     assert meta.emotion == "普通"
     assert body == long_text
+
+
+async def test_meta_and_dialogue_on_same_line_are_split():
+    """模型把 meta 和台词写在同一行（2026-10-16 发布轮实测）→ 按 JSON 前缀切，花括号不得漏给玩家。"""
+    text = '{"emo":"微笑","fav":0}好，痛快。出了基地往东，环线公路上见真章。'
+    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+    body = await _collect_text(rest)
+    assert meta.emotion == "微笑" and meta.favorability_change == 0
+    assert body == "好，痛快。出了基地往东，环线公路上见真章。"
+    assert "{" not in body
+
+
+async def test_meta_and_dialogue_on_same_line_keeps_following_paragraphs():
+    """同行 meta 之后的换行分段仍归正文，不能多吃一个换行或丢掉后文。"""
+    text = '{"emo":"惊讶","fav":1}这么快？\n环线都清干净了？'
+    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+    body = await _collect_text(rest)
+    assert meta.emotion == "惊讶" and meta.favorability_change == 1
+    assert body == "这么快？\n环线都清干净了？"
+
+
+async def test_whole_meta_only_line_still_waits_for_newline():
+    """只有 meta、后面还没有增量时不提前判定：等换行或流结束再定，正文不得凭空多个空行。"""
+    text = '{"emo":"微笑","fav":0}\n你好呀。'
+    meta, rest = await split_meta(_stream_from_text(text), EMOTIONS)
+    body = await _collect_text(rest)
+    assert meta.emotion == "微笑"
+    assert body == "你好呀。"
 
 
 async def test_reasoning_events_never_enter_meta_or_content():

@@ -1,7 +1,8 @@
 """meta 行协议：解析器 + 校验 + prompt 说明文本生成。
 
 对应 docs/v3-developer/02-LLM接入层.md §4。聊天主 Agent 的响应第一行是
-单行紧凑 JSON（情绪/好感），第二行起为 NPC 台词正文。
+单行紧凑 JSON（情绪/好感），第二行起为 NPC 台词正文。模型漏掉那个换行时按
+JSON 前缀切一刀（实测 glm-5.3-flash 的发布轮会写成同一行）。
 解析器全容错：解析失败、缺字段、类型错误一律按「无 meta」处理，绝不丢正文。
 
 v3 再次重构（路由工具化）：meta 行只剩情绪与好感两个字段。委派意图不再走 meta——
@@ -84,6 +85,24 @@ def _passes_meta_schema(obj: dict, npc_emotions: Sequence[str]) -> bool:
     return any(key in obj for key in ("emo", "fav"))
 
 
+def _decode_meta_prefix(text: str) -> tuple[dict, int] | None:
+    """text 以合法 meta JSON 开头时返回 (对象, 该 JSON 之后的下标)，否则 None。
+
+    实测有模型把 meta 和台词挤在同一行（`{"emo":"坏笑","fav":0}好，痛快。……`），
+    此时没有换行可依据；按 JSON 前缀切一刀才能既取出情绪又不把花括号漏给玩家。
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        obj, idx = json.JSONDecoder().raw_decode(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or not _passes_meta_schema(obj, ()):
+        return None
+    return obj, len(text) - len(stripped) + idx
+
+
 def _forwardable(kind: str) -> bool:
     """聊天主 Agent 只转发 content / usage / finish；reasoning 一律丢弃（修 A7）。"""
     return kind in ("content", "usage", "finish")
@@ -93,9 +112,10 @@ async def split_meta_events(
     stream: AsyncIterator[StreamEvent],
     npc_emotions: Sequence[str],
 ) -> tuple[Meta, AsyncIterator[StreamEvent]]:
-    """缓冲流的开头直到凑齐第一行（\\n）或超过 512 字符，切出 meta 与事件流。
+    """缓冲流的开头直到凑齐一个 meta JSON（或换行、或超过 512 字符），切出 meta 与事件流。
 
-    - 首非空字符是 '{' 且首行 json.loads 成功且通过 schema 校验 → (Meta, 剩余事件流)
+    - 首非空字符是 '{' 且 json.loads 成功且通过 schema 校验 → (Meta, 剩余事件流)
+    - meta JSON 之后紧跟台词（模型漏了换行）→ 按 JSON 前缀切，剩下的仍归正文
     - 否则 → (默认 Meta, 已缓冲文本作为 content 事件原样还给事件流)
     - 剩余事件流只含 content / usage / finish（reasoning 丢弃）。
     """
@@ -117,6 +137,17 @@ async def split_meta_events(
             buffer += ev.text
             nl = buffer.find("\n")
             if nl < 0:
+                hit = _decode_meta_prefix(buffer)
+                if hit is not None and buffer[hit[1]:]:
+                    # JSON 已完整且后面就是台词（模型漏了换行）；此时继续等换行会把
+                    # 花括号连同台词一起当成正文。
+                    obj, consumed = hit
+                    rest_text = buffer[consumed:]
+                    meta = parse_meta_obj(obj, npc_emotions) or Meta()
+                    # 正文必须排在 held usage/finish 之前，否则「finish 即终止」的转发会丢正文
+                    leftover = [StreamEvent(kind="content", text=rest_text), *held_events]
+                    logger.warning("meta 与台词同行（缺换行），已按 JSON 前缀切出: %.80r", buffer)
+                    return _finish(leftover, meta)
                 if len(buffer) > _MAX_META_LINE_CHARS:
                     # 超过 512 字符仍无换行 → 无 meta，缓冲原样还给正文
                     return _finish([StreamEvent(kind="content", text=buffer)], Meta())
@@ -127,6 +158,14 @@ async def split_meta_events(
                 meta = parse_meta_obj(obj, npc_emotions) or Meta()
                 leftover = [StreamEvent(kind="content", text=rest_text)] if rest_text else []
                 return _finish(leftover, meta)
+            hit = _decode_meta_prefix(first_line)
+            if hit is not None:
+                obj, consumed = hit
+                tail = first_line[consumed:]
+                body = (tail + "\n" + rest_text) if rest_text else tail
+                logger.warning("meta 与台词同行（缺换行），已按 JSON 前缀切出: %.80r", first_line)
+                meta = parse_meta_obj(obj, npc_emotions) or Meta()
+                return _finish([StreamEvent(kind="content", text=body)] if body else [], meta)
             # 观测点：模型尝试发 meta 但格式不合法（warning），或完全没发 meta（debug）
             if first_line.lstrip().startswith("{"):
                 logger.warning("meta 首行 JSON 解析失败，整段按正文处理: %.160r", first_line)
@@ -190,7 +229,8 @@ def meta_prompt_block(npc_emotions: Sequence[str], *, agent_enabled: bool = True
     )
     return "\n".join([
         "【输出格式（最高优先级）】",
-        "你的回复第一行必须是一个单行 JSON（不要解释、不要用代码块包裹）。" + after_first_line,
+        "你的回复第一行必须是一个单行 JSON（不要解释、不要用代码块包裹），写完就换行、"
+        "台词从第二行开始。" + after_first_line,
         '{"emo":"微笑","fav":0}',
         "诶，是你啊。今天有什么想聊的？",
         "",

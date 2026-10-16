@@ -168,6 +168,15 @@ async def split_meta_events(stream: AsyncIterator[StreamEvent], npc_emotions: Se
     容错：JSON 解析失败、缺字段、类型错误一律按『无 meta』处理，绝不让解析失败弄丢正文。"""
 ```
 
+**meta 与台词同行（实测 glm-5.3-flash 的 confirm 收场轮会这么写）**：模型漏掉那个换行、
+把 `{"emo":"坏笑","fav":0}` 和台词挤成一行时，按行首解析必然失败，花括号会原样漏给玩家。
+解析器因此再走一次 JSON **前缀**解码（`json.JSONDecoder().raw_decode`）：切出前缀当 meta，
+剩下的仍归正文，并打 `meta 与台词同行（缺换行）` warning 留痕。两条边界：
+- 只有「JSON 已完整且后面确有文字」才提前判定；纯 meta 行（路由轮）继续等换行，
+  避免把后续正文里的换行当成正文首字符吐出去。
+- 前缀同样要过 `_passes_meta_schema`（含 `emo`/`fav` 才算），台词里恰好出现
+  `{"result":"ok"}` 之类不会被误认；多行 JSON 冒充 meta 依旧按正文处理。
+
 meta 解析成功的瞬间：发出 `meta` SSE 事件（情绪/好感）→ 继续转发正文与 `finish`
 里的 `tool_calls`。这保证**情绪先于正文到达前端**（B5 开发者注的硬性要求）。
 
