@@ -415,6 +415,7 @@ def test_block_order_sparse_then_history_then_session_then_rag():
         favorability=30,
         relationship_level="熟悉",
         relationship_hint="【关系跨档提示】",
+        pending_draft_summary="【待确认草案块】",
         finished_task_block="【已完成委托块】",
         long_term_block="【长期记忆块】",
         retrieved_context="检索到的资料",
@@ -427,6 +428,8 @@ def test_block_order_sparse_then_history_then_session_then_rag():
     # 好感度每轮都在变，必须落在这些稀疏块之后，否则一变就打断后面全部前缀
     assert core.index("早期摘要") < core.index("玩家：你好")
     assert core.index("玩家：你好") < core.index("好感度是 30")
+    # 会话态块内同理：草案只在拟定/议价那几轮变，好感度那行压在整块最末
+    assert core.index("【待确认草案块】") < core.index("好感度是 30")
     assert core.index("好感度是 30") < core.index("【关系跨档提示】")
     # RAG 与提及 NPC 跨轮全变，排在最末尾
     assert core.index("【关系跨档提示】") < core.index("检索到的资料")

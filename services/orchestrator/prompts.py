@@ -376,13 +376,15 @@ def build_session_state_block(
         parts.append(scene_line)
     if progress_desc:
         parts.append(progress_desc)
-    parts.append(f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。")
     if pending_draft_summary:
         parts.append(
             "【待确认的任务草案（已拟定、尚未发布）】\n"
             f"{pending_draft_summary}\n"
             "玩家可能会接受、拒绝、讨价还价或岔开话题。"
         )
+    # 好感度是这块里唯一几乎每轮都在变的数字，压在最后：它一变只废掉自己这一行，
+    # 不会连带把上面的身份/场景/进度与草案块的前缀缓存一起打断。
+    parts.append(f"你目前对玩家的好感度是 {favorability}（{relationship_level}）。")
     return "\n".join(parts)
 
 
@@ -420,9 +422,9 @@ def build_user_shared_core(
 
     排序按前缀缓存对齐（从稳定到易变）：已完成委托 → 长期记忆（跨窗口，改动稀疏）
     → 早期摘要（同为跨轮稀疏，紧跟长期记忆）→ 近期对话（跨轮追加；窗口填满后
-    整块前滑，在此之前前缀是稳的）→ 会话态（玩家身份/所在场景/进度/好感度/待确认
-    草案，几乎每轮都有数字或场景在变）→ 关系跨档提示（只在委派工具真的下发那几轮
-    出现）→ RAG/提及 NPC（跨轮全变、轮内不变）。
+    整块前滑，在此之前前缀是稳的）→ 会话态（玩家身份/所在场景/进度/待确认草案，
+    块内好感度压尾）→ 关系跨档提示（只在委派工具真的下发那几轮出现）
+    → RAG/提及 NPC（跨轮全变、轮内不变）。
 
     好感度原先排在最前面，于是它每轮一变就把后面所有块的前缀缓存全部打断；
     挪到这些块之后，稳定段才能真正复用。
