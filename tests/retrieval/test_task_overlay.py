@@ -1,4 +1,8 @@
-"""B2-7 语料增读：绑定存档的任务覆盖层、稳定节点 id、指纹作用域。
+"""语料装配与指纹只含基础数据（作者裁定 2026-10-17）。
+
+AI 终端写的任务文件——发布委托的 agent_tasks.json / text/agent_text.json（未绑定时在
+data/task 下、绑定后在 data/rag/agent_saves/<slot>/ 槽内）——既不装配成节点也不计入
+指纹，索引因此与存档无关。改写文本的查询期替换见 test_overlay_query.py。
 
 全部用 tmp 资源树，不触碰真实数据目录；绑定态用全局单例，fixture 里复位。
 """
@@ -12,6 +16,9 @@ import pytest
 
 from services.integration.state import get_integration_state
 from services.retrieval.loader import compute_corpus_fingerprint, load_task_nodes
+
+#: resources fixture 的两条任务展开出的四个基础节点
+BASE_IDS = frozenset({"task-101-get-0", "task-101-get-1", "task-101-finish-0", "task-102-get-0"})
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -53,10 +60,11 @@ def resources(tmp_path) -> Path:
     return tmp_path
 
 
-def _write_slot(tmp_path: Path, slot: str, task_id: int, get_text: str, finish_text: str) -> None:
-    slot_dir = tmp_path / "data" / "rag" / "agent_saves" / slot
+def _write_agent_task_files(tasks_path: Path, text_path: Path, task_id: int,
+                            get_text: str, finish_text: str) -> None:
+    """写一对委托文件（共享侧 text 落在 text/ 子目录，槽内平铺——与真实写盘路径一致）。"""
     _write_json(
-        slot_dir / "agent_tasks.json",
+        tasks_path,
         {
             "tasks": [
                 {
@@ -68,7 +76,7 @@ def _write_slot(tmp_path: Path, slot: str, task_id: int, get_text: str, finish_t
         },
     )
     _write_json(
-        slot_dir / "agent_text.json",
+        text_path,
         {
             f"$AGENT_GET_{task_id}": [{"name": "铁匠", "text": get_text}],
             f"$AGENT_FINISH_{task_id}": [{"name": "铁匠", "text": finish_text}],
@@ -86,32 +94,11 @@ def _ids(nodes) -> set[str]:
 
 def test_task_ids_use_stable_format(resources):
     nodes = load_task_nodes(resources)
-    assert _ids(nodes) == {
-        "task-101-get-0",
-        "task-101-get-1",
-        "task-101-finish-0",
-        "task-102-get-0",
-    }
+    assert _ids(nodes) == BASE_IDS
     by_id = {n.id: n for n in nodes}
     assert by_id["task-101-get-0"].text == "拿废铁来。"
     assert by_id["task-101-get-0"].character == "铁匠"
     assert by_id["task-101-get-0"].type == "task"
-
-
-def test_new_earlier_sorted_file_does_not_shift_ids(resources):
-    """新增排序在前的任务文件（agent_tasks.json 排首）时，既有节点 id 不漂移。"""
-    before = _ids(load_task_nodes(resources))
-    _write_json(
-        resources / "data" / "task" / "agent_tasks.json",
-        {"tasks": [{"id": 200005, "get_conversation": "$AGENT_GET_200005"}]},
-    )
-    _write_json(
-        resources / "data" / "task" / "text" / "agent_text.json",
-        {"$AGENT_GET_200005": [{"name": "铁匠", "text": "新委托。"}]},
-    )
-    after = _ids(load_task_nodes(resources))
-    assert before <= after
-    assert "task-200005-get-0" in after
 
 
 def test_task_without_id_falls_back_to_conversation_key(resources):
@@ -127,75 +114,77 @@ def test_task_without_id_falls_back_to_conversation_key(resources):
 
 
 # ---------------------------------------------------------------------------
-# 绑定存档覆盖层
+# AI 终端写的文件不进语料
 # ---------------------------------------------------------------------------
 
-def test_overlay_unbound_absent_bound_present(resources, state):
-    _write_slot(resources, "slot_a", 200001, "甲存档的委托。", "甲存档完成了。")
-    _write_slot(resources, "slot_b", 200002, "乙存档的委托。", "乙存档完成了。")
+def test_shared_agent_files_never_enter_corpus(resources):
+    """未绑定态的发布委托落点（data/task 下）不装配：写多少次都不改节点集合。"""
+    _write_agent_task_files(
+        resources / "data" / "task" / "agent_tasks.json",
+        resources / "data" / "task" / "text" / "agent_text.json",
+        200005, "新委托。", "新委托完成了。",
+    )
+    assert _ids(load_task_nodes(resources)) == BASE_IDS
 
-    ids_unbound = _ids(load_task_nodes(resources))
-    assert "task-200001-get-0" not in ids_unbound
-    assert "task-200002-get-0" not in ids_unbound
+
+def test_slot_agent_files_never_enter_corpus(resources, state):
+    """绑定后槽内的委托文件同样不装配——索引与存档无关，换槽不重建。"""
+    slot_dir = resources / "data" / "rag" / "agent_saves" / "slot_a"
+    _write_agent_task_files(
+        slot_dir / "agent_tasks.json", slot_dir / "agent_text.json",
+        200001, "甲存档的委托。", "甲存档完成了。",
+    )
 
     state.bind(slot_key="slot_a")
-    nodes = load_task_nodes(resources)
-    ids = _ids(nodes)
-    by_id = {n.id: n for n in nodes}
-    assert {"task-200001-get-0", "task-200001-finish-0"} <= ids
-    assert by_id["task-200001-get-0"].text == "甲存档的委托。"
-    assert "task-200002-get-0" not in ids  # 其他槽的文件不增读
+    assert _ids(load_task_nodes(resources)) == BASE_IDS
 
     state.bind(slot_key="slot_b")
-    assert "task-200002-get-0" in _ids(load_task_nodes(resources))
+    assert _ids(load_task_nodes(resources)) == BASE_IDS
 
 
-def test_overlay_slot_text_overrides_shared_same_key(resources, state):
-    """槽内与共享同名文本 key：槽文本生效（覆盖层后加载，存档优先）。"""
-    slot_dir = resources / "data" / "rag" / "agent_saves" / "slot_a"
+def test_slot_text_override_does_not_change_corpus(resources, state):
+    """槽内同名 key 不改基础节点：改写只发生在检索之后，语料装配始终是基础文本。"""
     _write_json(
-        slot_dir / "agent_text.json",
+        resources / "data" / "rag" / "agent_saves" / "slot_a" / "agent_text.json",
         {"$T101_GET": [{"name": "铁匠", "text": "覆盖后的台词。"}]},
     )
     state.bind(slot_key="slot_a")
-    nodes = {n.id: n for n in load_task_nodes(resources)}
-    assert nodes["task-101-get-0"].text == "覆盖后的台词。"
-    assert "task-101-get-1" not in nodes  # 覆盖数组以槽内为准（一条）
-
-
-def test_overlay_missing_files_silent(resources, state):
-    state.bind(slot_key="slot_empty")  # 槽目录不存在
-    assert _ids(load_task_nodes(resources)) == {
-        "task-101-get-0",
-        "task-101-get-1",
-        "task-101-finish-0",
-        "task-102-get-0",
-    }
+    by_id = {n.id: n for n in load_task_nodes(resources)}
+    assert by_id["task-101-get-0"].text == "拿废铁来。"
+    assert "task-101-get-1" in by_id
 
 
 # ---------------------------------------------------------------------------
-# 指纹作用域
+# 指纹与存档无关
 # ---------------------------------------------------------------------------
 
-def test_fingerprint_scoped_to_bound_slot(resources, state):
+def test_fingerprint_ignores_agent_written_files(resources, state):
     base = compute_corpus_fingerprint(resources)
-    # 未绑定时：其他槽文件写入不影响
-    _write_slot(resources, "slot_b", 200002, "乙委托。", "乙完成。")
+
+    _write_agent_task_files(
+        resources / "data" / "task" / "agent_tasks.json",
+        resources / "data" / "task" / "text" / "agent_text.json",
+        200005, "新委托。", "新委托完成了。",
+    )
     assert compute_corpus_fingerprint(resources) == base
 
-    # 绑定空槽：无增量，指纹不变
+    slot_dir = resources / "data" / "rag" / "agent_saves" / "slot_a"
+    _write_agent_task_files(
+        slot_dir / "agent_tasks.json", slot_dir / "agent_text.json",
+        200001, "甲委托。", "甲完成。",
+    )
     state.bind(slot_key="slot_a")
     assert compute_corpus_fingerprint(resources) == base
 
-    # 绑定到已有文件的槽：指纹变化
     state.bind(slot_key="slot_b")
-    with_files = compute_corpus_fingerprint(resources)
-    assert with_files != base
-
-    # 本槽文件内容修改：指纹再变
-    _write_slot(resources, "slot_b", 200002, "乙委托改长了。", "乙完成改长了。")
-    assert compute_corpus_fingerprint(resources) != with_files
-
-    # 解绑：回到基线
-    state.unbind()
     assert compute_corpus_fingerprint(resources) == base
+
+
+def test_fingerprint_still_tracks_base_corpus(resources):
+    """基础语料本身的变化仍要计入，否则游戏数据更新后索引永不追平。"""
+    base = compute_corpus_fingerprint(resources)
+    _write_json(
+        resources / "data" / "task" / "mainline_tasks.json",
+        {"tasks": [{"id": 101, "get_conversation": "$T101_GET"}]},
+    )
+    assert compute_corpus_fingerprint(resources) != base

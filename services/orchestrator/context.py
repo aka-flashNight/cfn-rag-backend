@@ -179,13 +179,17 @@ def retrieve_tier1(
     npc_last_message: Optional[str],
     forbidden: set[str],
 ) -> Any:
-    """单轮 Tier-1 检索（同步实现；调用方用 to_thread 包装）。engine.ready False 时返回 None。"""
+    """单轮 Tier-1 检索（同步实现；调用方用 to_thread 包装）。engine.ready False 时返回 None。
+
+    返回前按当前绑定存档的覆盖层替换结果文本：索引只装基础语料（覆盖层不进向量库，
+    否则每次改对话/发任务都要全量重建），改写后的台词在这一步补回来。
+    """
     from services.retrieval import RetrievalInput
 
     if engine is None or not getattr(engine, "ready", False):
         return None
     try:
-        return engine.retrieve(RetrievalInput(
+        bundle = engine.retrieve(RetrievalInput(
             user_query=user_query,
             npc_name=npc_name,
             npc_titles=npc_titles,
@@ -196,6 +200,9 @@ def retrieve_tier1(
     except Exception as exc:  # 检索降级不阻断回合（04）
         logger.warning("Tier-1 检索失败，降级为空上下文: %s", exc)
         return None
+    from services.retrieval.overlay import apply_slot_overrides
+
+    return apply_slot_overrides(bundle)
 
 
 def entity_hints_block(bundle: Any, game_data: Any) -> str:

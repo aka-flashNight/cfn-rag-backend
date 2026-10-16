@@ -279,10 +279,6 @@ class DialogueEditor:
             # 这里绝不能报错，否则模型会重交同一批修改、把追加行写重。
             logger.warning("dialogue_version 更新失败（覆盖层已落盘，游戏侧下次载入生效）: %s", exc)
 
-        from services.retrieval.refresh import refresh_index_if_stale
-
-        refresh_index_if_stale()
-
 
 def _trailing_char(old: list[DialogueLine], speaker: str) -> str:
     """同说话人在原组里最后一次出现的 Char（带表情后缀），没有就用说话人名。"""

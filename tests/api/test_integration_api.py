@@ -138,8 +138,9 @@ def test_bind_calls_ensure_agent_save_files(state, monkeypatch):
     assert calls == ["slot_ensure"]
 
 
-def test_bind_and_unbind_trigger_index_refresh(state, monkeypatch):
-    """B2-7 接线：bind / unbind 后检查语料刷新（后台重建行为见 tests/retrieval/test_refresh.py）。"""
+def test_bind_checks_index_but_unbind_does_not(state, monkeypatch):
+    """bind 是一次语义节点，复核语料指纹；unbind 不触发——索引与存档无关，
+    覆盖层也不再进语料（后台重建行为见 tests/retrieval/test_refresh.py）。"""
     from api import integration_api
 
     calls: list[int] = []
@@ -147,8 +148,9 @@ def test_bind_and_unbind_trigger_index_refresh(state, monkeypatch):
 
     client = _make_client()
     assert client.post("/integration/bind", json={"slot_key": "slot_refresh"}).status_code == 200
+    assert calls == [1]
     assert client.post("/integration/unbind").status_code == 200
-    assert calls == [1, 1]
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("bad", ["", "../x", "a/b", "a\\b", "a" * 129, "a b", "存档"])

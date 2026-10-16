@@ -51,7 +51,7 @@ async def bind(payload: BindRequest) -> BindResponse:
     )
     # B2-4：按需建槽目录与空文件（best-effort，失败不影响 bind）
     ensure_agent_save_files(payload.slot_key)
-    # B2-7：绑定后按新槽作用域检查语料（指纹失配则后台重建，best-effort）
+    # 游戏数据文件本身可能在运行期被换掉：bind 是一次语义节点，顺带复核语料指纹
     refresh_index_if_stale()
     logger.info("[integration] bind slot=%s mode=%s", payload.slot_key, state.mode)
     return BindResponse(mode=state.mode, frontend_url=frontend_url_for(state.mode))
@@ -61,8 +61,6 @@ async def bind(payload: BindRequest) -> BindResponse:
 async def unbind() -> UnbindResponse:
     state = get_integration_state()
     state.unbind()
-    # B2-7：解绑后语料作用域回共享（指纹失配则后台重建，best-effort）
-    refresh_index_if_stale()
     logger.info("[integration] unbind mode=%s", state.mode)
     return UnbindResponse(mode=state.mode)
 

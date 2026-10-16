@@ -167,16 +167,3 @@ def test_invalid_slot_key_fail_closed(state, fake_game_data, tmp_path):
     # 既不写槽目录、也不回退共享文件
     assert not (tmp_path / "rag" / "agent_saves").exists()
     assert not _shared_paths(tmp_path)[0].exists()
-
-
-def test_write_triggers_index_refresh(state, fake_game_data, monkeypatch):
-    """B2-7 接线：写盘成功后（锁外）触发语料刷新检查。"""
-    from services.agent_tools import task_tools as task_tools_mod
-
-    calls: list[int] = []
-    monkeypatch.setattr(task_tools_mod, "refresh_index_if_stale", lambda: calls.append(1))
-
-    write_confirmed_agent_task_files(
-        draft=_draft(), npc_name_fallback=NPC, game_data=fake_game_data,
-    )
-    assert calls == [1]

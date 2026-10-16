@@ -17,7 +17,6 @@ from services.dialogue.sources import DialogueSources, resolve_speaker_title, sp
 from services.dialogue.view import shared_sources
 from services.game_data.registry import GameDataRegistry
 from services.integration.save_paths import resolve_task_write_paths, shared_task_paths
-from services.retrieval.refresh import refresh_index_if_stale
 
 # 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
 MAX_MAINLINE_TASK_PROGRESS: int = 77
@@ -542,7 +541,5 @@ def write_confirmed_agent_task_files(
         else:
             msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
 
-    # B2-7：锁外触发语料刷新（新任务台词应立即可检索；引擎未就绪时天然 no-op）
-    refresh_index_if_stale()
     return msg, task_id_int
 

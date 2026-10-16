@@ -489,10 +489,6 @@ def test_partial_batch_applies_good_and_rejects_bad(dialogue_env):
 def test_save_bumps_dialogue_version_and_preserves_other_keys(dialogue_env, monkeypatch):
     """落盘后 dialogue_version 递增（游戏侧据此使对话缓存失效），其它键原样保留。"""
     import services.agent_tools.task_tools as task_tools
-    import services.retrieval.refresh as refresh
-
-    refresh_calls: list[int] = []
-    monkeypatch.setattr(refresh, "refresh_index_if_stale", lambda: refresh_calls.append(1) or False)
 
     sync_path = dialogue_env.data_root / "rag" / "sync_state.json"
     sync_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,7 +503,6 @@ def test_save_bumps_dialogue_version_and_preserves_other_keys(dialogue_env, monk
     doc = json.loads(sync_path.read_text("utf-8"))
     assert doc["dialogue_version"] == 2
     assert doc["task_version"] == 7 and doc["text_version"] == 3   # 同一文件，别的键不能丢
-    assert refresh_calls == [1, 1]                                  # 语料变了要触发索引复检
 
     # 版本号 bump 失败绝不能报错：覆盖层已经写成了，报错只会让模型重交、把追加行写重
     def _boom(_data_root):
