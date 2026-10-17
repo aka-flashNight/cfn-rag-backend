@@ -196,6 +196,13 @@ def test_edit_strategy_block_verbatim_in_both_heads():
         assert sentence in stripped
 
 
+def test_dialogue_system_requires_pc_placeholder_for_player_lines():
+    """真模型爱把玩家行的说话人写成中文「玩家」，两个 system 头都必须写明落盘用 $PC。"""
+    for allow_search in (True, False):
+        text = build_dialogue_system(npc_name=NPC, allow_search=allow_search)
+        assert "玩家那行的说话人写 $PC，不要写「玩家」，也不要写他的名字。" in text
+
+
 def test_dialogue_system_carries_roleplay_material():
     """角色扮演资料补齐：世界观/说话方式/脑补禁令都在，且与聊天主 Agent 同一份文本。"""
     from services.orchestrator.prompts import (

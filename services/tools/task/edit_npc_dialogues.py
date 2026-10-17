@@ -20,7 +20,7 @@ from services.tools.base import BaseTool, ToolContext, ToolResult
 _LINE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "name": {"type": "string", "description": "说话人：你自己（NPC 名）或玩家。"},
+        "name": {"type": "string", "description": "说话人：你自己（填你的名字）或玩家（固定填 $PC）。"},
         "text": {"type": "string", "description": "这行台词。"},
         "emotion": {
             "type": "string",

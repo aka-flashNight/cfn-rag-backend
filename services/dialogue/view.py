@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from services.dialogue.models import DialogueGroup, DialogueLine
+from services.dialogue.models import DialogueGroup, DialogueLine, PLAYER_NAME
 from services.dialogue import overrides as overlay
 from services.dialogue import task_text as text_overlay
 from services.dialogue.sources import DialogueSources
@@ -430,7 +430,9 @@ def _body(group: DialogueGroup) -> str:
     """台词行（不含组说明与编号）；Title 不拼给模型。"""
     lines = []
     for index, line in enumerate(group.lines, start=1):
-        speaker = "玩家" if line.is_player else (line.name or "旁白")
+        # 玩家行直接按落盘占位符显示：模型「原样抄回」就会照抄 $PC，
+        # 写成中文「玩家」只能靠后端改写，等于把正确性押在兜底上。
+        speaker = PLAYER_NAME if line.is_player else (line.name or "旁白")
         lines.append(f"  {index}) {speaker}：{line.text}")
     return "\n".join(lines)
 

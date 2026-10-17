@@ -63,6 +63,22 @@ def test_multi_scope_select(dialogue_env, bound_slot):
     assert res.dialogue_index[-1]["key"] == "$SIDE_GET_1"
 
 
+def test_player_line_renders_as_pc_placeholder(dialogue_env, bound_slot):
+    """玩家行按落盘占位符列出：模型「原样抄回」就写对 $PC，不必靠后端改写。"""
+    bound_slot()
+    res = search_tool.run({"scopes": ["daily_all"]}, _ctx(dialogue_env))
+    text = res.result_json
+    assert "$PC：给我打把刀。" in text
+    assert "玩家：" not in text
+
+
+def test_edit_tool_name_field_states_pc_placeholder():
+    """说话人字段的描述必须给出生成者看得懂的取值（曾经写「或玩家」，模型就填「玩家」）。"""
+    desc = edit_tool.parameters_schema["properties"]["edits"]["items"]["properties"][
+        "lines"]["items"]["properties"]["name"]["description"]
+    assert "固定填 $PC" in desc
+
+
 def test_task_recent_wins_over_task_all(dialogue_env, bound_slot):
     """任务近期与任务全量同选时采用任务近期（6 个主线只取最近 5 组）。"""
     bound_slot()
