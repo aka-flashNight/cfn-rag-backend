@@ -33,9 +33,28 @@ def _draft_item_role_notes(draft: dict[str, Any], item_name: str) -> list[str]:
     return notes
 
 
+def _npc_shop_marker(
+    game_data: Optional[GameDataRegistry],
+    npc_name: str,
+    item_name: str,
+) -> str:
+    """该物品是否由这位 NPC 自己售卖（用于让聊天 Agent 知道东西是哪来的）。"""
+    if not game_data or not npc_name or not item_name:
+        return ""
+    shops = getattr(game_data, "shops", None)
+    if shops is None or not shops.has_shop(npc_name):
+        return ""
+    try:
+        goods = shops.get_npc_shop(npc_name) or []
+    except Exception:  # pragma: no cover - 数据异常时不标注即可
+        return ""
+    return "（本NPC商店在售）" if item_name in goods else ""
+
+
 def _format_items_with_price(
     items: list[dict[str, Any]],
     game_data: Optional[GameDataRegistry] = None,
+    npc_name: str = "",
 ) -> list[str]:
     parts: list[str] = []
     for it in items[:10]:
@@ -47,10 +66,11 @@ def _format_items_with_price(
                 price = game_data.items.get_price(name)
             except Exception:
                 pass
+        marker = _npc_shop_marker(game_data, npc_name, name)
         if price and name != "金币":
-            parts.append(f"{name}x{count}(单价{price})")
+            parts.append(f"{name}x{count}(单价{price}){marker}")
         else:
-            parts.append(f"{name}x{count}")
+            parts.append(f"{name}x{count}{marker}")
     return parts
 
 
@@ -161,6 +181,7 @@ def _build_draft_entity_context_lines(
                 it, reward_tags=tags, price=it.price,
                 sources=format_item_sources(game_data, nm),
             )
+            seg += _npc_shop_marker(game_data, str(draft.get("npc_name") or ""), nm)
             if notes:
                 seg += f"；草案涉及：{'；'.join(notes)}"
             lines.append(f"[物品] {seg}")
@@ -192,6 +213,8 @@ def _detailed_draft_summary(
     if isinstance(_desc, str) and _desc.strip():
         lines.append(f"描述: {_desc}")
     npc_name_fallback = draft.get("npc_name") or "?"
+    # 商店归属＝发布 NPC：奖励/提交/持有里由他自己在售的物品要标出来，避免聊天侧信息遗漏
+    shop_owner = str(draft.get("npc_name") or "")
     lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
     # 完成 NPC ≠ 发布 NPC 时补其属性与所在场景（B8-3）：无记录/查不到时对应片段省略、不附指示句
     finish_npc = (draft.get("finish_npc") or "").strip() or str(npc_name_fallback)
@@ -221,17 +244,17 @@ def _detailed_draft_summary(
 
     finish_submit = draft.get("finish_submit_items") or []
     if finish_submit:
-        fs_strs = _format_items_with_price(finish_submit, game_data)
+        fs_strs = _format_items_with_price(finish_submit, game_data, npc_name=shop_owner)
         lines.append(f"提交物品: {', '.join(fs_strs)}")
 
     finish_contain = draft.get("finish_contain_items") or []
     if finish_contain:
-        fc_strs = _format_items_with_price(finish_contain, game_data)
+        fc_strs = _format_items_with_price(finish_contain, game_data, npc_name=shop_owner)
         lines.append(f"持有物品: {', '.join(fc_strs)}")
 
     rewards = draft.get("rewards") or []
     if rewards:
-        rw_strs = _format_items_with_price(rewards, game_data)
+        rw_strs = _format_items_with_price(rewards, game_data, npc_name=shop_owner)
         lines.append(f"奖励: {', '.join(rw_strs)}")
 
     def _summarize_dialogue(dialogue: Any) -> str:
