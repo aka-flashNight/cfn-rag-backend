@@ -267,6 +267,26 @@ def test_new_group_lines_get_defaults_from_npc(dialogue_env):
     assert player_defaults() == (PLAYER_TITLE, PLAYER_CHAR)
 
 
+def test_player_speaker_alias_normalized_to_pc(dialogue_env):
+    """模型把玩家写成中文「玩家」时后端归一成 $PC：改已有组与新增组都不打回，落盘走占位符。"""
+    view = _view(dialogue_env)
+    outcome = _daily_editor(view).apply(npc=NPC, edits=[_edit(1, [
+        _say("炉子今天歇火。"), _say("给我打把刀。", "玩家"),
+    ])], new_groups=[
+        {"lines": [_say("新组第一句。"), _say("好。", "玩家")]},
+    ])
+    assert outcome.rejected == []
+
+    dialogue_path, _ = _paths(dialogue_env)
+    lines = [
+        line.to_subdialogue()
+        for entry in overlay.load_overrides(dialogue_path)
+        for line in entry.lines
+    ]
+    assert [line["Name"] for line in lines] == [NPC, PLAYER_NAME, NPC, PLAYER_NAME]
+    assert lines[1]["Title"] == PLAYER_TITLE and lines[1]["Char"] == PLAYER_CHAR
+
+
 # ---------------------------------------------------------------------------
 # 二次修改就地更新同一条目 / agent_<n> 不撞
 # ---------------------------------------------------------------------------

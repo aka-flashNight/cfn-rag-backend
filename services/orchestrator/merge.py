@@ -139,6 +139,10 @@ class MergeCoordinator:
                 continue
             if ev.kind in ("final", "failed"):
                 self._final_event = ev
+                # 子 Agent 各次调用的 usage 随终态事件带上来：按时序先并入本回合逐次明细
+                # （早于汇合轮），再从业务载荷摘掉——留着会混进汇合提示词的结果块。
+                for row in (ev.payload or {}).pop("usage_rows", None) or []:
+                    self.outcome.usage = accumulate_usage(self.outcome.usage, row)
                 phase = "done" if ev.kind == "final" else "failed"
                 yield agent_status_event(self.agent, phase, ev.ui_hint)
                 return

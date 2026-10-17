@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal
 
@@ -119,9 +120,39 @@ def normalize_usage(raw: Any) -> dict[str, Any] | None:
     return out or None
 
 
+_USAGE_LOG_KEYS = (("prompt_tokens", "prompt"), ("completion_tokens", "completion"), ("cached_tokens", "cached"))
+
+
+def _log_call(
+    *,
+    purpose: str,
+    model: str,
+    stream: bool,
+    usage: dict[str, Any] | None,
+    elapsed_ms: float,
+    first_token_ms: float | None = None,
+) -> None:
+    """每次真实调用落一行 INFO：token 三项（含 cached_tokens＝前缀缓存命中量）＋耗时。
+
+    usage 唯一落日志的漏斗：后台子 Agent 与脱离回合的对话修改 worker 都经过这里，
+    事后查缓存命中率只读 cfn-rag.log 就够，不必再挂探针。
+    """
+    row = usage or {}
+    parts = [
+        f"LLM 调用 purpose={purpose} model={model}",
+        "stream=流式" if stream else "stream=非流式",
+        f"耗时={elapsed_ms:.0f}ms",
+    ]
+    if first_token_ms is not None:
+        parts.append(f"首字={first_token_ms:.0f}ms")
+    for key, label in _USAGE_LOG_KEYS:
+        value = row.get(key)
+        parts.append(f"{label}={value if value is not None else '-'}")
+    logger.info(" ".join(parts))
+
+
 def _is_image_part(part: dict[str, Any]) -> bool:
     return isinstance(part, dict) and part.get("type") == "image_url"
-
 
 def messages_have_images(messages: list[dict[str, Any]]) -> bool:
     return any(
@@ -264,6 +295,7 @@ class LLMClient:
 
     async def chat(self, req: ChatRequest) -> ChatResult:
         """非流式调用（后台子 Agent / 摘要）。"""
+        started = time.perf_counter()
         allow_images = self._allow_images(req)
         kwargs = self._build_kwargs(
             req, stream=False, with_thinking=True, allow_images=allow_images,
@@ -283,15 +315,25 @@ class LLMClient:
             tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
             for tc in (getattr(message, "tool_calls", None) or [])
         ]
+        usage = normalize_usage(getattr(resp, "usage", None))
+        _log_call(
+            purpose=req.purpose,
+            model=self.config.model_name,
+            stream=False,
+            usage=usage,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+        )
         return ChatResult(
             content=content,
             reasoning=str(reasoning),
             tool_calls=tool_calls,
-            usage=normalize_usage(getattr(resp, "usage", None)),
+            usage=usage,
         )
 
     async def chat_stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
         """流式调用（聊天主 Agent）。yield StreamEvent；reasoning 单独成事件。"""
+        started = time.perf_counter()
+        first_content_ms: float | None = None
         allow_images = self._allow_images(req)
         kwargs = self._build_kwargs(
             req, stream=True, with_thinking=True, allow_images=allow_images,
@@ -318,6 +360,8 @@ class LLMClient:
             if reasoning:
                 yield StreamEvent(kind="reasoning", text=str(reasoning))
             if getattr(delta, "content", None):
+                if first_content_ms is None:
+                    first_content_ms = (time.perf_counter() - started) * 1000
                 yield StreamEvent(kind="content", text=delta.content)
             for tc in getattr(delta, "tool_calls", None) or []:
                 idx = getattr(tc, "index", None)
@@ -344,6 +388,15 @@ class LLMClient:
             }
             for i in sorted(tool_calls_acc)
         ]
+        # 必须在 finish 之前记：下游见到 finish 就 return，生成器随之被关闭，此后的代码不再执行
+        _log_call(
+            purpose=req.purpose,
+            model=self.config.model_name,
+            stream=True,
+            usage=last_usage,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            first_token_ms=first_content_ms,
+        )
         yield StreamEvent(kind="finish", tool_calls=aggregated or None, usage=last_usage)
 
     # ------------------------------------------------------------------

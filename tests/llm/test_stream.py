@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from services.llm.client import ChatRequest, LLMClient, LLMConfig
 from services.llm.meta import split_meta_events
 
@@ -76,6 +78,34 @@ async def test_usage_via_final_chunk_reaches_finish():
     }
     assert events[-1].kind == "finish"
     assert events[-1].usage["cached_tokens"] == 640
+
+
+async def test_stream_call_is_logged_before_finish(caplog):
+    """流式也落一行 INFO，且**必须在 finish 之前**记：下游见到 finish 就 return，
+    生成器随即关闭，写在 finish 之后的代码永不执行。"""
+
+    def handler(kwargs):
+        async def gen():
+            yield FakeStreamChunk(delta=FakeDelta(content="嗯"))
+            yield FakeStreamChunk(usage=type("U", (), {
+                "prompt_tokens": 6561, "completion_tokens": 44, "total_tokens": 6605,
+                "prompt_tokens_details": type("D", (), {"cached_tokens": 3136})(),
+            })())
+        return gen()
+
+    llm = _make_client(handler)
+    with caplog.at_level(logging.INFO, logger="services.llm.client"):
+        async for ev in llm.chat_stream(ChatRequest(messages=[{"role": "user", "content": "hi"}])):
+            if ev.kind == "finish":
+                break
+
+    assert caplog.text.count("LLM 调用") == 1
+    assert "purpose=chat" in caplog.text
+    assert "stream=流式" in caplog.text
+    assert "首字=" in caplog.text
+    assert "prompt=6561" in caplog.text
+    assert "completion=44" in caplog.text
+    assert "cached=3136" in caplog.text
 
 
 async def test_split_meta_events_forward_usage_and_finish():

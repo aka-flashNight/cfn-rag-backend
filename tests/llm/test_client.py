@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -213,6 +214,30 @@ async def test_non_stream_usage_recaptured():
     llm, _ = _make_client(handler)
     result = await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}]))
     assert result.usage == {"prompt_tokens": 128, "completion_tokens": 32, "total_tokens": 160}
+
+
+async def test_non_stream_call_is_logged_with_usage(caplog):
+    """每次真实调用落一行 INFO（purpose／模型／token 三项／耗时）：事后查缓存命中率不必再挂探针。"""
+    usage_obj = type("U", (), {
+        "prompt_tokens": 748, "completion_tokens": 34, "total_tokens": 782,
+        "prompt_tokens_details": type("D", (), {"cached_tokens": 512})(),
+    })()
+
+    def handler(kwargs):
+        return FakeResponse(content="好", usage=usage_obj)
+
+    llm, _ = _make_client(handler)
+    with caplog.at_level(logging.INFO, logger="services.llm.client"):
+        await llm.chat(ChatRequest(messages=[{"role": "user", "content": "hi"}], purpose="subagent"))
+
+    assert caplog.text.count("LLM 调用") == 1
+    assert "purpose=subagent" in caplog.text
+    assert "model=test-model" in caplog.text
+    assert "stream=非流式" in caplog.text
+    assert "prompt=748" in caplog.text
+    assert "completion=34" in caplog.text
+    assert "cached=512" in caplog.text
+    assert "耗时=" in caplog.text
 
 
 async def test_subagent_purpose_forces_no_image():

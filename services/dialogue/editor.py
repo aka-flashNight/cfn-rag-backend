@@ -194,6 +194,10 @@ class DialogueEditor:
         merged: list[DialogueLine] = []
         for index, (raw_name, raw_text, raw_emotion) in enumerate(submitted):
             speaker = sanitize_text(raw_name) or npc
+            # 模型爱把玩家写成中文「玩家」，而落盘必须是 $PC——AS2 按这个占位符换玩家
+            # 角色名与立绘，写成「玩家」会当成陌生 NPC（称号槽与立绘都取不到）。
+            if speaker == "玩家":
+                speaker = PLAYER_NAME
             text = sanitize_text(raw_text)
             if not text:
                 return [], f"第 {index + 1} 行台词为空。"

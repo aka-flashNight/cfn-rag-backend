@@ -32,7 +32,7 @@ class SubagentEvent:
     kind: Literal["progress", "intermediate", "final", "failed"]
     ui_hint: str = ""            # ≤12 字，给前端进度条：「拟定委托中」「校验修正中」「查资料中」
     vague_note: str = ""         # intermediate 专用：只说类型不说数字的一句话
-    payload: dict[str, Any] = field(default_factory=dict)  # final: draft_summary/findings；failed: reason
+    payload: dict[str, Any] = field(default_factory=dict)  # final: draft_summary/findings；failed: reason；终态一律带 usage_rows
 
 
 class SubagentHandle:
@@ -126,6 +126,9 @@ class SubagentBase:
         self.max_rounds = max_rounds
         self.queue = queue
         self.rounds_used = 0
+        # 每次 llm.chat() 原样留下的 usage（含 cached_tokens），随终态事件交给上层；
+        # 求和与逐次明细由编排层做（accumulate_usage 属 SSE 契约层，不反向依赖本层）。
+        self.usage_rows: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
 
@@ -143,6 +146,10 @@ class SubagentBase:
             self.queue.put_nowait(ev)
         except Exception:  # pragma: no cover
             pass
+
+    def _with_usage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """终态载荷带上各次调用的 usage 行（编排层据此并入回合逐次明细与合计）。"""
+        return {**payload, "usage_rows": self.usage_rows}
 
     def _terminal_payload(self, results: list[tuple[str, "ToolResult", ToolContext]]) -> Optional[dict[str, Any]]:
         """子类覆盖：从本轮工具结果中识别终态（如 draft_created），返回 final payload。"""
@@ -206,6 +213,8 @@ class SubagentBase:
                     tools=tools or None,
                     purpose="subagent",
                 ))
+                if result.usage:
+                    self.usage_rows.append(result.usage)
                 if result.tool_calls:
                     messages.append({
                         "role": "assistant",
@@ -235,17 +244,17 @@ class SubagentBase:
                 logger.warning("%s 达到轮限 %d", self.__class__.__name__, self.max_rounds)
 
             if terminal is not None:
-                self._push(SubagentEvent(kind="final", payload=terminal))
+                self._push(SubagentEvent(kind="final", payload=self._with_usage(terminal)))
                 return
 
             fallback_payload = await self._on_exhausted()
             if fallback_payload is not None:
-                self._push(SubagentEvent(kind="final", payload=fallback_payload))
+                self._push(SubagentEvent(kind="final", payload=self._with_usage(fallback_payload)))
                 return
 
             self._last_model_text = last_text
             payload = self._final_from_text(last_text)
-            self._push(SubagentEvent(kind="final", payload=payload))
+            self._push(SubagentEvent(kind="final", payload=self._with_usage(payload)))
         except asyncio.CancelledError:
             # 同会话新回合取消：副作用仅内存与草案，安全丢弃（01 §4）
             raise
@@ -256,7 +265,10 @@ class SubagentBase:
                 if isinstance(exc, LLMError) and is_tools_unsupported_error(exc)
                 else f"{type(exc).__name__}: {exc}"
             )
-            self._push(SubagentEvent(kind="failed", payload={"reason": reason}))
+            self._push(SubagentEvent(
+                kind="failed",
+                payload=self._with_usage({"reason": reason}),
+            ))
 
 
 # ---------------------------------------------------------------------------
