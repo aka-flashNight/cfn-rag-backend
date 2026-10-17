@@ -2693,8 +2693,10 @@ def _build_existing_agent_tasks(game_data: Any, npc_name: str) -> list[dict[str,
     """当前 NPC 已发布的 Agent 委托：[{title, completion}]（任务名＋通关条件）。
 
     只读磁盘：``TaskRegistry`` 排除了 ``agent_tasks.json``，``game_data.tasks`` 里
-    根本看不到 Agent 任务。读取范围＝共享 ∪ 当前绑定存档（存档覆盖共享），
-    与已完成委托块同一口径；只保留 ``get_npc`` 等于当前 NPC 的记录。
+    根本看不到 Agent 任务，所以只读 Agent 任务文件、**不碰主线/原有任务**。
+    读取范围＝**本存档的 Agent 任务**（绑定存档时只读本存档，不并入共享落点、
+    也不看其它存档）；未绑定（standalone）时读共享文件。
+    只保留 ``get_npc`` 等于当前 NPC 的记录——避重只在本存档、本 NPC 内部发生。
     排序＝任务 id 倒序（最新的在前）；标题缺失＝跳过该条并记 warning。
     **本函数没有任何写盘副作用**（只读两个 JSON，不碰存档/状态/索引）。
     """
@@ -2711,7 +2713,7 @@ def _build_existing_agent_tasks(game_data: Any, npc_name: str) -> list[dict[str,
     try:
         from services.agent_tools.finished_tasks import _completion_phrase, _merged_docs
 
-        tasks, texts = _merged_docs(Path(data_root), slot_key)
+        tasks, texts = _merged_docs(Path(data_root), slot_key, slot_only=True)
     except Exception as exc:
         logger.warning("existing_tasks 读取失败，按空列表处理: %s", exc)
         return []

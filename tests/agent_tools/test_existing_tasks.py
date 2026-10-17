@@ -2,7 +2,9 @@
 
 为什么要直读磁盘：``TaskRegistry`` 排除了 ``agent_tasks.json``，
 ``game_data.tasks`` 里根本看不到 Agent 任务（旧写法就算恢复也拿不到数据）。
-读取范围＝共享 ∪ 当前绑定存档（存档覆盖共享），字段恰好是 ``title``/``completion``。
+读取范围＝**本存档的 Agent 委托**（绑定存档时只读本存档，不并入共享落点、不看其它存档；
+未绑定时读共享文件），字段恰好是 ``title``/``completion``。
+非 Agent 任务（主线/原有任务）不参与——避重只在本存档的 Agent 任务内部发生。
 """
 
 from __future__ import annotations
@@ -82,17 +84,36 @@ def test_only_current_npc_and_fields_are_title_completion(data_root, state):
     assert set(items[0]) == {"title", "completion"}
 
 
-def test_slot_overlay_wins_over_shared(data_root, state):
-    """本存档文件后读覆盖同 id：达成条件以存档侧为准。"""
+def test_bound_slot_ignores_shared_landing(data_root, state):
+    """绑定存档后只读本存档：共享落点里同 NPC 的旧委托不再进避重名单。"""
     tasks_path, text_path = agent_save_task_paths(data_root, "slot_x")
-    _write(tasks_path, {"tasks": [_task(200001, finish_requirements=["医院#困难"])]})
-    _write(text_path, {"$AGENT_TITLE_200001": "取回祖传铁锤（本存档改题）"})
+    _write(tasks_path, {"tasks": [_task(200005, finish_requirements=["医院#困难"])]})
+    _write(text_path, {"$AGENT_TITLE_200005": "本存档的委托"})
     state.bind(slot_key="slot_x")
 
     items = _build_existing_agent_tasks(_game_data(data_root), NPC)
-    assert items[0]["title"] == "取回祖传铁锤（本存档改题）"
+    assert [it["title"] for it in items] == ["本存档的委托"]
     assert "通关医院（困难）" in items[0]["completion"]
-    assert len(items) == 1
+
+
+def test_other_saves_are_invisible(data_root, state):
+    """其它存档的 Agent 委托不参与避重：只看当前绑定的那个存档。"""
+    for slot, tid, title in (
+        ("slot_a", 200006, "A 存档的委托"),
+        ("slot_b", 200007, "B 存档的委托"),
+    ):
+        tasks_path, text_path = agent_save_task_paths(data_root, slot)
+        _write(tasks_path, {"tasks": [_task(tid)]})
+        _write(text_path, {f"$AGENT_TITLE_{tid}": title})
+
+    state.bind(slot_key="slot_a")
+    assert [it["title"] for it in _build_existing_agent_tasks(_game_data(data_root), NPC)] == [
+        "A 存档的委托",
+    ]
+    state.bind(slot_key="slot_b")
+    assert [it["title"] for it in _build_existing_agent_tasks(_game_data(data_root), NPC)] == [
+        "B 存档的委托",
+    ]
 
 
 def test_standalone_reads_shared_only(data_root, state):
@@ -104,9 +125,10 @@ def test_standalone_reads_shared_only(data_root, state):
     assert [it["title"] for it in _build_existing_agent_tasks(_game_data(data_root), NPC)] == [
         "取回祖传铁锤",
     ]
+    # 绑定后只看到本存档，共享落点完全不参与
     state.bind(slot_key="slot_y")
     titles = [it["title"] for it in _build_existing_agent_tasks(_game_data(data_root), NPC)]
-    assert titles == ["只有存档有的委托", "取回祖传铁锤"]  # id 倒序
+    assert titles == ["只有存档有的委托"]
 
 
 def test_missing_title_is_skipped(data_root, state):

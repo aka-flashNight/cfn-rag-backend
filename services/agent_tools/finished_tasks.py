@@ -76,13 +76,24 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _merged_docs(data_root: Path, slot_key: str | None) -> tuple[dict[int, dict], dict[str, Any]]:
-    """(任务记录 by id, 文本表)；共享文件先读、本存档文件后读并覆盖同 id。"""
+def _merged_docs(
+    data_root: Path, slot_key: str | None, *, slot_only: bool = False,
+) -> tuple[dict[int, dict], dict[str, Any]]:
+    """(任务记录 by id, 文本表)；共享文件先读、本存档文件后读并覆盖同 id。
+
+    ``slot_only=True`` 且已绑定存档时**只读本存档**、不并入共享文件：用于
+    「同一个 NPC 别派同一类活」的避重——只看本存档的 Agent 委托，
+    不让共享落点（旧数据）或其它存档的记录影响选型。未绑定（standalone）时共享文件
+    就是本档，照旧读它。
+    """
     tasks: dict[int, dict] = {}
     texts: dict[str, Any] = {}
-    pairs = [shared_task_paths(data_root)]
-    if slot_key:
-        pairs.append(agent_save_task_paths(data_root, slot_key))
+    if slot_only and slot_key:
+        pairs = [agent_save_task_paths(data_root, slot_key)]
+    else:
+        pairs = [shared_task_paths(data_root)]
+        if slot_key:
+            pairs.append(agent_save_task_paths(data_root, slot_key))
     for tasks_path, text_path in pairs:
         doc = _read_json(tasks_path, {"tasks": []})
         records = doc.get("tasks") if isinstance(doc, dict) else None
