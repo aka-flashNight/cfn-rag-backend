@@ -1353,6 +1353,10 @@ def _stage_loot_profile(
     return has_intel, total
 
 
+#: NPC 池上限（问候 / 传话）
+NPC_POOL_CAP = 10
+
+
 def _build_npc_list(
     game_data: GameDataRegistry,
     npc_states: dict[str, Any],
@@ -1406,46 +1410,177 @@ def _build_npc_list(
             entry["emotions"] = ["普通"]
         if name == current_npc:
             entry["is_current"] = True
+        entry["_has_shop"] = bool(
+            getattr(game_data, "shops", None) is not None
+            and game_data.shops.has_shop(name)
+        )
+        entry["_has_challenge"] = bool(getattr(state, "challenge", None))
+        entry["_sex"] = str(getattr(state, "sex", "") or "")
+        entry["_region"] = pt.npc_region(str(entry.get("scene") or ""))
         result.append(entry)
 
-    kw = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_npc_keywords(requirement_keywords)
+    publisher_region = ""
+    if current_npc:
+        pub_scene = ""
+        if scene_text_fn is not None and map_reg is not None:
+            pub_scene = scene_text_fn(map_reg, current_npc) or ""
+        publisher_region = pt.npc_region(pub_scene)
 
-    def _npc_kw_hit(entry: dict[str, Any]) -> bool:
-        if not kw:
-            return False
-        titles = entry.get("titles") or []
-        title_parts = list(titles) if isinstance(titles, list) else [str(titles)]
-        blob = "".join([
-            str(entry.get("name") or ""),
-            str(entry.get("faction") or ""),
-            str(entry.get("title") or ""),
-            *title_parts,
-        ])
-        return _any_keyword_in_text(blob, kw)
+    for e in result:
+        e["_hit_tags"] = _npc_tag_hits(
+            e,
+            tags=tags,
+            current_npc=current_npc,
+            current_faction=current_faction,
+            publisher_region=publisher_region,
+        )
+        e["_hit_words"] = _npc_word_hits(e, words)
 
-    if not kw:
-        cur = [e for e in result if e.get("is_current")]
-        rest = [e for e in result if not e.get("is_current")]
-        ordered = _shuffle_each_bucket_concat([cur, rest])
-        return ordered[:30]
+    picked = _pick_npc_rows_n(result, keywords=all_wanted)
+    for e in picked:
+        e.pop("_sex", None)
+        e.pop("_region", None)
+        e.pop("_has_shop", None)
+        e.pop("_has_challenge", None)
+    return picked
 
-    b0: list[dict[str, Any]] = []  # 关键词 + 当前 NPC
-    b1: list[dict[str, Any]] = []  # 关键词 + 其他
-    b2: list[dict[str, Any]] = []  # 无关键词 + 当前 NPC
-    b3: list[dict[str, Any]] = []  # 无关键词 + 其他
-    for entry in result:
-        kh = _npc_kw_hit(entry)
-        cur = bool(entry.get("is_current"))
-        if kh and cur:
-            b0.append(entry)
-        elif kh and not cur:
-            b1.append(entry)
-        elif not kh and cur:
-            b2.append(entry)
+
+def _split_npc_keywords(
+    requirement_keywords: Optional[list[str]],
+) -> tuple[list[str], list[str], list[str]]:
+    wanted = _normalize_kw_list(requirement_keywords)
+    if not wanted:
+        return [], [], []
+    available = [t for t, _ in pt.NPC_TAGS]
+    tags: list[str] = []
+    words: list[str] = []
+    for raw in wanted:
+        tag = pt.normalize_tag(raw, available)
+        if tag:
+            if tag not in tags:
+                tags.append(tag)
         else:
-            b3.append(entry)
-    ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
-    return ordered[:30]
+            words.append(raw)
+    return tags, words, wanted
+
+
+def _npc_tag_hits(
+    entry: dict[str, Any],
+    *,
+    tags: list[str],
+    current_npc: str,
+    current_faction: str,
+    publisher_region: str,
+) -> list[str]:
+    if not tags:
+        return []
+    faction = str(entry.get("faction") or "")
+    region = str(entry.get("_region") or "")
+    hits: list[str] = []
+    for tag in tags:
+        if tag == "同阵营":
+            ok = bool(current_faction) and faction == current_faction
+        elif tag == "其他阵营":
+            ok = faction != current_faction
+        elif tag == "男":
+            ok = entry.get("_sex") == "男"
+        elif tag == "女":
+            ok = entry.get("_sex") == "女"
+        elif tag == "商人":
+            ok = bool(entry.get("_has_shop"))
+        elif tag == "可切磋":
+            ok = bool(entry.get("_has_challenge"))
+        elif tag == "同区域":
+            ok = bool(publisher_region) and region == publisher_region
+        elif tag == "跨区域":
+            ok = bool(publisher_region) and region != publisher_region
+        elif tag in pt.NPC_FACTIONS:
+            ok = faction == tag
+        else:
+            ok = False
+        if ok:
+            hits.append(tag)
+    return hits
+
+
+def _npc_word_hits(entry: dict[str, Any], words: list[str]) -> list[str]:
+    if not words:
+        return []
+    titles = entry.get("titles") or []
+    title_parts = list(titles) if isinstance(titles, list) else [str(titles)]
+    blob = "".join([
+        str(entry.get("name") or ""),
+        str(entry.get("faction") or ""),
+        str(entry.get("title") or ""),
+        *title_parts,
+    ])
+    return [w for w in words if w in blob]
+
+
+def _npc_rank(entry: dict[str, Any], words: list[str]) -> int:
+    name = str(entry.get("name") or "")
+    for w in words:
+        if w == name:
+            return _RANK_NAME_EXACT
+    for w in words:
+        if w and w in name:
+            return _RANK_NAME_CONTAINS
+    if entry.get("_hit_tags"):
+        return _RANK_TAG
+    return _RANK_DESC
+
+
+def _pick_npc_rows_n(
+    rows: list[dict[str, Any]],
+    *,
+    keywords: Optional[list[str]],
+    cap: int = NPC_POOL_CAP,
+) -> list[dict[str, Any]]:
+    """NPC 池抽样：口径与关卡/物品池一致。"""
+    if not rows:
+        return []
+    words = _normalize_kw_list(keywords)
+    hits = [r for r in rows if (r.get("_hit_tags") or r.get("_hit_words"))]
+    non_hits = [r for r in rows if not (r.get("_hit_tags") or r.get("_hit_words"))]
+
+    if not hits:
+        random.shuffle(non_hits)
+        for r in non_hits[:cap]:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+        return non_hits[:cap]
+
+    for r in hits:
+        r["_rank"] = _npc_rank(r, words)
+    by_rank: list[dict[str, Any]] = []
+    for rank in range(_RANK_OTHER + 1):
+        same = [r for r in hits if r.get("_rank") == rank]
+        random.shuffle(same)
+        by_rank.extend(same)
+
+    if len(hits) <= cap:
+        picked = list(by_rank)
+        rest = [r for r in non_hits]
+        random.shuffle(rest)
+        picked.extend(rest[: max(0, cap - len(picked))])
+    else:
+        top = by_rank[:POOL_TOP_BY_RANK]
+        rest = by_rank[POOL_TOP_BY_RANK:]
+        random.shuffle(rest)
+        picked = top + rest[: max(0, cap - len(top))]
+
+    for r in picked:
+        if r in hits:
+            r[pt.MATCHED_BY_FIELD] = (r.get("_hit_tags") or r.get("_hit_words"))[0]
+        else:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+    return picked[:cap]
+
+
+def _npc_kw_hit(entry: dict[str, Any], kw: list[str]) -> bool:
+    """兼容旧引用：自由词是否命中该 NPC。"""
+    return bool(_npc_word_hits(entry, kw))
+
 
 
 def _build_challenge_targets(
@@ -2559,6 +2694,73 @@ def _build_existing_agent_tasks(game_data: Any, npc_name: str) -> list[dict[str,
     return out
 
 
+_POOL_NOTE_LABELS: tuple[tuple[str, str], ...] = (
+    ("stage_list", "关卡"),
+    ("stage_loot_list", "关卡"),
+    ("npc_list", "人"),
+    ("collectable_items", "物品"),
+    ("equipment_items", "物品"),
+    ("special_items", "物品"),
+    ("holdable_items", "物品"),
+)
+
+
+def _flat_pool_rows(value: Any) -> list[dict[str, Any]]:
+    """关卡池是大区分组结构，物品/NPC 池是扁平列表；统一拍平。"""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        inner = item.get("stages")
+        if isinstance(inner, list):
+            out.extend(x for x in inner if isinstance(x, dict))
+        else:
+            out.append(item)
+    return out
+
+
+def build_pool_note(context: dict[str, Any]) -> str:
+    """整池都由关键词命中填满时，给过渡语用的一句话范围说明；否则返回空串。
+
+    口径（用户 2026-10-18）：只有「候选池被关键词完全覆盖」才把关键词与说明交给
+    过渡话；只要混进随机候选就不给——否则过渡话会说池子里其实没有的方向。
+    """
+    groups: list[tuple[str, list[str]]] = []
+    for key, label in _POOL_NOTE_LABELS:
+        rows = _flat_pool_rows(context.get(key))
+        if not rows:
+            continue
+        labels = {str(r.get(pt.MATCHED_BY_FIELD) or "") for r in rows}
+        if not labels or pt.RANDOM_PICK_LABEL in labels:
+            return ""
+        tags: list[str] = []
+        for lb in labels:
+            if lb and lb not in tags and pt.tag_description(lb):
+                tags.append(lb)
+        if not tags:
+            return ""
+        groups.append((label, tags))
+    if not groups:
+        return ""
+
+    merged: list[tuple[str, list[str]]] = []
+    for label, tags in groups:
+        for i, (existing_label, existing_tags) in enumerate(merged):
+            if existing_label == label:
+                existing_tags.extend(t for t in tags if t not in existing_tags)
+                break
+        else:
+            merged.append((label, list(tags)))
+
+    parts: list[str] = []
+    for label, tags in merged:
+        desc = "、".join(f"{t}（{pt.tag_description(t).rstrip('。')}）" for t in tags)
+        parts.append(f"{label}——{desc}")
+    return "候选范围：" + "；".join(parts)
+
+
 def prepare_task_context(
     *,
     task_type: str,
@@ -2707,5 +2909,9 @@ def prepare_task_context(
         context["submit_vs_reward_hint"] = (
             "拟定草案时 `finish_submit_items` 与 `rewards` 不得出现相同物品；玩家需要的物品要放到rewards里。"
         )
+
+    pool_note = build_pool_note(context)
+    if pool_note:
+        context["pool_note"] = pool_note
 
     return json.dumps(context, ensure_ascii=False)

@@ -313,7 +313,7 @@ RANDOM_PICK_LABEL = "随机候选"
 def stage_tags_for_faction(
     faction: str,
     *,
-    home_area_factions: Iterable[str] = (),
+    home_area_factions: Iterable[str] | None = None,
 ) -> list[str]:
     """该阵营可用的关卡标签（按 STAGE_TAGS 顺序，只注册真能命中东西的）。
 
@@ -321,19 +321,24 @@ def stage_tags_for_faction(
     - 本方区域里全是自家或友军关卡（军阀的基地房顶）：不注册 `周边地区`——这正是
       「军阀不可能让玩家去打军阀」的结构性保证；
     - `敌对区域` 只要本方区域之外还有能打的势力就注册。
+
+    `home_area_factions` 不传时用区域默认表粗估（提示词侧用；与运行期实测口径一致）。
     """
     f = faction or ""
     home = FACTION_HOME_AREA.get(f, "")
     if not home:
         hidden = {"周边地区", "敌对区域"}
     else:
-        present = {x for x in home_area_factions if x and x != NO_FACTION}
-        has_target_in_home = any(
-            x != f and can_target(f, x) for x in present
-        )
-        hidden = set()
-        if not has_target_in_home:
-            hidden.add("周边地区")
+        if home_area_factions is None:
+            present = {AREA_DEFAULT_FACTION.get(home, "")}
+            second = AREA_SECOND_FACTION.get(home, "")
+            if second:
+                present.add(second)
+        else:
+            present = set(home_area_factions)
+        present.discard("")
+        has_target_in_home = any(x != f and can_target(f, x) for x in present)
+        hidden = set() if has_target_in_home else {"周边地区"}
     return [t for t, _ in STAGE_TAGS if t not in hidden]
 
 

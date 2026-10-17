@@ -64,10 +64,11 @@ PREPARE_SELECTION_GUIDE = """\
    - 经验值仅挑战/切磋类任务可大量给；其他类型的任务经验值只能少量给。
    - K点仅玩家进度阶段 4 及以上可选。
    - 武器/防具/插件仅发布 NPC 经营商店且商店覆盖对应类型时可选。
-3. requirement_keywords / reward_keywords：把玩家提到的关键词填进去（模糊搜索，让相关候选排前）。
-   例：玩家说「去废城找点东西」→ requirement_keywords 填 ["废城"]；
+3. requirement_keywords / reward_keywords：把玩家提到的方向填成下面「候选标签」里的词，最多 5 个，按优先级从高到低排。
+   玩家点到了具体区域/关卡/物品/NPC 时，把那个名字写在最前面，可以再跟 1~2 个标签。
+   例：玩家说「去废城找点东西」→ requirement_keywords 填 ["废城","势均力敌"]；
    玩家说「我要上装」→ reward_keywords 填 ["上装装备"]；
-   玩家说「想要药剂」→ requirement_keywords 或 reward_keywords 填 ["药剂"]。
+   玩家说「想要药剂」→ reward_keywords 填 ["药剂"]。
 4. prepare 返回的候选池为空、或校验指出 task_type 选错：**换 task_type 重新 prepare**，
    不要在错误的类型上硬凑草案。
 5. existing_tasks 是该 NPC 已发布过的 Agent 委托（任务名＋通关条件）。新委托不得与其中任何一条
@@ -85,6 +86,53 @@ _DRAFT_FIELD_REQUIREMENTS = (
     "- rewards 是玩家得到的东西，finish_submit_items 是玩家交给你的东西，两者禁止同名物品。\n"
     "- 物品数量参考候选列表标注的数量范围；奖励物品从候选列表中选（候选即合规）。"
 )
+
+
+def build_pool_keyword_block(*, npc_faction: str = "") -> str:
+    """候选标签清单（关卡按发布者阵营动态裁剪；物品按任务类型分组）。
+
+    标签是闭集：模型只能原样抄写；抄不上的词会被当自由词走子串，等于白填。
+    """
+    from services.agent_tools import pool_tags as pt
+
+    stage_tags = pt.stage_tags_for_faction(npc_faction)
+    stage_line = "、".join(stage_tags)
+    stage_desc = "；".join(
+        f"{t}={pt.tag_description(t).rstrip('。')}" for t in stage_tags
+    )
+
+    item_groups = []
+    seen_group: dict[tuple[str, ...], list[str]] = {}
+    for task_type, tags in pt.ITEM_TAGS_PER_TASK.items():
+        seen_group.setdefault(tuple(tags), []).append(task_type)
+    for tags, task_types in seen_group.items():
+        item_groups.append(f"{'、'.join(tags)}（用于 {'/'.join(task_types)}）")
+
+    npc_named: list[str] = []
+    for t, _ in pt.NPC_TAGS:
+        if t not in npc_named:
+            npc_named.append(t)
+    npc_factions = [t for t in npc_named if t in pt.NPC_FACTIONS and t != "商人"]
+    npc_desc = "；".join(
+        f"{t}={pt.tag_description(t).rstrip('。')}"
+        for t in npc_named if t not in pt.NPC_FACTIONS
+    )
+
+    lines = [
+        "【候选标签（写 requirement_keywords / reward_keywords 时只能从这里原样抄，最多 5 个，按优先级从高到低排）】",
+        f"- 关卡（本次可选）：{stage_line}",
+        f"  含义：{stage_desc}",
+        "- 物品（按你选的 task_type 取对应那一组）：" + "；".join(item_groups),
+        f"- NPC：{'、'.join(npc_factions)}，以及 {npc_desc}",
+        "- 自由词：也可以直接写任何具体名称（区域名、关卡名、物品名、NPC 名或称号），"
+        "填那个名字本身即可。",
+        "互斥（同一组里最多选一个，同时填了只会白占名额）："
+        "势均力敌⇄轻松应对；同阵营⇄其他阵营；男⇄女；同区域⇄跨区域；"
+        "具体阵营名不要和同阵营/其他阵营同时填。",
+        "一句话说明：这些词只决定候选池装什么，候选里带 matched_by 标明它来自哪个词，"
+        "没标的就是随机候选。",
+    ]
+    return "\n".join(lines)
 
 
 def build_capability_block(
@@ -126,6 +174,7 @@ def build_task_system(
     shop_reward_types: Optional[list[str]] = None,
     has_challenge: bool = False,
     player_can_challenge: bool = False,
+    npc_faction: str = "",
 ) -> str:
     """mode: draft（prepare→draft）| update。
 
@@ -147,6 +196,7 @@ def build_task_system(
             "拿到候选后再调用 draft_agent_task 提交新草案。"
         )
         parts.append(PREPARE_SELECTION_GUIDE)
+        parts.append(build_pool_keyword_block(npc_faction=npc_faction))
         parts.append(build_capability_block(
             has_shop=has_shop,
             shop_reward_types=shop_reward_types,
@@ -164,6 +214,7 @@ def build_task_system(
 
     # draft：先 prepare 再 draft
     parts.append(PREPARE_SELECTION_GUIDE)
+    parts.append(build_pool_keyword_block(npc_faction=npc_faction))
     parts.append(build_capability_block(
         has_shop=has_shop,
         shop_reward_types=shop_reward_types,

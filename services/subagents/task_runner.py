@@ -84,6 +84,8 @@ class TaskRunner(SubagentBase):
         # prepare 的 task_type 只存在于调用参数里（工具返回不带），故单独记录
         self._prepare_task_type = ""
         self._pricing_injected = False
+        # prepare 返回里可能带「候选池被关键词全覆盖」的范围说明（否则为空）
+        self._pool_note = ""
 
     # ------------------------------------------------------------------
     # 动态工具表（prepare 前：draft 只给 prepare，update 给 update+prepare；
@@ -164,6 +166,7 @@ class TaskRunner(SubagentBase):
             # prepare 结果无 status 键：以候选字段的存在判定完成
             if not self._prepare_done and (_PREPARE_KEYS & set(payload.keys())):
                 saw_prepare = True
+                self._pool_note = str(payload.get("pool_note") or "")
             if status == "validation_failed":
                 saw_failure = True
                 for issue in payload.get("issues") or []:
@@ -189,6 +192,7 @@ class TaskRunner(SubagentBase):
                 kind="intermediate",
                 ui_hint="拟定委托中",
                 vague_note=note,
+                pool_note=self._pool_note,
             ))
             logger.info(
                 "TaskRunner 候选池已就绪（task_type=%s），切换至 draft 节点并请求过渡话",
@@ -345,6 +349,7 @@ class TaskRunner(SubagentBase):
             shop_reward_types=shop_reward_types,
             has_challenge=bool((npc_challenge or "").strip()),
             player_can_challenge=player_can_challenge,
+            npc_faction=npc_faction,
         )
         if mode == MODE_UPDATE:
             from services.agent_tools.draft_formatting import _detailed_draft_summary

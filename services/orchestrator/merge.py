@@ -95,6 +95,7 @@ class MergeCoordinator:
         self.saw_intermediate = False
         self.spoke_interim = False
         self._vague_note_cache = ""
+        self._pool_note_cache = ""
         self._final_event: Any = None
         self.outcome = MergeOutcome(agent=self.agent)
 
@@ -153,6 +154,8 @@ class MergeCoordinator:
                 # 被后到的调整话覆盖会让玩家觉得 NPC 自己也说不清要派什么活。
                 if ev.vague_note and not self._vague_note_cache:
                     self._vague_note_cache = ev.vague_note
+                if getattr(ev, "pool_note", "") and not self._pool_note_cache:
+                    self._pool_note_cache = ev.pool_note
             yield agent_status_event(self.agent, self._phase_for(ev), ev.ui_hint)
             if bridge_on_intermediate and ev.kind == "intermediate":
                 return
@@ -183,7 +186,7 @@ class MergeCoordinator:
         except Exception as exc:
             logger.warning("汇合回复调用失败: %s", exc)
 
-    async def _interim_reply(self, vague_note: str) -> AsyncIterator[SSEEvent]:
+    async def _interim_reply(self, vague_note: str, pool_note: str = "") -> AsyncIterator[SSEEvent]:
         """过渡语 #2a：1~2 句报方向的模糊过渡，禁止数字/物品名/金额（03 §3）。"""
         self.spoke_interim = True
         self.outcome.spoke_interim = True
@@ -194,6 +197,11 @@ class MergeCoordinator:
             "也别假装细节已经敲定了。"
             "硬性要求：本轮**绝对不要**说出任何具体数字、物品名、金额、人名、地名或任务细节。"
         )
+        scope_note = (pool_note or "").strip()
+        if scope_note:
+            result_block += (
+                f"\n【本次的考量范围（心里有数就行，可以顺着说一句这件事的路数，别照念）】{scope_note}"
+            )
         prompt = build_merge_user_prompt(
             npc_name=self.npc_name,
             player_query=self.player_query,
@@ -205,6 +213,10 @@ class MergeCoordinator:
                 "用你自己的口吻说，不要照搬固定句式，不要许诺稍后再细讲"
                 "（紧接着你就会把这件事讲完，许诺了就是自相矛盾），"
                 "不要带动作描写，说完就停，不要展开、不要追问玩家、不要许诺任何具体内容。准确的说是不要涉及任何具体内容，此时你脑海中只有个大致方向，还没想好任何任务细节。不要把关注点放在任务内容上，而是要放在上下过渡上，核心是表述你确实【有】个任务/委托/需求/想法等，而不是你有【什么】任务。"
+                + (
+                    "范围那一行只用来帮你把语气对准路数，不要把它复述出来，也不要提到具体关卡、物品或人名。"
+                    if scope_note else ""
+                )
             ),
         )
         before = self.outcome.reply_text
@@ -265,7 +277,7 @@ class MergeCoordinator:
         #    bridge 排水遇到 intermediate 立即返回，晚到的中间结果也不会漏说
         while self._final_event is None:
             if self.saw_intermediate and not self.spoke_interim:
-                async for ev in self._interim_reply(self._vague_note_cache):
+                async for ev in self._interim_reply(self._vague_note_cache, self._pool_note_cache):
                     yield ev
                 async for ev in self._drain(self._remaining(deadline)):
                     yield ev

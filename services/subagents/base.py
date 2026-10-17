@@ -32,6 +32,8 @@ class SubagentEvent:
     kind: Literal["progress", "intermediate", "final", "failed"]
     ui_hint: str = ""            # ≤12 字，给前端进度条：「拟定委托中」「校验修正中」「查资料中」
     vague_note: str = ""         # intermediate 专用：只说类型不说数字的一句话
+    # intermediate 专用：候选池被关键词完全覆盖时的范围说明（否则为空，过渡语不许多说）
+    pool_note: str = ""
     payload: dict[str, Any] = field(default_factory=dict)  # final: draft_summary/findings；failed: reason；终态一律带 usage_rows
 
 
