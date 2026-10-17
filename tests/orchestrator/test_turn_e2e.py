@@ -523,20 +523,109 @@ async def test_draft_expiry_after_keep_turns(env):
 # 7. 搜索
 # ---------------------------------------------------------------------------
 
-async def test_search_parallel(env):
-    _route(env, "route_search", {"query": "安迪的过去"}, meta='{"emo":"普通","fav":0}')
-    env.fake.add_chat(tool_calls=[tc("search_knowledge", {"keyword": "安迪 过去"})])
-    env.fake.add_chat(content="安迪曾在废城担任佣兵，后来加入了A兵团。")
+async def test_search_default_prefetch_flows_into_next_chat_round(env, monkeypatch):
+    """常规检索：编排层预取后不离子 Agent，结果直接拼进下一轮聊天调用（共 2 次流式调用）。"""
+    from services.orchestrator.search_prefetch import SearchPrefetch
+
+    monkeypatch.setattr(
+        "services.orchestrator.search_prefetch.run_search_prefetch",
+        lambda **kwargs: SearchPrefetch(
+            text="【世界观】安迪曾是A兵团佣兵，后来离开。",
+            sources=("knowledge",),
+            knowledge_count=1,
+        ),
+    )
+    _route(env, "route_search", {"keywords": "安迪 过去"}, meta='{"emo":"普通","fav":0}')
     env.fake.add_stream(text="安迪以前是A兵团的佣兵，这事我知道一些。")
 
     events = await collect(_orch(env, "你知道安迪以前的事吗？"))
 
     phases = phases_of(events)
     assert phases == [("search", "searching"), ("search", "done")]
+    # 不委派子 Agent：没有 chat 调用，只有路由轮 + 续写轮
+    assert env.fake.chat_requests == []
+    assert len(env.fake.stream_requests) == 2
+    # 续写轮不下发 tools（机制闸：模型没有可调的东西，只能开口）
+    assert not env.fake.stream_requests[1].tools
+    continuation = env.fake.stream_requests[1].messages[-1]["content"]
+    assert "【后台结果：检索到的资料】" in continuation
+    assert "安迪曾是A兵团佣兵" in continuation
+    assert "请以你的口吻把查到的内容讲给玩家" in continuation
     assert "安迪以前是A兵团的佣兵" in "".join(contents_of(events))
     assert notices_of(events) == []  # 搜索无草案，无系统通知
     assert events[-1].event == "done"
     assert await env.store.get_draft(env.session_id) is None
+
+
+async def test_search_deep_passes_materials_to_subagent(env, monkeypatch):
+    """深度检索：预取结果 + 已有 Tier-1 材料一起交给检索子 Agent，结论回汇合轮。"""
+    from services.orchestrator.search_prefetch import SearchPrefetch
+
+    monkeypatch.setattr(
+        "services.orchestrator.search_prefetch.run_search_prefetch",
+        lambda **kwargs: SearchPrefetch(
+            text="【世界观】安迪曾是A兵团佣兵，后来离开。",
+            sources=("knowledge",),
+            knowledge_count=1,
+        ),
+    )
+    _route(env, "route_search", {
+        "keywords": "安迪 过去",
+        "deep_search": True,
+        "query": "安迪与A兵团的往事",
+    }, meta='{"emo":"普通","fav":0}')
+    env.fake.add_chat(content="安迪曾在废城担任佣兵，后来加入了A兵团。")
+    env.fake.add_stream(text="安迪以前是A兵团的佣兵，这事我知道一些。")
+
+    events = await collect(_orch(env, "你知道安迪以前的事吗？"))
+
+    phases = phases_of(events)
+    # 编排层预取报一次 searching，子 Agent 自己的 progress 也是 searching（同相位重复无害）
+    assert phases[0] == ("search", "searching")
+    assert phases[-1] == ("search", "done")
+    assert {phase for _agent, phase in phases} <= {"searching", "done"}
+    # 深度检索才委派子 Agent：一次 chat 调用（材料已足够，不再补查）
+    assert len(env.fake.chat_requests) == 1
+    request = env.fake.chat_requests[0]
+    assert [t["function"]["name"] for t in request.tools] == [
+        "search_knowledge", "search_items", "search_stages",
+    ]
+    system_prompt = request.messages[0]["content"]
+    assert "user 里已经给了两批资料" in system_prompt
+    user_prompt = request.messages[1]["content"]
+    assert "【已有资料" in user_prompt
+    assert "【本轮已检索资料" in user_prompt
+    assert user_prompt.index("【已有资料") < user_prompt.index("【本轮已检索资料")
+    assert "安迪曾是A兵团佣兵" in user_prompt
+    # 子 Agent 结论进汇合轮
+    merge_prompt = env.fake.stream_requests[-1].messages[-1]["content"]
+    assert "【后台结果：检索到的资料】" in merge_prompt
+    assert "安迪曾在废城担任佣兵" in merge_prompt
+    assert "安迪以前是A兵团的佣兵" in "".join(contents_of(events))
+
+
+async def test_search_deep_without_query_falls_back_to_prefetch(env, caplog, monkeypatch):
+    """deep_search=true 但没填 query：按常规检索处理并留痕。"""
+    import logging
+
+    from services.orchestrator.search_prefetch import SearchPrefetch
+
+    monkeypatch.setattr(
+        "services.orchestrator.search_prefetch.run_search_prefetch",
+        lambda **kwargs: SearchPrefetch(text="", sources=("knowledge",)),
+    )
+    _route(env, "route_search", {"keywords": "安迪 过去", "deep_search": True})
+    env.fake.add_stream(text="这我也不太清楚。")
+
+    with caplog.at_level(logging.WARNING, logger="services.orchestrator.turn"):
+        events = await collect(_orch(env, "你知道安迪以前的事吗？"))
+
+    assert "没填 query" in caplog.text
+    assert env.fake.chat_requests == []
+    assert len(env.fake.stream_requests) == 2
+    continuation = env.fake.stream_requests[1].messages[-1]["content"]
+    assert "（本次没有检索到新的相关资料）" in continuation
+    assert "这我也不太清楚" in "".join(contents_of(events))
 
 
 # ---------------------------------------------------------------------------

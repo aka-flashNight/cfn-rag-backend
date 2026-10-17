@@ -73,19 +73,20 @@ class StreamEvent:
 
 按 `model_name` 小写子串匹配，先匹配先中；**匹配不到 = `DEFAULT_PROFILE`（不传任何思考参数、vision 探测型）**。
 
-| Profile（匹配子串）              | vision | 思考控制参数（随请求发送）                 | 备注                                                                                                                                                                              |
-| -------------------------------- | ------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+
+| Profile（匹配子串）            | vision | 思考控制参数（随请求发送）               | 备注                                                                                                                                                                                                           |
+| -------------------------------- | -------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `glm-5.3-flash`                | ✅     | `thinking={"type":"enabled"}` + 低强度档 | **不能关**，传 disabled 会报错（官方明确）。`reasoning_effort` 是官方参数（枚举含 `low`），2026-10-16 真机非流式/流式各一次均无 400、未触发降级；将来参数名不被接受时由 §3.2.b 剥掉整个 `extra_body` 重试一次 |
-| `glm-5.3`（其他档）            | ✅     | 同上                                       | 同上                                                                                                                                                                              |
-| `deepseek-v4-flash-vision-exp` | ✅     | `thinking={"type":"disabled"}`           | 视觉需手动声明启用的细节以官方文档为准；按 OpenAI image_url 发送即可                                                                                                              |
-| `deepseek-v4-flash`            | ❌     | `thinking={"type":"disabled"}`           | 纯文本                                                                                                                                                                            |
-| `qwen3.8-flash`                | ✅     | `extra_body={"enable_thinking": False}`  | 百炼默认即关；显式传确保。另有`/no_think` 软开关可写进 prompt 兜底                                                                                                              |
-| `gpt-5.6-luna`                 | ✅     | `reasoning_effort="none"`                | none=真·非思考（官方）                                                                                                                                                           |
-| `doubao-seed-2-0-lite`         | ✅     | `thinking={"type":"disabled"}`           | 方舟统一参数                                                                                                                                                                      |
-| `kimi-k3`                      | ✅     | 不传（恒开，无法关）                       | 不传 temperature                                                                                                                                                                  |
-| `minimax-m3`                   | ✅     | `thinking={"type":"disabled"}`           |                                                                                                                                                                                   |
-| `gemini-3`（flash 系）         | ✅     | `extra_body={"thinking_level":"low"}`    | 未见完全关闭档；low 为最低                                                                                                                                                        |
-| `DEFAULT_PROFILE`              | 探测   | 不传                                       | 新模型接入零配置可用                                                                                                                                                              |
+| `glm-5.3`（其他档）            | ✅     | 同上                                     | 同上                                                                                                                                                                                                           |
+| `deepseek-v4-flash-vision-exp` | ✅     | `thinking={"type":"disabled"}`           | 视觉需手动声明启用的细节以官方文档为准；按 OpenAI image_url 发送即可                                                                                                                                           |
+| `deepseek-v4-flash`            | ❌     | `thinking={"type":"disabled"}`           | 纯文本                                                                                                                                                                                                         |
+| `qwen3.8-flash`                | ✅     | `extra_body={"enable_thinking": False}`  | 百炼默认即关；显式传确保。另有`/no_think` 软开关可写进 prompt 兜底                                                                                                                                             |
+| `gpt-5.6-luna`                 | ✅     | `reasoning_effort="none"`                | none=真·非思考（官方）                                                                                                                                                                                        |
+| `doubao-seed-2-0-lite`         | ✅     | `thinking={"type":"disabled"}`           | 方舟统一参数                                                                                                                                                                                                   |
+| `kimi-k3`                      | ✅     | 不传（恒开，无法关）                     | 不传 temperature                                                                                                                                                                                               |
+| `minimax-m3`                   | ✅     | `thinking={"type":"disabled"}`           |                                                                                                                                                                                                                |
+| `gemini-3`（flash 系）         | ✅     | `extra_body={"thinking_level":"low"}`    | 未见完全关闭档；low 为最低                                                                                                                                                                                     |
+| `DEFAULT_PROFILE`              | 探测   | 不传                                     | 新模型接入零配置可用                                                                                                                                                                                           |
 
 > 上表参数以调研文档为准，但**所有参数都被视为"可能错"**：§3.2 的降级链是正确性的最终保证。Profile 表是集中配置，后续新增/修正模型只改这一处。
 
@@ -136,13 +137,14 @@ class StreamEvent:
 meta 行只有 `emo` / `fav` 两个字段。委派意图不在 meta 里，改由五个路由声明工具承载
 （`services/tools/route/`，`category="route"`，工具本体零副作用）：
 
-| 路由工具 | 参数 | 何时下发 |
-|---|---|---|
-| `route_task_draft` | `note`（必填，≤60 字，只写诉求要点、不写数量/金额） | 恒下发 |
-| `route_search` | `query`（必填，≤40 字） | 仅无待确认草案时 |
-| `route_task_confirm` | 无 | 仅有待确认草案时 |
-| `route_task_cancel` | 无 | 仅有待确认草案时 |
-| `route_task_update` | `note`（必填，≤60 字，玩家的新条件） | 仅有待确认草案时 |
+
+| 路由工具             | 参数                                                 | 何时下发         |
+| ---------------------- | ------------------------------------------------------ | ------------------ |
+| `route_task_draft`   | `note`（必填，≤60 字，只写诉求要点、不写数量/金额） | 恒下发           |
+| `route_search`       | `keywords`（必填，≤80 字，检索要点）、`sources`（多选 `knowledge`/`items`/`stages`/`all`，不填＝全部）、`deep_search`（默认 false）、`query`（≤40 字，仅 `deep_search=true` 时必填，只给后台子 Agent） | 仅无待确认草案时 |
+| `route_task_confirm` | 无                                                   | 仅有待确认草案时 |
+| `route_task_cancel`  | 无                                                   | 仅有待确认草案时 |
+| `route_task_update`  | `note`（必填，≤60 字，玩家的新条件）                | 仅有待确认草案时 |
 
 字段约束：
 
@@ -172,6 +174,7 @@ async def split_meta_events(stream: AsyncIterator[StreamEvent], npc_emotions: Se
 把 `{"emo":"坏笑","fav":0}` 和台词挤成一行时，按行首解析必然失败，花括号会原样漏给玩家。
 解析器因此再走一次 JSON **前缀**解码（`json.JSONDecoder().raw_decode`）：切出前缀当 meta，
 剩下的仍归正文，并打 `meta 与台词同行（缺换行）` warning 留痕。两条边界：
+
 - 只有「JSON 已完整且后面确有文字」才提前判定；纯 meta 行（路由轮）继续等换行，
   避免把后续正文里的换行当成正文首字符吐出去。
 - 前缀同样要过 `_passes_meta_schema`（含 `emo`/`fav` 才算），台词里恰好出现
@@ -203,13 +206,14 @@ Agent 的路由提示词）与 `build_routing_guide`（跨工具公共规则：�
 
 ## 5. 路由的执行语义（orchestrator 侧，本章只定义契约）
 
-| 路由 | 执行方式 | 失败处理 |
-| --- | --- | --- |
-| `route_task_draft` | 立即启动 TaskRunner（draft 模式，`note` 作为方向注入；无 note 时回落玩家原话） | 见 03 §4 汇合规则 |
-| `route_task_update` | 立即启动 TaskRunner（update 模式，携带 pending draft）；无草案可改时降级为 draft 模式重拟 | 同上 |
-| `route_search` | 立即启动 SearchRunner（`query` 缺省时回落玩家原话） | 同上 |
-| `route_task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）→ tool_status(success) → 一次收场调用让 NPC 交代；失败 → tool_status(failed) + `system_notice` 给真实原因 + 携带原因做 1 次补救调用让 NPC 解释 | 见 05 §6 |
-| `route_task_cancel` | 同步执行 cancel → tool_status(success) → 收场调用；无草案可撤不算失败，让 NPC 顺着话头自然回应 | 极少失败 |
+
+| 路由                 | 执行方式                                                                                                                                                                                                | 失败处理           |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `route_task_draft`   | 立即启动 TaskRunner（draft 模式，`note` 作为方向注入；无 note 时回落玩家原话）                                                                                                                          | 见 03 §4 汇合规则 |
+| `route_task_update`  | 立即启动 TaskRunner（update 模式，携带 pending draft）；无草案可改时降级为 draft 模式重拟                                                                                                               | 同上               |
+| `route_search`       | 编排层直接用 `keywords` 在 `sources` 范围内检索（`orchestrator/search_prefetch.py`，不调模型）：`deep_search=false` 时结果拼进收场调用，不启动子 Agent；`deep_search=true` 且填了 `query` 才启动 SearchRunner，把预取结果与聊天 Agent 已有的 Tier-1 材料一起交给它 | 同上               |
+| `route_task_confirm` | **同步执行** confirm_agent_task（校验+原子写，<300ms）→ tool_status(success) → 一次收场调用让 NPC 交代；失败 → tool_status(failed) + `system_notice` 给真实原因 + 携带原因做 1 次补救调用让 NPC 解释 | 见 05 §6          |
+| `route_task_cancel`  | 同步执行 cancel → tool_status(success) → 收场调用；无草案可撤不算失败，让 NPC 顺着话头自然回应                                                                                                        | 极少失败           |
 
 confirm/cancel 不经过子 Agent——它们是纯后端操作，编排层直接执行（用户决策："模型聊天+快速调用对应工具就行了"）。
 **路由轮不输出台词**，所以这两条路径上 NPC 的那句话来自事后的收场调用（模型空回复时

@@ -343,6 +343,8 @@ class TurnContext:
     # 本 NPC 发布且当前存档已完成的委托（含完成对话原文）；has_unmarked 供触发三的条件闸
     finished_task_block: FinishedTaskBlock = field(default_factory=FinishedTaskBlock)
     retrieve_fn: Optional[Callable[[str], str]] = None
+    # Tier-1 检索的原始 bundle（route_search 预取按节点 id 去重；展示文本已进 rag_context_text）
+    retrieval_bundle: Any = None
     llm_config: LLMConfig = field(default_factory=LLMConfig)
     # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
     image_data_url: Optional[str] = None
@@ -513,8 +515,9 @@ async def assemble_context(
             text = f"{text}\n\n{hints}" if text else hints
         return text, bundle
 
+    retrieval_bundle: Any = None
     try:
-        rag_context_text, _bundle = await asyncio.to_thread(_retrieve_and_format)
+        rag_context_text, retrieval_bundle = await asyncio.to_thread(_retrieve_and_format)
     except Exception as exc:
         logger.warning("上下文检索装配失败，降级: %s", exc)
         rag_context_text = ""
@@ -601,6 +604,7 @@ async def assemble_context(
         long_term=long_term,
         finished_task_block=finished_task_block,
         retrieve_fn=retrieve_fn,
+        retrieval_bundle=retrieval_bundle,
         llm_config=llm_config,
         image_data_url=image_data_url,
     )

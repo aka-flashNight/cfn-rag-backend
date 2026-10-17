@@ -1,6 +1,6 @@
 # 03 · 对话编排与多 Agent 并行（services/orchestrator/ + services/subagents/）
 
-> 实施阶段 P3/P4。本章定义回合状态机、任务全流程时序、讨价还价、搜索并行、HITL 与「中间结果规则」。
+> 实施阶段 P3/P4。本章定义回合状态机、任务全流程时序、检索路径、讨价还价、HITL 与「中间结果规则」。
 > 依据：`docs/v3-searching/02-联网调研-Agent编排.md`（fire-and-steer 后台子 Agent 模式）+ 用户的聊天/任务并行设计方案。
 
 ---
@@ -50,7 +50,7 @@ IDLE
   → DONE
 ```
 
-**LLM 调用预算（替代旧 token 死熔断，B4）**：每回合聊天主 Agent ≤ 3 次调用（#1 + 过渡 #2a + 汇合 #2b；SYNC_ACTION 路径是 #1 + 收场 #2）；TaskRunner ≤ 4 轮、SearchRunner ≤ 3 轮工具循环（config 可调）。任何超限立即走失败话术路径，绝不无限循环。
+**LLM 调用预算（替代旧 token 死熔断，B4）**：每回合聊天主 Agent ≤ 3 次调用（#1 + 过渡 #2a + 汇合 #2b；SYNC_ACTION 路径与常规检索路径是 #1 + 收场 #2）；TaskRunner ≤ 4 轮、SearchRunner ≤ 3 轮工具循环（config 可调）。`route_search` 默认不启动子 Agent——预取由编排层代码完成，只有 `deep_search=true` 才起 SearchRunner。任何超限立即走失败话术路径，绝不无限循环。
 
 **路由轮为什么静默**：`client.py` 只在 `finish` 事件里聚合 `tool_calls`，正文开始流出时
 编排层还不知道本轮会不会路由。缓冲整个调用 #1 再决定，会让 100% 的回合（含纯聊天）
@@ -165,14 +165,24 @@ confirm 失败（草案过期/校验回归，极少）：tool_status(failed) →
 补救调用让 NPC 解释（"这份委托刚才出了点问题……"）。路由轮本来就没有台词，所以不存在
 「丢弃已生成正文」这一步；草案保留不清。收场/补救调用若模型空回复，用静态兜底话术补上。
 
-### 4.3 搜索并行（route_search）
+### 4.3 检索（route_search）
+
+`route_search` 承担检索的第一步：`keywords` + `sources` 交给编排层代码预取（`orchestrator/search_prefetch.py`，不调模型），
+常规路径不再经过子 Agent。
 
 ```
 玩家："你知道安迪以前的事吗？"
-├─ 调用 #1（路由轮，无台词）：meta {"emo":"普通","fav":0} + route_search(query="安迪的过去")
-├─ SearchRunner 后台：search_knowledge 等工具循环 ≤3 轮 → final(findings ≤400字)
-└─ MERGE：调用 #2 携带 findings → NPC 以人设口吻讲述。
+├─ 调用 #1（路由轮，无台词）：meta {"emo":"普通","fav":0}
+│    + route_search(keywords="安迪 过去", sources=["knowledge"], deep_search=false)
+├─ 编排层预取：knowledge 走 Tier-1 管线（与本轮已有结果按节点 id 去重），
+│    items/stages 走名称/区域匹配；分类型截断（3600/1200/1200，合计约 6000 字）
+└─ 调用 #2（收场轮，不带 tools）：结果块【后台结果：检索到的资料】拼进 user
+     → NPC 以人设口吻讲述；查不到就自然带过。
 ```
+
+`deep_search=true`（且必须填 `query`）时才委派 SearchRunner：预取结果连同聊天 Agent
+本轮已有的 Tier-1 材料一起给它，由它决定补查还是直接总结，最后仍由收场轮转述。
+`deep_search=true` 但缺 `query` 时记 warning 并按常规检索处理（路由轮已静默发出，不能回头）。
 
 ### 4.4 等待预算与 bridge 排水（merge.py）
 
@@ -231,8 +241,9 @@ class SearchRunner(SubagentBase):
     tool_names = ["search_knowledge", "search_items", "search_stages"]
 ```
 
-- 输入：`route_search.query`（缺省回落玩家原话）+ NPC 视角简述。输出 final：`findings`（≤400 字结论，附关键出处类型）。
-- 这是「检索 Agent」的落地（用户问题 4）：Tier-1 预检索保底（每回合必有），SearchRunner 负责模型主动发起的深挖。
+- 输入：`route_search.query`（深度检索时必填）+ NPC 视角简述 + 两批现成材料（聊天 Agent 本轮已有的 Tier-1 文本、编排层按 `keywords` 预取的结果）。输出 final：`findings`（提示词要求 ≤400 字，后端到 1000 字才截断，且无论是否截断都回传给收场轮）。
+- 只有 `deep_search=true` 才启动；常规检索由编排层代码预取直接进收场轮，本 Runner 不参与。
+- 这是「检索 Agent」的落地（用户问题 4）：Tier-1 预检索保底（每回合必有）+ 关键词预取，SearchRunner 只负责模型主动发起的深挖。
 - 不吃 `recent_dialogue`，因此也不带滚动摘要（§7.1）。
 
 ## 7. 上下文装配（context.py）
@@ -331,7 +342,7 @@ schema 与描述按作用域当前状态**三选一**；摘要侧另有 `set_bas
 | --------- | --------------------------------------------------- | --------------------------------------- |
 | 纯聊天    | supervisor→(可能 worker)→dialogue，2~3 次串行 LLM | **1 次流式调用**，情绪同步前置    |
 | 发任务    | 串行等待 TaskAgent 全程，玩家干等                   | 路由轮静默，TaskRunner 后台并行，prepare 一回来就说过渡话，汇合再详述 |
-| 查资料    | 路由→QueryAgent→dialogue 串行                     | 路由轮静默，SearchRunner 后台并行，汇合讲述 |
+| 查资料    | 路由→QueryAgent→dialogue 串行                     | 路由轮就给出关键词与范围，编排层代码直接预取，收场轮一次讲述；只有深度检索才起 SearchRunner |
 | 确认/取消 | 重跑整条 agent 链路                                 | 路由声明直发，后端同步执行 <300ms，办完一次收场调用 |
 | 情绪      | supervisor 决定+回显约束                            | meta 行自带，解析即发，天然先于正文     |
 | 路由判据  | 挤在聊天 system 里，与扮演/选型规则混写             | 写在路由工具的 description 里，工具表即路由提示词；`agent_enabled=false` 时整张表摘掉 |

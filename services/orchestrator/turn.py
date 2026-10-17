@@ -80,6 +80,7 @@ from services.orchestrator.prompts import (
     CONFIRM_ARGS_SYSTEM,
     CONFIRM_FAIL_INSTRUCTION,
     EMPTY_REPLY_FALLBACK_TEXT,
+    SEARCH_MERGE_INSTRUCTION,
     TASK_CANCEL_MERGE_INSTRUCTION,
     TASK_CANCEL_NOOP_INSTRUCTION,
     TASK_CONFIRM_MERGE_INSTRUCTION,
@@ -117,6 +118,7 @@ SUBAGENT_RECENT_MESSAGES = 8
 _ROUTE_PREFIX = "route_"
 _ROUTE_NOTE_MAX_CHARS = 60
 _ROUTE_QUERY_MAX_CHARS = 40
+_ROUTE_KEYWORDS_MAX_CHARS = 80
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,19 @@ class Route:
     kind: str
     note: str = ""
     query: str = ""
+    keywords: str = ""
+    sources: tuple[str, ...] = ()
+    deep_search: bool = False
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
 
 
 def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
@@ -145,7 +160,24 @@ def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
             args = {}
         note = str(args.get("note") or "").strip()[:_ROUTE_NOTE_MAX_CHARS]
         query = str(args.get("query") or "").strip()[:_ROUTE_QUERY_MAX_CHARS]
-        return Route(kind=name[len(_ROUTE_PREFIX):], note=note, query=query)
+        keywords = str(args.get("keywords") or "").strip()[:_ROUTE_KEYWORDS_MAX_CHARS]
+        raw_sources = args.get("sources")
+        if isinstance(raw_sources, str):
+            sources = (raw_sources.strip().lower(),) if raw_sources.strip() else ()
+        elif isinstance(raw_sources, (list, tuple)):
+            sources = tuple(
+                str(item).strip().lower() for item in raw_sources if str(item).strip()
+            )
+        else:
+            sources = ()
+        return Route(
+            kind=name[len(_ROUTE_PREFIX):],
+            note=note,
+            query=query,
+            keywords=keywords,
+            sources=sources,
+            deep_search=_as_bool(args.get("deep_search")),
+        )
     return None
 
 
@@ -577,6 +609,58 @@ class TurnOrchestrator:
                     yield ev
                 if notice:
                     yield system_notice_event(notice)
+
+            elif route.kind == "search":
+                # ---- 检索：编排层先做关键词预取（检索子 Agent 的第一步）----
+                yield agent_status_event("search", "searching", "查资料中")
+                prefetch = await self._run_search_prefetch(route, ctx, deps)
+
+                deep = route.deep_search and bool(route.query.strip())
+                if route.deep_search and not deep:
+                    logger.warning(
+                        "会话 %s：route_search 开了 deep_search 但没填 query，按常规检索处理",
+                        self.session_id,
+                    )
+
+                if deep:
+                    # 深度检索：预取结果 + 聊天 Agent 已有的 Tier-1 材料交给子 Agent，
+                    # 由它决定继续补查还是直接总结。done/failed 由子 Agent 终态事件发。
+                    handle = self._launch_subagent(
+                        route, ctx, deps, spoken_text=spoken_text, prefetch=prefetch,
+                    )
+                    sess.register(handle)
+                    merge = MergeCoordinator(
+                        handle=handle,
+                        llm=llm,
+                        base_messages=base_messages,
+                        npc_name=self.npc_name,
+                        player_query=self.query,
+                        spoken_text=spoken_text,
+                        emotion=meta.emotion,
+                        grace_s=deps.merge_grace_ms / 1000.0,
+                        timeout_s=float(deps.subagent_timeout_s),
+                    )
+                    async for ev in merge.stream():
+                        yield ev
+                    outcome = merge.outcome
+                    self._usage = accumulate_usage(self._usage, outcome.usage)
+                else:
+                    # 常规检索：不委派子 Agent，结果直接拼进下一轮聊天调用。
+                    # _stream_simple 不下发 tools，模型没有可调用的东西，只能开口。
+                    from services.orchestrator.search_prefetch import build_prefetch_result_block
+
+                    yield agent_status_event("search", "done", "查资料完成")
+                    async for ev in self._sync_action_reply(
+                        llm,
+                        base_messages,
+                        meta,
+                        spoken_text,
+                        build_prefetch_result_block(prefetch.text),
+                        SEARCH_MERGE_INSTRUCTION,
+                        "这我也不太清楚。",
+                        collected_text,
+                    ):
+                        yield ev
 
             else:
                 # ---- 后台子 Agent（fire-and-steer）----
@@ -1141,6 +1225,39 @@ class TurnOrchestrator:
     # 子 Agent 启动
     # ------------------------------------------------------------------
 
+    async def _run_search_prefetch(
+        self, route: Route, ctx: TurnContext, deps: OrchestratorDeps,
+    ) -> Any:
+        """route_search 的编排层预取（同步检索放线程池，避免阻塞事件循环）。
+
+        检索范围由 route.sources 决定；结果与聊天 Agent 已有的 Tier-1 材料按节点 id
+        去重。任何失败都降级为空结果，后续仍会让 NPC 开口，不阻断回合。
+        """
+        from services.orchestrator.search_prefetch import SearchPrefetch, run_search_prefetch
+
+        keywords = (route.keywords or self.query).strip()
+        if not keywords:
+            return SearchPrefetch(sources=route.sources)
+
+        def _run() -> Any:
+            return run_search_prefetch(
+                engine=deps.engine,
+                game_data=deps.game_data,
+                keywords=keywords,
+                sources=route.sources,
+                npc_name=ctx.npc_name,
+                npc_titles=list(ctx.npc_state.titles or []),
+                npc_faction=ctx.npc_state.faction,
+                forbidden=ctx.forbidden,
+                existing_bundle=ctx.retrieval_bundle,
+            )
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.warning("会话 %s：检索预取失败，降级为空: %s", self.session_id, exc)
+            return SearchPrefetch(sources=route.sources)
+
     def _launch_subagent(
         self,
         route: Route,
@@ -1148,6 +1265,7 @@ class TurnOrchestrator:
         deps: OrchestratorDeps,
         *,
         spoken_text: str = "",
+        prefetch: Any = None,
     ) -> Any:
         """按路由声明启动后台子 Agent（fire-and-steer）。
 
@@ -1170,7 +1288,7 @@ class TurnOrchestrator:
             return SearchRunner.launch(
                 llm=llm,
                 registry=deps.registry,
-                query=route.query or self.query,
+                query=route.query or route.keywords or self.query,
                 player_query=self.query,
                 npc_name=self.npc_name,
                 npc_faction=ctx.npc_state.faction or "",
@@ -1181,6 +1299,8 @@ class TurnOrchestrator:
                 npc_states=npc_states,
                 game_data=deps.game_data,
                 retrieve_fn=ctx.retrieve_fn,
+                existing_material=ctx.rag_context_text,
+                first_round_material=(prefetch.text if prefetch is not None else ""),
                 max_rounds=deps.search_max_rounds,
             )
 

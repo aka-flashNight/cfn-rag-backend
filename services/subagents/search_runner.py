@@ -1,8 +1,9 @@
 """SearchRunner：检索后台子 Agent（对应 docs/v3-developer/03 §6）。
 
-输入 query + NPC 视角简述；工具循环 ≤3 轮；输出 final：findings（≤400 字结论，
-附关键出处类型）。Tier-1 预检索保底由 orchestrator 上下文装配承担，本 Runner
-负责模型主动发起的深挖。
+输入 query + NPC 视角简述 + 两批现成材料（聊天 Agent 已有的 Tier-1 结果、编排层
+按 keywords 预取的结果）；工具循环 ≤3 轮；输出 final：findings（提示词要求 400 字，
+后端允许 1000 字，避免模型多写一点就被砍掉重写）。Tier-1 预检索与关键词预取由
+orchestrator 承担，本 Runner 只负责模型主动发起的深挖。
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ SEARCH_TOOLS = [
     "search_stages",
 ]
 
-_FINDINGS_MAX_CHARS = 400
+# 提示词仍要求 400 字；这里放宽到 1000，允许模型自然收尾而不是被硬切
+_FINDINGS_MAX_CHARS = 1000
 
 
 class SearchRunner(SubagentBase):
@@ -61,6 +63,8 @@ class SearchRunner(SubagentBase):
         npc_states: Optional[dict] = None,
         game_data: Any = None,
         retrieve_fn: Optional[Callable[[str], str]] = None,
+        existing_material: str = "",
+        first_round_material: str = "",
         max_rounds: int = 3,
         skill_registry: Optional[SkillRegistry] = None,
     ) -> SubagentHandle:
@@ -79,6 +83,8 @@ class SearchRunner(SubagentBase):
             query=query,
             npc_name=npc_name,
             player_query=player_query,
+            existing_material=existing_material,
+            first_round_material=first_round_material,
         )
         runner = cls(
             llm=llm,

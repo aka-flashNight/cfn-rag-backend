@@ -296,11 +296,14 @@ SEARCH_RUNNER_SYSTEM = """\
 主对话 Agent 以 NPC 口吻转述。
 
 【工作方式】
-1. 依据查询要点组织 1~3 次检索：
+1. user 里已经给了两批资料：「已有资料」是主对话 Agent 本轮上下文里已有的检索结果，\
+「本轮已检索资料」是按查询要点预取的结果。两批都可以直接采用。
+2. 先通读这两批资料，判断是否已经足够回答查询要点。足够就直接输出结论，不要再调用工具。
+3. 不够时再用工具补充检索，最多补查 2 次：
    - search_knowledge：世界观/剧情/角色往事/冷门设定（自由文本）；
    - search_stages / search_items：关卡与物品的结构化属性。
-2. 每次检索后评估信息是否足够；足够就停止检索，输出结论。
-3. 查不到就直说「未找到相关信息」，不要编造设定。
+   不要重复检索已经给出的内容；补充结果会追加在对话后面。
+4. 查不到就直说「未找到相关信息」，不要编造设定。
 
 【最终输出】
 一段不超过 400 字的结论，按要点分条列出；每条末尾用括号标注出处类型：\
@@ -313,6 +316,8 @@ def search_runner_user_prompt(
     query: str,
     npc_name: str,
     player_query: str = "",
+    existing_material: str = "",
+    first_round_material: str = "",
 ) -> str:
     lines = [
         f"【查询要点】{query}",
@@ -320,6 +325,14 @@ def search_runner_user_prompt(
     ]
     if player_query:
         lines.append(f"【玩家当轮发言（供理解意图）】{player_query}")
+    lines.append(
+        "【已有资料（主对话 Agent 本轮上下文里已有，可直接采用，不必重复检索）】\n"
+        + ((existing_material or "").strip() or "（无）")
+    )
+    lines.append(
+        "【本轮已检索资料（按查询要点预取，可直接采用；不够时再补查）】\n"
+        + ((first_round_material or "").strip() or "（无）")
+    )
     return "\n".join(lines)
 
 

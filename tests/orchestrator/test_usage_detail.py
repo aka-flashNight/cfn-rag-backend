@@ -71,7 +71,9 @@ async def test_subagent_usage_rows_reach_turn_detail(env):
     """路由轮 → 子 Agent 两轮 → 汇合轮：done 的 calls 应有四行，按调用时序排列。"""
     env.fake.add_stream(
         meta='{"emo":"普通","fav":0}', text="",
-        tool_calls=[tc("route_search", {"query": "安迪的过去"})],
+        tool_calls=[tc("route_search", {
+            "keywords": "安迪 过去", "deep_search": True, "query": "安迪的过去",
+        })],
         usage={"prompt_tokens": 6561, "completion_tokens": 44, "cached_tokens": 3136},
     )
     env.fake.add_chat(
@@ -111,7 +113,9 @@ async def test_failed_subagent_usage_rows_still_counted(env):
     env.deps.subagent_timeout_s = 2
     env.fake.add_stream(
         meta='{"emo":"普通","fav":0}', text="",
-        tool_calls=[tc("route_search", {"query": "安迪的过去"})],
+        tool_calls=[tc("route_search", {
+            "keywords": "安迪 过去", "deep_search": True, "query": "安迪的过去",
+        })],
         usage={"prompt_tokens": 100, "completion_tokens": 10},
     )
     env.fake.add_chat(
