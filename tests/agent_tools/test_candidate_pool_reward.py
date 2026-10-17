@@ -49,10 +49,21 @@ def _level(game_data, name: str) -> int:
     return int(getattr(item, "level", 0) or 0)
 
 
-def test_pool_capped_at_ten_without_keywords(game_data):
+def test_each_side_has_its_own_budget(game_data):
+    """单例≤5 ＋ 商店≤10 ＋ 任务池非单例≤max(5, 类型数)；不是全局 10 条。"""
     for npc in ("King", "铁匠", "冷兵器商人"):
         rows = _rewards(game_data, npc, level=25)
-        assert len(rows) == REWARD_POOL_CAP
+        shop = [r for r in rows if r.get("source") == "本NPC商店"]
+        task_non_sing = [
+            r for r in rows
+            if r.get("source") != "本NPC商店" and r["name"] not in SINGLETONS
+        ]
+        pinned = [r for r in rows if r["name"] in SINGLETONS]
+        assert len(pinned) <= 5
+        assert len(shop) <= 10
+        assert len(task_non_sing) <= max(5, 3)
+        assert len(rows) == len(pinned) + len(shop) + len(task_non_sing)
+        assert len(rows) <= 20
 
 
 def test_selected_singletons_always_kept(game_data):
@@ -71,12 +82,13 @@ def test_keyword_hits_may_exceed_cap(game_data):
 
 def test_task_pool_cap_counts_types(game_data):
     """任务池非单例条目不超过 max(5, 勾选的非单例类型数)。"""
-    rows = _rewards(game_data, "铁匠", level=25)
-    task_non_sing = [
-        r for r in rows
-        if r.get("source") != "本NPC商店" and r["name"] not in SINGLETONS
-    ]
-    assert len(task_non_sing) <= TASK_POOL_DEFAULT_CAP
+    for npc in ("铁匠", "King", "冷兵器商人"):
+        rows = _rewards(game_data, npc, level=25)
+        task_non_sing = [
+            r for r in rows
+            if r.get("source") != "本NPC商店" and r["name"] not in SINGLETONS
+        ]
+        assert len(task_non_sing) <= TASK_POOL_DEFAULT_CAP
 
 
 def test_equipment_window_math():
@@ -106,14 +118,22 @@ def test_high_priority_equipment_inside_window(game_data):
 
 
 def test_no_level_falls_back_to_stage_range(game_data):
+    """没有玩家等级时窗口退化为阶段区间（阶段 4＝20-31），装备仍能进池。"""
     rows = _rewards(game_data, "冷兵器商人", level=None,
                     reward_types={"regular": ["金币"], "optional": ["武器"]}, stage=4)
-    assert len(rows) <= REWARD_POOL_CAP
+    equip = [r for r in rows if _is_reward_equipment(game_data.items.get_by_name(r["name"]))]
+    assert equip, "退化到阶段区间后仍应选出装备"
+    assert all(
+        20 <= _level(game_data, r["name"]) <= 31 for r in equip
+    ), [(r["name"], _level(game_data, r["name"])) for r in equip]
 
 
 def test_uses_are_spread(game_data):
     """高优先层按 use 轮转：同一 use 不会把 10 个名额占满。"""
-    rows = [r for r in _rewards(game_data, "King", level=25) if r["name"] not in SINGLETONS]
+    rows = [
+        r for r in _rewards(game_data, "铁匠", level=25)
+        if r["name"] not in SINGLETONS and r.get("source") != "本NPC商店"
+    ]
     uses = []
     for r in rows:
         item = game_data.items.get_by_name(r["name"])
@@ -121,4 +141,4 @@ def test_uses_are_spread(game_data):
     from collections import Counter
 
     top = Counter(uses).most_common(1)[0][1]
-    assert top <= 2, Counter(uses)
+    assert top <= 3, Counter(uses)

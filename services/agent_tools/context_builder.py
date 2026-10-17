@@ -2681,15 +2681,17 @@ def _finalize_reward_item_candidates(
     stage_level_range: Optional[tuple[int, int]] = None,
 ) -> list[dict[str, Any]]:
     """
-    分层口径（用户 2026-10-18 定稿）：
-    1) 勾选的单例类型（金币/经验值/K点/技能点/强化石）各至多 1 条，必留；
-    2) 关键词命中的候选**全部保留**，允许超过上限（不硬截断）；
-    3) 高优先层＝装备等级落在玩家窗口 [L-5, L+3] 的物品 ＋ 所有非装备；
-       两者合在一起按 `use` 轮转抽选（避免某个 use 独占），填到上限；
-       没有玩家等级时窗口退化为当前阶段的等级区间（非游戏内打开）；
-    4) 任务池（任务奖励可选）的非单例条目另有条数上限：选了多少非单例类型就至少给几条，
-       不足 5 按 5 算——即「类型多时每类 1 条」；
-    5) 补位到上限时，才用不在窗口、也没命中关键词的装备，最多 3 条（2 条最接近玩家等级 + 1 条随机）。
+    分层口径（用户 2026-10-18 定稿，2026-10-18 二次澄清配额）：
+    1) 单例钉选：勾了的金币/经验值/K点/技能点/强化石各 1 条，**≤5 条，必留**；
+    2) 关键词命中的候选**全部保留**，不占配额、允许超额（不硬截断）；
+    3) 商店侧（本NPC商店）单独一份配额 **≤10 条**：先放装备窗口内 [L-5, L+3] 的装备与
+       所有非装备，按 `use` 轮转避免某类独占；配额还有空位时，用窗口外装备补，最多 3 条
+       （2 条最接近玩家等级 + 1 条随机）；
+    4) 任务池侧（任务奖励可选）非单例条目配额 = max(5, 勾选的非单例类型数)，
+       即「类型少按 5、类型多时每类 1 条可超 5」；同样先窗口内/非装备，再低优先装备补位 ≤3；
+    5) 没有玩家等级（非游戏内/未绑定）时，装备窗口退化为当前阶段的等级区间。
+
+    合计上限＝单例 5 ＋ 任务池 max(5, 类型数) ＋ 商店 10，关键词命中另计。
     """
     kw = _normalize_kw_list(reward_keywords)
     sel = list(selected_reward_types or [])
@@ -2706,15 +2708,13 @@ def _finalize_reward_item_candidates(
 
     def _is_equip(entry: dict[str, Any]) -> bool:
         it = _item(entry)
-        if it is None:
-            return False
-        return _is_reward_equipment(it)
+        return bool(it is not None and _is_reward_equipment(it))
 
     def _level(entry: dict[str, Any]) -> int:
         it = _item(entry)
         return int(getattr(it, "level", 0) or 0) if it is not None else 0
 
-    # 关键词命中：全保留（允许超额）
+    # 关键词命中：全保留（不占配额、可超额）
     kw_hits: list[dict[str, Any]] = []
     rest: list[dict[str, Any]] = []
     for c in pool:
@@ -2724,75 +2724,65 @@ def _finalize_reward_item_candidates(
         else:
             rest.append(c)
 
-    high: list[dict[str, Any]] = []
-    low_equip: list[dict[str, Any]] = []
-    for c in rest:
-        if _is_equip(c):
-            lv = _level(c)
-            if lv == 0 or lo <= lv <= hi:
-                high.append(c)
+    def _fill_side(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+        """单侧（商店/任务池）抽选：窗口内装备＋非装备按 use 轮转，再低优先装备补位 ≤3。"""
+        if cap <= 0 or not rows:
+            return []
+        high: list[dict[str, Any]] = []
+        low_equip: list[dict[str, Any]] = []
+        for c in rows:
+            if _is_equip(c):
+                lv = _level(c)
+                (high if (lv == 0 or lo <= lv <= hi) else low_equip).append(c)
             else:
-                low_equip.append(c)
-        else:
-            high.append(c)
+                high.append(c)
 
-    picked: list[dict[str, Any]] = list(pinned) + list(kw_hits)
-    # 任务池上限只数**非单例**条目：单例（金币/经验值/…）是钉死的，不占任务池名额
-    task_used = sum(
-        1 for c in picked
-        if c.get("source") != "本NPC商店" and (c.get("name") or "") not in SINGLETON_REWARD_LABELS
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for c in high:
+            it = _item(c)
+            key = str(getattr(it, "use", "") or getattr(it, "type", "") or "其他")
+            groups.setdefault(key, []).append(c)
+        for arr in groups.values():
+            arr.sort(key=lambda x: reward_task_tier_by_name.get(x.get("name") or "", 5))
+            random.shuffle(arr)
+        order = sorted(groups)
+        random.shuffle(order)
+
+        picked: list[dict[str, Any]] = []
+        while len(picked) < cap:
+            progressed = False
+            for key in order:
+                if len(picked) >= cap:
+                    break
+                arr = groups.get(key) or []
+                if arr:
+                    picked.append(arr.pop(0))
+                    progressed = True
+            if not progressed:
+                break
+
+        if len(picked) < cap and low_equip:
+            if player_level:
+                low_equip.sort(key=lambda c: abs((_level(c) or 999) - player_level))
+            else:
+                low_equip.sort(key=lambda c: -(_level(c) or 0))
+            near = low_equip[:2]
+            tail = low_equip[2:]
+            random.shuffle(tail)
+            for c in (near + tail[:1])[:LOW_PRIORITY_EQUIP_CAP]:
+                if len(picked) >= cap:
+                    break
+                picked.append(c)
+        return picked[:cap]
+
+    shop_rows = [c for c in rest if c.get("source") == "本NPC商店"]
+    task_rows = [c for c in rest if c.get("source") != "本NPC商店"]
+    return (
+        list(pinned)
+        + kw_hits
+        + _fill_side(shop_rows, max_n)
+        + _fill_side(task_rows, task_cap)
     )
-    cap = max(max_n, len(picked))
-
-    def _take(entry: dict[str, Any]) -> None:
-        nonlocal task_used
-        if entry.get("source") != "本NPC商店":
-            task_used += 1
-        picked.append(entry)
-
-    # 高优先层：按 use 轮转，避免某个 use 独占；任务池条目受 task_cap 限制
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for c in high:
-        it = _item(c)
-        key = str(getattr(it, "use", "") or getattr(it, "type", "") or "其他")
-        groups.setdefault(key, []).append(c)
-    for arr in groups.values():
-        arr.sort(key=lambda x: reward_task_tier_by_name.get(x.get("name") or "", 5))
-        random.shuffle(arr)
-    order = sorted(groups)  # 稳定的 use 顺序，避免每次调用顺序抖动
-    random.shuffle(order)
-    while len(picked) < cap:
-        progressed = False
-        for key in order:
-            if len(picked) >= cap:
-                break
-            arr = groups.get(key) or []
-            while arr:
-                cand = arr.pop(0)
-                if cand.get("source") != "本NPC商店" and task_used >= task_cap:
-                    continue
-                _take(cand)
-                progressed = True
-                break
-        if not progressed:
-            break
-
-    # 低优先装备：只在补位时用，最多 LOW_PRIORITY_EQUIP_CAP 条（2 近 + 1 随机）
-    if len(picked) < cap and low_equip:
-        if player_level:
-            by_near = sorted(low_equip, key=lambda c: abs((_level(c) or 999) - player_level))
-        else:
-            by_near = sorted(low_equip, key=lambda c: -( _level(c) or 0))
-        near = by_near[:2]
-        tail = [c for c in by_near[2:]]
-        random.shuffle(tail)
-        extra = near + tail[:1]
-        for c in extra[:LOW_PRIORITY_EQUIP_CAP]:
-            if len(picked) >= cap:
-                break
-            _take(c)
-
-    return picked[:cap] if len(picked) <= max_n else picked
 
 
 # ---------------------------------------------------------------------------
