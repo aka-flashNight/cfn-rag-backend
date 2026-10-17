@@ -8,7 +8,7 @@
 - 商店：NPC 金币商店（图鉴里就是这个 NPC 卖）；
 - K点商店；
 - 关卡掉落：箱子掉落（按关卡名）；
-- 任务：核心任务池里的提交物 / 奖励物。
+- 任务奖励：核心任务池里作为**奖励**出现过的物品（任务提交物不算来源——那是玩家掏东西）。
 
 反查索引第一次构建约 0.15s（扫 152 个关卡 XML，掉落记录仅数十条），
 之后挂在 GameDataRegistry 实例上复用，故不引入启动开销。
@@ -23,13 +23,13 @@ _CACHE_ATTR = "_item_source_index_cache"
 
 
 def _build_index(game_data: Any) -> dict[str, dict[str, Any]]:
-    """item 名 -> {craft: [来源表], shop: [NPC], kshop: bool, stage: [关卡名], task: [角色]}"""
+    """item 名 -> {craft: [来源表], shop: [NPC], kshop: bool, stage: [关卡名], task: bool}"""
     index: dict[str, dict[str, Any]] = {}
 
     def _entry(name: str) -> dict[str, Any]:
         return index.setdefault(
             name,
-            {"craft": [], "shop": [], "kshop": False, "stage": [], "task": []},
+            {"craft": [], "shop": [], "kshop": False, "stage": [], "task": False},
         )
 
     # 1. 合成配方
@@ -82,19 +82,14 @@ def _build_index(game_data: Any) -> dict[str, dict[str, Any]]:
                 if stage_name not in e["stage"]:
                     e["stage"].append(stage_name)
 
-    # 5. 核心任务池（提交 / 奖励）
+    # 5. 核心任务池：只认「奖励」，任务提交不是物品来源（提交是玩家掏东西，不是获取途径）
     tasks = getattr(game_data, "tasks", None)
     try:
-        submit_names = set(tasks.list_core_submit_items() or ())
         reward_names = set(tasks.list_core_reward_item_names() or ())
     except Exception:  # pragma: no cover
-        submit_names, reward_names = set(), set()
-    for name in submit_names:
-        _entry(name)["task"].append("提交")
+        reward_names = set()
     for name in reward_names:
-        e = _entry(name)
-        if "奖励" not in e["task"]:
-            e["task"].append("奖励")
+        _entry(name)["task"] = True
 
     return index
 
@@ -132,7 +127,7 @@ def format_item_sources(
     商店默认**全列**（数据侧每件物品最多 4 家在售，全列代价极低，且模型需要知道
     「还有哪家能买到」）；关卡掉落仍折叠成「首个 等N个关卡」。
 
-    例：``合成（调酒）；商店（酒保、The Girl）；关卡掉落（地铁站 等3关）；任务提交或奖励``
+    例：``合成（调酒）；商店（酒保、The Girl）；关卡掉落（地铁站 等3关）；任务奖励``
     """
     if game_data is None or not item_name:
         return ""
@@ -161,11 +156,7 @@ def format_item_sources(
     if stage_txt:
         parts.append(f"关卡掉落（{stage_txt}）")
 
-    task = rec.get("task") or []
-    if task:
-        if len(task) == 1:
-            parts.append(f"任务{task[0]}")
-        else:
-            parts.append("任务提交或奖励")
+    if rec.get("task"):
+        parts.append("任务奖励")
 
     return "；".join(parts)

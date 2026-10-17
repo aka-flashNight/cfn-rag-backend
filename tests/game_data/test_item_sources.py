@@ -1,6 +1,6 @@
 """物品获取途径反查（物品图鉴注释口径）的测试。
 
-口径：合成 / NPC 商店 / K点商店 / 关卡掉落 / 核心任务池（提交·奖励）；
+口径：合成 / NPC 商店 / K点商店 / 关卡掉落 / 核心任务池奖励（提交物不算来源）；
 查不到任何来源＝空串（不写「未知」、不留占位）。
 """
 
@@ -11,13 +11,13 @@ from services.game_entity_prompts import format_item_prompt_line
 
 
 def test_crafting_item_reports_craft_source(game_data):
-    # 抗生素：合成（化学生产）+ 商店 + K点 + 掉落 + 任务，五个来源都能反查到
+    # 抗生素：合成（化学生产）+ 商店 + K点 + 掉落 + 任务奖励，五个来源都能反查到
     text = format_item_sources(game_data, "抗生素")
     assert text.startswith("合成（")
     assert "商店（" in text
     assert "K点商店" in text
     assert "关卡掉落（" in text
-    assert "任务" in text
+    assert text.endswith("任务奖励")
 
 
 def test_shop_only_item(game_data):
@@ -29,6 +29,16 @@ def test_shop_only_item(game_data):
 def test_stage_drop_item(game_data):
     text = format_item_sources(game_data, "牛肉罐头")
     assert "关卡掉落（" in text
+
+
+def test_submit_only_item_is_not_a_source(game_data):
+    """任务提交物不是物品来源：只在提交池出现的物品不得因「任务」被标来源。"""
+    submit_only = "土豆炒肉丝"
+    assert submit_only in set(game_data.tasks.list_core_submit_items())
+    assert submit_only not in set(game_data.tasks.list_core_reward_item_names())
+    text = format_item_sources(game_data, submit_only)
+    assert "任务" not in text
+    assert text == "合成（烹饪）"
 
 
 def test_unknown_item_or_missing_registry_yields_empty(game_data):
@@ -58,7 +68,7 @@ def test_prompt_line_appends_sources_last(game_data):
     assert line.startswith("名称：抗生素；")
     # 获取途径是最后一段（内部可能自带「；」分隔的多来源）
     assert "；获取途径：" in line
-    assert line.endswith("任务提交或奖励")
+    assert line.endswith("任务奖励")
 
 
 def test_prompt_line_omits_sources_when_empty(game_data):
