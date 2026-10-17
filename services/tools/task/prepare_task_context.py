@@ -27,6 +27,7 @@ class PrepareTaskContextTool(BaseTool):
             npc_faction=ctx.npc_faction,
             npc_challenge=ctx.npc_challenge,
             player_progress=ctx.player_progress,
+            player_level=ctx.player_level,
             npc_affinity=ctx.npc_affinity,
             npc_states=ctx.npc_states,
             game_data=ctx.game_data,

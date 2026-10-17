@@ -28,6 +28,7 @@ from services.agent_tools.finished_tasks import FinishedTaskBlock
 from services.game_progress import (
     StageConfig,
     derive_progress_stage,
+    get_player_level,
     get_progress_stage_config,
 )
 from services.integration.state import get_integration_state
@@ -334,6 +335,8 @@ class TurnContext:
     player_query: str
     player_identity: str = ""
     progress_stage: Optional[int] = None
+    # 玩家真实等级（绑定存档投影；None＝没有，装备窗口退化用阶段等级区间）
+    player_level: Optional[int] = None
     stage_cfg: Optional[StageConfig] = None
     rag_context_text: str = ""
     mentioned_npcs_str: str = ""
@@ -691,6 +694,7 @@ async def assemble_context(
         player_query=player_query,
         player_identity=player_identity,
         progress_stage=progress_stage,
+        player_level=get_player_level(snap["player"]) if snap["player"] else None,
         stage_cfg=stage_cfg,
         rag_context_text=rag_context_text,
         mentioned_npcs_str=mentioned_npcs_str,

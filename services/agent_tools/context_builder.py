@@ -597,6 +597,8 @@ def _build_reward_item_candidates(
     max_level: int,
     main_task_range: tuple[int, int],
     reward_keywords: Optional[list[str]] = None,
+    player_level: Optional[int] = None,
+    stage_level_range: Optional[tuple[int, int]] = None,
 ) -> list[dict[str, Any]]:
     """
     组装奖励物品候选列表（文档 6.3.2 通用字段 reward_item_candidates）。
@@ -772,8 +774,10 @@ def _build_reward_item_candidates(
         equipment_mods=equipment_mods,
         reward_keywords=reward_keywords,
         reward_task_tier_by_name=reward_task_tier_by_name,
-        max_n=20,
+        max_n=REWARD_POOL_CAP,
         selected_reward_types=all_types,
+        player_level=player_level,
+        stage_level_range=stage_level_range,
     )
 
 
@@ -2623,6 +2627,47 @@ def _pick_layer_shop_task_82_proportional(
     return picked[:n]
 
 
+#: 奖励池上限（关键词命中允许超出，其余按此填满）
+REWARD_POOL_CAP = 10
+#: 任务池（任务奖励可选）非单例条目的保底条数：类型少按 5，类型多按类型数
+TASK_POOL_DEFAULT_CAP = 5
+#: 低优先装备（窗口外、未命中关键词）补位上限
+LOW_PRIORITY_EQUIP_CAP = 3
+#: 装备等级窗口：以玩家等级为基准的上下浮动
+EQUIP_LEVEL_UP = 3
+EQUIP_LEVEL_DOWN = 5
+#: 「装备」只算武器与防具，且排除颈部装备（项链/军牌）这类饰品
+_EQUIP_TYPES = frozenset({"武器", "防具"})
+_EQUIP_EXCLUDE_USES = frozenset({"颈部装备"})
+
+
+def _is_reward_equipment(item: Any) -> bool:
+    """奖励侧的「装备」＝武器/防具，但不含颈部装备（项链、军牌等饰品）。"""
+    if item is None:
+        return False
+    if str(getattr(item, "type", "") or "") not in _EQUIP_TYPES:
+        return False
+    return str(getattr(item, "use", "") or "") not in _EQUIP_EXCLUDE_USES
+
+
+def _reward_equip_window(
+    *,
+    player_level: Optional[int],
+    stage_level_range: Optional[tuple[int, int]],
+) -> tuple[int, int]:
+    """装备高优先等级窗口。
+
+    有玩家等级（游戏内）＝[L-5, L+3]；没有（非游戏内/未绑定）＝退化用当前阶段的等级区间。
+    """
+    if player_level and player_level > 0:
+        lo = max(1, int(player_level) - EQUIP_LEVEL_DOWN)
+        return lo, int(player_level) + EQUIP_LEVEL_UP
+    if stage_level_range:
+        lo, hi = stage_level_range
+        return int(lo), int(hi)
+    return 1, 100
+
+
 def _finalize_reward_item_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -2630,16 +2675,21 @@ def _finalize_reward_item_candidates(
     equipment_mods: Any,
     reward_keywords: Optional[list[str]],
     reward_task_tier_by_name: dict[str, int],
-    max_n: int = 20,
+    max_n: int = REWARD_POOL_CAP,
     selected_reward_types: Optional[list[str]] = None,
+    player_level: Optional[int] = None,
+    stage_level_range: Optional[tuple[int, int]] = None,
 ) -> list[dict[str, Any]]:
     """
-    截断优先级（从高到低）：
-    1) 勾选的单例类型（金币/经验值/K点/技能点/强化石）各至多 1 条且优先商店——排在一切关键词之前，
-       因勾选即表示玩家/NPC 明确需要；
-    2) 剩余名额：有关键词时先填「关键词命中」再填「未命中」；
-    3) 上述每一层内部：商店 : 任务池 = 8 : 2，再按非单例奖励类型轮询均分，
-       类型内按任务进度 tier 分桶、桶内随机；不足则跨源补齐。
+    分层口径（用户 2026-10-18 定稿）：
+    1) 勾选的单例类型（金币/经验值/K点/技能点/强化石）各至多 1 条，必留；
+    2) 关键词命中的候选**全部保留**，允许超过上限（不硬截断）；
+    3) 高优先层＝装备等级落在玩家窗口 [L-5, L+3] 的物品 ＋ 所有非装备；
+       两者合在一起按 `use` 轮转抽选（避免某个 use 独占），填到上限；
+       没有玩家等级时窗口退化为当前阶段的等级区间（非游戏内打开）；
+    4) 任务池（任务奖励可选）的非单例条目另有条数上限：选了多少非单例类型就至少给几条，
+       不足 5 按 5 算——即「类型多时每类 1 条」；
+    5) 补位到上限时，才用不在窗口、也没命中关键词的装备，最多 3 条（2 条最接近玩家等级 + 1 条随机）。
     """
     kw = _normalize_kw_list(reward_keywords)
     sel = list(selected_reward_types or [])
@@ -2647,42 +2697,102 @@ def _finalize_reward_item_candidates(
         candidates, sel, item_registry, equipment_mods,
     )
     pool = [c for c in candidates if (c.get("name") or "") not in pinned_names]
-    budget = max(0, max_n - len(pinned))
     non_sing = [t for t in sel if t not in SINGLETON_REWARD_LABELS]
+    task_cap = max(TASK_POOL_DEFAULT_CAP, len(non_sing))
+    lo, hi = _reward_equip_window(player_level=player_level, stage_level_range=stage_level_range)
 
-    if budget <= 0:
-        return pinned[:max_n]
+    def _item(entry: dict[str, Any]) -> Any:
+        return item_registry.get_by_name(entry.get("name") or "")
 
-    if not kw:
-        rest = _pick_layer_shop_task_82_proportional(
-            pool, budget, non_sing,
-            item_registry, equipment_mods, reward_task_tier_by_name,
-        )
-        return (pinned + rest)[:max_n]
+    def _is_equip(entry: dict[str, Any]) -> bool:
+        it = _item(entry)
+        if it is None:
+            return False
+        return _is_reward_equipment(it)
 
-    # 关键词分层在单例占位之后；命中池、未命中池各自内部仍为 8:2 商店优先 + 类型轮询。
-    matched: list[dict[str, Any]] = []
-    unmatched: list[dict[str, Any]] = []
+    def _level(entry: dict[str, Any]) -> int:
+        it = _item(entry)
+        return int(getattr(it, "level", 0) or 0) if it is not None else 0
+
+    # 关键词命中：全保留（允许超额）
+    kw_hits: list[dict[str, Any]] = []
+    rest: list[dict[str, Any]] = []
     for c in pool:
-        it = item_registry.get_by_name(c.get("name") or "")
-        if _entry_matches_item_keywords(c, it, equipment_mods, kw):
-            matched.append(c)
+        it = _item(c)
+        if kw and _entry_matches_item_keywords(c, it, equipment_mods, kw):
+            kw_hits.append(c)
         else:
-            unmatched.append(c)
+            rest.append(c)
 
-    take_kw = min(budget, len(matched))
-    p_kw = _pick_layer_shop_task_82_proportional(
-        matched, take_kw, non_sing,
-        item_registry, equipment_mods, reward_task_tier_by_name,
+    high: list[dict[str, Any]] = []
+    low_equip: list[dict[str, Any]] = []
+    for c in rest:
+        if _is_equip(c):
+            lv = _level(c)
+            if lv == 0 or lo <= lv <= hi:
+                high.append(c)
+            else:
+                low_equip.append(c)
+        else:
+            high.append(c)
+
+    picked: list[dict[str, Any]] = list(pinned) + list(kw_hits)
+    # 任务池上限只数**非单例**条目：单例（金币/经验值/…）是钉死的，不占任务池名额
+    task_used = sum(
+        1 for c in picked
+        if c.get("source") != "本NPC商店" and (c.get("name") or "") not in SINGLETON_REWARD_LABELS
     )
-    budget -= len(p_kw)
-    p_nkw: list[dict[str, Any]] = []
-    if budget > 0 and unmatched:
-        p_nkw = _pick_layer_shop_task_82_proportional(
-            unmatched, budget, non_sing,
-            item_registry, equipment_mods, reward_task_tier_by_name,
-        )
-    return (pinned + p_kw + p_nkw)[:max_n]
+    cap = max(max_n, len(picked))
+
+    def _take(entry: dict[str, Any]) -> None:
+        nonlocal task_used
+        if entry.get("source") != "本NPC商店":
+            task_used += 1
+        picked.append(entry)
+
+    # 高优先层：按 use 轮转，避免某个 use 独占；任务池条目受 task_cap 限制
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for c in high:
+        it = _item(c)
+        key = str(getattr(it, "use", "") or getattr(it, "type", "") or "其他")
+        groups.setdefault(key, []).append(c)
+    for arr in groups.values():
+        arr.sort(key=lambda x: reward_task_tier_by_name.get(x.get("name") or "", 5))
+        random.shuffle(arr)
+    order = sorted(groups)  # 稳定的 use 顺序，避免每次调用顺序抖动
+    random.shuffle(order)
+    while len(picked) < cap:
+        progressed = False
+        for key in order:
+            if len(picked) >= cap:
+                break
+            arr = groups.get(key) or []
+            while arr:
+                cand = arr.pop(0)
+                if cand.get("source") != "本NPC商店" and task_used >= task_cap:
+                    continue
+                _take(cand)
+                progressed = True
+                break
+        if not progressed:
+            break
+
+    # 低优先装备：只在补位时用，最多 LOW_PRIORITY_EQUIP_CAP 条（2 近 + 1 随机）
+    if len(picked) < cap and low_equip:
+        if player_level:
+            by_near = sorted(low_equip, key=lambda c: abs((_level(c) or 999) - player_level))
+        else:
+            by_near = sorted(low_equip, key=lambda c: -( _level(c) or 0))
+        near = by_near[:2]
+        tail = [c for c in by_near[2:]]
+        random.shuffle(tail)
+        extra = near + tail[:1]
+        for c in extra[:LOW_PRIORITY_EQUIP_CAP]:
+            if len(picked) >= cap:
+                break
+            _take(c)
+
+    return picked[:cap] if len(picked) <= max_n else picked
 
 
 # ---------------------------------------------------------------------------
@@ -2807,6 +2917,7 @@ def prepare_task_context(
     npc_faction: str = "",
     npc_challenge: Optional[str] = None,
     player_progress: int = 1,
+    player_level: Optional[int] = None,
     npc_affinity: int = 0,
     npc_states: Optional[dict[str, Any]] = None,
     requirement_keywords: Optional[list[str]] = None,
@@ -2844,6 +2955,8 @@ def prepare_task_context(
         max_level=max_level,
         main_task_range=(main_task_range[0], main_task_range[1]),
         reward_keywords=reward_keywords,
+        player_level=player_level,
+        stage_level_range=(level_range[0], level_range[1]),
     )
 
     task_rules = _TASK_RULES.get(task_type, "")

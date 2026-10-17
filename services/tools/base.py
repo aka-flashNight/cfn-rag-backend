@@ -69,6 +69,8 @@ class ToolContext:
     npc_faction: str = ""
     npc_challenge: Optional[str] = None
     player_progress: int = 1
+    # 玩家等级（绑定存档投影里的真实等级；非游戏内/未绑定＝None，由阶段退化）
+    player_level: Optional[int] = None
     npc_affinity: int = 0
     npc_states: Optional[dict[str, Any]] = None
     game_data: Optional["GameDataRegistry"] = None

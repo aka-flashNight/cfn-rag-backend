@@ -1576,6 +1576,7 @@ class TurnOrchestrator:
             npc_titles=npc_titles,
             npc_challenge=ctx.npc_state.challenge,
             player_progress=progress,
+            player_level=ctx.player_level,
             progress_desc=ctx.progress_desc,
             npc_affinity=affinity,
             npc_states=npc_states,

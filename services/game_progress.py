@@ -230,6 +230,11 @@ def _player_level(player: Any) -> Optional[int]:
     return level if level > 0 else None
 
 
+def get_player_level(player: Any) -> Optional[int]:
+    """从绑定存档投影取玩家等级（公开入口；缺失=不可判）。"""
+    return _player_level(player)
+
+
 def derive_progress_stage(progress: Any, player: Any = None) -> Optional[int]:
     """
     由绑定存档投影推导主线阶段（1-7）；数据不足以判定时返回 None（由调用方回落请求值）。
