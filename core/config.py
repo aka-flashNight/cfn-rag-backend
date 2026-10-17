@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
 
     draft_keep_turns: int = 3  # 岔开话题草案保留回合数（连续 N 次 ask 未触碰任务工具即删除）
+    # 委托发布后持续供给「任务达成要点」的总轮数（含发布轮；发布轮记 N-1）
+    published_task_highlight_turns: int = 5
     subagent_task_max_rounds: int = 4
     subagent_search_max_rounds: int = 3
     merge_grace_ms: int = 1500  # 正文流完后等子 Agent 的宽限

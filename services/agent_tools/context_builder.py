@@ -8,7 +8,9 @@ prepare_task_context 工具执行器。
 from __future__ import annotations
 
 import json
+import logging
 import random
+from pathlib import Path
 from typing import Any, Optional
 
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
@@ -28,6 +30,11 @@ from services.game_progress import (
 
 # 当 challenge 无 llm_hint 时使用的默认提醒（仅在选择该难度时随 challenge_modes 返回，按需占用 token）
 DEFAULT_CHALLENGE_LLM_HINT = "若选择此难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
+
+logger = logging.getLogger(__name__)
+
+#: existing_tasks 条数上限；超过时截断并置 truncated: true（语义不变）
+MAX_EXISTING_AGENT_TASKS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -2240,6 +2247,47 @@ def _finalize_reward_item_candidates(
 # 主入口
 # ---------------------------------------------------------------------------
 
+def _build_existing_agent_tasks(game_data: Any, npc_name: str) -> list[dict[str, Any]]:
+    """当前 NPC 已发布的 Agent 委托：[{title, completion}]（任务名＋通关条件）。
+
+    只读磁盘：``TaskRegistry`` 排除了 ``agent_tasks.json``，``game_data.tasks`` 里
+    根本看不到 Agent 任务。读取范围＝共享 ∪ 当前绑定存档（存档覆盖共享），
+    与已完成委托块同一口径；只保留 ``get_npc`` 等于当前 NPC 的记录。
+    排序＝任务 id 倒序（最新的在前）；标题缺失＝跳过该条并记 warning。
+    **本函数没有任何写盘副作用**（只读两个 JSON，不碰存档/状态/索引）。
+    """
+    data_root = getattr(game_data, "data_root", None)
+    npc = (npc_name or "").strip()
+    if data_root is None or not npc:
+        return []
+    try:
+        from services.integration.state import get_integration_state
+
+        slot_key = get_integration_state().slot_key
+    except Exception:  # pragma: no cover - 集成状态异常按 standalone 处理
+        slot_key = None
+    try:
+        from services.agent_tools.finished_tasks import _completion_phrase, _merged_docs
+
+        tasks, texts = _merged_docs(Path(data_root), slot_key)
+    except Exception as exc:
+        logger.warning("existing_tasks 读取失败，按空列表处理: %s", exc)
+        return []
+    out: list[dict[str, Any]] = []
+    for task_id in sorted(tasks, reverse=True):
+        record = tasks[task_id]
+        if str(record.get("get_npc") or "").strip() != npc:
+            continue
+        title = str(texts.get(f"$AGENT_TITLE_{task_id}") or "").strip()
+        if not title:
+            logger.warning("委托 %d 缺少标题文本，existing_tasks 跳过该条", task_id)
+            continue
+        out.append({"title": title, "completion": _completion_phrase(record)})
+        if len(out) > MAX_EXISTING_AGENT_TASKS:
+            break  # 只需要知道「已超上限」，不必把整份都读进来
+    return out
+
+
 def prepare_task_context(
     *,
     task_type: str,
@@ -2274,14 +2322,7 @@ def prepare_task_context(
         stage=stage, task_type=task_type, affinity=npc_affinity,
     )
 
-    existing_tasks: list[dict[str, Any]] = []
-    # 注释掉已存在任务
-    # for t in game_data.tasks.list_by_npc(npc_name):
-    #     existing_tasks.append({
-    #         "id": t.id,
-    #         "title": t.title,
-    #         "type": t.chain or "",
-    #     })
+    existing_tasks = _build_existing_agent_tasks(game_data, npc_name)
 
     reward_item_candidates = _build_reward_item_candidates(
         reward_types=reward_types,
@@ -2300,12 +2341,12 @@ def prepare_task_context(
         "level_range": list(level_range),
         "main_task_range": list(main_task_range),
         "reward_budget": reward_budget,
-        "existing_tasks": existing_tasks[:15],
+        "existing_tasks": existing_tasks[:MAX_EXISTING_AGENT_TASKS],
         "reward_item_candidates": reward_item_candidates,
         "task_rules": task_rules,
     }
 
-    if len(existing_tasks) > 15:
+    if len(existing_tasks) > MAX_EXISTING_AGENT_TASKS:
         context["truncated"] = True
 
     # 类型专属字段

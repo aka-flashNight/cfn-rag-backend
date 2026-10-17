@@ -70,6 +70,9 @@ PREPARE_SELECTION_GUIDE = """\
    玩家说「想要药剂」→ requirement_keywords 或 reward_keywords 填 ["药剂"]。
 4. prepare 返回的候选池为空、或校验指出 task_type 选错：**换 task_type 重新 prepare**，
    不要在错误的类型上硬凑草案。
+5. existing_tasks 是该 NPC 已发布过的 Agent 委托（任务名＋通关条件）。新委托不得与其中任何一条
+   在主题、目标物品、目标关卡或达成方式上重复；即使玩家要求重发，也先说明已有类似委托，
+   不得再发布同类任务。
 """
 
 

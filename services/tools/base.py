@@ -47,12 +47,13 @@ ROUTE_TOOL_NAMES: tuple[str, ...] = (
 )
 # 无待确认草案时可路由的目标（confirm/cancel/update 都针对既有草案）
 ROUTE_TOOLS_NEW: tuple[str, ...] = ("route_task_draft", "route_search")
-# 有待确认草案时可路由的目标
+# 有待确认草案时可路由的目标（草案在途时检索仍可用：查设定不需要先丢掉草案）
 ROUTE_TOOLS_DRAFT: tuple[str, ...] = (
     "route_task_confirm",
     "route_task_cancel",
     "route_task_update",
     "route_task_draft",
+    "route_search",
 )
 
 

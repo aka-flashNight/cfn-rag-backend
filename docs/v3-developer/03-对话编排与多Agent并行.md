@@ -165,6 +165,23 @@ confirm 失败（草案过期/校验回归，极少）：tool_status(failed) →
 补救调用让 NPC 解释（"这份委托刚才出了点问题……"）。路由轮本来就没有台词，所以不存在
 「丢弃已生成正文」这一步；草案保留不清。收场/补救调用若模型空回复，用静态兜底话术补上。
 
+#### 4.2.1 草案在途时仍可检索（2026-10-17）
+
+工具表按**有无待确认草案**二选一，两张表都在 `services/tools/base.py` 定量给出：
+
+| 状态 | 工具表（顺序固定） |
+| ---- | ------------------ |
+| 无草案 | `ROUTE_TOOLS_NEW`＝`route_task_draft`、`route_search` |
+| 有草案 | `ROUTE_TOOLS_DRAFT`＝`route_task_confirm`、`route_task_cancel`、`route_task_update`、`route_task_draft`、`route_search` |
+
+草案在途时玩家仍可能问设定、人物往事、关卡或物品——那是检索，不是对草案表态。
+`route_search` 因此**在两张表里都在**：检索既不取消草案，也不重置/推进
+`rounds_without_task`（草案过期只由「连续 `draft_keep_turns` 轮纯聊天」触发，
+`route_search` 路径压根不碰这个计数器）。`build_routing_guide(has_pending_draft=True)`
+也把这条写成了明文规则（「草案在途时仍可检索，检索不会取消草案，也不会让它提前过期」）。
+`ToolRegistry.dispatch_batch` 只按 pipeline 分组、不按本轮工具表过滤，故补表后检索工具照常执行。
+回归锁＝`tests/orchestrator/test_draft_route_search.py`。
+
 ### 4.3 检索（route_search）
 
 `route_search` 承担检索的第一步：`keywords` + `sources` 交给编排层代码预取（`orchestrator/search_prefetch.py`，不调模型），
@@ -307,10 +324,26 @@ standalone 按字段值，不传＝关闭。**不落后端库**：玩家的选�
 取最大值 +1，**永不复用、不重排**（改写不换号，所以提示词里的编号跨轮稳定可引用）。
 
 **注入**：`context.py` 一轮读一次快照进 `TurnContext.long_term`，`prompts.build_user_shared_core`
-把它拼成独立块。块序＝会话态 → 已完成委托 → 长期记忆 → RAG/提及 NPC → 摘要 → 近期对话
-（按前缀缓存从稳定到易变；长期记忆改动稀疏，放在每轮全变的 RAG 之前）。
+把它拼成独立块。块序（2026-10-17 按前缀缓存重排，本批再插入两块任务块）＝
+已完成委托 → 进行中委托 → 刚发布委托 → 长期记忆 → 早期摘要 → 近期对话 → 会话态（好感压尾）
+→ 关系跨档提示 → RAG/提及 NPC（按前缀缓存从稳定到易变：三块任务块都是「任务相关」，
+任务一完成/过期就整块消失，改动稀疏，故排在长期记忆之前；长期记忆又放在每轮全变的 RAG 之前）。
 作用域内一条都没有＝整块不注入，不留空壳。摘要轮另有 `format_summary_block()`，
 块尾写明「长期记忆不参与对话摘要的撰写」——摘要只总结本次给出的对话记录。
+
+**任务三块（2026-10-17，user 侧共享 core 的最前面三块）**：
+
+| 块 | 来源 | 生命周期 |
+| -- | ---- | -------- |
+| 已完成委托 | 直读 `agent_tasks.json`/`agent_text.json`（共享 ∪ 本存档），按 `progress.tasks_finished` 过滤 | 无状态，每轮实时算，最多 3 条 |
+| 进行中委托 | 同上读取，按绑定投影 `progress.tasks_active` 过滤 | 无状态、只读、不记账；最多 3 条，超出在块尾写「另有 N 条进行中的委托未展开」 |
+| 刚发布委托 | 同上读取，由**会话库** `session_published_task_highlights` 的 task_id 驱动 | 发布轮起算 `published_task_highlight_turns`（默认 5，含发布轮）轮；任务完成即清 |
+
+三块按 task_id 互相去重：已完成 ∩ 进行中、进行中 ∩ 刚发布都不重复出现；highlight 过期后
+若任务仍未完成，由进行中块接管。**发布轮**把块拼进本轮 **result_block**（收场调用可见），
+后续轮才进 **user 侧共享 core**——同一轮不会出现两遍（`turn.py` 记本轮已注入的 task_id）。
+**记录只在会话库**（`memory.db` 的一张会话级表），不落 `npc_state_db` / status / progress，
+轮次也只存在库里、不进提示词（保持文本稳定、减少前缀缓存抖动）。
 
 **工具（关键设计约束）**：聊天侧永远只有一个工具名 `update_long_term_memory`，
 schema 与描述按作用域当前状态**三选一**；摘要侧另有 `set_base_long_term_memory`（只在摘要那次调用下发）。

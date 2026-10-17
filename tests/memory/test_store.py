@@ -170,3 +170,67 @@ def test_legacy_sessions_db_gains_slot_key_without_backfill(tmp_path):
     assert sessions[0].session_id == "s-legacy"
     assert sessions[0].slot_key is None  # 不迁移回填：旧会话＝standalone
     assert store.list_sessions_sync("slot_a") == []
+
+
+# ---------------------------------------------------------------------------
+# 刚发布委托的达成要点供给期（session_published_task_highlights）
+# ---------------------------------------------------------------------------
+
+def test_published_task_highlight_roundtrip(store):
+    """写入即可读回；无记录＝None（不返回空壳）。"""
+    assert store.published_task_highlight_read_sync("s1") is None
+    store.published_task_highlight_write_sync("s1", 200001, 4)
+
+    hl = store.published_task_highlight_read_sync("s1")
+    assert hl is not None
+    assert (hl.session_id, hl.task_id, hl.rounds_left) == ("s1", 200001, 4)
+
+
+def test_published_task_highlight_overwrites_previous_task(store):
+    """单会话单行：发布新委托覆盖旧记录，同一时间只跟踪最近发布的一份。"""
+    store.published_task_highlight_write_sync("s1", 200001, 4)
+    store.published_task_highlight_write_sync("s1", 200002, 4)
+
+    hl = store.published_task_highlight_read_sync("s1")
+    assert hl.task_id == 200002
+    rows = store._conn.execute(
+        "SELECT COUNT(*) FROM session_published_task_highlights WHERE session_id = 's1'"
+    ).fetchone()[0]
+    assert rows == 1
+
+
+def test_published_task_highlight_decrements_to_delete(store):
+    """每轮递减；减到 0 即删（读回 None），不留 rounds_left<=0 的僵尸行。"""
+    store.published_task_highlight_write_sync("s1", 200001, 2)
+    store.published_task_highlight_write_sync("s1", 200001, 1)
+    assert store.published_task_highlight_read_sync("s1").rounds_left == 1
+
+    store.published_task_highlight_write_sync("s1", 200001, 0)
+    assert store.published_task_highlight_read_sync("s1") is None
+    rows = store._conn.execute(
+        "SELECT COUNT(*) FROM session_published_task_highlights"
+    ).fetchone()[0]
+    assert rows == 0
+
+
+def test_published_task_highlight_clear_and_session_cascade(store):
+    store.published_task_highlight_write_sync("s1", 200001, 3)
+    store.published_task_highlight_clear_sync("s1")
+    assert store.published_task_highlight_read_sync("s1") is None
+
+    session = store.create_session_sync(npc_name="铁匠", title="测试会话")
+    store.published_task_highlight_write_sync(session.session_id, 200002, 3)
+    store.delete_session_sync(session.session_id)
+
+    rows = store._conn.execute(
+        "SELECT COUNT(*) FROM session_published_task_highlights WHERE session_id = ?",
+        (session.session_id,),
+    ).fetchone()[0]
+    assert rows == 0
+
+
+def test_published_task_highlight_ignores_blank_session_and_bad_id(store):
+    store.published_task_highlight_write_sync("", 200001, 3)
+    store.published_task_highlight_write_sync("s1", "abc", 3)
+    assert store.published_task_highlight_read_sync("") is None
+    assert store.published_task_highlight_read_sync("s1") is None

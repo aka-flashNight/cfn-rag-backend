@@ -16,6 +16,9 @@ kind='fact'（追加的关键记录，entry_no 是作用域内单调递增编号
 并按 (slot_key, task_id) 建部分唯一索引做**硬幂等**——重要任务只在首次收到完成
 事件时委派一次，重复事件在数据库层就被挡掉，不依赖调用方自查。
 session_dialogue_hints 表存好感度跨档后的待提示文案与剩余轮数（触发二，跨轮持续）。
+session_published_task_highlights 表存「刚发布的委托」的达成要点供给期（单会话单条）：
+发布轮记 rounds_left＝published_task_highlight_turns-1，之后每轮装配时递减，归零即删；
+该表只服务提示词装配，不落 npc_state_db / status / progress。
 """
 
 from __future__ import annotations
@@ -210,6 +213,15 @@ class DialogueHint:
     rounds_left: int = 0
 
 
+@dataclass
+class PublishedTaskHighlight:
+    """刚发布的委托的达成要点供给记录（单会话单条，同一时间只跟踪最近发布的一份）。"""
+
+    session_id: str
+    task_id: int
+    rounds_left: int = 0
+
+
 class MemoryStore:
     """SQLite 存储访问层（同步实现 + asyncio.to_thread 包装）。"""
 
@@ -351,6 +363,17 @@ class MemoryStore:
                 CREATE TABLE IF NOT EXISTS session_dialogue_hints (
                     session_id TEXT NOT NULL PRIMARY KEY,
                     hint TEXT NOT NULL DEFAULT '',
+                    rounds_left INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            # 刚发布的委托的达成要点供给期（单会话单条；轮次只存在于库里，不进提示词）
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_published_task_highlights (
+                    session_id TEXT NOT NULL PRIMARY KEY,
+                    task_id INTEGER NOT NULL,
                     rounds_left INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 )
@@ -591,6 +614,9 @@ class MemoryStore:
             cur.execute("DELETE FROM session_task_drafts WHERE session_id = ?", (session_id,))
             cur.execute("DELETE FROM session_ask_counters WHERE session_id = ?", (session_id,))
             cur.execute("DELETE FROM session_dialogue_hints WHERE session_id = ?", (session_id,))
+            cur.execute(
+                "DELETE FROM session_published_task_highlights WHERE session_id = ?", (session_id,),
+            )
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -1188,6 +1214,82 @@ class MemoryStore:
         """清掉跨档提示：模型已经调用过委派，不再提示（§4.0.2-2）。"""
         self.dialogue_hint_write_sync(session_id, "", 0)
 
+    # ------------------------------------------------------------------
+    # 刚发布委托的达成要点供给期
+    # ------------------------------------------------------------------
+
+    def published_task_highlight_read_sync(
+        self, session_id: str,
+    ) -> PublishedTaskHighlight | None:
+        """当前会话正在供给的委托记录；没有记录、轮数用完＝None。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT session_id, task_id, rounds_left FROM session_published_task_highlights"
+                " WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        rounds_left = int(row["rounds_left"])
+        if rounds_left <= 0:
+            return None
+        return PublishedTaskHighlight(
+            session_id=str(row["session_id"]),
+            task_id=int(row["task_id"]),
+            rounds_left=rounds_left,
+        )
+
+    def published_task_highlight_write_sync(
+        self, session_id: str, task_id: int, rounds_left: int,
+    ) -> None:
+        """写入/覆盖该会话的记录；rounds_left<=0＝删除（发布新委托时覆盖旧记录）。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return
+        try:
+            tid = int(task_id)
+        except (TypeError, ValueError):
+            return
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            if rounds_left <= 0:
+                cur.execute(
+                    "DELETE FROM session_published_task_highlights WHERE session_id = ?",
+                    (session_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO session_published_task_highlights
+                        (session_id, task_id, rounds_left, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        task_id = excluded.task_id,
+                        rounds_left = excluded.rounds_left,
+                        updated_at = excluded.updated_at
+                    """,
+                    (session_id, tid, int(rounds_left), now),
+                )
+            self._conn.commit()
+
+    def published_task_highlight_clear_sync(self, session_id: str) -> None:
+        """撤掉记录（任务已完成 / 轮次用尽 / 会话删除）。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM session_published_task_highlights WHERE session_id = ?", (session_id,),
+            )
+            self._conn.commit()
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -1236,6 +1338,9 @@ for _name in [
     "dialogue_hint_read",
     "dialogue_hint_write",
     "dialogue_hint_clear",
+    "published_task_highlight_read",
+    "published_task_highlight_write",
+    "published_task_highlight_clear",
 ]:
     setattr(MemoryStore, _name, _make_async(f"{_name}_sync"))
 

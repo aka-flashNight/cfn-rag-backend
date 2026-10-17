@@ -138,6 +138,37 @@ def test_bind_calls_ensure_agent_save_files(state, monkeypatch):
     assert calls == ["slot_ensure"]
 
 
+def test_bind_carries_tasks_active_through_schema(state, monkeypatch):
+    """progress.tasks_active 显式进 schema：bind 后 /status 原样透传，不被丢弃。"""
+    from api import integration_api
+
+    monkeypatch.setattr(integration_api, "ensure_agent_save_files", lambda key: None)
+    client = _make_client()
+    payload = {
+        "slot_key": "slot_active",
+        "progress": {"tasks_finished": [200001], "tasks_active": [200002, 200003]},
+    }
+    assert client.post("/integration/bind", json=payload).status_code == 200
+
+    progress = client.get("/integration/status").json()["progress"]
+    assert progress["tasks_active"] == [200002, 200003]
+    assert progress["tasks_finished"] == [200001]
+
+
+def test_bind_without_tasks_active_keeps_none(state, monkeypatch):
+    """旧游戏不发这个字段：schema 补 None，消费方据此按「没有进行中委托」处理。"""
+    from api import integration_api
+
+    monkeypatch.setattr(integration_api, "ensure_agent_save_files", lambda key: None)
+    client = _make_client()
+    assert client.post(
+        "/integration/bind", json={"slot_key": "slot_legacy", "progress": {"tasks_finished": []}},
+    ).status_code == 200
+
+    progress = client.get("/integration/status").json()["progress"]
+    assert progress["tasks_active"] is None
+
+
 def test_bind_checks_index_but_unbind_does_not(state, monkeypatch):
     """bind 是一次语义节点，复核语料指纹；unbind 不触发——索引与存档无关，
     覆盖层也不再进语料（后台重建行为见 tests/retrieval/test_refresh.py）。"""

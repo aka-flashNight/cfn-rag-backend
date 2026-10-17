@@ -38,6 +38,14 @@ class Item(BaseModel):
         description="物品说明（XML: description 子节点或属性；入库前已去 HTML）",
     )
 
+    title: str = Field(
+        default="",
+        description=(
+            "称号（XML: data/title；已去标签压缩空白）。多用于颈部等装备，"
+            "NPC 装备块以「称号：X」呈现；无则空串。"
+        ),
+    )
+
     weight: Optional[str] = Field(
         default=None,
         description="重量（XML: data/weight 等，保留原文）",

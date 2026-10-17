@@ -338,6 +338,9 @@ class TurnOrchestrator:
 
         self._ctx: Optional[TurnContext] = None
         self._usage: dict[str, Any] | None = None
+        # 本轮已把「刚发布的委托」块拼进 result_block 的 task_id：
+        # 同一轮若再重建消息，user core 里不再重复注入（一个 Turn 一个实例，天生本轮有效）。
+        self._published_block_task_id: Optional[int] = None
 
     # ------------------------------------------------------------------
     # 入口
@@ -593,9 +596,18 @@ class TurnOrchestrator:
                         await memory.delete_draft(self.session_id, draft_id=draft_row.draft_id)
                         await memory.reset_rounds_without_task(self.session_id)
                         yield tool_status_event(tool_name, "success", ui_hint=ui_hint)
-                        reply = (
+                        # 发布轮就要给达成要点：拼进本轮结果块，并登记后续几轮的供给期
+                        published_block = await self._publish_task_highlight(
+                            ctx, deps, task_id=outcome.payload.get("task_id"),
+                        )
+                        base_text = (
                             "【后台结果】这份委托已经正式派给玩家了"
-                            "（内容就是上面会话状态里那份待确认草案）。",
+                            "（内容就是上面会话状态里那份待确认草案）。"
+                        )
+                        if published_block:
+                            base_text = f"{base_text}\n\n{published_block}"
+                        reply = (
+                            base_text,
                             TASK_CONFIRM_MERGE_INSTRUCTION,
                             "这事就这么定了，去办吧。",
                             "委托已发布",
@@ -783,7 +795,16 @@ class TurnOrchestrator:
             has_pending_draft=has_pending_draft,
             agent_enabled=self.agent_enabled,
             task_publish_disabled=self.task_publish_disabled,
+            equipment_block=self._equipment_block(),
         )
+        # 发布轮已经把这块拼进 result_block 了：同一轮若再重建消息，不能在这里再来一遍
+        published_block = ctx.published_task_block
+        if (
+            published_block
+            and ctx.published_task_id is not None
+            and ctx.published_task_id == self._published_block_task_id
+        ):
+            published_block = ""
         shared = build_user_shared_core(
             retrieved_context=ctx.rag_context_text,
             mentioned_npcs_str=ctx.mentioned_npcs_str,
@@ -801,11 +822,76 @@ class TurnOrchestrator:
                 ctx.finished_task_block.text,
                 has_long_term_facts=bool(ctx.long_term and ctx.long_term.facts),
             ),
+            active_task_block=ctx.active_task_block,
+            published_task_block=published_block,
         )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": shared},
         ]
+
+    def _equipment_block(self) -> str:
+        """NPC 固定层装备块（units.json ＋ items 解析）。任何异常一律降级为空串：
+        units.json 缺失或名字对不上，都不该让这轮对话失败。"""
+        try:
+            from services.npc.npc_equipment import build_npc_equipment_block
+
+            return build_npc_equipment_block(
+                npc_name=self.npc_name, game_data=self._resolve_deps().game_data,
+            )
+        except Exception as exc:
+            logger.warning("装备块装配失败，降级为空: %s", exc)
+            return ""
+
+    async def _publish_task_highlight(
+        self, ctx: TurnContext, deps: OrchestratorDeps, *, task_id: Any,
+    ) -> str:
+        """发布轮：拼「刚发布的委托」块，并登记后续轮次的供给期。
+
+        构建失败（读不到任务记录 / 缺标题）＝空串且**不写记录**，只记 warning：
+        宁可不给，也不给半截内容让模型自己补全。轮次只写进会话库，不进提示词。
+        """
+        try:
+            tid = int(task_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "会话 %s：confirm 成功但 payload 缺有效 task_id，跳过达成要点", self.session_id,
+            )
+            return ""
+        data_root = getattr(deps.game_data, "data_root", None)
+        if data_root is None:
+            logger.warning("会话 %s：游戏数据根不可用，跳过发布轮达成要点", self.session_id)
+            return ""
+        slot_key = ctx.save_info.get("slot_key") if isinstance(ctx.save_info, dict) else None
+        try:
+            from services.agent_tools.finished_tasks import build_published_task_block
+
+            block = await asyncio.to_thread(
+                lambda: build_published_task_block(
+                    data_root=data_root,
+                    slot_key=slot_key,
+                    npc_name=self.npc_name,
+                    task_id=tid,
+                    game_data=deps.game_data,
+                )
+            )
+        except Exception as exc:
+            logger.warning("会话 %s：发布轮达成要点拼接失败，降级为空: %s", self.session_id, exc)
+            return ""
+        if not block:
+            return ""
+        # 本轮已拼进 result_block：同一轮若重建消息，user core 里不重复注入
+        self._published_block_task_id = tid
+        from core.config import get_settings
+
+        total = int(getattr(get_settings(), "published_task_highlight_turns", 5))
+        try:
+            await deps.memory.published_task_highlight_write(
+                self.session_id, tid, max(0, total - 1),
+            )
+        except Exception as exc:
+            logger.warning("会话 %s：达成要点供给期写入失败（本轮仍注入）: %s", self.session_id, exc)
+        return block
 
     @staticmethod
     def _raw_summary(ctx: TurnContext) -> str:
@@ -900,7 +986,9 @@ class TurnOrchestrator:
         """聊天主 Agent 的工具表 = 路由表（判据写在工具 description 里）。
 
         按有无待确认草案二选一：无草案时 confirm/cancel/update 都无从下手，
-        摆出来只会诱导模型空调用；有草案时反过来要给足四个任务侧入口。
+        摆出来只会诱导模型空调用；有草案时反过来要给足五个入口——四个任务侧
+        （confirm/cancel/update/draft）＋ 检索（草案在途时仍可查设定，检索既不取消
+        也不提前过期草案）。
         顺序固定（ROUTE_TOOLS_* 的定义序），保证 system/tools 前缀稳定，
         有利于前缀缓存与逐轮 diff。
         """

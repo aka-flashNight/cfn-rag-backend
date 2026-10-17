@@ -178,6 +178,8 @@ def build_routing_guide(*, has_pending_draft: bool) -> str:
             "   - 讨价还价、要求小幅调整，而你愿意让步 → route_task_update；",
             "   - 要求彻底换一个任务方向 → route_task_draft（新草案会替换旧草案）；",
             "   - 你不愿意让步 → 不调用任何工具，直接以你的口吻拒绝，并问他到底接还是不接。",
+            "   - 只是问设定、人物往事、关卡或物品信息 → route_search。草案在途时仍可检索，"
+            "检索不会取消草案，也不会让它提前过期。",
             "5. 后台把调整后的方案交回来时，重新说明方案（内容/要求/报酬），并再次征询他是否接取。",
         ])
     else:
@@ -202,10 +204,11 @@ def build_static_system(
     has_pending_draft: bool = False,
     agent_enabled: bool = True,
     task_publish_disabled: bool = False,
+    equipment_block: str = "",
 ) -> str:
     """system 分层（前缀缓存对齐，从稳定到易变）：
     层1 跨 NPC 一致（世界观、输出规则、说话方式）→ 层2 单 NPC 一致
-    （扮演约束、meta 协议、场景块、appearance、发布硬约束、商店报酬）
+    （扮演约束、meta 协议、场景块、appearance、装备、发布硬约束、商店报酬）
     → 稀疏变动（切磋可行性：随玩家等级变）→ 每轮重装配（路由指南：随草案状态变；
     同阵营表与场景补充：随玩家这句话提到的角色变）。
 
@@ -252,6 +255,11 @@ def build_static_system(
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)
+    # NPC 固定层：身上的装备（units.json + items 解析，每轮文本稳定）。
+    # 只在 appearance 之后、任务发布硬约束之前——它同样是单 NPC 恒定内容。
+    eq = (equipment_block or "").strip()
+    if eq:
+        parts.append(eq)
     if can_publish:
         parts.append("【任务发布硬约束（具体怎么拟由后台任务系统负责，你只决定要不要派、往哪个方向派）】")
         parts.append(
@@ -417,22 +425,34 @@ def build_user_shared_core(
     save_info: Any = None,
     long_term_block: str = "",
     finished_task_block: str = "",
+    active_task_block: str = "",
+    published_task_block: str = "",
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
-    排序按前缀缓存对齐（从稳定到易变）：已完成委托 → 长期记忆（跨窗口，改动稀疏）
-    → 早期摘要（同为跨轮稀疏，紧跟长期记忆）→ 近期对话（跨轮追加；窗口填满后
-    整块前滑，在此之前前缀是稳的）→ 会话态（玩家身份/所在场景/进度/待确认草案，
-    块内好感度压尾）→ 关系跨档提示（只在委派工具真的下发那几轮出现）
-    → RAG/提及 NPC（跨轮全变、轮内不变）。
+    排序按前缀缓存对齐（从稳定到易变）：已完成委托 → 进行中委托 → 刚发布委托
+    （三块都是任务相关、放在一起；任务块随任务完成/过期整体消失，改得稀疏）
+    → 长期记忆（跨窗口，改动稀疏）→ 早期摘要（同为跨轮稀疏，紧跟长期记忆）
+    → 近期对话（跨轮追加；窗口填满后整块前滑，在此之前前缀是稳的）→ 会话态
+    （玩家身份/所在场景/进度/待确认草案，块内好感度压尾）→ 关系跨档提示
+    （只在委派工具真的下发那几轮出现）→ RAG/提及 NPC（跨轮全变、轮内不变）。
 
     好感度原先排在最前面，于是它每轮一变就把后面所有块的前缀缓存全部打断；
     挪到这些块之后，稳定段才能真正复用。
+
+    三块任务块不重复同一任务：已完成与进行中按 task_id 去重（由装配侧保证），
+    进行中块还会把「刚发布」块正在展示的 task_id 排除掉。
     """
     parts: list[str] = []
     done = (finished_task_block or "").strip()
     if done:
         parts.append(done)
+    active = (active_task_block or "").strip()
+    if active:
+        parts.append(active)
+    published = (published_task_block or "").strip()
+    if published:
+        parts.append(published)
     long_term = (long_term_block or "").strip()
     if long_term:
         parts.append(long_term)

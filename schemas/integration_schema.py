@@ -27,6 +27,9 @@ class BindProgress(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     tasks_finished: list[int] = Field(default_factory=list)
+    #: 当前仍在途的 Agent 委托 id（游戏侧 _root.tasks_to_do 过滤出的整数数组）。
+    #: 旧游戏不发这个字段＝None；消费方按「缺失＝没有进行中委托」处理。
+    tasks_active: list[int] | None = None
     task_chains_progress: dict[str, Any] = Field(default_factory=dict)
 
 

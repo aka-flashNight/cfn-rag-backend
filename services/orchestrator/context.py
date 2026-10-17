@@ -9,6 +9,12 @@ save_info 填入集成层绑定投影 {slot_key, character, progress, scene, pla
 未绑定＝None。阶段判定：绑定存档可推导时以此为准，否则用请求携带的 progress_stage。
 长期记忆（B3-3）：启用时按 (作用域, NPC) 读一份快照进 TurnContext.long_term；
 另外把「本 NPC 发布、当前存档已完成的委托」实时拼成 finished_task_block（直读磁盘）。
+
+任务三块（2026-10-17）：已完成（上面那块）之外再加两块未完成委托——
+① published_task_block：「刚发布的委托」的达成要点，记录在会话库
+   （session_published_task_highlights），每轮装配时递减、归零即删，任务完成即清；
+② active_task_block：绑定投影 progress.tasks_active 里仍在途的委托，每轮实时算、只读、不记账。
+两块都在 data_root ＋ save_info 可用时才尝试；不可用时不消耗轮次。
 """
 
 from __future__ import annotations
@@ -347,6 +353,11 @@ class TurnContext:
     long_term: Optional[LongTermSnapshot] = None  # 启用时的作用域快照；关闭＝None
     # 本 NPC 发布且当前存档已完成的委托（含完成对话原文）；has_unmarked 供触发三的条件闸
     finished_task_block: FinishedTaskBlock = field(default_factory=FinishedTaskBlock)
+    # 绑定投影 tasks_active 里仍在途的委托（每轮实时算，只读、不记账）
+    active_task_block: str = ""
+    # 刚发布委托的达成要点（会话库记录的供给期内才非空）
+    published_task_block: str = ""
+    published_task_id: Optional[int] = None
     retrieve_fn: Optional[Callable[[str], str]] = None
     # Tier-1 检索的原始 bundle（route_search 预取按节点 id 去重；展示文本已进 rag_context_text）
     retrieval_bundle: Any = None
@@ -499,6 +510,93 @@ async def assemble_context(
         except Exception as exc:
             logger.warning("已完成委托拼接失败，降级为空: %s", exc)
 
+    # 未完成的两块（工作项 1/2）：
+    # ① 「刚发布的委托」——记录在会话库，发布轮已用掉一轮，这里每轮递减、归零即删；
+    #    任务已完成（tasks_finished 命中）立刻清记录、不再注入。
+    # ② 「尚在途中」——按绑定时投影的 tasks_active 每轮实时拼，只读、不记账。
+    # 两个块都只在 data_root ＋ save_info 都可用时尝试；不可用时不消耗轮次。
+    active_task_block = ""
+    published_task_block = ""
+    published_task_id: Optional[int] = None
+    if save_info is not None and data_root is not None:
+        progress = save_info.get("progress")
+        progress = progress if isinstance(progress, dict) else {}
+        finished_ids = progress.get("tasks_finished")
+        slot_key = save_info.get("slot_key")
+        get_highlight = getattr(memory, "published_task_highlight_read", None)
+        highlight = None
+        if get_highlight is not None:
+            try:
+                highlight = await get_highlight(session_id)
+            except Exception as exc:
+                logger.warning("达成要点记录读取失败，按无记录处理: %s", exc)
+        highlight_task_id: Optional[int] = None
+        if highlight is not None:
+            highlight_task_id = int(highlight.task_id)
+            try:
+                finished_set = {int(v) for v in (finished_ids or [])}
+            except (TypeError, ValueError):
+                finished_set = set()
+            if highlight_task_id in finished_set:
+                # 玩家已经完成：立刻撤掉，别再让模型按「尚未完成」说话
+                try:
+                    await memory.published_task_highlight_clear(session_id)
+                except Exception as exc:
+                    logger.warning("达成要点记录清除失败: %s", exc)
+                highlight_task_id = None
+            else:
+                try:
+                    from services.agent_tools.finished_tasks import build_published_task_block
+
+                    published_task_block = await asyncio.to_thread(
+                        lambda: build_published_task_block(
+                            data_root=data_root,
+                            slot_key=slot_key,
+                            npc_name=npc_name,
+                            task_id=highlight_task_id,
+                            game_data=game_data,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("刚发布委托块拼接失败，降级为空: %s", exc)
+                    published_task_block = ""
+                if published_task_block:
+                    published_task_id = highlight_task_id
+                else:
+                    logger.warning(
+                        "会话 %s：达成要点任务 %s 拼不出内容，本轮不注入并扣掉一轮",
+                        session_id, highlight_task_id,
+                    )
+                # 无论是否拼出内容都消耗一轮，避免读不到数据的记录长期占位
+                next_rounds = int(highlight.rounds_left) - 1
+                try:
+                    if next_rounds <= 0:
+                        await memory.published_task_highlight_clear(session_id)
+                    else:
+                        await memory.published_task_highlight_write(
+                            session_id, highlight_task_id, next_rounds,
+                        )
+                except Exception as exc:
+                    logger.warning("达成要点供给期递减失败（不影响本轮注入）: %s", exc)
+
+        try:
+            from services.agent_tools.finished_tasks import build_active_tasks_block
+
+            active_task_block = await asyncio.to_thread(
+                lambda: build_active_tasks_block(
+                    data_root=data_root,
+                    slot_key=slot_key,
+                    npc_name=npc_name,
+                    active_ids=progress.get("tasks_active"),
+                    finished_ids=finished_ids,
+                    exclude_ids=[highlight_task_id] if highlight_task_id is not None else [],
+                    game_data=game_data,
+                )
+            )
+        except Exception as exc:
+            logger.warning("进行中委托块拼接失败，降级为空: %s", exc)
+            active_task_block = ""
+
     # Tier-1 检索 + 实体提示（同步实现，to_thread）
     def _retrieve_and_format() -> tuple[str, Any]:
         bundle = retrieve_tier1(
@@ -608,6 +706,9 @@ async def assemble_context(
         long_term_enabled=long_term_enabled,
         long_term=long_term,
         finished_task_block=finished_task_block,
+        active_task_block=active_task_block,
+        published_task_block=published_task_block,
+        published_task_id=published_task_id,
         retrieve_fn=retrieve_fn,
         retrieval_bundle=retrieval_bundle,
         llm_config=llm_config,
