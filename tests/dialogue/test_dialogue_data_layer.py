@@ -168,8 +168,11 @@ def test_daily_groups_read_merged_view_with_overlay_last(dialogue_env):
     assert groups["3"].lines[0].text == "这组没有测试使说话。"  # 进合并视图，只是不进候选
 
 
-def test_npc_line_samples_take_own_lines_only(dialogue_env):
-    """完成 NPC 的台词参考：只取该 NPC 本人说的行，玩家与他人的行跳过。"""
+def test_npc_line_samples_take_all_daily_plus_task(dialogue_env):
+    """完成 NPC 的台词参考：日常全量 + 任务取前 task_limit 条，只取本人行。
+
+    任务样本含已完成任务（过往台词），但 Agent 委托永远排除。
+    """
     _write_overlays(
         dialogue_env,
         [_line_entry("2", "覆盖层改写后的第二组台词。")],
@@ -177,14 +180,18 @@ def test_npc_line_samples_take_own_lines_only(dialogue_env):
     )
     view = _view(dialogue_env)
 
-    assert view.npc_line_samples(NPC) == [
-        "今天炉子烧得正旺。",
-        "覆盖层改写后的第二组台词。",
-    ]
-    assert view.npc_line_samples(NPC, limit=1) == ["今天炉子烧得正旺。"]
-    assert "给我打把刀。" not in view.npc_line_samples(NPC)          # 玩家行
-    assert "这组没有测试使说话。" not in view.npc_line_samples(NPC)  # 旁人说的行
+    daily = ["今天炉子烧得正旺。", "覆盖层改写后的第二组台词。"]
+    tasks = [f"主线{i}的接取话，龙鳞记得带来。" for i in range(1, 7)]
+
+    assert view.npc_line_samples(NPC) == daily + tasks
+    assert view.npc_line_samples(NPC, task_limit=2) == daily + tasks[:2]
     assert view.npc_line_samples("查无此人") == []
+
+    long_samples = view.npc_line_samples(NPC, task_limit=20)
+    assert "已完成任务的接取话。" in long_samples        # 已完成任务也作为过往台词
+    assert "委托任务的接取话。" not in long_samples      # Agent 委托永不参考
+    assert "给我打把刀。" not in long_samples            # 玩家行
+    assert "这组没有测试使说话。" not in long_samples    # 旁人说的行
 
 
 def test_task_dialogue_reads_merged_text_and_keeps_extra_fields(dialogue_env):

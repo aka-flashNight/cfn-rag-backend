@@ -210,27 +210,28 @@ class DialogueView:
         base = self.sources.groups(name)
         return overlay.merge_groups(base, self.daily_overrides(), name)
 
-    def npc_line_samples(self, npc: str, *, limit: int = 6) -> list[str]:
-        """该 NPC 自己的日常台词样本（合并本存档覆盖层，按组序取前 limit 条）。
+    def npc_line_samples(self, npc: str, *, task_limit: int = 6) -> list[str]:
+        """该 NPC 自己的台词样本：全部日常台词 + 至多 ``task_limit`` 条任务台词。
 
-        只取该 NPC 本人说的行（玩家行与同组里其他 NPC 的行都跳过），供 prompt
-        给别的 NPC 写台词时参考其说话风格；无此 NPC 或无台词返回空表。
+        日常对话总量一般不多，全量取；任务对话数量大，按候选顺序取前若干条。
+        任务侧含已完成任务（「过往台词」本就该看已经发生过的对话），但仍排除
+        Agent 任务；只取该 NPC 本人说的行（玩家行与同组其他 NPC 的行都跳过）。
+        供 prompt 给别的 NPC 写台词时参考其说话风格；无此 NPC 或无台词返回空表。
         """
         name = (npc or "").strip()
         if not name:
             return []
         out: list[str] = []
         for group in self.daily_groups(name):
-            for line in group.lines:
-                if line.is_player or line.name != name:
-                    continue
-                text = (line.text or "").strip()
-                if not text:
-                    continue
-                out.append(text)
-                if len(out) >= limit:
-                    return out
-        return out
+            out.extend(_own_texts(group, name))
+        if task_limit <= 0:
+            return out
+        task_lines: list[str] = []
+        for cand in self.task_candidates(name, include_finished=True):
+            task_lines.extend(_own_texts(cand.group, name))
+            if len(task_lines) >= task_limit:
+                break
+        return out + task_lines[:task_limit]
 
     # --- 任务对话 -------------------------------------------------------
 
@@ -257,10 +258,11 @@ class DialogueView:
             return value.strip()
         return key
 
-    def task_candidates(self, npc: str) -> list[TaskGroupCandidate]:
-        """未完成任务里「该 NPC 说话」的对话组，按（链前缀, 链序号, 任务id, get/finish）排。
+    def task_candidates(self, npc: str, *, include_finished: bool = False) -> list[TaskGroupCandidate]:
+        """「该 NPC 说话」的任务对话组，按（链前缀, 链序号, 任务id, get/finish）排。
 
-        已完成任务与 Agent 任务全部排除。
+        默认排除已完成任务（修改候选口径）；``include_finished=True`` 仅供台词
+        样本读取，把已完成任务也纳入。Agent 任务在任何情况下都排除。
         """
         name = (npc or "").strip()
         tasks_registry = getattr(self.game_data, "tasks", None)
@@ -273,7 +275,9 @@ class DialogueView:
         out: list[TaskGroupCandidate] = []
         for task in tasks_registry.list_all_tasks():
             task_id = getattr(task, "id", None)
-            if is_agent_task_id(task_id) or task_id in self.finished_ids:
+            if is_agent_task_id(task_id):
+                continue
+            if not include_finished and task_id in self.finished_ids:
                 continue
             title = self._resolve_title(getattr(task, "title", None), texts)
             prefix, chain_index = _parse_chain(getattr(task, "chain", None))
@@ -446,6 +450,18 @@ def _matches_keywords(pick: _Pick, words: list[str]) -> bool:
         + ([pick.task.title] if pick.task else [])
     ).lower()
     return any(word.lower() in haystack for word in words)
+
+
+def _own_texts(group: DialogueGroup, npc: str) -> list[str]:
+    """组内该 NPC 本人说的非空台词（玩家行与其他说话人的行跳过）。"""
+    out: list[str] = []
+    for line in group.lines:
+        if line.is_player or line.name != npc:
+            continue
+        text = (line.text or "").strip()
+        if text:
+            out.append(text)
+    return out
 
 
 def _body(group: DialogueGroup) -> str:

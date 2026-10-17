@@ -1037,7 +1037,8 @@ class TurnOrchestrator:
     ) -> str:
         """完成 NPC 的写作参考（过往台词/情绪标签/与玩家的关系）。
 
-        台词取对话合并视图（含本存档覆盖层），只读；读取失败降级为空串。
+        台词取该 NPC 的全部日常台词＋前 6 条任务台词（含本存档覆盖层），
+        只读；读取失败降级为空串。
         只在完成 NPC ≠ 当前说话人时由调用方触发。
         """
         from services.dialogue.view import build_view
