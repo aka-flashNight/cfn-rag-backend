@@ -155,7 +155,12 @@ def _build_draft_entity_context_lines(
         notes = _draft_item_role_notes(draft, nm)
         if it is not None:
             tags = compute_reward_tags(it, game_data.equipment_mods)
-            seg = format_item_prompt_line(it, reward_tags=tags, price=it.price)
+            from services.game_data.item_sources import format_item_sources
+
+            seg = format_item_prompt_line(
+                it, reward_tags=tags, price=it.price,
+                sources=format_item_sources(game_data, nm),
+            )
             if notes:
                 seg += f"；草案涉及：{'；'.join(notes)}"
             lines.append(f"[物品] {seg}")

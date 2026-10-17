@@ -218,13 +218,18 @@ def entity_hints_block(bundle: Any, game_data: Any) -> str:
     lines: list[str] = []
     items = [sn.node for sn in (bundle.entity_items or [])][:6]
     if items:
+        from services.game_data.item_sources import format_item_sources
+
         lines.append("【玩家可能提到的物品类型】")
         for node in items:
             item = game_data.items.get_by_name(node.item_name or "")
             if item is None:
                 continue
             tags = compute_reward_tags(item, game_data.equipment_mods)
-            lines.append(format_item_prompt_line(item, reward_tags=tags, price=item.price))
+            lines.append(format_item_prompt_line(
+                item, reward_tags=tags, price=item.price,
+                sources=format_item_sources(game_data, item.name),
+            ))
     stages = [sn.node for sn in (bundle.entity_stages or [])][:6]
     if stages:
         lines.append("【玩家可能提到的关卡】")

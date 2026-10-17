@@ -358,9 +358,18 @@ def _prefetch_items(
     lines = [header]
     budget -= len(header) + 1
     used: set[str] = set()
+    from services.game_data.item_sources import format_item_sources
+
     for item in ordered:
         tags = compute_reward_tags(item, getattr(game_data, "equipment_mods", None))
-        line = format_item_prompt_line(item, reward_tags=tags, price=item.price)
+        line = format_item_prompt_line(
+            item, reward_tags=tags, price=item.price,
+            sources=format_item_sources(game_data, item.name),
+        )
+        if len(line) > _ITEM_LINE_MAX_CHARS:
+            # 超单行预算时先丢掉「获取途径」再考虑硬截断：来源是附加值，
+            # 不该把原本能显示的字段挤掉。
+            line = format_item_prompt_line(item, reward_tags=tags, price=item.price)
         if len(line) > _ITEM_LINE_MAX_CHARS:
             line = line[:_ITEM_LINE_MAX_CHARS].rstrip() + "…"
         if len(line) + 1 <= budget:

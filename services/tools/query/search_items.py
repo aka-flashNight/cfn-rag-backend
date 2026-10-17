@@ -50,10 +50,15 @@ class SearchItemsTool(BaseTool):
                 ensure_ascii=False,
             ))
         items = gd.items.search(kw, type=cat, limit=10)
+        from services.game_data.item_sources import format_item_sources
+
         rows: list[dict[str, Any]] = []
         for it in items:
             tags = compute_reward_tags(it, gd.equipment_mods)
-            line = format_item_prompt_line(it, reward_tags=tags, price=it.price)
+            line = format_item_prompt_line(
+                it, reward_tags=tags, price=it.price,
+                sources=format_item_sources(gd, it.name),
+            )
             rows.append({
                 "name": it.name,
                 "type": it.type,

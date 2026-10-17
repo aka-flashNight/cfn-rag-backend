@@ -93,10 +93,12 @@ def format_item_prompt_line(
     *,
     reward_tags: list[str],
     price: Optional[int],
+    sources: Optional[str] = None,
 ) -> str:
     """
     对话/RAG 用单行：名称、称呼(若)、任务类型标注、单价 靠前；其余字段随后。
     reward_tags 为空时，用分类/用途作简短替代（语义检索命中的物品等）。
+    sources＝获取途径（如「合成（烹饪）；商店（冷兵器商人）」），有空值时整段省略。
 
     约定（勿改）：每条必须以「名称：{name}；」开头，供 parse_rag_game_entity_mentions 与草案摘要去重。
     """
@@ -126,6 +128,8 @@ def format_item_prompt_line(
         parts.append(f"重量：{item.weight}")
     if item.clipname:
         parts.append(f"弹夹名：{item.clipname}")
+    if sources:
+        parts.append(f"获取途径：{sources}")
     return "；".join(parts)
 
 
