@@ -471,12 +471,142 @@ def test_item_details_keep_first_count_and_dedupe_within_task(data_root):
     assert "- 祖传铁锤×2" not in block
 
 
-def test_item_details_do_not_leak_acquisition_sources(data_root):
-    """物品详情只讲「是什么」，不讲「去哪弄」——避免与委托要求互相打架。"""
-    _stage_items(data_root, {**_task(200001), "rewards": ["祖传铁锤#1"]})
+def _with_sources(game_data: _FakeGameData, mapping: dict) -> _FakeGameData:
+    """直接塞入 item_sources 的反查索引缓存（只验接线，不验索引构建——那有专属用例）。"""
+    setattr(game_data, "_item_source_index_cache", mapping)
+    return game_data
+
+
+def _source_rec(*, craft=(), shop=(), kshop=False, stage=(), task=False) -> dict:
+    return {
+        "craft": list(craft), "shop": list(shop),
+        "kshop": kshop, "stage": list(stage), "task": task,
+    }
+
+
+def test_item_details_omit_sources_when_task_has_stage_requirement(data_root):
+    """委托自带关卡需求时不补获取途径——否则「去打掉落」和「商店有卖」自相矛盾。"""
+    _stage_items(data_root, {**_task(200001), "finish_submit_items": ["祖传铁锤#1"]})
+    game_data = _with_sources(
+        _FakeGameData([HAMMER]),
+        {"祖传铁锤": _source_rec(craft=["武器合成"], shop=["铁匠"])},
+    )
     block = build_published_task_block(
         data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
-        game_data=_FakeGameData([HAMMER]),
+        game_data=game_data,
     )
     for word in ("获取途径", "获得方式", "商店有售", "可购买"):
         assert word not in block
+
+
+def test_item_details_never_show_sources_on_rewards(data_root):
+    """奖励物品一律不补获取途径——那是玩家做完拿到的，不需要「去哪弄」。"""
+    _stage_items(data_root, {
+        **_task(200001),
+        "finish_requirements": [],
+        "rewards": ["祖传铁锤#1", "金币#900"],
+    })
+    game_data = _with_sources(
+        _FakeGameData([HAMMER, COIN]),
+        {
+            "祖传铁锤": _source_rec(craft=["武器合成"], shop=["铁匠"]),
+            "金币": _source_rec(task=True),
+        },
+    )
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=game_data,
+    )
+    assert "- 祖传铁锤×1（武器/刀，等级20，单价3000，重量0.5kg）：一把祖传的铁锤。" in block
+    assert "获取途径" not in block
+
+
+def test_item_details_add_sources_when_task_has_no_stage_requirement(data_root):
+    """没有关卡需求的委托照旧补获取途径（只补在需求物品上），否则玩家不知道去哪弄。"""
+    _stage_items(data_root, {
+        **_task(200001),
+        "finish_requirements": [],
+        "finish_submit_items": ["祖传铁锤#1"],
+        "finish_contain_items": ["旧钥匙#1"],
+        "rewards": ["金币#900"],
+    })
+    game_data = _with_sources(
+        _FakeGameData([HAMMER, _FakeItem("旧钥匙"), COIN]),
+        {
+            "祖传铁锤": _source_rec(craft=["武器合成"], shop=["铁匠"]),
+            "旧钥匙": _source_rec(),
+            "金币": _source_rec(task=True),
+        },
+    )
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=game_data,
+    )
+    assert "- 祖传铁锤×1（武器/刀，等级20，单价3000，重量0.5kg）：一把祖传的铁锤；获取途径：合成（武器合成）；商店（铁匠）" in block
+    # 查不到来源的需求物品不写「获取途径」，也不留占位；奖励物品（金币）同样不写
+    assert block.count("获取途径：") == 1
+    assert "- 旧钥匙×1" in block
+    assert "未知" not in block
+
+
+def test_item_details_sources_do_not_produce_double_punctuation(data_root):
+    """介绍以句号收尾时接「；获取途径：…」先剥句末标点，不出现「。；」。"""
+    _stage_items(data_root, {
+        **_task(200001), "finish_requirements": [],
+        "finish_submit_items": ["祖传铁锤#1"],
+    })
+    game_data = _with_sources(
+        _FakeGameData([HAMMER]), {"祖传铁锤": _source_rec(shop=["铁匠"])},
+    )
+    line = next(
+        ln for ln in build_published_task_block(
+            data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+            game_data=game_data,
+        ).splitlines() if ln.startswith("- 祖传铁锤")
+    )
+    assert line.endswith("：一把祖传的铁锤；获取途径：商店（铁匠）")
+    assert "。；" not in line
+
+
+def test_item_details_sources_follow_per_task_requirement_in_active_block(data_root):
+    """进行中块里逐条判断：无关卡需求＋需求物品才补，另一条（有关卡需求）不补。"""
+    _stage_items(
+        data_root,
+        {**_task(200001), "finish_requirements": [], "finish_submit_items": ["祖传铁锤#1"]},
+        {**_task(200002), "finish_submit_items": ["弹药#3"]},
+    )
+    game_data = _with_sources(
+        _FakeGameData([HAMMER, AMMO]),
+        {
+            "祖传铁锤": _source_rec(shop=["铁匠"]),
+            "弹药": _source_rec(stage=["军械库"]),
+        },
+    )
+    block = build_active_tasks_block(
+        data_root=data_root, slot_key=None, npc_name=NPC,
+        active_ids=[200001, 200002], finished_ids=[], exclude_ids=[],
+        game_data=game_data,
+    )
+    assert "- 祖传铁锤×1（武器/刀，等级20，单价3000，重量0.5kg）：一把祖传的铁锤；获取途径：商店（铁匠）" in block
+    assert "- 弹药×3（消耗品/材料，等级3，单价15，重量0.1kg）" in block
+    assert "获取途径：关卡掉落" not in block
+    assert block.count("获取途径：") == 1
+
+
+def test_item_details_sources_win_by_submit_when_also_rewarded(data_root):
+    """同一物品既被要求提交、又出现在奖励里：按需求物品算（保序去重取首次＝提交）。"""
+    _stage_items(data_root, {
+        **_task(200001),
+        "finish_requirements": [],
+        "finish_submit_items": ["祖传铁锤#1"],
+        "rewards": ["祖传铁锤#2"],
+    })
+    game_data = _with_sources(
+        _FakeGameData([HAMMER]), {"祖传铁锤": _source_rec(shop=["铁匠"])},
+    )
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=game_data,
+    )
+    assert block.count("- 祖传铁锤") == 1
+    assert "获取途径：商店（铁匠）" in block

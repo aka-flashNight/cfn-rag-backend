@@ -336,27 +336,36 @@ def _stage_names(record: dict) -> list[str]:
     return names
 
 
-def _item_entries(record: dict) -> list[tuple[str, str]]:
-    """任务涉及的物品 [(名称, 数量)]：提交 → 持有/获取 → 奖励，保序去重。"""
-    out: list[tuple[str, str]] = []
+def _item_entries(record: dict) -> list[tuple[str, str, bool]]:
+    """任务涉及的物品 [(名称, 数量, 是否任务需求)]：提交 → 持有/获取 → 奖励，保序去重。
+
+    第三位区分「任务要玩家交/持有的」与「玩家做完拿到的奖励」——只有前者需要获取途径。
+    """
+    out: list[tuple[str, str, bool]] = []
     seen: set[str] = set()
-    for key in ("finish_submit_items", "finish_contain_items", "rewards"):
+    for key, required in (
+        ("finish_submit_items", True),
+        ("finish_contain_items", True),
+        ("rewards", False),
+    ):
         for raw in record.get(key) or []:
             name, _, count = str(raw or "").strip().partition("#")
             name, count = name.strip(), count.strip()
             if not name or name in seen:
                 continue
             seen.add(name)
-            out.append((name, count))
+            out.append((name, count, required))
     return out
 
 
-def _item_detail_line(name: str, count: str, game_data: Any) -> str:
+def _item_detail_line(
+    name: str, count: str, game_data: Any, *, sources: str | None = None,
+) -> str:
     """一件物品的完整详情行；物品表里查不到＝空串（跳过，不写「未知」）。
 
-    只讲「这是什么东西」——分类用途、等级、单价、重量、介绍。**不给获取途径**：
-    那是攻略信息，且可能与本条委托冲突（委托让玩家去打，这里又说商店有卖），
-    玩家真问到「去哪弄」时由 RAG 物品图鉴兜底。
+    先讲「这是什么东西」——分类用途、等级、单价、重量、介绍；``sources``（获取途径）
+    只由调用方在「**任务需求**物品 ＋ 本条委托**没有关卡需求**」时传入（奖励物品不需要
+    「去哪弄」；委托本身就指定了关卡时，再说「商店有卖」会自相矛盾）；传空则整段省略。
     """
     items = getattr(game_data, "items", None) if game_data is not None else None
     if items is None:
@@ -387,7 +396,13 @@ def _item_detail_line(name: str, count: str, game_data: Any) -> str:
         line += f"（{'，'.join(bits)}）"
     description = str(getattr(item, "description", "") or "").strip()
     if description:
-        line += f"：{description}"
+        # 后面还要接「；获取途径：…」时先剥句末标点，避免「。；」
+        if sources:
+            description = description.rstrip("。；;，,.、 ")
+        if description:
+            line += f"：{description}"
+    if sources:
+        line += f"；获取途径：{sources}"
     return line
 
 
@@ -403,14 +418,25 @@ def _item_detail_lines(
     两层去重：``skip_items``＝本轮检索上下文里已经列过的物品（不再重复补）；
     ``seen``＝本块前面已经补过的物品（跨任务共享，同一件物品只给一次）。
     查不到详情的物品直接跳过；全部跳过＝空列表（整节不出现）。
+    获取途径只补在**任务需求物品**（提交物/持有物）上，且本条委托**没有关卡需求**
+    （见 ``_item_detail_line``）；奖励物品一律不补——那是玩家做完拿到的，不需要「去哪弄」。
     """
     skip = set(skip_items or ())
     seen_set = seen if seen is not None else set()
+    with_sources = not _stage_names(record)
     lines: list[str] = []
-    for name, count in _item_entries(record):
+    for name, count, required in _item_entries(record):
         if name in skip or name in seen_set:
             continue
-        line = _item_detail_line(name, count, game_data)
+        sources = ""
+        if with_sources and required:
+            try:
+                from services.game_data.item_sources import format_item_sources
+
+                sources = format_item_sources(game_data, name)
+            except Exception:  # pragma: no cover - 反查失败按「没有来源」处理
+                sources = ""
+        line = _item_detail_line(name, count, game_data, sources=sources)
         if not line:
             continue
         seen_set.add(name)
