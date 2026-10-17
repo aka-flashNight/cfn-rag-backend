@@ -14,7 +14,7 @@
    这句只进聊天主 Agent 的已完成委托块；触发一装配给对话修改子 Agent 的任务详情不带它
    （子 Agent 正是被派来改对话的那一个，提醒对它是自我指涉的干扰）。
 
-另外两块针对**未完成**的委托（同源读取、同源渲染，只多完成 NPC 场景与关卡怪物）：
+另外两块针对**未完成**的委托（同源读取、同源渲染，另加物品详情、完成 NPC 场景与关卡怪物）：
 ③ ``build_published_task_block``：刚发布的那一份——发布轮追加到本轮回合结果块，
    后续若干轮由会话库的记录驱动、进 user 侧共享上下文；
 ④ ``build_active_tasks_block``：绑定投影 ``progress.tasks_active`` 里仍在途的委托，
@@ -294,8 +294,8 @@ def load_task_rewrite_material(
 # ---------------------------------------------------------------------------
 #
 # 两块与已完成块同源：同一份磁盘读取（共享 ∪ 本存档，存档覆盖共享）、
-# 同一套呈现口径（标题/说明/报酬/达成内容），只多两段「完成 NPC 场景」与
-# 「关卡与怪物」。差别只在开头一句与块尾的行为约束。
+# 同一套呈现口径（标题/说明/报酬/达成内容），另外多三段「物品详情」
+# 「完成 NPC 场景」与「关卡与怪物」。差别只在开头一句与块尾的行为约束。
 #
 # 两块都**不做任何写盘**：读磁盘只读；rounds 计数由会话库
 # （session_published_task_highlights）自行维护，不碰 npc_state_db / status / progress。
@@ -336,6 +336,101 @@ def _stage_names(record: dict) -> list[str]:
     return names
 
 
+def _item_entries(record: dict) -> list[tuple[str, str]]:
+    """任务涉及的物品 [(名称, 数量)]：提交 → 持有/获取 → 奖励，保序去重。"""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key in ("finish_submit_items", "finish_contain_items", "rewards"):
+        for raw in record.get(key) or []:
+            name, _, count = str(raw or "").strip().partition("#")
+            name, count = name.strip(), count.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append((name, count))
+    return out
+
+
+def _item_detail_line(name: str, count: str, game_data: Any) -> str:
+    """一件物品的完整详情行；物品表里查不到＝空串（跳过，不写「未知」）。
+
+    只讲「这是什么东西」——分类用途、等级、单价、重量、介绍。**不给获取途径**：
+    那是攻略信息，且可能与本条委托冲突（委托让玩家去打，这里又说商店有卖），
+    玩家真问到「去哪弄」时由 RAG 物品图鉴兜底。
+    """
+    items = getattr(game_data, "items", None) if game_data is not None else None
+    if items is None:
+        return ""
+    try:
+        item = items.get_by_name(name)
+    except Exception:  # pragma: no cover - 注册表异常按查不到处理
+        item = None
+    if item is None:
+        return ""
+
+    from services.npc.npc_equipment import format_weight
+
+    bits: list[str] = []
+    kind = "/".join(str(v) for v in (getattr(item, "type", None), getattr(item, "use", None)) if v)
+    if kind:
+        bits.append(kind)
+    if getattr(item, "level", 0):
+        bits.append(f"等级{item.level}")
+    if getattr(item, "price", None):
+        bits.append(f"单价{item.price}")
+    weight = format_weight(getattr(item, "weight", None))
+    if weight:
+        bits.append(f"重量{weight}")
+
+    line = f"- {name}×{count}" if count else f"- {name}"
+    if bits:
+        line += f"（{'，'.join(bits)}）"
+    description = str(getattr(item, "description", "") or "").strip()
+    if description:
+        line += f"：{description}"
+    return line
+
+
+def _item_detail_lines(
+    record: dict,
+    game_data: Any,
+    *,
+    skip_items: Any = None,
+    seen: set[str] | None = None,
+) -> list[str]:
+    """该任务的物品详情行。
+
+    两层去重：``skip_items``＝本轮检索上下文里已经列过的物品（不再重复补）；
+    ``seen``＝本块前面已经补过的物品（跨任务共享，同一件物品只给一次）。
+    查不到详情的物品直接跳过；全部跳过＝空列表（整节不出现）。
+    """
+    skip = set(skip_items or ())
+    seen_set = seen if seen is not None else set()
+    lines: list[str] = []
+    for name, count in _item_entries(record):
+        if name in skip or name in seen_set:
+            continue
+        line = _item_detail_line(name, count, game_data)
+        if not line:
+            continue
+        seen_set.add(name)
+        lines.append(line)
+    return lines
+
+
+def _rag_listed_items(rag_context_text: str | None) -> set[str]:
+    """本轮检索上下文里已经出现过的物品名（与草案摘要同一套解析口径）。"""
+    if not rag_context_text:
+        return set()
+    try:
+        from services.game_entity_prompts import parse_rag_game_entity_mentions
+
+        items, _stages = parse_rag_game_entity_mentions(rag_context_text)
+        return set(items)
+    except Exception:  # pragma: no cover - 解析失败按「没列过」处理
+        return set()
+
+
 def _finish_npc_scene(game_data: Any, finish_npc: str) -> str:
     """完成 NPC 的驻场景（多驻地「、」连接）；查不到/无注册表＝空串（不写括号）。"""
     if game_data is None or not finish_npc:
@@ -372,11 +467,13 @@ def _finish_extra_lines(record: dict, game_data: Any) -> list[str]:
 
 def _unfinished_task_lines(
     task_id: int, record: dict, texts: dict[str, Any], header: str, game_data: Any,
+    *, rag_items: Any = None, item_seen: set[str] | None = None,
 ) -> list[str]:
     """一条未完成委托的呈现行；缺标题文本＝空列表（跳过该条）。
 
     未完成任务还没有完成对话，所以不出「任务前/任务后」两组——只给说明、报酬、
-    达成内容与完成 NPC/关卡怪物。
+    达成内容、物品详情与完成 NPC/关卡怪物。
+    物品详情与检索上下文（``rag_items``）及本块前面的条目（``item_seen``）去重。
     """
     title = _resolve_title(task_id, texts)
     if not title:
@@ -384,6 +481,12 @@ def _unfinished_task_lines(
     lines = [header.format(title=title, task_id=task_id)]
     lines.extend(_description_reward_lines(task_id, record, texts))
     lines.append(_completion_phrase(record))
+    item_lines = _item_detail_lines(
+        record, game_data, skip_items=rag_items, seen=item_seen,
+    )
+    if item_lines:
+        lines.append("物品：")
+        lines.extend(item_lines)
     lines.extend(_finish_extra_lines(record, game_data))
     return lines
 
@@ -395,13 +498,15 @@ def build_published_task_block(
     npc_name: str,
     task_id: Any,
     game_data: Any = None,
+    rag_context_text: str = "",
 ) -> str:
     """「你刚发布的委托」块（发布轮追加到 result_block，后续几轮进 user core）。
 
     读不到任务记录 / 标题缺失 / 不是该 NPC 发布 → 空串：调用方据此既不注入、
     也**不**写供给期记录（prompt 里不许出现半截内容）。
 
-    ``game_data`` 只用于补完成 NPC 场景与关卡怪物；缺省时这两段整段省略。
+    ``game_data`` 用于补物品详情、完成 NPC 场景与关卡怪物；缺省时这几段省略。
+    ``rag_context_text`` 只用于去重：本轮检索已经列过的物品不再重复补详情。
     """
     npc = (npc_name or "").strip()
     if not npc:
@@ -419,7 +524,10 @@ def build_published_task_block(
     if str(record.get("get_npc") or "").strip() != npc:
         logger.warning("发布轮委托 %d 的发布 NPC 不是「%s」，跳过达成要点拼接", tid, npc)
         return ""
-    lines = _unfinished_task_lines(tid, record, texts, _PUBLISHED_HEADER, game_data)
+    lines = _unfinished_task_lines(
+        tid, record, texts, _PUBLISHED_HEADER, game_data,
+        rag_items=_rag_listed_items(rag_context_text), item_seen=set(),
+    )
     if not lines:
         return ""
     return "\n".join(["【你刚发布的委托（玩家尚未完成）】", *lines, _PUBLISHED_TAIL])
@@ -434,6 +542,7 @@ def build_active_tasks_block(
     finished_ids: Any,
     exclude_ids: Any = None,
     game_data: Any = None,
+    rag_context_text: str = "",
 ) -> str:
     """「你发布的委托尚在途中」块（工作项 2）：按绑定时投影的 tasks_active 实时拼。
 
@@ -443,6 +552,8 @@ def build_active_tasks_block(
     过滤链：合法 id → 只留 ``get_npc`` 等于当前 NPC → 去掉已完成（防投影短暂不同步）
     → 去掉正在被「刚发布」块展示的那条 → id 倒序取最近若干条。
     ``active_ids`` 缺失/为空/无匹配＝空串（整块不注入）。
+    物品详情跨条目共享一份 ``seen``：同一件物品在块里只给一次详情；
+    ``rag_context_text`` 里已列过的物品同样跳过。
     """
     npc = (npc_name or "").strip()
     if not npc:
@@ -466,8 +577,13 @@ def build_active_tasks_block(
     matched.sort(key=lambda pair: pair[0], reverse=True)
 
     sections: list[str] = []
+    rag_items = _rag_listed_items(rag_context_text)
+    item_seen: set[str] = set()
     for task_id, record in matched[:MAX_ACTIVE_TASKS_PER_TURN]:
-        lines = _unfinished_task_lines(task_id, record, texts, _ACTIVE_HEADER, game_data)
+        lines = _unfinished_task_lines(
+            task_id, record, texts, _ACTIVE_HEADER, game_data,
+            rag_items=rag_items, item_seen=item_seen,
+        )
         if lines:
             sections.append("\n".join(lines))
     if not sections:

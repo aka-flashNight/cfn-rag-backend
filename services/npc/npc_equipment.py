@@ -156,8 +156,11 @@ def resolve_unit(units: Iterable[dict[str, Any]], npc_name: str) -> Optional[dic
 # 展示字段格式化
 # ---------------------------------------------------------------------------
 
-def _format_weight(raw: Any) -> str:
-    """重量短句：能转数字就格式化（0→0kg、0.5→0.5kg）；缺失/非数字＝空串。"""
+def format_weight(raw: Any) -> str:
+    """重量短句：能转数字就格式化（0→0kg、0.5→0.5kg）；缺失/非数字＝空串。
+
+    装备块与委托物品详情共用同一口径，避免两处对同一件物品写出不同重量。
+    """
     text = str(raw if raw is not None else "").strip()
     if not text:
         return ""
@@ -322,7 +325,7 @@ def build_npc_equipment_block(*, npc_name: str, game_data: Any) -> str:
             entries.append(EquipmentEntry(
                 label=label,
                 displayname=str(item.displayname or item.name),
-                weight=_format_weight(item.weight),
+                weight=format_weight(item.weight),
                 description=_clean_clause(item.description),
                 title=_clean_clause(getattr(item, "title", "")),
             ))

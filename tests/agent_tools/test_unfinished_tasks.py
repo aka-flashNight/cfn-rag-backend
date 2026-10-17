@@ -70,11 +70,55 @@ def rendered(monkeypatch):
     return scenes, monsters
 
 
-class _FakeGameData:
-    """只提供渲染需要的两样东西（map_registry 与 stages/enemy_registry）。"""
+class _FakeItem:
+    def __init__(
+        self,
+        name: str,
+        *,
+        type: str | None = None,
+        use: str | None = None,
+        level: int = 0,
+        price: int | None = None,
+        weight: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        self.name = name
+        self.type = type
+        self.use = use
+        self.level = level
+        self.price = price
+        self.weight = weight
+        self.description = description
 
-    def __init__(self) -> None:
+
+class _FakeItems:
+    def __init__(self, items: list[_FakeItem]) -> None:
+        self._by_name = {it.name: it for it in items}
+
+    def get_by_name(self, name: str):
+        return self._by_name.get(name)
+
+
+class _FakeGameData:
+    """只提供渲染需要的几样东西（map_registry 与物品注册表）。
+
+    ``items`` 缺省为 None——与真实 game_data 未装配物品表时一致，
+    此时委托块整段不出现「物品：」。
+    """
+
+    def __init__(self, items: list[_FakeItem] | None = None) -> None:
         self.map_registry = object()
+        self.items = _FakeItems(items) if items is not None else None
+
+
+HAMMER = _FakeItem(
+    "祖传铁锤", type="武器", use="刀", level=20, price=3000, weight="0.5",
+    description="一把祖传的铁锤。",
+)
+AMMO = _FakeItem("弹药", type="消耗品", use="材料", level=3, price=15, weight="0.1")
+COIN = _FakeItem("金币", type="货币", use="通货", price=1)
+
+_RAG_ITEM_HDR = "【玩家可能提到的物品类型（按玩家输入解析）】"
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +339,144 @@ def test_unfinished_blocks_write_nothing(data_root):
         active_ids=[200001], finished_ids=[], exclude_ids=[],
     )
     assert snapshot() == before
+
+
+# ---------------------------------------------------------------------------
+# 物品详情（含重量/介绍等完整字段，并按 RAG 上下文与本块前面条目去重）
+# ---------------------------------------------------------------------------
+
+def _stage_items(data_root: Path, *records: dict) -> None:
+    """把委托记录换成本测试要的那几条（标题文本按 id 补）。"""
+    tasks_path, text_path = shared_task_paths(data_root)
+    _write(tasks_path, {"tasks": list(records)})
+    _write(text_path, {f"$AGENT_TITLE_{r['id']}": f"委托{r['id']}" for r in records})
+
+
+def test_published_block_renders_full_item_details(data_root):
+    _stage_items(data_root, {
+        **_task(200001),
+        "finish_submit_items": ["祖传铁锤#1"],
+        "rewards": ["弹药#3", "金币#900"],
+    })
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([HAMMER, AMMO, COIN]),
+    )
+    assert "物品：\n" in block
+    assert "- 祖传铁锤×1（武器/刀，等级20，单价3000，重量0.5kg）：一把祖传的铁锤。" in block
+    # 缺介绍就不写冒号后的空内容；重量缺省就不写重量
+    assert "- 弹药×3（消耗品/材料，等级3，单价15，重量0.1kg）" in block
+    assert "- 金币×900（货币/通货，单价1）" in block
+    # 顺序：提交 → 奖励（沿用任务记录顺序）
+    assert block.index("- 祖传铁锤×1") < block.index("- 弹药×3") < block.index("- 金币×900")
+    # 物品段在达成内容之后
+    assert block.index("任务达成内容") < block.index("物品：")
+
+
+def test_item_detail_without_optional_fields_has_no_parentheses(data_root):
+    _stage_items(data_root, {**_task(200001), "rewards": ["旧钥匙#1"]})
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([_FakeItem("旧钥匙", description="能开一扇门。")]),
+    )
+    assert "- 旧钥匙×1：能开一扇门。" in block
+    assert "- 旧钥匙×1（" not in block
+
+
+def test_item_details_skip_unknown_items_and_whole_section(data_root):
+    """物品表查不到的跳过，不写「未知」；全部查不到＝整节不出现。"""
+    _stage_items(data_root, {**_task(200001), "rewards": ["查无此物#1", "金币#900"]})
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([COIN]),
+    )
+    assert "- 查无此物" not in block   # 报酬行照旧给名字×数量，只是不补详情
+    assert "- 金币×900" in block
+    assert "未知" not in block
+
+    # 全部查不到 → 连「物品：」标题都不出现
+    _stage_items(data_root, {**_task(200001), "rewards": ["查无此物#1"]})
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([COIN]),
+    )
+    assert "物品：" not in block
+
+
+def test_item_details_absent_when_game_data_has_no_item_registry(data_root):
+    """game_data 缺失/未装配物品表＝整段省略（不报错、不写占位）。"""
+    _stage_items(data_root, {**_task(200001), "rewards": ["金币#900"]})
+    assert "物品：" not in build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData(),
+    )
+    assert "物品：" not in build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+    )
+
+
+def test_item_details_skip_items_already_listed_in_rag_context(data_root):
+    """检索上下文里已经列过这件物品 → 这里不再补（上面有就跳过）。"""
+    _stage_items(data_root, {**_task(200001), "rewards": ["金币#900", "弹药#3"]})
+    rag = (
+        f"{_RAG_ITEM_HDR}\n"
+        "名称：金币；类型：货币；等级：0；单价：1\n"
+        "【玩家可能提到的关卡】\n"
+        "关卡名称：堕落城；难度：普通\n"
+    )
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([HAMMER, AMMO, COIN]),
+        rag_context_text=rag,
+    )
+    assert "- 金币×900" not in block
+    assert "- 弹药×3" in block
+    # 关卡区的内容不会被误当成物品名
+    assert "- 堕落城" not in block
+
+
+def test_item_details_deduped_across_active_tasks(data_root):
+    """同一件物品在块里只补一次详情（跨委托共享一份已补集合）。"""
+    _stage_items(
+        data_root,
+        {**_task(200001), "rewards": ["弹药#3"]},
+        {**_task(200002), "rewards": ["弹药#5", "金币#900"]},
+    )
+    block = build_active_tasks_block(
+        data_root=data_root, slot_key=None, npc_name=NPC,
+        active_ids=[200001, 200002], finished_ids=[], exclude_ids=[],
+        game_data=_FakeGameData([AMMO, COIN]),
+    )
+    # 新委托排在前面（id 倒序），它拿到详情；早的那条只剩「物品：」标题后无行
+    assert block.count("- 弹药×") == 1
+    assert block.count("物品：") == 1
+    assert "- 弹药×5" in block
+    assert "- 金币×900" in block
+
+
+def test_item_details_keep_first_count_and_dedupe_within_task(data_root):
+    """同一件物品在一条委托里出现多次（提交/持有/奖励）只出一次，数量取首次。"""
+    _stage_items(data_root, {
+        **_task(200001),
+        "finish_submit_items": ["祖传铁锤#1"],
+        "finish_contain_items": ["祖传铁锤#1", "弹药#3"],
+        "rewards": ["祖传铁锤#2", "金币#900"],
+    })
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([HAMMER, AMMO, COIN]),
+    )
+    assert block.count("- 祖传铁锤") == 1
+    assert "- 祖传铁锤×1" in block
+    assert "- 祖传铁锤×2" not in block
+
+
+def test_item_details_do_not_leak_acquisition_sources(data_root):
+    """物品详情只讲「是什么」，不讲「去哪弄」——避免与委托要求互相打架。"""
+    _stage_items(data_root, {**_task(200001), "rewards": ["祖传铁锤#1"]})
+    block = build_published_task_block(
+        data_root=data_root, slot_key=None, npc_name=NPC, task_id=200001,
+        game_data=_FakeGameData([HAMMER]),
+    )
+    for word in ("获取途径", "获得方式", "商店有售", "可购买"):
+        assert word not in block

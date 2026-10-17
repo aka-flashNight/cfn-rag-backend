@@ -873,6 +873,7 @@ class TurnOrchestrator:
                     npc_name=self.npc_name,
                     task_id=tid,
                     game_data=deps.game_data,
+                    rag_context_text=ctx.rag_context_text,
                 )
             )
         except Exception as exc:

@@ -510,11 +510,40 @@ async def assemble_context(
         except Exception as exc:
             logger.warning("已完成委托拼接失败，降级为空: %s", exc)
 
+    # Tier-1 检索 + 实体提示（同步实现，to_thread）
+    def _retrieve_and_format() -> tuple[str, Any]:
+        bundle = retrieve_tier1(
+            engine=engine,
+            user_query=player_query,
+            npc_name=npc_name,
+            npc_titles=titles,
+            npc_faction=npc_state.faction,
+            npc_last_message=last_npc_message,
+            forbidden=forbidden,
+        )
+        text = ""
+        if bundle is not None and not bundle.is_empty:
+            from services.retrieval import format_retrieval_context
+
+            text = format_retrieval_context(bundle, forbidden)
+        hints = entity_hints_block(bundle, game_data)
+        if hints:
+            text = f"{text}\n\n{hints}" if text else hints
+        return text, bundle
+
+    retrieval_bundle: Any = None
+    try:
+        rag_context_text, retrieval_bundle = await asyncio.to_thread(_retrieve_and_format)
+    except Exception as exc:
+        logger.warning("上下文检索装配失败，降级: %s", exc)
+        rag_context_text = ""
+
     # 未完成的两块（工作项 1/2）：
     # ① 「刚发布的委托」——记录在会话库，发布轮已用掉一轮，这里每轮递减、归零即删；
     #    任务已完成（tasks_finished 命中）立刻清记录、不再注入。
     # ② 「尚在途中」——按绑定时投影的 tasks_active 每轮实时拼，只读、不记账。
-    # 两个块都只在 data_root ＋ save_info 都可用时尝试；不可用时不消耗轮次。
+    # 两块都只在 data_root ＋ save_info 都可用时尝试；不可用时不消耗轮次。
+    # 位置在检索之后：物品详情要拿本轮 RAG 文本做去重（「上面给过就不重复给」）。
     active_task_block = ""
     published_task_block = ""
     published_task_id: Optional[int] = None
@@ -555,6 +584,7 @@ async def assemble_context(
                             npc_name=npc_name,
                             task_id=highlight_task_id,
                             game_data=game_data,
+                            rag_context_text=rag_context_text,
                         )
                     )
                 except Exception as exc:
@@ -591,39 +621,12 @@ async def assemble_context(
                     finished_ids=finished_ids,
                     exclude_ids=[highlight_task_id] if highlight_task_id is not None else [],
                     game_data=game_data,
+                    rag_context_text=rag_context_text,
                 )
             )
         except Exception as exc:
             logger.warning("进行中委托块拼接失败，降级为空: %s", exc)
             active_task_block = ""
-
-    # Tier-1 检索 + 实体提示（同步实现，to_thread）
-    def _retrieve_and_format() -> tuple[str, Any]:
-        bundle = retrieve_tier1(
-            engine=engine,
-            user_query=player_query,
-            npc_name=npc_name,
-            npc_titles=titles,
-            npc_faction=npc_state.faction,
-            npc_last_message=last_npc_message,
-            forbidden=forbidden,
-        )
-        text = ""
-        if bundle is not None and not bundle.is_empty:
-            from services.retrieval import format_retrieval_context
-
-            text = format_retrieval_context(bundle, forbidden)
-        hints = entity_hints_block(bundle, game_data)
-        if hints:
-            text = f"{text}\n\n{hints}" if text else hints
-        return text, bundle
-
-    retrieval_bundle: Any = None
-    try:
-        rag_context_text, retrieval_bundle = await asyncio.to_thread(_retrieve_and_format)
-    except Exception as exc:
-        logger.warning("上下文检索装配失败，降级: %s", exc)
-        rag_context_text = ""
 
     # 待确认草案摘要
     pending_draft_summary = ""
