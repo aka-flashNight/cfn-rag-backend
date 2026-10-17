@@ -13,6 +13,7 @@ import random
 from pathlib import Path
 from typing import Any, Optional
 
+from services.agent_tools import pool_tags as pt
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
 from services.game_data.reward_utils import (
     REWARD_STAGE_BASE_MAX,
@@ -954,46 +955,157 @@ def _stage_row_keyword_hit(
     return _any_keyword_in_text(blob, keywords)
 
 
+def _stage_tag_hits(
+    row: dict[str, Any],
+    *,
+    requested_tags: list[str],
+    publisher_faction: str,
+) -> list[str]:
+    """该关卡行命中了哪些请求标签（按请求顺序）。"""
+    hits: list[str] = []
+    area = str(row.get("area") or "")
+    faction = str(row.get("faction") or "")
+    home = pt.FACTION_HOME_AREA.get(publisher_faction or "", "")
+    below = bool(row.get("below_progress"))
+    for tag in requested_tags:
+        if tag == "势均力敌":
+            ok = not below
+        elif tag == "轻松应对":
+            ok = below
+        elif tag == "周边地区":
+            ok = bool(home) and area == home and pt.can_target(publisher_faction, faction)
+        elif tag == "敌对区域":
+            ok = bool(home) and area != home and pt.can_target(publisher_faction, faction)
+        elif tag == "副本":
+            ok = bool(row.get("is_dungeon"))
+        elif tag in pt.FACTION_TAGS:
+            ok = faction == tag
+        elif tag == "有情报产出":
+            ok = bool(row.get("_has_intel_loot"))
+        elif tag == "掉落丰厚":
+            ok = bool(row.get("_rich_loot"))
+        else:
+            ok = False
+        if ok:
+            hits.append(tag)
+    return hits
+
+
+def _stage_word_hits(row: dict[str, Any], words: list[str]) -> list[str]:
+    """自由词命中（原有子串逻辑 + 区域别名），返回命中的词。"""
+    if not words:
+        return []
+    area = str(row.get("area") or "")
+    name = str(row.get("name") or "")
+    blob = "".join([
+        area,
+        stage_root_region_hint(area),
+        _STAGE_ROOT_REGION_HINT_EXTRA.get(area, ""),
+        name,
+        str(row.get("description") or ""),
+    ])
+    hits: list[str] = []
+    for w in words:
+        if w in blob or pt.AREA_ALIASES.get(w, "") == area:
+            hits.append(w)
+    return hits
+
+
+_RANK_NAME_EXACT = 0
+_RANK_NAME_CONTAINS = 1
+_RANK_TAG = 2
+_RANK_ALIAS = 3
+_RANK_DESC = 4
+_RANK_OTHER = 5
+
+#: 关卡池上限（用户口径：每个池子最多 10 条，不足则全放）
+STAGE_POOL_CAP = 10
+#: 关键词命中超额时，凭「相似度」保留的条数
+POOL_TOP_BY_RANK = 5
+
+
+def _stage_rank(row: dict[str, Any], words: list[str]) -> int:
+    """命中项的相似度档位（越小越靠前）：名称全等 > 名称包含 > 标签 > 别名 > 描述包含。"""
+    name = str(row.get("name") or "")
+    tags = row.get("_hit_tags") or []
+    for w in words:
+        if w == name:
+            return _RANK_NAME_EXACT
+    for w in words:
+        if w and w in name:
+            return _RANK_NAME_CONTAINS
+    if tags:
+        return _RANK_TAG
+    area = str(row.get("area") or "")
+    for w in words:
+        if pt.AREA_ALIASES.get(w, "") == area:
+            return _RANK_ALIAS
+    return _RANK_DESC
+
+
+def _pick_stage_rows_n(
+    rows: list[dict[str, Any]],
+    *,
+    requirement_keywords: Optional[list[str]],
+    cap: int = STAGE_POOL_CAP,
+) -> list[dict[str, Any]]:
+    """关卡候选池抽样（上限 cap，默认 10）：
+
+    1. 关键词（标签 + 自由词）命中的行全部进池；
+    2. 命中数超过 cap：按相似度留前 5，其余在命中里随机补足；来源全标关键词；
+    3. 命中不足 cap：其余名额按「当前进度 : 低于进度 = 8 : 2」随机补足，标「随机候选」。
+    """
+    if not rows:
+        return []
+    words = _normalize_kw_list(requirement_keywords)
+
+    hits = [r for r in rows if (r.get("_hit_tags") or r.get("_hit_words"))]
+    non_hits = [r for r in rows if not (r.get("_hit_tags") or r.get("_hit_words"))]
+
+    if not hits:
+        in_prog = [r for r in non_hits if not r.get("below_progress")]
+        below = [r for r in non_hits if r.get("below_progress")]
+        picked = _allocate_remainder_quota_pools(cap, [in_prog, below], "82")
+        for r in picked:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+        return picked[:cap]
+
+    for r in hits:
+        r["_rank"] = _stage_rank(r, words)
+    by_rank: list[dict[str, Any]] = []
+    for rank in range(_RANK_OTHER + 1):
+        same = [r for r in hits if r.get("_rank") == rank]
+        random.shuffle(same)
+        by_rank.extend(same)
+
+    if len(hits) <= cap:
+        picked = list(by_rank)
+        rem = cap - len(picked)
+        if rem > 0:
+            in_prog = [r for r in non_hits if not r.get("below_progress")]
+            below = [r for r in non_hits if r.get("below_progress")]
+            picked.extend(_allocate_remainder_quota_pools(rem, [in_prog, below], "82"))
+    else:
+        top = by_rank[:POOL_TOP_BY_RANK]
+        rest = by_rank[POOL_TOP_BY_RANK:]
+        random.shuffle(rest)
+        picked = top + rest[: max(0, cap - len(top))]
+
+    for r in picked:
+        if r in hits:
+            r[pt.MATCHED_BY_FIELD] = (r.get("_hit_tags") or r.get("_hit_words"))[0]
+        else:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+    return picked[:cap]
+
+
 def _pick_stage_rows_20(
     rows: list[dict[str, Any]],
     *,
     requirement_keywords: Optional[list[str]],
 ) -> list[dict[str, Any]]:
-    """
-    关卡候选分桶抽样（上限 20）：
-    - 关键词命中优先（先吃满）；
-    - 剩余名额按 当前进度 : 低于进度 = 8 : 2；
-    - 桶内随机。
-    """
-    max_n = 20
-    kw = _normalize_kw_list(requirement_keywords)
-    if not rows:
-        return []
-
-    if kw:
-        matched: list[dict[str, Any]] = [r for r in rows if r.get("_keyword_hit")]
-        unmatched_in = [
-            r for r in rows if (not r.get("_keyword_hit")) and (not r.get("below_progress"))
-        ]
-        unmatched_below = [
-            r for r in rows if (not r.get("_keyword_hit")) and r.get("below_progress")
-        ]
-        random.shuffle(matched)
-        random.shuffle(unmatched_in)
-        random.shuffle(unmatched_below)
-        picked = matched[:max_n]
-        rem = max_n - len(picked)
-        if rem > 0:
-            picked.extend(
-                _allocate_remainder_quota_pools(rem, [unmatched_in, unmatched_below], "82")
-            )
-        return picked[:max_n]
-
-    in_prog = [r for r in rows if not r.get("below_progress")]
-    below = [r for r in rows if r.get("below_progress")]
-    random.shuffle(in_prog)
-    random.shuffle(below)
-    return _allocate_remainder_quota_pools(max_n, [in_prog, below], "82")
+    """旧名保留（调用点未变）；口径已换成「关键词池 + 随机池，上限 10」。"""
+    return _pick_stage_rows_n(rows, requirement_keywords=requirement_keywords)
 
 
 def _group_stage_rows_by_area(
@@ -1053,6 +1165,10 @@ def _group_stage_rows_by_area(
                 has_dungeon_mode = True
             if r.get("below_progress"):
                 item["below_progress"] = True
+            if r.get(pt.ENEMIES_FIELD):
+                item[pt.ENEMIES_FIELD] = list(r.get(pt.ENEMIES_FIELD) or [])
+            if r.get(pt.MATCHED_BY_FIELD):
+                item[pt.MATCHED_BY_FIELD] = r.get(pt.MATCHED_BY_FIELD)
             if "loot_items" in r:
                 item["loot_items"] = r.get("loot_items") or []
             if "total_loot_value" in r:
@@ -1076,14 +1192,66 @@ def _group_stage_rows_by_area(
     return out
 
 
+def _split_stage_keywords(
+    requirement_keywords: Optional[list[str]],
+    *,
+    publisher_faction: str,
+    game_data: Optional[GameDataRegistry] = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """把关卡关键词拆成（有效标签, 自由词, 全部请求词）。
+
+    标签必须是该阵营**真注册**的（军阀没有「周边地区」）；对不上的当自由词走子串。
+    """
+    wanted = _normalize_kw_list(requirement_keywords)
+    if not wanted:
+        return [], [], []
+    available = pt.stage_tags_for_faction(
+        publisher_faction,
+        home_area_factions=_home_area_factions(publisher_faction, game_data),
+    )
+    tags: list[str] = []
+    words: list[str] = []
+    for raw in wanted:
+        tag = pt.normalize_tag(raw, available)
+        if tag:
+            if tag not in tags:
+                tags.append(tag)
+        else:
+            words.append(raw)
+    return tags, words, wanted
+
+
+def _home_area_factions(
+    publisher_faction: str, game_data: Optional[GameDataRegistry] = None,
+) -> set[str]:
+    """发布者本方区域里出现的势力集合（用于「周边地区」是否注册）。"""
+    home = pt.FACTION_HOME_AREA.get(publisher_faction or "", "")
+    if not home:
+        return set()
+    present = {pt.AREA_DEFAULT_FACTION.get(home, "")}
+    second = pt.AREA_SECOND_FACTION.get(home, "")
+    if second:
+        present.add(second)
+    if game_data is not None:
+        for (area, name) in getattr(game_data.stages, "_stage_infos", {}):
+            if area == home:
+                present.add(pt.stage_faction(home, name))
+    present.discard("")
+    return present
+
+
 def _get_all_stages_for_progress(
     game_data: GameDataRegistry,
     stage: int,
     requirement_keywords: Optional[list[str]] = None,
+    *,
+    npc_faction: str = "",
 ) -> list[dict[str, Any]]:
     """
     获取所有有效关卡的二级结构列表（通关/清理/挑战类用）。
-    筛选：unlock_condition ≤ main_task_max_id，副本按推荐等级筛选。
+
+    筛选：unlock_condition ≤ main_task_max_id，副本按推荐等级筛选；
+    **中立外交地图（type=外交地图）不是可攻打关卡，直接排除**。
     """
     stage_registry = game_data.stages
     mercenary_registry = game_data.mercenary_tasks
@@ -1103,11 +1271,17 @@ def _get_all_stages_for_progress(
             continue
         mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
+    tags, words, all_wanted = _split_stage_keywords(
+        requirement_keywords, publisher_faction=npc_faction, game_data=game_data,
+    )
+    need_loot_tags = bool({"有情报产出", "掉落丰厚"} & set(tags))
+
     rows: list[dict[str, Any]] = []
-    kw = _normalize_kw_list(requirement_keywords)
     for (area, name), si in stage_registry._stage_infos.items():
         if si.unlock_condition is None:
             continue
+        if pt.is_diplomatic_stage(si):
+            continue  # 外交地图：中立区域，不是可攻打关卡
         meta = _build_stage_access_meta(
             area=area,
             stage_name=name,
@@ -1131,21 +1305,52 @@ def _get_all_stages_for_progress(
             "is_dungeon": bool(meta.get("is_dungeon")),
             "recommended_level": meta.get("recommended_level"),
             "challenge_modes": meta.get("challenge_modes") or [],
-            "_keyword_hit": _stage_row_keyword_hit(
-                area=area,
-                stage_name=name,
-                area_region_hint=stage_root_region_hint(area),
-                keywords=kw,
-            ),
+            "faction": pt.stage_faction(area, name),
+            pt.ENEMIES_FIELD: pt.stage_enemy_tags(area, name),
         }
         if si.description:
             row["description"] = si.description
         if below_progress:
             row["below_progress"] = True
+        if need_loot_tags:
+            has_intel, loot_value = _stage_loot_profile(game_data, area, name)
+            row["_has_intel_loot"] = has_intel
+            row["_loot_value"] = loot_value
+        row["_hit_tags"] = _stage_tag_hits(
+            row, requested_tags=tags, publisher_faction=npc_faction,
+        )
+        row["_hit_words"] = _stage_word_hits(row, words)
         rows.append(row)
 
-    picked = _pick_stage_rows_20(rows, requirement_keywords=requirement_keywords)
+    if need_loot_tags:
+        values = sorted(float(r.get("_loot_value") or 0) for r in rows)
+        median = values[len(values) // 2] if values else 0.0
+        for r in rows:
+            r["_rich_loot"] = (r.get("_loot_value") or 0) > median
+            if r["_rich_loot"] and "掉落丰厚" in tags:
+                if "掉落丰厚" not in r["_hit_tags"]:
+                    r["_hit_tags"].append("掉落丰厚")
+
+    picked = _pick_stage_rows_n(rows, requirement_keywords=all_wanted)
     return _group_stage_rows_by_area(picked, stage=stage)
+
+
+def _stage_loot_profile(
+    game_data: GameDataRegistry, area: str, stage_name: str,
+) -> tuple[bool, float]:
+    """(箱子里有没有情报, 箱子产出总价值)；无箱子＝(False, 0)。"""
+    item_registry = game_data.items
+    has_intel = False
+    total = 0.0
+    for crate in game_data.stages.get_stage_loot(area, stage_name) or []:
+        for drop in getattr(crate, "drops", []) or []:
+            item = item_registry.get_by_name(drop.name)
+            use = getattr(item, "use", None) if item is not None else None
+            typ = getattr(item, "type", None) if item is not None else None
+            if use == "情报" or typ == "情报":
+                has_intel = True
+            total += float(item_registry.get_price(drop.name) or 0) * int(drop.min_count or 0)
+    return has_intel, total
 
 
 def _build_npc_list(
@@ -1874,8 +2079,10 @@ def _build_stage_loot_list(
     game_data: GameDataRegistry,
     stage: int,
     requirement_keywords: Optional[list[str]] = None,
+    *,
+    npc_faction: str = "",
 ) -> list[dict[str, Any]]:
-    """通关并收集/通关并持有：仅有箱子掉落的关卡。"""
+    """通关并收集/通关并持有：仅有箱子掉落的关卡（外交地图同样排除）。"""
     stage_registry = game_data.stages
     item_registry = game_data.items
     mercenary_registry = game_data.mercenary_tasks
@@ -1896,11 +2103,15 @@ def _build_stage_loot_list(
         mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
     rows: list[dict[str, Any]] = []
-    kw = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_stage_keywords(
+        requirement_keywords, publisher_faction=npc_faction, game_data=game_data,
+    )
 
     for (area, name), si in stage_registry._stage_infos.items():
         if si.unlock_condition is None:
             continue
+        if pt.is_diplomatic_stage(si):
+            continue  # 外交地图：中立区域，不是可攻打关卡
 
         meta = _build_stage_access_meta(
             area=area,
@@ -1982,25 +2193,44 @@ def _build_stage_loot_list(
             "challenge_modes": meta.get("challenge_modes") or [],
             "loot_items": loot_items,
             "total_loot_value": total_loot_value,
-            "_keyword_hit": _stage_loot_row_matches_keywords(
+            "faction": pt.stage_faction(area, name),
+            pt.ENEMIES_FIELD: pt.stage_enemy_tags(area, name),
+            "_has_intel_loot": bool(intel_items),
+        }
+        if si.description:
+            row["description"] = si.description
+        if below_progress:
+            row["below_progress"] = True
+        row["_hit_tags"] = _stage_tag_hits(
+            row, requested_tags=tags, publisher_faction=npc_faction,
+        )
+        # 自由词通道：先看关卡/区域，再看掉落物名（原有逻辑保留）
+        word_hits = _stage_word_hits(row, words)
+        if not word_hits and words:
+            if _stage_loot_row_matches_keywords(
                 {
                     "area": area,
                     "area_region_hint": stage_root_region_hint(area),
                     "stage_name": name,
                     "loot_items": loot_items,
                 },
-                kw,
+                words,
                 item_registry,
                 equipment_mods,
-            ),
-        }
-        if si.description:
-            row["description"] = si.description
-        if below_progress:
-            row["below_progress"] = True
+            ):
+                word_hits = list(words)
+        row["_hit_words"] = word_hits
         rows.append(row)
 
-    picked = _pick_stage_rows_20(rows, requirement_keywords=requirement_keywords)
+    if "掉落丰厚" in tags:
+        values = sorted(float(r.get("total_loot_value") or 0) for r in rows)
+        median = values[len(values) // 2] if values else 0.0
+        for r in rows:
+            r["_rich_loot"] = float(r.get("total_loot_value") or 0) > median
+            if r["_rich_loot"] and "掉落丰厚" not in r["_hit_tags"]:
+                r["_hit_tags"].append("掉落丰厚")
+
+    picked = _pick_stage_rows_n(rows, requirement_keywords=all_wanted)
     return _group_stage_rows_by_area(picked, stage=stage)
 
 
@@ -2374,6 +2604,7 @@ def prepare_task_context(
     elif task_type in ("通关", "清理", "挑战"):
         context["stage_list"] = _get_all_stages_for_progress(
             game_data, stage, requirement_keywords=requirement_keywords,
+            npc_faction=npc_faction,
         )
 
     elif task_type == "切磋":
@@ -2428,6 +2659,7 @@ def prepare_task_context(
     elif task_type in ("通关并收集", "通关并持有"):
         context["stage_loot_list"] = _build_stage_loot_list(
             game_data, stage, requirement_keywords=requirement_keywords,
+            npc_faction=npc_faction,
         )
 
     if task_type in ("资源收集", "装备缴纳", "特殊物品获取", "通关并收集"):
