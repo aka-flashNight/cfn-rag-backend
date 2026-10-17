@@ -358,6 +358,35 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "dialogue_rewrite 为 true 时填：你希望自己的对话怎么变（改写指示）。",
         },
+        "return_for_reward": {
+            "type": "boolean",
+            "description": (
+                "仅当完成 NPC 与接取 NPC 不同、且真实报酬应由接取 NPC 发放时填 true；否则填 false。"
+            ),
+        },
+        "return_description": {
+            "type": "string",
+            "description": (
+                "return_for_reward 为 true 时必填：回访任务（玩家回到接取 NPC 处复命领报酬）的"
+                "任务说明；为 false 时留空。"
+            ),
+        },
+        "return_get_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": (
+                "return_for_reward 为 true 时必填：玩家在完成 NPC 处接取回访时的对话；"
+                "NPC 说话人只能是完成 NPC，玩家用 $PC。"
+            ),
+        },
+        "return_finish_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": (
+                "return_for_reward 为 true 时必填：玩家回到接取 NPC 处完成回访时的对话；"
+                "NPC 说话人只能是接取 NPC，玩家用 $PC。"
+            ),
+        },
     },
     "required": ["draft_id", "title", "description", "get_dialogue", "finish_dialogue"],
     "additionalProperties": False,

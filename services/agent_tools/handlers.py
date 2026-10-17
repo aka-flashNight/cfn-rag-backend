@@ -31,14 +31,22 @@ from services.agent_tools.validator import (
     ValidationReport,
     validate_task_draft,
 )
-from services.agent_tools.task_tools import collect_existing_task_titles
+from services.agent_tools.task_tools import collect_existing_task_titles, resolve_task_npcs
+from services.dialogue.models import PLAYER_NAME
 
 logger = logging.getLogger(__name__)
 
 # 讨价还价上限（业务红线，沿用旧约定）
 BARGAIN_LIMIT = 2
 # 更新时禁止触碰的字段（仅在 confirm 时写入）
-_TEXT_ONLY_ON_CONFIRM = {"description", "get_dialogue", "finish_dialogue"}
+_TEXT_ONLY_ON_CONFIRM = {
+    "description",
+    "get_dialogue",
+    "finish_dialogue",
+    "return_for_reward",
+    "return_get_dialogue",
+    "return_finish_dialogue",
+}
 # 触发讨价还价计数的奖励类字段
 _BARGAIN_KEYS = {"rewards", "finish_submit_items", "finish_contain_items"}
 
@@ -54,6 +62,92 @@ class DraftOpOutcome:
     task_write_result: Optional[str] = None
     fallback_used: bool = False
     payload: dict[str, Any] = field(default_factory=dict)  # result_json 解析后的对象（免二次解析）
+
+
+def coerce_return_for_reward(value: Any) -> bool:
+    """回访开关的宽松布尔化：JSON 布尔直接用；字符串只认 true/false（大小写不敏感）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return False
+
+
+def _dialogue_rows(rows: Any) -> list[dict[str, Any]]:
+    """只认带非空 text 的对话条目（空行不算在场的台词）。"""
+    if not isinstance(rows, list):
+        return []
+    return [
+        row for row in rows
+        if isinstance(row, dict) and str(row.get("text") or "").strip()
+    ]
+
+
+def validate_confirm_dialogues(
+    args: dict[str, Any],
+    *,
+    get_npc: str,
+    finish_npc: str,
+) -> list[dict[str, str]]:
+    """confirm 四组对话的说话人校验（turn 重试与 handler 写盘共用同一套判据）。
+
+    返回 issue 列表（空＝通过）；issue 形状与草案校验一致（field/message/fix_hint），
+    可直接回给模型做定向修改。四组对话各锁各的在场 NPC：
+
+    - 任务一接取＝接取 NPC；任务一完成＝完成 NPC；
+    - 任务二接取＝完成 NPC；任务二完成＝接取 NPC；玩家条目一律 $PC。
+    """
+    issues: list[dict[str, str]] = []
+    enter_npc = (get_npc or "").strip()
+    leave_npc = (finish_npc or "").strip()
+    flag = coerce_return_for_reward(args.get("return_for_reward"))
+
+    if flag and enter_npc == leave_npc:
+        issues.append({
+            "field": "return_for_reward",
+            "message": f"接取 NPC 与完成 NPC 都是「{enter_npc}」，不能启用回访领奖。",
+            "fix_hint": "把 return_for_reward 改成 false，两组回访对话留空。",
+        })
+
+    if flag:
+        if not _dialogue_rows(args.get("return_get_dialogue")):
+            issues.append({
+                "field": "return_get_dialogue",
+                "message": "return_for_reward 为 true 时，回访接取对话不能为空。",
+                "fix_hint": (
+                    f"补上玩家在 {leave_npc} 处接取回访时的对话，"
+                    f"NPC 说话人只能是 {leave_npc}，玩家用 $PC。"
+                ),
+            })
+        if not _dialogue_rows(args.get("return_finish_dialogue")):
+            issues.append({
+                "field": "return_finish_dialogue",
+                "message": "return_for_reward 为 true 时，回访完成对话不能为空。",
+                "fix_hint": (
+                    f"补上玩家回到 {enter_npc} 处完成回访时的对话，"
+                    f"NPC 说话人只能是 {enter_npc}，玩家用 $PC。"
+                ),
+            })
+
+    # (字段, 这一场的在场 NPC, 用于报错的中文场次名)
+    checks = (
+        ("get_dialogue", enter_npc, "任务一接取对话"),
+        ("finish_dialogue", leave_npc, "任务一完成对话"),
+        ("return_get_dialogue", leave_npc, "任务二接取对话"),
+        ("return_finish_dialogue", enter_npc, "任务二完成对话"),
+    )
+    for field, expected, label in checks:
+        for row in _dialogue_rows(args.get(field)):
+            speaker = str(row.get("name") or "").strip()
+            if speaker == PLAYER_NAME or speaker == expected:
+                continue
+            issues.append({
+                "field": field,
+                "message": f"{label}的说话人「{speaker}」不在场，这一场只能是 {expected} 或 $PC。",
+                "fix_hint": f"把该条 name 改成 {expected}（NPC 台词）或 $PC（玩家台词）。",
+            })
+
+    return issues
 
 
 def _reward_field_value_changed(cur: Any, new: Any) -> bool:
@@ -410,11 +504,14 @@ def execute_confirm_agent_task(
     rag_context_text: Optional[str] = None,
     npc_states: Optional[dict[str, Any]] = None,
     publish_session_id: str = "",
+    generation_warnings: Optional[list[str]] = None,
 ) -> DraftOpOutcome:
     """校验并写入任务文件。
 
     ``publish_session_id``＝发布这场对话的会话 id：只在 args 挂了对话重写标记时写进
     任务记录，玩家完成后据此把「发布当时的对话」作为材料交给对话修改子 Agent。
+    ``generation_warnings``＝confirm 生成阶段的降级说明（配对未启用等），与草案校验的
+    warnings 合并后回给调用方。
     """
     if pending_draft is None:
         return DraftOpOutcome(result_json=json.dumps({
@@ -453,6 +550,22 @@ def execute_confirm_agent_task(
     if not isinstance(fin_dg, list):
         fin_dg = []
 
+    # 回访领奖（两段式）：false 时两组对话与回访描述一律清空，避免残留数据被写进单任务。
+    return_for_reward = coerce_return_for_reward(args.get("return_for_reward"))
+    return_desc = args.get("return_description")
+    if not isinstance(return_desc, str):
+        return_desc = ""
+    return_get_dg = args.get("return_get_dialogue")
+    return_fin_dg = args.get("return_finish_dialogue")
+    if not isinstance(return_get_dg, list):
+        return_get_dg = []
+    if not isinstance(return_fin_dg, list):
+        return_fin_dg = []
+    if not return_for_reward:
+        return_desc = ""
+        return_get_dg = []
+        return_fin_dg = []
+
     draft_for_commit = dict(pending_draft)
     draft_for_commit["title"] = title
     draft_for_commit["description"] = desc
@@ -485,6 +598,34 @@ def execute_confirm_agent_task(
             draft=pending_draft,
         )
 
+    # 两段式对话校验：说话人必须与那一场的在场 NPC 一致（跨 NPC 委托最容易说错人）。
+    get_npc, finish_npc = resolve_task_npcs(
+        pending_draft, npc_name or str(pending_draft.get("npc_name") or ""),
+    )
+    dialogue_issues = validate_confirm_dialogues(
+        {
+            "return_for_reward": return_for_reward,
+            "get_dialogue": get_dg,
+            "finish_dialogue": fin_dg,
+            "return_get_dialogue": return_get_dg,
+            "return_finish_dialogue": return_fin_dg,
+        },
+        get_npc=get_npc,
+        finish_npc=finish_npc,
+    )
+    if dialogue_issues:
+        return DraftOpOutcome(
+            result_json=json.dumps(
+                {
+                    "status": "validation_failed",
+                    "message": "两段式对话校验未通过，无法确认。",
+                    "issues": dialogue_issues,
+                },
+                ensure_ascii=False,
+            ),
+            draft=pending_draft,
+        )
+
     try:
         from services.agent_tools.task_tools import write_confirmed_agent_task_files
 
@@ -495,6 +636,10 @@ def execute_confirm_agent_task(
             dialogue_rewrite=bool(args.get("dialogue_rewrite")),
             dialogue_rewrite_instruction=str(args.get("dialogue_rewrite_instruction") or ""),
             publish_session_id=publish_session_id,
+            return_for_reward=return_for_reward,
+            return_description=return_desc.strip(),
+            return_get_dialogue=return_get_dg,
+            return_finish_dialogue=return_fin_dg,
         )
     except Exception as e:
         logger.exception("任务写入失败")
@@ -516,8 +661,9 @@ def execute_confirm_agent_task(
         "message": write_desc,
         "draft_summary": detailed,
     }
-    if report.warnings:
-        confirm_payload["warnings"] = report.warnings
+    warnings = list(report.warnings or []) + list(generation_warnings or [])
+    if warnings:
+        confirm_payload["warnings"] = warnings
     return DraftOpOutcome(
         result_json=json.dumps(confirm_payload, ensure_ascii=False),
         draft=None,

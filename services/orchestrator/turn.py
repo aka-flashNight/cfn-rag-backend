@@ -31,9 +31,12 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 from services.agent_tools.draft_formatting import _detailed_draft_summary
 from services.agent_tools.handlers import (
+    coerce_return_for_reward,
     execute_cancel_agent_task,
     execute_confirm_agent_task,
+    validate_confirm_dialogues,
 )
+from services.agent_tools.task_tools import resolve_task_npcs
 from services.dialogue.delegation import (
     DELEGATE_TOOL_NAME,
     RELATIONSHIP_HINT_ROUNDS,
@@ -41,6 +44,7 @@ from services.dialogue.delegation import (
     build_relationship_hint,
     delegate_tool_or_none,
 )
+from services.dialogue.models import PLAYER_NAME
 from services.llm import (
     ChatRequest,
     LLMClient,
@@ -85,6 +89,7 @@ from services.orchestrator.prompts import (
     TASK_CANCEL_NOOP_INSTRUCTION,
     TASK_CONFIRM_MERGE_INSTRUCTION,
     build_confirm_args_user_prompt,
+    build_confirm_retry_prompt,
     build_empty_reply_user_prompt,
     build_finished_task_block,
     build_player_message,
@@ -564,7 +569,7 @@ class TurnOrchestrator:
                     yield system_notice_event(f"委托确认失败：{fail_reason}")
                     reply = self._fail_reply_args(fail_reason)
                 else:
-                    confirm_args = await self._generate_confirm_args(
+                    confirm_args, confirm_warnings = await self._generate_confirm_args(
                         llm, ctx, draft_row, deps.game_data,
                         base_messages=base_messages, spoken_text=spoken_text,
                         emotion=meta.emotion,
@@ -579,6 +584,7 @@ class TurnOrchestrator:
                         rag_context_text=ctx.rag_context_text,
                         npc_states=ctx.npc_states,
                         publish_session_id=self.session_id,
+                        generation_warnings=confirm_warnings,
                     )
                     if outcome.payload.get("status") == "confirmed":
                         draft_touched = True
@@ -1034,14 +1040,19 @@ class TurnOrchestrator:
         base_messages: list[dict[str, Any]],
         spoken_text: str = "",
         emotion: str = "",
-    ) -> dict[str, Any]:
-        """confirm 发布文本（title/description/接取与完成对话）生成。
+    ) -> tuple[dict[str, Any], list[str]]:
+        """confirm 发布文本（title/description/两组或四组对话）生成。
 
         与聊天 Agent **同源前缀**（世界观/扮演/RAG/会话态/近期历史），追加本轮
         过渡话与草案详情——保证生成的对话贴合对话脉络。单次、无工具、宽松归一化；
         仅当 LLM 调用整体失败或解析不出 JSON 时回退模板（优先保证发布流程可用）。
+
+        说话人校验不过时额外做 **一次** 修正重试（带具体问题），仍不通过就降级：
+        原两组对话本身合规 → 保留模型产出、关掉回访配对；原两组也不合规 → 整份换
+        模板兜底。返回 (args, warnings)，warnings 回给调用方合并进确认结果。
         """
         draft = draft_row.draft
+        get_npc, finish_npc = resolve_task_npcs(draft, self.npc_name)
         summary = _detailed_draft_summary(
             draft, game_data, rag_context_text=ctx.rag_context_text,
             npc_states=ctx.npc_states,
@@ -1055,37 +1066,126 @@ class TurnOrchestrator:
                 emotion=emotion,
             )
         )
+        messages = [*base_messages, {"role": "user", "content": user_prompt}]
+        warnings: list[str] = []
+
+        def _parse_and_clean(raw: str) -> dict[str, Any] | None:
+            return self._sanitize_confirm_args(
+                parse_confirm_args(raw), get_npc=get_npc, finish_npc=finish_npc,
+            )
+
         args: dict[str, Any] | None = None
+        raw_text = ""
         try:
-            result = await llm.chat(ChatRequest(
-                messages=[*base_messages, {"role": "user", "content": user_prompt}],
-                purpose="subagent",
-            ))
+            result = await llm.chat(ChatRequest(messages=messages, purpose="subagent"))
             self._usage = accumulate_usage(self._usage, result.usage)
-            args = self._sanitize_confirm_args(parse_confirm_args(result.content))
+            raw_text = result.content or ""
+            args = _parse_and_clean(raw_text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("confirm 发布文本生成失败，使用模板兜底: %s", exc)
+
+        if args:
+            issues = validate_confirm_dialogues(args, get_npc=get_npc, finish_npc=finish_npc)
+            if issues:
+                # 只对可机器判定的校验问题重试一次；调用异常/解析失败不重试（已在上方兜底）
+                retry_messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw_text},
+                    {"role": "user", "content": build_confirm_retry_prompt(issues)},
+                ]
+                retry_args: dict[str, Any] | None = None
+                try:
+                    retry = await llm.chat(ChatRequest(
+                        messages=retry_messages, purpose="subagent",
+                    ))
+                    self._usage = accumulate_usage(self._usage, retry.usage)
+                    retry_args = _parse_and_clean(retry.content or "")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("confirm 修正重试失败，走降级: %s", exc)
+                if retry_args:
+                    args = retry_args
+                    issues = validate_confirm_dialogues(
+                        args, get_npc=get_npc, finish_npc=finish_npc,
+                    )
+                if issues:
+                    args = self._degrade_confirm_args(
+                        draft, args, issues, get_npc=get_npc,
+                        finish_npc=finish_npc, warnings=warnings,
+                    )
+
         if not args:
             args = fallback_confirm_args(draft, self.npc_name)
         args["draft_id"] = draft_row.draft_id
+        return args, warnings
+
+    def _degrade_confirm_args(
+        self,
+        draft: dict[str, Any],
+        args: dict[str, Any],
+        issues: list[dict[str, str]],
+        *,
+        get_npc: str,
+        finish_npc: str,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        """两段式校验最终未通过：退回单任务，绝不写半套配对。"""
+        base_broken = any(
+            issue.get("field") in {"get_dialogue", "finish_dialogue"} for issue in issues
+        )
+        if base_broken:
+            logger.warning("confirm 两段式校验失败且原对话不合规，整份改用模板兜底: %s", issues)
+            warnings.append("两段式回访对话校验未通过，已改用模板文本发布单个任务。")
+            return fallback_confirm_args(draft, self.npc_name)
+        logger.warning("confirm 两段式校验失败，退回单任务并保留原对话: %s", issues)
+        warnings.append("两段式回访对话校验未通过，本次按单任务发布。")
+        args["return_for_reward"] = False
+        args["return_description"] = ""
+        args["return_get_dialogue"] = []
+        args["return_finish_dialogue"] = []
         return args
 
-    def _sanitize_confirm_args(self, args: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _sanitize_confirm_args(
+        self,
+        args: dict[str, Any] | None,
+        *,
+        get_npc: Optional[str] = None,
+        finish_npc: Optional[str] = None,
+    ) -> dict[str, Any] | None:
         """宽松归一化（不硬打回）：字符串化 + 空对话补占位，优先保住 LLM 的产出。
 
-        对话重写标记一并归一：布尔化，标记为假时清空指示（避免留下半截标记）。
+        占位说话人按场次取：接取对话用接取 NPC、完成对话用完成 NPC（都用当前 NPC 会在
+        跨 NPC 委托里把完成对话说成接取人）。回访开关宽松布尔化；为假时两组回访对话与
+        回访描述一律清空，残留给的值不保留。
         """
         if not isinstance(args, dict):
             return None
+        enter_npc = (get_npc or self.npc_name or "").strip() or self.npc_name
+        leave_npc = (finish_npc or self.npc_name or "").strip() or self.npc_name
         out: dict[str, Any] = {}
         title = args.get("title")
         desc = args.get("description")
         out["title"] = title.strip() if isinstance(title, str) else ""
         out["description"] = desc.strip() if isinstance(desc, str) else ""
 
-        def _dlg(key: str, fallback_text: str) -> list[dict[str, Any]]:
+        def _speaker(value: Any, default_npc: str) -> str:
+            name = str(value or "").strip()
+            # 模型爱把玩家写成「玩家」，或写成落盘占位符的变体（$PC_TITLE、（$PC）、$pc）；
+            # 一律收敛成 $PC——AS2 按它换玩家角色名与立绘，写别的会被当成陌生 NPC。
+            if name == "玩家" or PLAYER_NAME in name.upper():
+                return PLAYER_NAME
+            return name or default_npc
+
+        def _dlg(
+            key: str,
+            fallback_text: str,
+            default_npc: str,
+            *,
+            allow_empty: bool = False,
+        ) -> list[dict[str, Any]]:
             rows = args.get(key)
             cleaned: list[dict[str, Any]] = []
             if isinstance(rows, list):
@@ -1096,17 +1196,37 @@ class TurnOrchestrator:
                     if not text:
                         continue
                     cleaned.append({
-                        "name": str(r.get("name") or self.npc_name).strip() or self.npc_name,
+                        "name": _speaker(r.get("name"), default_npc),
                         "emotion": str(r.get("emotion") or "").strip(),
                         "text": text,
                     })
-            if not cleaned:
+            if not cleaned and not allow_empty:
                 # 对话缺失不回炉重生成：补一条占位，保证发布流程可用
-                cleaned = [{"name": self.npc_name, "emotion": "", "text": fallback_text}]
+                cleaned = [{"name": default_npc, "emotion": "", "text": fallback_text}]
             return cleaned
 
-        out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。")
-        out["finish_dialogue"] = _dlg("finish_dialogue", "干得漂亮，报酬一分不少。")
+        out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。", enter_npc)
+        out["finish_dialogue"] = _dlg("finish_dialogue", "干得漂亮，报酬一分不少。", leave_npc)
+
+        flag = coerce_return_for_reward(args.get("return_for_reward"))
+        out["return_for_reward"] = flag
+        if flag:
+            # 回访两组不补占位：缺内容交给校验打回，宁可不启用配对也不写半套对话
+            return_desc = args.get("return_description")
+            out["return_description"] = (
+                return_desc.strip() if isinstance(return_desc, str) else ""
+            )
+            out["return_get_dialogue"] = _dlg(
+                "return_get_dialogue", "", leave_npc, allow_empty=True,
+            )
+            out["return_finish_dialogue"] = _dlg(
+                "return_finish_dialogue", "", enter_npc, allow_empty=True,
+            )
+        else:
+            out["return_description"] = ""
+            out["return_get_dialogue"] = []
+            out["return_finish_dialogue"] = []
+
         rewrite = bool(args.get("dialogue_rewrite"))
         out["dialogue_rewrite"] = rewrite
         out["dialogue_rewrite_instruction"] = (

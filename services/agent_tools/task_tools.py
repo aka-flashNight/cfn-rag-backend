@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -20,6 +21,11 @@ from services.integration.save_paths import resolve_task_write_paths, shared_tas
 
 # 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
 MAX_MAINLINE_TASK_PROGRESS: int = 77
+# Agent 任务 id 区间（上游 200000 为基准，超出 300000 视为越界）
+AGENT_TASK_ID_BASE: int = 200000
+AGENT_TASK_ID_MAX: int = 300000
+
+logger = logging.getLogger(__name__)
 
 
 _WRITE_LOCK = threading.Lock()
@@ -338,9 +344,31 @@ def _dialogue_entry_to_agent_text_item(
     return _agent_text_item(entry.get("name"), entry.get("emotion"), text, sources)
 
 
+def resolve_task_npcs(
+    draft: Dict[str, Any],
+    npc_name_fallback: str,
+) -> tuple[str, str]:
+    """解析任务记录的接取 NPC 与完成 NPC（结果已 strip）。
+
+    优先级：草稿的 get_npc / finish_npc → 草稿的 npc_name → 调用方兜底。
+    confirm 生成与写盘共用本函数，避免两处 fallback 不一致（跨 NPC 时会说错人）。
+    """
+    fallback = (npc_name_fallback or "").strip()
+    raw_draft_npc = draft.get("npc_name")
+    draft_npc = raw_draft_npc.strip() if isinstance(raw_draft_npc, str) else ""
+
+    def _pick(key: str) -> str:
+        value = draft.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return draft_npc or fallback
+
+    return _pick("get_npc"), _pick("finish_npc")
+
+
 def _max_agent_task_id(scan_paths: List[Path]) -> int:
     """扫描给定任务文件中 200001–300000 段的现有最大 id（B2-3：共享 ∪ 本存档）。"""
-    max_agent = 200000
+    max_agent = AGENT_TASK_ID_BASE
     for path in scan_paths:
         doc = _read_json(path, default={"tasks": []})
         tasks = doc.get("tasks", []) if isinstance(doc, dict) else []
@@ -353,7 +381,7 @@ def _max_agent_task_id(scan_paths: List[Path]) -> int:
                 tid = int(t.get("id"))
             except Exception:
                 continue
-            if 200001 <= tid <= 300000 and tid > max_agent:
+            if AGENT_TASK_ID_BASE < tid <= AGENT_TASK_ID_MAX and tid > max_agent:
                 max_agent = tid
     return max_agent
 
@@ -366,6 +394,10 @@ def write_confirmed_agent_task_files(
     dialogue_rewrite: bool = False,
     dialogue_rewrite_instruction: str = "",
     publish_session_id: str = "",
+    return_for_reward: bool = False,
+    return_description: str = "",
+    return_get_dialogue: Optional[List[Dict[str, Any]]] = None,
+    return_finish_dialogue: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, int]:
     """
     将已确认的任务草案写入（B2-2 按绑定分流）：
@@ -380,7 +412,9 @@ def write_confirmed_agent_task_files(
     dialogue_rewrite 与它的重写指示，外加发布那场对话的会话 id——三者一起落进任务记录，
     任务完成事件推来时据此自动委派对话修改子 Agent。未标记的任务记录形状与现状逐字一致。
 
-    返回 (写入描述字符串, 分配的任务 ID)。
+    ``return_for_reward``＝「回接取 NPC 领奖」两段式：任务一把话带到（完成 NPC＝B，
+    只给固定 1000 经验），任务二回到接取 NPC（A）领真实奖励。两条任务一次写入、只 bump
+    一次版本号；不启用时与单任务路径逐字一致。返回 (写入描述, 任务一的 ID)。
     """
     with _WRITE_LOCK:
         data_root = game_data.data_root
@@ -398,22 +432,36 @@ def write_confirmed_agent_task_files(
         if agent_tasks_path != shared_tasks_path:
             scan_paths.append(agent_tasks_path)
         task_id_int = _max_agent_task_id(scan_paths) + 1
+        if task_id_int > AGENT_TASK_ID_MAX:
+            raise ValueError(
+                f"Agent 任务 id 已超出 {AGENT_TASK_ID_BASE + 1}-{AGENT_TASK_ID_MAX} 区间"
+                f"（当前应分配 {task_id_int}），拒绝写入越界任务。"
+            )
         draft["id"] = task_id_int
 
-        get_npc = (
-            draft.get("get_npc")
-            if isinstance(draft.get("get_npc"), str) and draft.get("get_npc").strip()
-            else draft.get("npc_name")
-        )
-        finish_npc = (
-            draft.get("finish_npc")
-            if isinstance(draft.get("finish_npc"), str) and draft.get("finish_npc").strip()
-            else draft.get("npc_name")
-        )
-        if not isinstance(get_npc, str) or not get_npc.strip():
-            get_npc = npc_name_fallback
-        if not isinstance(finish_npc, str) or not finish_npc.strip():
-            finish_npc = npc_name_fallback
+        get_npc, finish_npc = resolve_task_npcs(draft, npc_name_fallback)
+
+        # -------- 两段式配对的入参防御（不静默降级：降级只发生在 confirm 生成阶段与 id 越界）--------
+        paired = bool(return_for_reward)
+        paired_get_rows: List[Dict[str, Any]] = []
+        paired_finish_rows: List[Dict[str, Any]] = []
+        if paired:
+            if get_npc == finish_npc:
+                raise ValueError(
+                    f"两段式配对要求接取 NPC 与完成 NPC 不同（都是「{get_npc}」）。"
+                )
+            paired_get_rows = [
+                r for r in (return_get_dialogue or [])
+                if isinstance(r, dict) and str(r.get("text") or "").strip()
+            ]
+            paired_finish_rows = [
+                r for r in (return_finish_dialogue or [])
+                if isinstance(r, dict) and str(r.get("text") or "").strip()
+            ]
+            if not paired_get_rows:
+                raise ValueError("两段式配对缺少回访接取对话（return_get_dialogue 为空）。")
+            if not paired_finish_rows:
+                raise ValueError("两段式配对缺少回访完成对话（return_finish_dialogue 为空）。")
 
         title = draft.get("title") if isinstance(draft.get("title"), str) else ""
         # 最终落盘前统一做标题去重，避免与已有任务重名。
@@ -488,33 +536,90 @@ def write_confirmed_agent_task_files(
         finish_reqs = _stage_reqs_to_strings(draft.get("finish_requirements"))
         finish_submit = _reward_items_to_expr(draft.get("finish_submit_items"))
         finish_contain = _reward_items_to_expr(draft.get("finish_contain_items"))
-        rewards = _reward_items_to_expr(draft.get("rewards"))
+        draft_rewards = _reward_items_to_expr(draft.get("rewards"))
 
         # -------- agent_tasks.json（tasks_doc 已在上方读取）--------
         # 防止重复写入同 id
         tasks = [t for t in tasks if not (isinstance(t, dict) and str(t.get("id")) == str(task_id_int))]
 
-        record = {
-            "id": task_id_int,
-            "title": f"$AGENT_TITLE_{task_id_int}",
-            "description": f"$AGENT_DESCRIPTION_{task_id_int}",
-            "get_requirements": get_req_list,
-            "get_conversation": f"$AGENT_GET_{task_id_int}",
-            "get_npc": get_npc,
-            "finish_requirements": finish_reqs,
-            "finish_submit_items": finish_submit,
-            "finish_contain_items": finish_contain,
-            "finish_conversation": f"$AGENT_FINISH_{task_id_int}",
-            "finish_npc": finish_npc,
-            "rewards": rewards,
-            "announcement": "",
-            "chain": "委托",
-        }
+        # id2 越界时按单任务写：真实奖励必须全部挂在唯一那条任务上，绝不留下固定的 1000 经验。
+        id_range_downgraded = paired and (task_id_int + 1) > AGENT_TASK_ID_MAX
+        if id_range_downgraded:
+            logger.warning(
+                "回访任务 id 越界（%s），本次按单任务写入，奖励取草稿真实奖励",
+                task_id_int + 1,
+            )
+            paired = False
+
+        if paired:
+            next_id = task_id_int + 1
+            record = {
+                "id": task_id_int,
+                "title": f"$AGENT_TITLE_{task_id_int}",
+                "description": f"$AGENT_DESCRIPTION_{task_id_int}",
+                "get_requirements": get_req_list,
+                "get_conversation": f"$AGENT_GET_{task_id_int}",
+                "get_npc": get_npc,
+                "finish_requirements": finish_reqs,
+                "finish_submit_items": finish_submit,
+                "finish_contain_items": finish_contain,
+                "finish_conversation": f"$AGENT_FINISH_{task_id_int}",
+                "finish_npc": finish_npc,
+                "rewards": _reward_items_to_expr([{"item_name": "经验值", "count": 1000}]),
+                "announcement": "",
+                "chain": "委托",
+                "next_task_id": next_id,
+            }
+        else:
+            next_id = 0
+            record = {
+                "id": task_id_int,
+                "title": f"$AGENT_TITLE_{task_id_int}",
+                "description": f"$AGENT_DESCRIPTION_{task_id_int}",
+                "get_requirements": get_req_list,
+                "get_conversation": f"$AGENT_GET_{task_id_int}",
+                "get_npc": get_npc,
+                "finish_requirements": finish_reqs,
+                "finish_submit_items": finish_submit,
+                "finish_contain_items": finish_contain,
+                "finish_conversation": f"$AGENT_FINISH_{task_id_int}",
+                "finish_npc": finish_npc,
+                "rewards": draft_rewards,
+                "announcement": "",
+                "chain": "委托",
+            }
+        # 委派按任务记录的 get_npc 解析权威发布 NPC：任务二的 get_npc 是 B，标记挂任务二
+        # 会在最终领奖时去改 B 的对话；标记挂任务一（A）才对，代价是委派在任务一完成
+        # （送达 B）时触发，而不是最终领奖时。
         if dialogue_rewrite:
             record["dialogue_rewrite"] = True
             record["dialogue_rewrite_instruction"] = (dialogue_rewrite_instruction or "").strip()
             record["publish_session_id"] = (publish_session_id or "").strip()
         tasks.append(record)
+
+        return_record: Optional[Dict[str, Any]] = None
+        if paired:
+            # 任务二只是回去说话领奖：完成条件、提交品、持有品全部留空（全留在任务一）。
+            # get_requirements 必须在 clamp 之后单独赋 [任务一 id]——把它送进
+            # min(id, 77) 会被压成 77，前置条件直接消失，玩家不做任务一也能接。
+            return_record = {
+                "id": next_id,
+                "title": f"$AGENT_TITLE_{next_id}",
+                "description": f"$AGENT_DESCRIPTION_{next_id}",
+                "get_requirements": [task_id_int],
+                "get_conversation": f"$AGENT_GET_{next_id}",
+                "get_npc": finish_npc,
+                "finish_requirements": [],
+                "finish_submit_items": [],
+                "finish_contain_items": [],
+                "finish_conversation": f"$AGENT_FINISH_{next_id}",
+                "finish_npc": get_npc,
+                "rewards": draft_rewards,
+                "announcement": "",
+                "chain": "委托",
+            }
+            tasks.append(return_record)
+
         new_tasks_doc = {"tasks": tasks}
 
         # -------- agent_text.json --------
@@ -528,18 +633,68 @@ def write_confirmed_agent_task_files(
         text_doc[f"$AGENT_GET_{task_id_int}"] = get_items
         text_doc[f"$AGENT_FINISH_{task_id_int}"] = finish_items
 
-        _atomic_write_text(agent_tasks_path, _dump_json(new_tasks_doc))
-        _atomic_write_text(agent_text_path, _dump_json(text_doc))
+        if paired:
+            return_title, return_title_renamed = make_unique_task_title(
+                f"{title}·回访", game_data=game_data,
+            )
+            title_auto_renamed = title_auto_renamed or return_title_renamed
+            return_description_text = (return_description or "").strip() or (
+                f"回到{get_npc}处复命，领取这份委托的报酬。"
+            )
+            return_get_items = [
+                _dialogue_entry_to_agent_text_item(
+                    {**it, "name": str(it.get("name") or "").strip() or finish_npc},
+                    sources,
+                )
+                for it in paired_get_rows
+            ]
+            return_finish_items = [
+                _dialogue_entry_to_agent_text_item(
+                    {**it, "name": str(it.get("name") or "").strip() or get_npc},
+                    sources,
+                )
+                for it in paired_finish_rows
+            ]
+            text_doc[f"$AGENT_TITLE_{next_id}"] = return_title
+            text_doc[f"$AGENT_DESCRIPTION_{next_id}"] = return_description_text
+            text_doc[f"$AGENT_GET_{next_id}"] = return_get_items
+            text_doc[f"$AGENT_FINISH_{next_id}"] = return_finish_items
 
-        _bump_task_publish_version(_sync_state_path(data_root))
+        # -------- 原子写盘：先快照，text → tasks → 单次 bump；任一步失败恢复两个数据文件 --------
+        snapshot_text = agent_text_path.read_bytes() if agent_text_path.exists() else None
+        snapshot_tasks = agent_tasks_path.read_bytes() if agent_tasks_path.exists() else None
 
-        if title_auto_renamed:
+        def _restore(path: Path, snapshot: Optional[bytes]) -> None:
+            try:
+                if snapshot is None:
+                    path.unlink(missing_ok=True)  # type: ignore[arg-type]
+                else:
+                    _atomic_write_text(path, snapshot.decode("utf-8"))
+            except Exception:
+                logger.exception("回滚任务文件失败：%s", path)
+
+        try:
+            _atomic_write_text(agent_text_path, _dump_json(text_doc))
+            _atomic_write_text(agent_tasks_path, _dump_json(new_tasks_doc))
+            _bump_task_publish_version(_sync_state_path(data_root))
+        except Exception:
+            _restore(agent_text_path, snapshot_text)
+            _restore(agent_tasks_path, snapshot_tasks)
+            raise
+
+        if paired:
+            msg = (
+                f"任务 {task_id_int} 与回访任务 {next_id} 已写入 agent_tasks.json 与 agent_text.json。"
+            )
+        elif id_range_downgraded:
             msg = (
                 f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
-                f"标题重复，已自动调整为「{title}」。"
+                f"回访任务因 id 区间不足未创建，奖励已全部挂在本次任务上。"
             )
         else:
             msg = f"任务 {task_id_int} 已写入 agent_tasks.json 与 agent_text.json。"
+        if title_auto_renamed:
+            msg += f"标题重复，已自动调整为「{title}」。"
 
     return msg, task_id_int
 

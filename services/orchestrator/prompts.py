@@ -667,15 +667,28 @@ CONFIRM_ARGS_SYSTEM = (
     "严格按角色口吻撰写。输出一个 JSON 对象（不要代码块、不要解释）。字段："
     'title（任务标题，简洁）、description（任务说明，与任务内容一致）、'
     "get_dialogue（接取对话数组：发布 NPC 向玩家发布任务，可穿插玩家回应，建议 2~4 条），"
-    "finish_dialogue（完成对话数组：玩家向 NPC 交付，NPC 验收，建议 2~4 条）。"
+    "finish_dialogue（完成对话数组：玩家向 NPC 交付，NPC 验收，建议 2~4 条）、"
+    "return_for_reward（布尔）、return_description（回访任务说明）、"
+    "return_get_dialogue（回访接取对话数组）、"
+    "return_finish_dialogue（回访完成对话数组）。"
     '每条格式 {"name","emotion","text"}，撰写规则：'
     "1. text 只能是纯对话内容——**不能包含任何动作/神态/旁白描述，不能使用【】中括号或任何括号补注**；"
     "神态一律写在 emotion 字段（从你的可用情绪中选，可为空字符串）。"
     "emotion 逐条各填：每句话都有自己的情绪，随这段对话的推进换，不要整段共用同一个。"
     "写入任务系统的对话会被游戏直接展示，中括号内容会被后端剥离。"
-    "2. 玩家条目 name 用 $PC，不要写死玩家名字；NPC 条目 name 用你的名字。"
-    "3. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
-    "4. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
+    "2. 任何对话中，NPC 说话人必须是该场对话在场的 NPC：任务一接取对话＝接取 NPC，"
+    "任务一完成对话＝完成 NPC，任务二接取对话＝完成 NPC，任务二完成对话＝接取 NPC；"
+    "玩家条目 name 用 $PC，不要写死玩家名字。"
+    "3. 完成 NPC 与接取 NPC 不同时，你可以选择让玩家在任务一完成后回到接取 NPC 领取真实报酬，"
+    "用 return_for_reward 表示。"
+    "4. return_for_reward 为 true 时，必须同时给出 return_get_dialogue"
+    "（任务二在完成 NPC 处接取）和 return_finish_dialogue（任务二回到接取 NPC 处完成），"
+    "两组都不能为空。"
+    "5. return_for_reward 为 true 时，return_description 填任务二的说明，"
+    "讲清玩家回接取 NPC 处复命领报酬；为 false 时留空。"
+    "6. return_for_reward 为 false 时，两组对话留空数组。"
+    "7. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
+    "8. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
     "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
 )
 
@@ -697,10 +710,26 @@ def build_confirm_args_user_prompt(
     parts.append(f"【待发布任务详情】\n{draft_summary}")
     parts.append(
         "现在以你的身份生成发布文本 JSON（title/description/get_dialogue/finish_dialogue/"
+        "return_for_reward/return_description/return_get_dialogue/return_finish_dialogue/"
         "dialogue_rewrite/dialogue_rewrite_instruction）。"
         "对话中的玩家条目 name 用 $PC。"
     )
     return "\n\n".join(parts)
+
+
+def build_confirm_retry_prompt(issues: list[dict]) -> str:
+    """confirm 未通过校验时的修正消息：逐条给出问题与修法，要求重新输出完整 JSON。"""
+    lines = ["上一次输出未通过校验："]
+    for issue in issues:
+        field = str(issue.get("field") or "").strip()
+        message = str(issue.get("message") or "").strip()
+        hint = str(issue.get("fix_hint") or "").strip()
+        head = f"- {field}：{message}" if field else f"- {message}"
+        lines.append(head)
+        if hint:
+            lines.append(f"  修改建议：{hint}")
+    lines.append("请修正后重新输出完整 JSON（字段与上一次要求相同）。")
+    return "\n".join(lines)
 
 
 def parse_confirm_args_json(text: str) -> Optional[dict]:
@@ -719,7 +748,14 @@ def parse_confirm_args_json(text: str) -> Optional[dict]:
 
 
 def fallback_confirm_args(draft: dict, npc_name: str) -> dict:
-    """confirm 参数生成的 LLM 失败兜底：模板文本，保证流程不中断。"""
+    """confirm 参数生成的 LLM 失败兜底：模板文本，保证流程不中断。
+
+    两段对话的说话人分别取接取 NPC 与完成 NPC——跨 NPC 委托时都用当前 NPC
+    会把完成对话说成接取人，说话人校验会直接判错。
+    """
+    from services.agent_tools.task_tools import resolve_task_npcs
+
+    get_npc, finish_npc = resolve_task_npcs(draft, npc_name)
     title = str(draft.get("title") or "委托")
     reqs = "、".join(
         f"{r.get('stage_name', '?')}({r.get('difficulty', '简单')})"
@@ -746,8 +782,12 @@ def fallback_confirm_args(draft: dict, npc_name: str) -> dict:
     return {
         "title": title,
         "description": description,
-        "get_dialogue": [{"name": npc_name, "emotion": "", "text": get_text}],
-        "finish_dialogue": [{"name": npc_name, "emotion": "", "text": finish_text}],
+        "get_dialogue": [{"name": get_npc, "emotion": "", "text": get_text}],
+        "finish_dialogue": [{"name": finish_npc, "emotion": "", "text": finish_text}],
+        "return_for_reward": False,
+        "return_description": "",
+        "return_get_dialogue": [],
+        "return_finish_dialogue": [],
     }
 
 
