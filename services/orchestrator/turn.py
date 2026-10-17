@@ -81,7 +81,6 @@ from services.orchestrator.events import (
 )
 from services.orchestrator.merge import MergeCoordinator
 from services.orchestrator.prompts import (
-    CONFIRM_ARGS_SYSTEM,
     CONFIRM_FAIL_INSTRUCTION,
     EMPTY_REPLY_FALLBACK_TEXT,
     SEARCH_MERGE_INSTRUCTION,
@@ -96,6 +95,7 @@ from services.orchestrator.prompts import (
     build_merge_user_prompt,
     build_static_system,
     build_user_shared_core,
+    confirm_args_system,
     fallback_confirm_args,
     parse_confirm_args_json as parse_confirm_args,
 )
@@ -1053,17 +1053,20 @@ class TurnOrchestrator:
         """
         draft = draft_row.draft
         get_npc, finish_npc = resolve_task_npcs(draft, self.npc_name)
+        # 接取与完成同一人时完全走单任务口径：不给模型看任何回访字段
+        allow_return = get_npc != finish_npc
         summary = _detailed_draft_summary(
             draft, game_data, rag_context_text=ctx.rag_context_text,
             npc_states=ctx.npc_states,
         )
         user_prompt = (
-            CONFIRM_ARGS_SYSTEM + "\n\n"
+            confirm_args_system(allow_return=allow_return) + "\n\n"
             + build_confirm_args_user_prompt(
                 draft_summary=summary,
                 npc_name=self.npc_name,
                 spoken_text=spoken_text,
                 emotion=emotion,
+                allow_return=allow_return,
             )
         )
         messages = [*base_messages, {"role": "user", "content": user_prompt}]
@@ -1072,6 +1075,7 @@ class TurnOrchestrator:
         def _parse_and_clean(raw: str) -> dict[str, Any] | None:
             return self._sanitize_confirm_args(
                 parse_confirm_args(raw), get_npc=get_npc, finish_npc=finish_npc,
+                allow_return=allow_return,
             )
 
         args: dict[str, Any] | None = None
@@ -1154,17 +1158,20 @@ class TurnOrchestrator:
         *,
         get_npc: Optional[str] = None,
         finish_npc: Optional[str] = None,
+        allow_return: Optional[bool] = None,
     ) -> dict[str, Any] | None:
         """宽松归一化（不硬打回）：字符串化 + 空对话补占位，优先保住 LLM 的产出。
 
         占位说话人按场次取：接取对话用接取 NPC、完成对话用完成 NPC（都用当前 NPC 会在
-        跨 NPC 委托里把完成对话说成接取人）。回访开关宽松布尔化；为假时两组回访对话与
-        回访描述一律清空，残留给的值不保留。
+        跨 NPC 委托里把完成对话说成接取人）。回访开关宽松布尔化；不启用配对时（接取与
+        完成同一人，或开关为假）两组回访对话与回访描述一律清空，残留给的值不保留。
         """
         if not isinstance(args, dict):
             return None
         enter_npc = (get_npc or self.npc_name or "").strip() or self.npc_name
         leave_npc = (finish_npc or self.npc_name or "").strip() or self.npc_name
+        if allow_return is None:
+            allow_return = enter_npc != leave_npc
         out: dict[str, Any] = {}
         title = args.get("title")
         desc = args.get("description")
@@ -1208,7 +1215,7 @@ class TurnOrchestrator:
         out["get_dialogue"] = _dlg("get_dialogue", "这份委托就交给你了。", enter_npc)
         out["finish_dialogue"] = _dlg("finish_dialogue", "干得漂亮，报酬一分不少。", leave_npc)
 
-        flag = coerce_return_for_reward(args.get("return_for_reward"))
+        flag = allow_return and coerce_return_for_reward(args.get("return_for_reward"))
         out["return_for_reward"] = flag
         if flag:
             # 回访两组不补占位：缺内容交给校验打回，宁可不启用配对也不写半套对话

@@ -667,10 +667,30 @@ CONFIRM_ARGS_SYSTEM = (
     "严格按角色口吻撰写。输出一个 JSON 对象（不要代码块、不要解释）。字段："
     'title（任务标题，简洁）、description（任务说明，与任务内容一致）、'
     "get_dialogue（接取对话数组：发布 NPC 向玩家发布任务，可穿插玩家回应，建议 2~4 条），"
-    "finish_dialogue（完成对话数组：玩家向 NPC 交付，NPC 验收，建议 2~4 条）、"
+    "finish_dialogue（完成对话数组：玩家向 NPC 交付，NPC 验收，建议 2~4 条）。"
+    '每条格式 {"name","emotion","text"}，撰写规则：'
+    "1. text 只能是纯对话内容——**不能包含任何动作/神态/旁白描述，不能使用【】中括号或任何括号补注**；"
+    "神态一律写在 emotion 字段（从你的可用情绪中选，可为空字符串）。"
+    "emotion 逐条各填：每句话都有自己的情绪，随这段对话的推进换，不要整段共用同一个。"
+    "写入任务系统的对话会被游戏直接展示，中括号内容会被后端剥离。"
+    "2. 玩家条目 name 用 $PC，不要写死玩家名字；NPC 条目 name 用你的名字。"
+    "3. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
+    "4. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
+    "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
+)
+
+# 完成 NPC 与接取 NPC 不同时才使用：多出「回接取 NPC 领奖」这一段的字段与规则。
+# 两者相同时逐字走 CONFIRM_ARGS_SYSTEM，绝不把回访字段带进模型视野。
+CONFIRM_ARGS_PAIRING_SYSTEM = (
+    "你正在以当前扮演角色的身份，为自己刚与玩家谈妥的委托撰写发布文书。"
+    "这份委托的完成 NPC 与接取 NPC 不同。"
+    "严格按角色口吻撰写。输出一个 JSON 对象（不要代码块、不要解释）。字段："
+    'title（任务标题，简洁）、description（任务说明，与任务内容一致）、'
+    "get_dialogue（任务一接取对话数组：发布 NPC 向玩家发布任务，可穿插玩家回应，建议 2~4 条）、"
+    "finish_dialogue（任务一完成对话数组：玩家向完成 NPC 交付，完成 NPC 验收，建议 2~4 条）、"
     "return_for_reward（布尔）、return_description（回访任务说明）、"
-    "return_get_dialogue（回访接取对话数组）、"
-    "return_finish_dialogue（回访完成对话数组）。"
+    "return_get_dialogue（任务二接取对话数组）、"
+    "return_finish_dialogue（任务二完成对话数组）。"
     '每条格式 {"name","emotion","text"}，撰写规则：'
     "1. text 只能是纯对话内容——**不能包含任何动作/神态/旁白描述，不能使用【】中括号或任何括号补注**；"
     "神态一律写在 emotion 字段（从你的可用情绪中选，可为空字符串）。"
@@ -679,18 +699,30 @@ CONFIRM_ARGS_SYSTEM = (
     "2. 任何对话中，NPC 说话人必须是该场对话在场的 NPC：任务一接取对话＝接取 NPC，"
     "任务一完成对话＝完成 NPC，任务二接取对话＝完成 NPC，任务二完成对话＝接取 NPC；"
     "玩家条目 name 用 $PC，不要写死玩家名字。"
-    "3. 完成 NPC 与接取 NPC 不同时，你可以选择让玩家在任务一完成后回到接取 NPC 领取真实报酬，"
-    "用 return_for_reward 表示。"
-    "4. return_for_reward 为 true 时，必须同时给出 return_get_dialogue"
+    "3. 完成 NPC 与接取 NPC 不同时，你可以选择是否让玩家在任务一完成后回到接取 NPC 领取真实报酬，"
+    "用 return_for_reward 表示。return_for_reward 为 false 时，玩家是直接从完成 NPC 获取报酬，"
+    "只需要 get_dialogue + finish_dialogue 这两组任务对话；return_for_reward 为 true 时，"
+    "玩家是最后回到接取 NPC 获取报酬，此时需要 get_dialogue + finish_dialogue + "
+    "return_get_dialogue + return_finish_dialogue 四组任务对话，依次触发。"
+    "4. return_for_reward 为 true 时，return_description 填任务二的说明，"
+    "讲清玩家回接取 NPC 处复命领报酬；为 false 时留空。"
+    "5. return_for_reward 为 true 时，必须同时给出 return_get_dialogue"
     "（任务二在完成 NPC 处接取）和 return_finish_dialogue（任务二回到接取 NPC 处完成），"
     "两组都不能为空。"
-    "5. return_for_reward 为 true 时，return_description 填任务二的说明，"
-    "讲清玩家回接取 NPC 处复命领报酬；为 false 时留空。"
-    "6. return_for_reward 为 false 时，两组对话留空数组。"
+    "6. return_for_reward 为 false 时，return_get_dialogue 与 return_finish_dialogue "
+    "都必须留空数组。"
     "7. 对话要自然衔接上文，不要与近期发言重复，不要复用其它任务的对话文本。"
     "8. dialogue_rewrite 填这份委托是否非常关键或有长期较大影响、玩家完成后你的说话方式应当随之改变"
     "（true/false）；为 true 时在 dialogue_rewrite_instruction 里写你希望自己的对话怎么变。"
 )
+
+
+def confirm_args_system(*, allow_return: bool) -> str:
+    """按「接取 NPC 与完成 NPC 是否不同」选取 confirm 系统提示词。
+
+    相同时走单任务版（无任何回访字段），避免模型被不存在的选项误导。
+    """
+    return CONFIRM_ARGS_PAIRING_SYSTEM if allow_return else CONFIRM_ARGS_SYSTEM
 
 
 def build_confirm_args_user_prompt(
@@ -699,8 +731,12 @@ def build_confirm_args_user_prompt(
     npc_name: str,
     spoken_text: str = "",
     emotion: str = "",
+    allow_return: bool = False,
 ) -> str:
-    """confirm 参数生成（复用聊天 Agent base_messages 前缀后追加的 user 消息）。"""
+    """confirm 参数生成（复用聊天 Agent base_messages 前缀后追加的 user 消息）。
+
+    ``allow_return``＝接取 NPC 与完成 NPC 不同：只有此时字段清单才列出回访四件套。
+    """
     parts = []
     if (spoken_text or "").strip():
         parts.append(
@@ -708,10 +744,16 @@ def build_confirm_args_user_prompt(
             f"{npc_name}：{spoken_text.strip()}"
         )
     parts.append(f"【待发布任务详情】\n{draft_summary}")
-    parts.append(
-        "现在以你的身份生成发布文本 JSON（title/description/get_dialogue/finish_dialogue/"
+    fields = (
+        "title/description/get_dialogue/finish_dialogue/"
         "return_for_reward/return_description/return_get_dialogue/return_finish_dialogue/"
-        "dialogue_rewrite/dialogue_rewrite_instruction）。"
+        "dialogue_rewrite/dialogue_rewrite_instruction"
+        if allow_return else
+        "title/description/get_dialogue/finish_dialogue/"
+        "dialogue_rewrite/dialogue_rewrite_instruction"
+    )
+    parts.append(
+        f"现在以你的身份生成发布文本 JSON（{fields}）。"
         "对话中的玩家条目 name 用 $PC。"
     )
     return "\n\n".join(parts)

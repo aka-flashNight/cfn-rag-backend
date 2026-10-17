@@ -77,14 +77,19 @@ def _bad_return_args() -> dict:
     return args
 
 
-async def _run(env, responses: list[dict | str]):
+async def _run(env, responses: list[dict | str], draft: dict | None = None):
     orch = _orch(env)
     for item in responses:
         env.fake.add_chat(
             content=item if isinstance(item, str) else json.dumps(item, ensure_ascii=False),
         )
+    row = _draft_row()
+    if draft is not None:
+        row = TaskDraftRow(
+            session_id="s1", draft_id="d1", npc_name=NPC_A, draft=dict(draft),
+        )
     return await orch._generate_confirm_args(
-        env.fake, _ctx(), _draft_row(), env.game_data, base_messages=[],
+        env.fake, _ctx(), row, env.game_data, base_messages=[],
     )
 
 
@@ -263,3 +268,55 @@ async def test_cancelled_error_propagates(env):
         await orch._generate_confirm_args(
             _CancelLLM(), _ctx(), _draft_row(), env.game_data, base_messages=[],
         )
+
+
+# ---------------------------------------------------------------------------
+# 接取与完成同一人：完全回到单任务口径
+# ---------------------------------------------------------------------------
+
+SAME_NPC_DRAFT = dict(DRAFT, finish_npc=NPC_A)
+
+
+async def test_same_npc_prompt_has_no_return_fields(env):
+    """同一 NPC 时系统提示词与字段清单都不出现回访字段，避免误导模型。"""
+    await _run(env, [{
+        "title": "带话给药师",
+        "description": "把话带给药师。",
+        "get_dialogue": [{"name": NPC_A, "text": "替我把话带到。"}],
+        "finish_dialogue": [{"name": NPC_A, "text": "话我收到了。"}],
+    }], draft=SAME_NPC_DRAFT)
+
+    prompt = env.fake.chat_requests[0].messages[-1]["content"]
+    for word in ("return_for_reward", "return_description",
+                 "return_get_dialogue", "return_finish_dialogue"):
+        assert word not in prompt
+
+
+async def test_same_npc_ignores_return_output_without_retry(env):
+    """模型硬塞回访字段：静默清空、按单任务发布，不触发重试。"""
+    same_args = _valid_args()
+    same_args["finish_dialogue"] = [
+        {"name": NPC_A, "emotion": "", "text": "话我收到了。"},
+    ]
+    args, warnings = await _run(env, [same_args], draft=SAME_NPC_DRAFT)
+
+    assert args["return_for_reward"] is False
+    assert args["return_description"] == ""
+    assert args["return_get_dialogue"] == []
+    assert args["return_finish_dialogue"] == []
+    assert warnings == []
+    assert len(env.fake.chat_requests) == 1
+
+
+def test_user_prompt_lists_return_fields_only_when_allowed():
+    from services.orchestrator.prompts import build_confirm_args_user_prompt
+
+    paired = build_confirm_args_user_prompt(
+        draft_summary="x", npc_name=NPC_A, allow_return=True,
+    )
+    single = build_confirm_args_user_prompt(
+        draft_summary="x", npc_name=NPC_A, allow_return=False,
+    )
+    assert "return_get_dialogue" in paired and "return_description" in paired
+    assert "return_get_dialogue" not in single
+    assert "return_description" not in single
