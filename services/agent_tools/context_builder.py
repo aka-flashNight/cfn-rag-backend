@@ -241,6 +241,7 @@ _TASK_RULES: dict[str, str] = {
         "完成任务对话内容中是完成NPC和玩家进行对话，奖励也由完成NPC提供。"
         "适合低好感度或初次对话时使用。"
         "传话/问候任务通常要排除同场景npc，因为你可以和他们直接面对面说话。优先选择其他场景的npc。"
+        "候选里标了 same_scene 的 NPC 就在你跟前，正常情况下不要选他，除非玩家明确要求。"
     ),
     "传话": (
         "传话类任务：要求玩家去找另一个NPC对话。"
@@ -248,6 +249,7 @@ _TASK_RULES: dict[str, str] = {
         "注意，传话类任务中，完成NPC和发布NPC不同。完成NPC一定要是需要传话的NPC对象，完成任务时的对话内容也是该完成NPC和玩家对话，奖励也由完成NPC提供。"
         "奖励较少。适合推动NPC间剧情互动。"
         "传话/问候任务通常要排除同场景npc，因为你可以和他们直接面对面说话。优先选择其他场景的npc。"
+        "候选里标了 same_scene 的 NPC 就在你跟前，正常情况下不要选他，除非玩家明确要求。"
     ),
     "通关": (
         "通关类任务：要求玩家通关指定关卡。"
@@ -1421,13 +1423,21 @@ def _build_npc_list(
 
     tags, words, all_wanted = _split_npc_keywords(requirement_keywords)
     publisher_region = ""
+    publisher_scene_labels: set[str] = set()
     if current_npc:
         pub_scene = ""
         if scene_text_fn is not None and map_reg is not None:
             pub_scene = scene_text_fn(map_reg, current_npc) or ""
         publisher_region = pt.npc_region(pub_scene)
+        publisher_scene_labels = _scene_labels(pub_scene)
 
     for e in result:
+        # 同场景｢就在跟前｣：降权到本组最末并标注，派任务去跟他说话没有意义
+        e["_same_scene"] = bool(
+            not e.get("is_current")
+            and publisher_scene_labels
+            and (publisher_scene_labels & _scene_labels(str(e.get("scene") or "")))
+        )
         e["_hit_tags"] = _npc_tag_hits(
             e,
             tags=tags,
@@ -1443,7 +1453,19 @@ def _build_npc_list(
         e.pop("_region", None)
         e.pop("_has_shop", None)
         e.pop("_has_challenge", None)
+        if e.pop("_same_scene", False):
+            e["same_scene"] = True
     return picked
+
+
+def _scene_labels(scene_text: str) -> set[str]:
+    """场景文本 -> 场景显示名集合（多驻地以「、」分隔，去掉括号里的 linkage）。"""
+    out: set[str] = set()
+    for part in str(scene_text or "").split("、"):
+        label = part.split("（")[0].strip()
+        if label:
+            out.add(label)
+    return out
 
 
 def _split_npc_keywords(
@@ -1537,32 +1559,46 @@ def _pick_npc_rows_n(
     keywords: Optional[list[str]],
     cap: int = NPC_POOL_CAP,
 ) -> list[dict[str, Any]]:
-    """NPC 池抽样：口径与关卡/物品池一致。"""
+    """NPC 池抽样：口径与关卡/物品池一致，另外**同场景 NPC 降权到最末**。
+
+    同场景＝发布 NPC 抬头就能看见的人，派玩家去跟他说话没有意义，因此：
+    关键词命中项里同场景的排最后；随机补足时先跳过同场景，实在不够才用。
+    """
     if not rows:
         return []
     words = _normalize_kw_list(keywords)
     hits = [r for r in rows if (r.get("_hit_tags") or r.get("_hit_words"))]
     non_hits = [r for r in rows if not (r.get("_hit_tags") or r.get("_hit_words"))]
 
+    def _near(seq: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        far = [r for r in seq if not r.get("_same_scene")]
+        near = [r for r in seq if r.get("_same_scene")]
+        random.shuffle(far)
+        random.shuffle(near)
+        return far, near
+
     if not hits:
-        random.shuffle(non_hits)
-        for r in non_hits[:cap]:
+        far, near = _near(non_hits)
+        for r in (far + near)[:cap]:
             r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
-        return non_hits[:cap]
+        return (far + near)[:cap]
 
     for r in hits:
         r["_rank"] = _npc_rank(r, words)
     by_rank: list[dict[str, Any]] = []
     for rank in range(_RANK_OTHER + 1):
-        same = [r for r in hits if r.get("_rank") == rank]
+        same = [r for r in hits if r.get("_rank") == rank and not r.get("_same_scene")]
         random.shuffle(same)
         by_rank.extend(same)
+    # 关键词命中的同场景项也进池，但整体排在所有非同场景命中之后
+    near_hits = [r for r in hits if r.get("_same_scene")]
+    random.shuffle(near_hits)
+    by_rank.extend(near_hits)
 
     if len(hits) <= cap:
         picked = list(by_rank)
-        rest = [r for r in non_hits]
-        random.shuffle(rest)
-        picked.extend(rest[: max(0, cap - len(picked))])
+        far, near = _near([r for r in non_hits if r not in by_rank])
+        picked.extend((far + near)[: max(0, cap - len(picked))])
     else:
         top = by_rank[:POOL_TOP_BY_RANK]
         rest = by_rank[POOL_TOP_BY_RANK:]

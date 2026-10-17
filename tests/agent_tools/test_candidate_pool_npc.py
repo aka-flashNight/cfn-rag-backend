@@ -116,3 +116,35 @@ def test_blackiron_prompt_has_nearby_tag():
 def test_tag_catalog_has_no_package_tag():
     for tags in pt.ITEM_TAGS_PER_TASK.values():
         assert "礼包" not in tags
+
+
+def test_same_scene_npc_is_flagged(game_data):
+    """发布 NPC 抬眼见得到的人要标 same_scene（冷兵器商人跟 Boy 同在基地车库）。"""
+    ctx = _ctx(game_data, npc="Boy", keywords=["冷兵器商人"])
+    hit = [r for r in ctx["npc_list"] if r["name"] == "冷兵器商人"]
+    assert hit and hit[0].get("same_scene") is True
+
+
+def test_same_scene_hits_come_after_other_hits(game_data):
+    """同一组命中里，同场景的排在所有非同场景命中之后。"""
+    rows = _ctx(game_data, npc="Boy", keywords=["同阵营"])["npc_list"]
+    hit_rows = [r for r in rows if r["matched_by"] != pt.RANDOM_PICK_LABEL]
+    near = [i for i, r in enumerate(hit_rows) if r.get("same_scene")]
+    far = [i for i, r in enumerate(hit_rows) if not r.get("same_scene")]
+    if near and far:
+        assert min(near) > max(far)
+
+
+def test_same_scene_not_preferred_in_random_fill(game_data):
+    """无关键词时随机补足优先跳过同场景；真被选进来时一定带标注。"""
+    for npc in ("Boy", "Pig", "Andy Law"):
+        rows = _ctx(game_data, npc=npc)["npc_list"]
+        flagged = [r for r in rows if r.get("same_scene")]
+        assert len(flagged) <= 1, [r["name"] for r in flagged]
+
+
+def test_task_rules_mention_same_scene_demotion():
+    from services.agent_tools.context_builder import _TASK_RULES
+
+    for task_type in ("问候", "传话"):
+        assert "same_scene" in _TASK_RULES[task_type]
