@@ -182,16 +182,21 @@ def test_index_usable_across_rounds(dialogue_env, bound_slot):
 
 
 def test_edit_rejected_nothing_persisted(dialogue_env, bound_slot):
-    """编辑打回后不落盘：提交行数少于原组即整组打回，覆盖层文件不生成。"""
+    """非法行整组打回：原因带修正方向与重交提示，覆盖层文件不生成。"""
     bound_slot()
     ctx, _ = _search_then_edit_ctx(dialogue_env)
     res = edit_tool.run({"edits": [{
         "number": 1,
-        "lines": [{"name": NPC, "text": "只剩一行。"}],
+        "lines": [
+            {"name": NPC, "text": "今天炉子烧得正旺。"},
+            {"name": "旁人", "text": "替别人说话。"},
+        ],
     }]}, ctx)
     payload = json.loads(res.result_json)
     assert payload["status"] == "rejected"
-    assert any("不能删除原有信息" in r for r in payload["rejected"])
+    assert any("不在允许范围内" in r and "修正：" in r for r in payload["rejected"])
+    assert "重新提交" in payload["retry_hint"]
+    assert "不要重复提交" in payload["retry_hint"]
     dialogue_path, text_path = _override_paths(dialogue_env)
     assert not dialogue_path.exists()
     assert not text_path.exists()

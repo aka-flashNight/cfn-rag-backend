@@ -1,4 +1,4 @@
-"""DialogueRunner：对话修改子 Agent（阶段四 B4-2，三轮固定流程）。
+"""DialogueRunner：对话修改子 Agent（阶段四 B4-2，主体三轮＋一次打回重试）。
 
 轮数上限由流程定死，不靠提示词自觉（用户口径 §4.0.3）：
 
@@ -7,11 +7,15 @@
 - 第 2 轮：查询未满两次时可再查一次，也可直接调用 edit_npc_dialogues 改；
 - 查询用满两次后：查询工具与它的全部提示词一并摘除——system 整体换头成无查询
   表述的版本（``_before_round``），工具表只剩 edit_npc_dialogues；
-- 第 3 轮：只能改。
+- 第 3 轮：只能改；
+- 第 4 轮：前一轮有组被打回时才会用到，按打回原因重交一次。
 
-终态：edit 返回 status=ok（有内容落盘）即 final（changed=True）；
-edit 被打回（rejected）不终态，模型按打回原因修正后下一轮重交；
-轮限耗尽仍无落盘 → final（changed=False, exhausted=True）。
+终态：
+- 一批修改全部生效（无 rejected）即 final（changed=True）；
+- 一批里部分生效、部分打回时不终态——已生效的组保留，模型拿打回原因重交；
+- 打回只给一次重试机会：重试后仍有 rejected，则以「已落盘的组＋最终打回原因」
+  收尾，不再继续烧轮次；
+- 轮限耗尽仍无落盘 → final（changed=False, exhausted=True）。
 
 本 Runner 由全局串行 worker 驱动（services/dialogue/worker.py），
 不注册进会话级 SessionSubagents——它是完全派出去的独立链路（§4.0.1）。
@@ -41,8 +45,8 @@ _EDIT_TOOL = "edit_npc_dialogues"
 
 #: 查询次数硬上限（第 1 轮一次＋第 2 轮一次）
 MAX_SEARCH_CALLS = 2
-#: 固定三轮
-DIALOGUE_MAX_ROUNDS = 3
+#: 主体三轮（查 → 可查/改 → 只改）＋至多一次打回重试轮
+DIALOGUE_MAX_ROUNDS = 4
 
 
 class DialogueRunner(SubagentBase):
@@ -55,6 +59,11 @@ class DialogueRunner(SubagentBase):
         self._edit_only_system = edit_only_system
         self._search_used = 0
         self._system_swapped = False
+        # 跨轮累计：已生效的组不能因为下一轮只重交被打回的组而丢失
+        self._applied: list[str] = []
+        self._latest_rejected: list[str] = []
+        self._last_edit: Optional[dict[str, Any]] = None
+        self._rejection_retry_used = False
 
     # ------------------------------------------------------------------
     # 动态工具表与查询摘除（流程定死轮数，不靠提示词自觉）
@@ -104,37 +113,93 @@ class DialogueRunner(SubagentBase):
     # 终态与收尾
     # ------------------------------------------------------------------
 
-    def _terminal_payload(self, results: list[tuple[str, Any, ToolContext]]) -> Optional[dict[str, Any]]:
+    @staticmethod
+    def _collect_edit_payload(
+        results: list[tuple[str, Any, ToolContext]],
+    ) -> Optional[dict[str, list[str]]]:
+        """合并本轮所有 edit 工具结果；同批多个 edit 调用不丢任何一条。
+
+        查询工具的结果是纯文本，不是 JSON，解析失败直接跳过；只有带 status 的
+        edit 结果才计入。
+        """
+        applied: list[str] = []
+        rejected: list[str] = []
+        found = False
         for _call_id, tr, _ctx in results:
             try:
                 payload = json.loads(tr.result_json)
             except (json.JSONDecodeError, TypeError):
-                continue  # 查询工具的结果是纯文本，不是 JSON
-            if not isinstance(payload, dict):
                 continue
-            if payload.get("status") != "ok":
+            if not isinstance(payload, dict) or "status" not in payload:
                 continue
+            found = True
+            applied.extend(str(item) for item in (payload.get("applied") or []))
+            rejected.extend(str(item) for item in (payload.get("rejected") or []))
+        if not found:
+            return None
+        return {"applied": applied, "rejected": rejected}
+
+    def _edit_final_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "changed": bool(self._applied),
+            "applied": list(self._applied),
+            "rejected": list(self._latest_rejected),
+        }
+        if not self._applied and self._latest_rejected:
+            payload["note"] = "修改被打回，未落盘。"
+        return payload
+
+    def _terminal_payload(self, results: list[tuple[str, Any, ToolContext]]) -> Optional[dict[str, Any]]:
+        payload = self._collect_edit_payload(results)
+        if payload is None:
+            return None
+
+        if payload["applied"] or payload["rejected"]:
+            self._last_edit = payload
+        for item in payload["applied"]:
+            if item not in self._applied:
+                self._applied.append(item)
+        if payload["rejected"]:
+            self._latest_rejected = payload["rejected"]
+        elif payload["applied"]:
+            # 重试的组已经全部生效，旧的打回原因随之清掉
+            self._latest_rejected = []
+
+        if payload["rejected"]:
+            if not self._rejection_retry_used and self.rounds_used < self.max_rounds:
+                self._rejection_retry_used = True
+                logger.info(
+                    "DialogueRunner 修改打回（第 %d 轮）: applied=%d rejected=%d，按原因重试一次",
+                    self.rounds_used, len(self._applied), len(self._latest_rejected),
+                )
+                return None
             logger.info(
-                "DialogueRunner 修改落盘: applied=%d rejected=%d（第 %d 轮）",
-                len(payload.get("applied") or []), len(payload.get("rejected") or []),
-                self.rounds_used,
+                "DialogueRunner 修改打回且不再重试: applied=%d rejected=%d（第 %d 轮）",
+                len(self._applied), len(self._latest_rejected), self.rounds_used,
             )
-            return {
-                "changed": True,
-                "applied": payload.get("applied") or [],
-                "rejected": payload.get("rejected") or [],
-            }
+            return self._edit_final_payload()
+
+        if payload["applied"]:
+            logger.info(
+                "DialogueRunner 修改落盘: applied=%d（第 %d 轮）",
+                len(self._applied), self.rounds_used,
+            )
+            return self._edit_final_payload()
+
+        # status=noop：本次调用没有产生修改，也没有打回原因；继续等模型动作
         return None
 
     def _final_from_text(self, text: str) -> dict[str, Any]:
-        """文本收笔＝「不动」；三轮工具调用用尽仍无落盘＝exhausted。
+        """文本收笔＝「不动」；轮次用尽仍无落盘＝exhausted。
 
-        模型只要输出过文本就会 break 出工具循环，故走到这里时 text 非空即「不动」、
-        为空即最后一轮仍是（被打回的）工具调用、轮限耗尽。
+        模型只要输出过文本就会 break 出工具循环。若此前已经有过修改尝试，
+        以修改结果收尾（已落盘的组不能因为模型最后只输出一句话而丢失）。
         """
+        if self._last_edit is not None:
+            return self._edit_final_payload()
         note = (text or "").strip()
         if not note:
-            logger.warning("DialogueRunner 三轮用尽仍无落盘")
+            logger.warning("DialogueRunner 轮次用尽仍无落盘")
             return {"changed": False, "exhausted": True}
         logger.info("DialogueRunner 判断不动: %.80s", note)
         return {"changed": False, "note": note[:200]}

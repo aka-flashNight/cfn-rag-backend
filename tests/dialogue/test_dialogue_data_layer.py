@@ -4,7 +4,7 @@
 这里锁数据层自身的口径——
 
 - 跳过规则：已完成任务与 Agent 委托的任务对话都不进候选，NPC 不说话的组也不进；
-- 读的是合并后视图：改过之后再看，行数门槛按改写后的组算；
+- 读的是合并后视图：改过之后再看，删行/改行按保序对齐保留原行字段；
 - 修／加／不动三种产出；
 - 二次修改就地更新同一条目、``agent_<n>`` 按 NPC 作用域不撞；
 - 逐条校验打回（打回的那组不落盘，同批其它组照常生效）；
@@ -195,8 +195,8 @@ def test_task_dialogue_reads_merged_text_and_keeps_extra_fields(dialogue_env):
     assert [item["text"] for item in items] == ["改写过的接取话。", "路上当心。"]
 
 
-def test_line_count_guard_uses_merged_group_not_base_data(dialogue_env):
-    """行数下限按**改写后**的组算：第一次加了行，第二次少交一行就要被打回。"""
+def test_deleting_lines_is_accepted(dialogue_env):
+    """删行是合法输出：行数少于原组不再打回，按提交的行落盘。"""
     view = _view(dialogue_env)
     editor = _daily_editor(view)
     first = editor.apply(npc=NPC, edits=[_edit(1, [
@@ -207,10 +207,70 @@ def test_line_count_guard_uses_merged_group_not_base_data(dialogue_env):
     # 换一个视图实例（模拟下一次委派重新读盘）：此时该组已有 3 行
     again = _daily_editor(_view(dialogue_env))
     second = again.apply(npc=NPC, edits=[_edit(1, [
-        _say("今天炉子烧得正旺。"), _say("给我打把刀。", PLAYER_NAME),
+        _say("今天炉子烧得正旺。"),
     ])])
-    assert second.changed is False
-    assert any("提交 2 行少于原有 3 行" in text for text in second.rejected)
+    assert second.changed is True and second.rejected == []
+    dialogue_path, _ = _paths(dialogue_env)
+    entry = overlay.load_overrides(dialogue_path)[0]
+    assert [line.text for line in entry.lines] == ["今天炉子烧得正旺。"]
+
+
+def test_deleted_middle_line_keeps_extra_fields_on_the_right_line(dialogue_env):
+    """删掉前一行后，后一行的附加字段（插图）必须跟着真正的原行走，不能错位。"""
+    _write_overlays(dialogue_env, None, {
+        "$MAIN_GET_1": [
+            {"name": NPC, "title": NPC, "char": NPC, "text": "先坐下喝一杯。"},
+            {
+                "name": NPC, "title": NPC, "char": NPC,
+                "text": "龙鳞记得带来。", "imageurl": "art/quest1.png",
+            },
+        ],
+    })
+    view = _view(dialogue_env)
+    selection = view.select(NPC, ["task_all"])
+    entry = next(e for e in selection.index_entries() if e["key"] == "$MAIN_GET_1")
+    outcome = DialogueEditor(view, selection.index_entries()).apply(
+        npc=NPC, edits=[_edit(entry["number"], [_say("龙鳞记得带回来。")])],
+    )
+    assert outcome.wrote_task_text is True and outcome.rejected == []
+
+    _, text_path = _paths(dialogue_env)
+    items = text_overlay.load_task_text_overrides(text_path)["$MAIN_GET_1"]
+    assert len(items) == 1
+    assert items[0]["text"] == "龙鳞记得带回来。"
+    assert items[0]["imageurl"] == "art/quest1.png"
+
+
+def test_normalized_speaker_still_matches_origin_for_extra_fields(dialogue_env):
+    """先归一化再对齐：玩家写成「玩家」、NPC 省略说话人时，原行附加字段仍跟着走。"""
+    _write_overlays(dialogue_env, None, {
+        "$MAIN_GET_1": [
+            {
+                "name": PLAYER_NAME, "title": PLAYER_TITLE, "char": PLAYER_CHAR,
+                "text": "龙鳞我带来了。", "imageurl": "art/player.png",
+            },
+            {
+                "name": NPC, "title": NPC, "char": NPC,
+                "text": "放桌上吧。", "imageurl": "art/npc.png",
+            },
+        ],
+    })
+    view = _view(dialogue_env)
+    selection = view.select(NPC, ["task_all"])
+    entry = next(e for e in selection.index_entries() if e["key"] == "$MAIN_GET_1")
+    outcome = DialogueEditor(view, selection.index_entries()).apply(
+        npc=NPC,
+        edits=[_edit(entry["number"], [
+            {"name": "玩家", "text": "龙鳞我带来了。"},
+            {"name": "", "text": "放桌上吧。"},
+        ])],
+    )
+    assert outcome.rejected == []
+
+    _, text_path = _paths(dialogue_env)
+    items = text_overlay.load_task_text_overrides(text_path)["$MAIN_GET_1"]
+    assert [item["name"] for item in items] == [PLAYER_NAME, NPC]
+    assert [item.get("imageurl") for item in items] == ["art/player.png", "art/npc.png"]
 
 
 # ---------------------------------------------------------------------------
@@ -456,20 +516,22 @@ def test_group_level_rejections(dialogue_env):
 
 
 def test_line_level_rejections(dialogue_env):
-    """逐行校验：超长台词整组打回；空白文本行在入口就被丢掉，表现为「少了一行」。"""
+    """逐行校验：超长/空台词整组打回，并给出具体行号与修正方向。"""
     view = _view(dialogue_env)
 
     long_text = _rejected_text(view, [_edit(1, [
         _say("很长" * MAX_LINE_TEXT_CHARS), _say("给我打把刀。", PLAYER_NAME),
     ])])
     assert f"超过上限 {MAX_LINE_TEXT_CHARS} 字" in long_text and "第 1 行" in long_text
+    assert "修正：" in long_text
 
-    # 全空＝等于没提交
-    assert "没有提交任何台词" in _rejected_text(view, [_edit(1, [_say(""), _say("   ")])])
-
-    # 空 text 项由入口过滤（DialogueLine 不允许空台词），故落到行数下限这条打回上
+    # 空 text 不再在入口被静默丢掉：明确指到行号打回
     blank = _rejected_text(view, [_edit(1, [_say(""), _say("今天炉子烧得正旺。")])])
-    assert "少于原有 2 行" in blank
+    assert "第 1 行台词为空" in blank
+    assert "修正：" in blank
+
+    # 整组都是空行时同样指到第一行，而不是含糊的「没有提交任何台词」
+    assert "第 1 行台词为空" in _rejected_text(view, [_edit(1, [_say(""), _say("   ")])])
 
 
 def test_unknown_or_stale_numbers(dialogue_env):

@@ -1,9 +1,9 @@
-"""DialogueRunner 三轮固定流程测试（阶段四 B4-2）。
+"""DialogueRunner 流程测试（阶段四 B4-2）。
 
-覆盖：三轮工具表逐轮收窄、查询用满后换头且 system 无查询残留、
-判断不动即结束、编辑打回后的修正轮、角色扮演资料（说话方式／脑补禁令进 system，
-聊天专用的输出协议不进）、提示词纯净（edit-only 版无查询表述、
-委派材料空块不出现）。
+覆盖：主体三轮工具表逐轮收窄、查询用满后换头且 system 无查询残留、
+判断不动即结束、编辑打回后的重试轮（含部分成功不终态、两次查询后仍有重试轮）、
+角色扮演资料（说话方式／脑补禁令进 system，聊天专用的输出协议不进）、
+提示词纯净（edit-only 版无查询表述、委派材料空块不出现）。
 """
 
 from __future__ import annotations
@@ -113,15 +113,18 @@ async def test_no_change_decision_ends_run(dialogue_env, bound_slot):
 
 
 async def test_rejected_edit_fixed_next_round(dialogue_env, bound_slot):
-    """编辑打回后的修正轮：第 2 轮被打回不落盘，第 3 轮修正重交后落盘。"""
+    """编辑打回后的重试轮：第 2 轮非法说话人被打回，第 3 轮按原因修正后落盘。"""
     bound_slot()
     fake = FakeLLM()
     fake.add_chat(tool_calls=[tc("search_npc_dialogues", {"scopes": ["daily_all"]}, "c1")])
-    # 第 2 轮：提交行数少于原组 → 打回
+    # 第 2 轮：越界说话人 → 整组打回（原因里带修正方向）
     fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
-        "edits": [{"number": 1, "lines": [{"name": NPC, "text": "只剩一句。"}]}],
+        "edits": [{"number": 1, "lines": [
+            {"name": NPC, "text": "今天炉子烧得正旺。"},
+            {"name": "旁人", "text": "只剩一句。"},
+        ]}],
     }, "c2")])
-    # 第 3 轮：按打回原因补齐原行后重交
+    # 第 3 轮：按打回原因修正后重交
     fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
         "edits": [{"number": 1, "lines": _FULL_EDIT_LINES}],
     }, "c3")])
@@ -130,22 +133,125 @@ async def test_rejected_edit_fixed_next_round(dialogue_env, bound_slot):
     event = await handle.wait_final(timeout=5)
     assert event.kind == "final"
     assert event.payload["changed"] is True
+    assert event.payload["rejected"] == []
 
     reqs = fake.chat_requests
     assert len(reqs) == 3
     # 第 2 轮查询仅用 1 次，仍可同时查/改；第 3 轮只能改
     assert _tool_names(reqs[1]) == ["search_npc_dialogues", "edit_npc_dialogues"]
     assert _tool_names(reqs[2]) == ["edit_npc_dialogues"]
-    # 第 2 轮工具结果里是打回原因原文（模型据此修正）
+    # 第 2 轮工具结果里是打回原因原文＋修正方向＋重交提示（模型据此修正）
     tool_msgs = [m for m in reqs[2].messages if m.get("role") == "tool"]
     rejected_payload = json.loads(tool_msgs[-1]["content"])
     assert rejected_payload["status"] == "rejected"
-    assert any("不能删除原有信息" in r for r in rejected_payload["rejected"])
+    assert any(
+        "不在允许范围内" in r and "修正：" in r for r in rejected_payload["rejected"]
+    )
+    assert "重新提交" in rejected_payload["retry_hint"]
     # 第 3 轮 system 已换头（第 3 轮不再下发查询工具，提示词同步摘除）
     assert "search_npc_dialogues" not in reqs[2].messages[0]["content"]
 
     dialogue_path, _ = agent_save_override_paths(dialogue_env.data_root, SLOT)
     assert len(load_overrides(dialogue_path)) == 1
+
+
+async def test_partial_success_does_not_end_run(dialogue_env, bound_slot):
+    """一批里一组生效、一组打回：不能就地终态，必须让模型带着原因重试。"""
+    bound_slot()
+    fake = FakeLLM()
+    fake.add_chat(tool_calls=[tc("search_npc_dialogues", {"scopes": ["daily_all"]}, "c1")])
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
+        "edits": [
+            {"number": 1, "lines": _FULL_EDIT_LINES},
+            {"number": 2, "lines": [{"name": "旁人", "text": "越界的说话人。"}]},
+        ],
+    }, "c2")])
+    # 第 3 轮只重交被打回的编号 2
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
+        "edits": [{"number": 2, "lines": [{"name": NPC, "text": "龙鳞那事我记下了。"}]}],
+    }, "c3")])
+
+    handle = _launch(fake, _registry(), dialogue_env.game_data)
+    event = await handle.wait_final(timeout=5)
+    assert event.kind == "final"
+    assert event.payload["changed"] is True
+    assert event.payload["rejected"] == []
+    # 第 2 轮已生效的组不会因为第 3 轮只重交编号 2 而丢失
+    assert len(event.payload["applied"]) == 2
+    assert len(fake.chat_requests) == 3
+
+    dialogue_path, _ = agent_save_override_paths(dialogue_env.data_root, SLOT)
+    entries = {entry.group_id: entry for entry in load_overrides(dialogue_path)}
+    assert set(entries) == {"1", "2"}
+    assert entries["2"].lines[0].text == "龙鳞那事我记下了。"
+
+
+async def test_rejection_after_two_searches_gets_retry_round(dialogue_env, bound_slot):
+    """两次查询用满后在第三轮才改、且被打回：仍有第四轮按原因重试。"""
+    bound_slot()
+    fake = FakeLLM()
+    fake.add_chat(tool_calls=[tc("search_npc_dialogues", {"scopes": ["daily_all"]}, "c1")])
+    fake.add_chat(tool_calls=[tc("search_npc_dialogues", {
+        "scopes": ["keyword"], "keywords": ["龙鳞"],
+    }, "c2")])
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
+        "edits": [{"number": 1, "lines": [
+            {"name": NPC, "text": "今天炉子烧得正旺。"},
+            {"name": "旁人", "text": "越界的说话人。"},
+        ]}],
+    }, "c3")])
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
+        "edits": [{"number": 1, "lines": _FULL_EDIT_LINES}],
+    }, "c4")])
+
+    handle = _launch(fake, _registry(), dialogue_env.game_data)
+    event = await handle.wait_final(timeout=5)
+    assert event.kind == "final"
+    assert event.payload["changed"] is True
+
+    reqs = fake.chat_requests
+    assert len(reqs) == 4
+    # 第 4 轮仍只有修改工具（重试轮不恢复查询）
+    assert _tool_names(reqs[3]) == ["edit_npc_dialogues"]
+    assert "search_npc_dialogues" not in reqs[3].messages[0]["content"]
+
+
+async def test_partial_success_then_text_keeps_applied(dialogue_env, bound_slot):
+    """部分成功后模型直接收笔：以已落盘结果收尾，不能退回「不动」。"""
+    bound_slot()
+    fake = FakeLLM()
+    fake.add_chat(tool_calls=[tc("search_npc_dialogues", {"scopes": ["daily_all"]}, "c1")])
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {
+        "edits": [
+            {"number": 1, "lines": _FULL_EDIT_LINES},
+            {"number": 2, "lines": [{"name": "旁人", "text": "越界的说话人。"}]},
+        ],
+    }, "c2")])
+    fake.add_chat(content="编号 2 我改不了，先这样。")
+
+    handle = _launch(fake, _registry(), dialogue_env.game_data)
+    event = await handle.wait_final(timeout=5)
+    assert event.kind == "final"
+    assert event.payload["changed"] is True
+    assert len(event.payload["applied"]) == 1
+    assert event.payload["rejected"] and "编号 2" in event.payload["rejected"][0]
+    assert len(fake.chat_requests) == 3
+
+
+async def test_noop_edit_then_text_is_plain_no_change(dialogue_env, bound_slot):
+    """空提交（status=noop）不算修改尝试：随后收笔仍按「不动」收尾。"""
+    bound_slot()
+    fake = FakeLLM()
+    fake.add_chat(tool_calls=[tc("search_npc_dialogues", {"scopes": ["daily_all"]}, "c1")])
+    fake.add_chat(tool_calls=[tc("edit_npc_dialogues", {"edits": []}, "c2")])
+    fake.add_chat(content="这些对话都不用改。")
+
+    handle = _launch(fake, _registry(), dialogue_env.game_data)
+    event = await handle.wait_final(timeout=5)
+    assert event.kind == "final"
+    assert event.payload["changed"] is False
+    assert "都不用改" in event.payload["note"]
+    assert "applied" not in event.payload
 
 
 def test_edit_only_system_has_no_search_wording():

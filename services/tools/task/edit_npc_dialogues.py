@@ -41,7 +41,8 @@ class EditNpcDialoguesTool(BaseTool):
         "- 每行填说话人 name 与台词 text，情绪可选填 emotion；\n"
         "- 任务对话只能在本组内改台词、在组尾加台词，不能新增组；"
         "日常对话除改已有组外，可以用 new_groups 直接新增一组；\n"
-        "- 修改被打回时结果里会给出原因，按原因修正后重新提交。"
+        "- 修改被打回时结果里会逐条给出原因和修正方向；修正后重新提交一次，"
+        "仍不合法的组不会落盘。"
     )
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -107,6 +108,11 @@ class EditNpcDialoguesTool(BaseTool):
             "applied": outcome.applied,
             "rejected": outcome.rejected,
         }
+        if outcome.rejected:
+            payload["retry_hint"] = (
+                "打回的组未落盘。请按 rejected 里每条的原因与「修正」方向改正后，"
+                "重新提交这些组；已 applied 的组已经生效，不要重复提交。"
+            )
         return ToolResult(result_json=json.dumps(payload, ensure_ascii=False))
 
 

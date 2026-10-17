@@ -54,11 +54,12 @@ from services.subagents.dialogue_runner import DialogueRunner
 
 logger = logging.getLogger(__name__)
 
-#: 单条委派的总时限：三轮 × 每轮 300 秒。口径依据＝LLM 层单次调用最坏合法耗时
-#: ≈241 秒（`httpx` 读超时 120 秒 + 网络错误退避重试一次 120 秒），本流程的输出天然长
-#: （查询一轮可回灌上万字符，修改一轮要把整组台词原样抄回），故 300 秒不是保险丝而是
-#: 会被正常慢响应撞开的量级；900 秒内仍未拿到终态＝真出问题，此时才放弃。
-DIALOGUE_JOB_TIMEOUT_S = 900
+#: 单条委派的总时限：主体三轮＋一次打回重试（最多四轮）× 每轮 300 秒。
+#: 口径依据＝LLM 层单次调用最坏合法耗时≈241 秒（`httpx` 读超时 120 秒 + 网络错误
+#: 退避重试一次 120 秒），本流程的输出天然长（查询一轮可回灌上万字符，修改一轮要把
+#: 整组台词原样抄回），故 300 秒不是保险丝而是会被正常慢响应撞开的量级；
+#: 1200 秒内仍未拿到终态＝真出问题，此时才放弃。
+DIALOGUE_JOB_TIMEOUT_S = 1200
 _QUEUE_MAX_SIZE = 16
 
 
@@ -344,7 +345,7 @@ class DialogueWorker:
             slot_key=job.slot_key,
         )
         # 任何退出路径都必须收掉子 Agent 任务：总时限触发时本协程是被取消的一方，
-        # finally 照样执行。否则孤儿会在「已放弃本次」之后继续跑完三轮并落盘，
+        # finally 照样执行。否则孤儿会在「已放弃本次」之后继续跑完整条流程并落盘，
         # 同时 running 标志已复位＝串行上限与注册闸两个口径一起被打穿。
         try:
             event = await handle.wait_final(timeout=DIALOGUE_JOB_TIMEOUT_S)
@@ -367,7 +368,7 @@ class DialogueWorker:
             return
         note = str(event.payload.get("note") or "").strip()
         if event.payload.get("exhausted"):
-            note = note or "三轮用尽仍无落盘"
+            note = note or "轮次用尽仍无落盘"
         logger.info("对话修改子 Agent 判断不动: npc=%s %.80s", job.npc_name, note)
         await _set_status(job.job_id, DIALOGUE_JOB_SKIPPED, detail=note or "子 Agent 判断不需要改")
 
