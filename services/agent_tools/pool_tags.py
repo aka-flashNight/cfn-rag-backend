@@ -131,12 +131,18 @@ AREA_DEFAULT_FACTION: dict[str, str] = {
     "基地车库": FACTION_BANDIT,          # 混战区，名字规则优先，兜底算盗贼
     "基地房顶": FACTION_WARLORD,
     "黑铁会总部": FACTION_BLACKIRON,
-    "地下2层": FACTION_SKYNET,
+    "地下2层": FACTION_NOAH,             # 没有名字线索的算诺亚，天网只认「禁区/终结者」
     "诺亚前线基地深处": FACTION_NOAH,
     "雪山": FACTION_NOAH,
     "试炼场深处": NO_FACTION,
     "副本任务": NO_FACTION,              # 跨区，不标势力
 }
+
+#: 名字命中这些词就判无主（用户点名的「魔神副本」＝锡蒙利/菲尼克斯的 Lv10、Lv16 四关）
+STAGE_NO_FACTION_KEYWORDS: tuple[str, ...] = (
+    "锡蒙利",
+    "菲尼克斯",
+)
 
 #: 混战区第二势力（给候选行的 enemies 补第二个标签）
 AREA_SECOND_FACTION: dict[str, str] = {
@@ -151,9 +157,9 @@ STAGE_NAME_FACTION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("下水道",), FACTION_ZOMBIE),
     (("盗", "贼", "寇"), FACTION_BANDIT),
     (("军阀",), FACTION_WARLORD),
-    (("诺亚",), FACTION_NOAH),
+    (("禁区", "终结者"), FACTION_SKYNET),
     (("僵尸",), FACTION_ZOMBIE),
-    (("终结者",), FACTION_SKYNET),
+    (("诺亚",), FACTION_NOAH),
     (("大学",), FACTION_UNIVERSITY),
 )
 
@@ -186,8 +192,10 @@ DIPLOMATIC_STAGE_TYPE = "外交地图"
 
 
 def stage_faction(area: str, stage_name: str) -> str:
-    """关卡的势力归属：先看关卡名，再看区域默认。"""
+    """关卡的势力归属：先看无主特例，再看关卡名，最后看区域默认。"""
     name = stage_name or ""
+    if any(w in name for w in STAGE_NO_FACTION_KEYWORDS):
+        return NO_FACTION
     for words, faction in STAGE_NAME_FACTION_RULES:
         if any(w in name for w in words):
             return faction
@@ -381,3 +389,150 @@ def normalize_tag(raw: str, available: Iterable[str]) -> Optional[str]:
 def is_diplomatic_stage(stage_info: Any) -> bool:
     """中立外交地图不是可攻打关卡。"""
     return str(getattr(stage_info, "type", "") or "") == DIPLOMATIC_STAGE_TYPE
+
+
+# ---------------------------------------------------------------------------
+# 物品标签的判定口径
+# ---------------------------------------------------------------------------
+
+#: 防具部位（等于 item.use）
+ARMOR_SLOTS: frozenset[str] = frozenset({
+    "头部装备", "上装装备", "下装装备", "脚部装备", "颈部装备", "手部装备",
+})
+
+#: 武器细类（可能落在 item.use 或 item.weapontype）
+WEAPON_SUBTYPES: frozenset[str] = frozenset({
+    "刀", "长枪", "手枪", "大威力手枪", "突击步枪", "冲锋枪", "霰弹枪",
+    "狙击步枪", "战斗步枪", "机枪", "发射器", "反器材武器", "特殊",
+})
+
+#: 「贵重」的单价门槛（与特殊物品的合成门槛同口径）
+VALUABLE_PRICE_THRESHOLD = 1000
+
+#: 每类任务开放哪些物品标签（只放真能命中东西的：资源收集的池是核心任务池，
+#: 实测里面没有食材/手雷，故不注册这两个标签）
+ITEM_TAGS_PER_TASK: dict[str, tuple[str, ...]] = {
+    "资源收集": ("药剂", "材料", "弹夹"),
+    "装备缴纳": ("武器", "防具") + tuple(sorted(ARMOR_SLOTS)) + tuple(sorted(WEAPON_SUBTYPES)),
+    "特殊物品获取": ("药剂", "酒水", "食品", "食材", "手雷", "情报", "插件", "材料", "贵重"),
+    "物品持有": ("情报", "插件", "食品", "药剂", "材料", "贵重"),
+    "通关并收集": ("食材", "药剂", "材料", "弹夹", "情报"),
+    "通关并持有": ("食材", "药剂", "材料", "弹夹", "情报"),
+}
+
+_LIQUOR_CACHE_ATTR = "_pool_liquor_cache"
+
+
+def liquor_names(game_data: Any) -> frozenset[str]:
+    """酒水 = 「调酒」配方产物 ∪ 商店在售且名字含「酒」的物品。
+
+    游戏仓库会持续加调酒配方，故按数据现算而非写死清单；结果缓存在注册表实例上。
+    """
+    cached = getattr(game_data, _LIQUOR_CACHE_ATTR, None)
+    if isinstance(cached, frozenset):
+        return cached
+    names: set[str] = set()
+    crafting = getattr(game_data, "crafting", None)
+    for recipe in getattr(crafting, "_recipes", []) or []:
+        if str(getattr(recipe, "source", "") or "").strip() == "调酒":
+            name = str(getattr(recipe, "name", "") or "")
+            if name:
+                names.add(name)
+    shops = getattr(game_data, "shops", None)
+    for npc in getattr(shops, "_shops", {}) or {}:
+        try:
+            goods = shops.get_npc_shop(npc) or []
+        except Exception:  # pragma: no cover
+            continue
+        for item_name in goods:
+            if "酒" in str(item_name or ""):
+                names.add(str(item_name))
+    frozen = frozenset(names)
+    try:
+        setattr(game_data, _LIQUOR_CACHE_ATTR, frozen)
+    except Exception:  # pragma: no cover
+        pass
+    return frozen
+
+
+def item_tag_matches(
+    tag: str,
+    *,
+    name: str,
+    item: Any,
+    price: int = 0,
+    is_plugin: bool = False,
+    liquor: frozenset[str] = frozenset(),
+) -> bool:
+    """单件物品是否命中某个物品标签。"""
+    typ = str(getattr(item, "type", "") or "")
+    use = str(getattr(item, "use", "") or "")
+    wpn = str(getattr(item, "weapontype", "") or "")
+
+    if tag == "武器":
+        return typ == "武器"
+    if tag == "防具":
+        return typ == "防具"
+    if tag in ARMOR_SLOTS:
+        return use == tag
+    if tag in WEAPON_SUBTYPES:
+        return use == tag or wpn == tag
+    if tag == "药剂":
+        return (use == "药剂" or typ == "药剂") and name not in liquor
+    if tag == "酒水":
+        return name in liquor
+    if tag == "食品":
+        return use == "食品" or typ == "食品"
+    if tag == "食材":
+        return use == "食材" or typ == "食材"
+    if tag == "材料":
+        return use == "材料" or typ == "材料" or typ == "收集品"
+    if tag == "弹夹":
+        return use == "弹夹"
+    if tag == "手雷":
+        return use == "手雷"
+    if tag == "情报":
+        return use == "情报" or typ == "情报"
+    if tag == "插件":
+        return bool(is_plugin)
+    if tag == "贵重":
+        return int(price or 0) >= VALUABLE_PRICE_THRESHOLD
+    return False
+
+
+# ---------------------------------------------------------------------------
+# NPC 大区域（「同区域 / 跨区域」用；场景标签 -> 大区域）
+# ---------------------------------------------------------------------------
+
+#: 场景显示名（`npc_scene_text` 里「（」之前那段）-> 大区域
+SCENE_REGION: dict[str, str] = {
+    "基地大厅": "基地", "医务室": "基地", "地下一层": "基地", "基地屋顶": "基地",
+    "基地车库": "基地", "武器库": "基地", "佣兵酒吧": "基地", "靶场": "基地",
+    "食堂": "基地",
+    "堕落城酒吧": "堕落城", "堕落城商业街": "堕落城", "黑铁阁": "堕落城",
+    "黑铁会修炼场": "堕落城", "摇滚公园": "堕落城", "联合大学": "堕落城",
+    "大学内部": "堕落城", "大学地下工坊": "堕落城", "教学楼内部": "堕落城",
+    "教学楼办公室": "堕落城", "文科教室": "堕落城", "理科教室": "堕落城",
+    "剑道社": "堕落城",
+    "第一防线": "废城",
+    "军阀基地": "荒漠", "军阀帐篷": "荒漠",
+    "同盟通路": "诺亚前线", "同盟卸货站": "诺亚前线", "幸存者营地": "诺亚前线",
+    "彩蛋地图": "彩蛋",
+}
+
+
+def scene_region(scene_text: str) -> str:
+    """从场景文本（可能多驻地用「、」连接）取第一个可识别的大区域。"""
+    text = str(scene_text or "")
+    if not text:
+        return ""
+    for part in text.split("、"):
+        label = part.split("（")[0].strip()
+        region = SCENE_REGION.get(label)
+        if region:
+            return region
+    return ""
+
+
+def npc_region(scene_text: str) -> str:
+    return scene_region(scene_text)

@@ -1527,6 +1527,151 @@ def _build_challenge_targets(
 _COLLECTABLE_MAX_ITEMS = 20
 
 
+# ---------------------------------------------------------------------------
+# 物品池通用抽选（关键词池 + 随机池，上限 10）
+# ---------------------------------------------------------------------------
+
+ITEM_POOL_CAP = 10
+
+
+def _split_item_keywords(
+    task_type: str, requirement_keywords: Optional[list[str]],
+) -> tuple[list[str], list[str], list[str]]:
+    """把物品关键词拆成（有效标签, 自由词, 全部请求词）。"""
+    wanted = _normalize_kw_list(requirement_keywords)
+    if not wanted:
+        return [], [], []
+    available = pt.ITEM_TAGS_PER_TASK.get(task_type, ())
+    tags: list[str] = []
+    words: list[str] = []
+    for raw in wanted:
+        tag = pt.normalize_tag(raw, available)
+        if tag:
+            if tag not in tags:
+                tags.append(tag)
+        else:
+            words.append(raw)
+    return tags, words, wanted
+
+
+def _item_hit_tags(
+    entry: dict[str, Any],
+    *,
+    tags: list[str],
+    game_data: GameDataRegistry,
+) -> list[str]:
+    if not tags:
+        return []
+    name = str(entry.get("name") or "")
+    item = game_data.items.get_by_name(name)
+    is_plugin = bool(game_data.equipment_mods.is_plugin(name)) if name else False
+    liquor = pt.liquor_names(game_data)
+    price = int(entry.get("price") or 0)
+    return [
+        t for t in tags
+        if pt.item_tag_matches(
+            t, name=name, item=item, price=price,
+            is_plugin=is_plugin, liquor=liquor,
+        )
+    ]
+
+
+def _item_word_hits(
+    entry: dict[str, Any],
+    *,
+    words: list[str],
+    game_data: GameDataRegistry,
+) -> list[str]:
+    """自由词：名称/称呼/类型/用途/来源 子串（原有逻辑，仅补 displayname 与实际名称）。"""
+    if not words:
+        return []
+    item = game_data.items.get_by_name(str(entry.get("name") or ""))
+    display = str(getattr(item, "displayname", "") or "") if item is not None else ""
+    blob = "".join([
+        str(entry.get("name") or ""),
+        display,
+        str(entry.get("type") or ""),
+        str(entry.get("source") or ""),
+        str(getattr(item, "use", "") or "") if item is not None else "",
+    ])
+    return [w for w in words if w in blob]
+
+
+def _item_rank(entry: dict[str, Any], words: list[str], *, display: str = "") -> int:
+    """名称（含 displayname）全等 > 名称包含 > 标签 > 类型/来源包含。"""
+    name = str(entry.get("name") or "")
+    names = [name] + ([display] if display else [])
+    for w in words:
+        if w in names:
+            return _RANK_NAME_EXACT
+    for w in words:
+        if any(w and w in n for n in names):
+            return _RANK_NAME_CONTAINS
+    if entry.get("_hit_tags"):
+        return _RANK_TAG
+    return _RANK_DESC
+
+
+def _pick_item_rows_n(
+    rows: list[dict[str, Any]],
+    *,
+    keywords: Optional[list[str]],
+    game_data: Optional[GameDataRegistry] = None,
+    cap: int = ITEM_POOL_CAP,
+) -> list[dict[str, Any]]:
+    """物品池抽样（口径与关卡池一致）：命中全进、超额留 5 随机补、不足随机补足。"""
+    if not rows:
+        return []
+    words = _normalize_kw_list(keywords)
+    hits = [r for r in rows if (r.get("_hit_tags") or r.get("_hit_words"))]
+    non_hits = [r for r in rows if not (r.get("_hit_tags") or r.get("_hit_words"))]
+
+    if not hits:
+        random.shuffle(non_hits)
+        for r in non_hits[:cap]:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+        return non_hits[:cap]
+
+    for r in hits:
+        display = ""
+        if game_data is not None:
+            item = game_data.items.get_by_name(str(r.get("name") or ""))
+            display = str(getattr(item, "displayname", "") or "") if item is not None else ""
+        r["_rank"] = _item_rank(r, words, display=display)
+
+    by_rank: list[dict[str, Any]] = []
+    for rank in range(_RANK_OTHER + 1):
+        same = [r for r in hits if r.get("_rank") == rank]
+        random.shuffle(same)
+        by_rank.extend(same)
+
+    if len(hits) <= cap:
+        picked = list(by_rank)
+        rest = [r for r in non_hits if r not in picked]
+        random.shuffle(rest)
+        picked.extend(rest[: max(0, cap - len(picked))])
+    else:
+        top = by_rank[:POOL_TOP_BY_RANK]
+        rest = by_rank[POOL_TOP_BY_RANK:]
+        random.shuffle(rest)
+        picked = top + rest[: max(0, cap - len(top))]
+
+    for r in picked:
+        if r in hits:
+            r[pt.MATCHED_BY_FIELD] = (r.get("_hit_tags") or r.get("_hit_words"))[0]
+        else:
+            r[pt.MATCHED_BY_FIELD] = pt.RANDOM_PICK_LABEL
+    return picked[:cap]
+
+
+def _strip_pool_marks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """去掉内部用字段（下划线开头），保留 matched_by 等对外字段。"""
+    for r in rows:
+        for k in [k for k in r if k.startswith("_")]:
+            r.pop(k, None)
+    return rows
+
+
 def _collectable_entry_for_name(
     item_name: str,
     *,
@@ -1566,13 +1711,15 @@ def _build_collectable_items(
     max_level: int,
     base_max: int,
     requirement_keywords: Optional[list[str]] = None,
+    *,
+    task_type: str = "资源收集",
 ) -> list[dict[str, Any]]:
     """资源收集类：食材/药剂/材料/弹夹，且在现有任务物品池中。"""
     item_registry = game_data.items
     task_registry = game_data.tasks
     mercenary_registry = game_data.mercenary_tasks
     equipment_mods = game_data.equipment_mods
-    keywords = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_item_keywords(task_type, requirement_keywords)
 
     allowed_uses = {"食材", "药剂", "材料", "弹夹"}
     pool = task_registry.list_core_submit_items() | task_registry.list_core_reward_item_names()  # 核心池
@@ -1633,37 +1780,15 @@ def _build_collectable_items(
             candidates.append(entry)
             seen.add(item_name)
 
-    if keywords:
-        b0, b1, b2, b3 = [], [], [], []
-        for e in candidates:
-            it = item_registry.get_by_name(e.get("name") or "")
-            km = _entry_matches_item_keywords(e, it, equipment_mods, keywords)
-            fo = bool(e.get("_from_ordered"))
-            if km and fo:
-                b0.append(e)
-            elif km and not fo:
-                b1.append(e)
-            elif not km and fo:
-                b2.append(e)
-            else:
-                b3.append(e)
-        ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
-    else:
-        fo_yes = [e for e in candidates if e.get("_from_ordered")]
-        fo_no = [e for e in candidates if not e.get("_from_ordered")]
-        ordered = _shuffle_each_bucket_concat([fo_yes, fo_no])
-
-    result: list[dict[str, Any]] = []
-    for e in ordered:
+    # 单价过滤在前：候选池只按「单件」对照任务规则（单价不超基础奖励 200%），不累加总价
+    candidates = [e for e in candidates if (e.get("price") or 0) <= price_cap]
+    for e in candidates:
         e.pop("_from_ordered", None)
-        if len(result) >= _COLLECTABLE_MAX_ITEMS:
-            break
-        p = e.get("price") or 0
-        # 候选项池只按「单件」对照任务规则（提交品单价不超过基础奖励 200%），不累加列表总价。
-        if p > price_cap:
-            continue
-        result.append(e)
-    return result
+        e["_hit_tags"] = _item_hit_tags(e, tags=tags, game_data=game_data)
+        e["_hit_words"] = _item_word_hits(e, words=words, game_data=game_data)
+
+    picked = _pick_item_rows_n(candidates, keywords=all_wanted, game_data=game_data)
+    return _strip_pool_marks(picked)
 
 
 _EQUIPMENT_ITEMS_MAX_COUNT = 20
@@ -1706,7 +1831,7 @@ def _build_equipment_items(
     crafting_registry = game_data.crafting
     kshop_registry = game_data.kshop
     equipment_mods = game_data.equipment_mods
-    keywords = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_item_keywords('装备缴纳', requirement_keywords)
 
     equipment_types = {"武器", "防具"}
     result: list[dict[str, Any]] = []
@@ -1774,42 +1899,12 @@ def _build_equipment_items(
             "source": "K点商店",
         })
 
-    max_total = _EQUIPMENT_ITEMS_MAX_COUNT
-    matched: list[dict[str, Any]] = []
-    if keywords:
-        for e in result:
-            it = item_registry.get_by_name(e.get("name") or "")
-            if _entry_matches_item_keywords(e, it, equipment_mods, keywords):
-                matched.append(e)
+    for e in result:
+        e["_hit_tags"] = _item_hit_tags(e, tags=tags, game_data=game_data)
+        e["_hit_words"] = _item_word_hits(e, words=words, game_data=game_data)
 
-    matched_names = {e.get("name") for e in matched}
-    unmatched = [e for e in result if e.get("name") not in matched_names]
-
-    synth_u, shop_u, k_u = _partition_special_by_source(unmatched)
-    random.shuffle(synth_u)
-    random.shuffle(shop_u)
-    random.shuffle(k_u)
-
-    picked: list[dict[str, Any]] = []
-    if keywords:
-        mk = _matched_items_ordered_level_then_source(
-            matched,
-            item_registry=item_registry,
-            min_level=min_level,
-            max_level=max_level,
-        )
-        take_m = min(len(mk), max_total)
-        picked.extend(mk[:take_m])
-        rem = max_total - len(picked)
-    else:
-        rem = max_total
-
-    if rem > 0:
-        picked.extend(
-            _allocate_remainder_quota_pools(rem, [synth_u, shop_u, k_u], "532")
-        )
-
-    return picked[:max_total]
+    picked = _pick_item_rows_n(result, keywords=all_wanted, game_data=game_data)
+    return _strip_pool_marks(picked)
 
 
 # 合成产出（如菜品）单价常低于「奖励下限×10%」，此处单独用固定门槛，避免被筛掉
@@ -1858,7 +1953,7 @@ def _build_special_items(
     crafting_registry = game_data.crafting
     kshop_registry = game_data.kshop
     equipment_mods = game_data.equipment_mods
-    keywords = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_item_keywords('特殊物品获取', requirement_keywords)
 
     equipment_types = {"武器", "防具"}
     result: list[dict[str, Any]] = []
@@ -1944,45 +2039,16 @@ def _build_special_items(
             return p >= _SPECIAL_ITEM_SYNTHESIS_MIN_PRICE
         return p >= min_shop_k_price
 
-    max_total = (
-        _SPECIAL_ITEMS_MAX_COUNT_WITH_KEYWORDS if keywords else _SPECIAL_ITEMS_MAX_COUNT
-    )
-
-    matched: list[dict[str, Any]] = []
-    if keywords:
-        for e in result:
-            it = item_registry.get_by_name(e.get("name") or "")
-            if _entry_matches_item_keywords(e, it, equipment_mods, keywords):
-                matched.append(e)
-
-    matched_names = {e.get("name") for e in matched}
-    unmatched_price_ok: list[dict[str, Any]] = []
+    # 无关键词时套用价格门槛；有关键词命中则不受该门槛限制（命中优先）
+    price_ok: list[dict[str, Any]] = []
     for e in result:
-        if e.get("name") in matched_names:
-            continue
-        if _passes_non_keyword_price(e):
-            unmatched_price_ok.append(e)
+        e["_hit_tags"] = _item_hit_tags(e, tags=tags, game_data=game_data)
+        e["_hit_words"] = _item_word_hits(e, words=words, game_data=game_data)
+        if (e["_hit_tags"] or e["_hit_words"]) or _passes_non_keyword_price(e):
+            price_ok.append(e)
 
-    synth_u, shop_u, k_u = _partition_special_by_source(unmatched_price_ok)
-    random.shuffle(synth_u)
-    random.shuffle(shop_u)
-    random.shuffle(k_u)
-
-    picked: list[dict[str, Any]] = []
-    if keywords:
-        mk = _matched_special_items_ordered_by_source(matched)
-        take_m = min(len(mk), max_total)
-        picked.extend(mk[:take_m])
-        rem = max_total - len(picked)
-    else:
-        rem = max_total
-
-    if rem > 0:
-        picked.extend(
-            _allocate_remainder_quota_pools(rem, [synth_u, shop_u, k_u], "532")
-        )
-
-    return picked[:max_total]
+    picked = _pick_item_rows_n(price_ok, keywords=all_wanted, game_data=game_data)
+    return _strip_pool_marks(picked)
 
 
 _HOLDABLE_MAX_ITEMS = 20
@@ -1999,7 +2065,7 @@ def _build_holdable_items(
     item_registry = game_data.items
     crafting_registry = game_data.crafting
     equipment_mods = game_data.equipment_mods
-    keywords = _normalize_kw_list(requirement_keywords)
+    tags, words, all_wanted = _split_item_keywords('物品持有', requirement_keywords)
     price_cap = base_max * 2
 
     candidates: list[dict[str, Any]] = []
@@ -2040,38 +2106,13 @@ def _build_holdable_items(
                 entry["plugin_tier"] = tier
         candidates.append(entry)
 
-    if keywords:
-        b0, b1, b2, b3 = [], [], [], []
-        for e in candidates:
-            it = item_registry.get_by_name(e.get("name") or "")
-            km = _entry_matches_item_keywords(e, it, equipment_mods, keywords)
-            intel = e.get("source") == "情报"
-            if km and intel:
-                b0.append(e)
-            elif km and not intel:
-                b1.append(e)
-            elif not km and intel:
-                b2.append(e)
-            else:
-                b3.append(e)
-        ordered = _shuffle_each_bucket_concat([b0, b1, b2, b3])
-    else:
-        intel_e = [e for e in candidates if e.get("source") == "情报"]
-        craft_e = [e for e in candidates if e.get("source") != "情报"]
-        intel_ok = [e for e in intel_e if (e.get("price") or 0) <= price_cap]
-        craft_ok = [e for e in craft_e if (e.get("price") or 0) <= price_cap]
-        return _allocate_remainder_quota_pools(
-            _HOLDABLE_MAX_ITEMS, [intel_ok, craft_ok], "55"
-        )
+    price_ok = [e for e in candidates if (e.get("price") or 0) <= price_cap]
+    for e in price_ok:
+        e["_hit_tags"] = _item_hit_tags(e, tags=tags, game_data=game_data)
+        e["_hit_words"] = _item_word_hits(e, words=words, game_data=game_data)
 
-    result: list[dict[str, Any]] = []
-    for e in ordered:
-        if len(result) >= _HOLDABLE_MAX_ITEMS:
-            break
-        p = e.get("price") or 0
-        if p > price_cap:
-            continue
-        result.append(e)
+    picked = _pick_item_rows_n(price_ok, keywords=all_wanted, game_data=game_data)
+    return _strip_pool_marks(picked)
     return result
 
 
