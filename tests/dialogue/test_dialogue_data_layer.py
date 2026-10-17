@@ -287,6 +287,27 @@ def test_player_speaker_alias_normalized_to_pc(dialogue_env):
     assert lines[1]["Title"] == PLAYER_TITLE and lines[1]["Char"] == PLAYER_CHAR
 
 
+@pytest.mark.parametrize("alias", ["$PC_TITLE", "（$PC）", "$pc"])
+def test_player_speaker_pc_variants_normalized_to_pc(dialogue_env, alias):
+    """说话人里含 $PC 但多写了前后缀时也收敛成 $PC——模型会把称号／立绘占位符当名字。"""
+    view = _view(dialogue_env)
+    outcome = _daily_editor(view).apply(npc=NPC, edits=[_edit(1, [
+        _say("炉子今天歇火。"), _say("给我打把刀。", alias),
+    ])], new_groups=[
+        {"lines": [_say("新组第一句。"), _say("好。", alias)]},
+    ])
+    assert outcome.rejected == []
+
+    dialogue_path, _ = _paths(dialogue_env)
+    lines = [
+        line.to_subdialogue()
+        for entry in overlay.load_overrides(dialogue_path)
+        for line in entry.lines
+    ]
+    assert [line["Name"] for line in lines] == [NPC, PLAYER_NAME, NPC, PLAYER_NAME]
+    assert lines[1]["Title"] == PLAYER_TITLE and lines[1]["Char"] == PLAYER_CHAR
+
+
 # ---------------------------------------------------------------------------
 # 二次修改就地更新同一条目 / agent_<n> 不撞
 # ---------------------------------------------------------------------------
