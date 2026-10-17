@@ -210,6 +210,28 @@ class DialogueView:
         base = self.sources.groups(name)
         return overlay.merge_groups(base, self.daily_overrides(), name)
 
+    def npc_line_samples(self, npc: str, *, limit: int = 6) -> list[str]:
+        """该 NPC 自己的日常台词样本（合并本存档覆盖层，按组序取前 limit 条）。
+
+        只取该 NPC 本人说的行（玩家行与同组里其他 NPC 的行都跳过），供 prompt
+        给别的 NPC 写台词时参考其说话风格；无此 NPC 或无台词返回空表。
+        """
+        name = (npc or "").strip()
+        if not name:
+            return []
+        out: list[str] = []
+        for group in self.daily_groups(name):
+            for line in group.lines:
+                if line.is_player or line.name != name:
+                    continue
+                text = (line.text or "").strip()
+                if not text:
+                    continue
+                out.append(text)
+                if len(out) >= limit:
+                    return out
+        return out
+
     # --- 任务对话 -------------------------------------------------------
 
     def _base_task_texts(self) -> dict[str, Any]:

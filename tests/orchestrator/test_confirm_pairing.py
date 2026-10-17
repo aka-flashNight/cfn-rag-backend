@@ -40,8 +40,12 @@ def _orch(env) -> TurnOrchestrator:
     )
 
 
-def _ctx() -> SimpleNamespace:
-    return SimpleNamespace(rag_context_text=None, npc_states=None)
+async def _ctx(env) -> SimpleNamespace:
+    return SimpleNamespace(
+        rag_context_text=None,
+        npc_states=await env.npc_manager.all_states(),
+        save_info=None,
+    )
 
 
 def _draft_row() -> TaskDraftRow:
@@ -89,7 +93,7 @@ async def _run(env, responses: list[dict | str], draft: dict | None = None):
             session_id="s1", draft_id="d1", npc_name=NPC_A, draft=dict(draft),
         )
     return await orch._generate_confirm_args(
-        env.fake, _ctx(), row, env.game_data, base_messages=[],
+        env.fake, await _ctx(env), row, env.game_data, base_messages=[],
     )
 
 
@@ -198,7 +202,7 @@ async def test_retry_usage_accumulates_twice(env):
     )
 
     await orch._generate_confirm_args(
-        env.fake, _ctx(), _draft_row(), env.game_data, base_messages=[],
+        env.fake, await _ctx(env), _draft_row(), env.game_data, base_messages=[],
     )
 
     assert orch._usage["prompt_tokens"] == 30
@@ -243,7 +247,7 @@ async def test_call_failure_falls_back_without_retry(env):
     llm = _BoomLLM()
     orch = _orch(env)
     args, _warnings = await orch._generate_confirm_args(
-        llm, _ctx(), _draft_row(), env.game_data, base_messages=[],
+        llm, await _ctx(env), _draft_row(), env.game_data, base_messages=[],
     )
 
     assert llm.calls == 1
@@ -266,7 +270,7 @@ async def test_cancelled_error_propagates(env):
     orch = _orch(env)
     with pytest.raises(asyncio.CancelledError):
         await orch._generate_confirm_args(
-            _CancelLLM(), _ctx(), _draft_row(), env.game_data, base_messages=[],
+            _CancelLLM(), await _ctx(env), _draft_row(), env.game_data, base_messages=[],
         )
 
 
@@ -320,3 +324,84 @@ def test_user_prompt_lists_return_fields_only_when_allowed():
     assert "return_get_dialogue" in paired and "return_description" in paired
     assert "return_get_dialogue" not in single
     assert "return_description" not in single
+
+
+# ---------------------------------------------------------------------------
+# 完成 NPC 的写作参考（完成 ≠ 当前说话人）
+# ---------------------------------------------------------------------------
+
+async def test_cross_npc_appends_finish_npc_reference_at_bottom(env):
+    """完成 NPC ≠ 当前说话人：user 提示词最下面拼该 NPC 的情绪与关系参考。"""
+    await _run(env, [_valid_args()])
+
+    prompt = env.fake.chat_requests[0].messages[-1]["content"]
+    assert "药师的可用情绪标签：[普通]" in prompt
+    assert "药师与玩家的关系/好感度：好感度 10（陌生）" in prompt
+    assert prompt.rstrip().endswith("药师与玩家的关系/好感度：好感度 10（陌生）")
+
+
+async def test_same_npc_has_no_finish_npc_reference(env):
+    """同一 NPC 时 base_messages 已带本人资料与台词，不再重复拼参考段。"""
+    await _run(env, [{
+        "title": "带话给药师",
+        "description": "把话带给药师。",
+        "get_dialogue": [{"name": NPC_A, "text": "替我把话带到。"}],
+        "finish_dialogue": [{"name": NPC_A, "text": "话我收到了。"}],
+    }], draft=SAME_NPC_DRAFT)
+
+    prompt = env.fake.chat_requests[0].messages[-1]["content"]
+    assert "的过往台词如下" not in prompt
+    assert "的可用情绪标签" not in prompt
+    assert "与玩家的关系/好感度" not in prompt
+
+
+def test_finish_npc_reference_formats_three_parts_in_order():
+    from services.orchestrator.prompts import build_finish_npc_reference
+
+    text = build_finish_npc_reference(
+        npc_name="药师",
+        lines=["话我收到了。", "  "],
+        emotions=["普通", "微笑"],
+        favorability=42,
+        relationship_level="朋友",
+    )
+
+    assert text == (
+        "药师的过往台词如下（请参考其说话风格编写其对话）：\n话我收到了。\n\n"
+        "药师的可用情绪标签：[普通、微笑]\n\n"
+        "药师与玩家的关系/好感度：好感度 42（朋友）"
+    )
+
+
+def test_finish_npc_reference_omits_missing_parts():
+    from services.orchestrator.prompts import build_finish_npc_reference
+
+    assert build_finish_npc_reference(npc_name="药师") == ""
+    assert build_finish_npc_reference(npc_name="", lines=["x"], favorability=1) == ""
+    assert build_finish_npc_reference(
+        npc_name="药师", favorability=0,
+    ) == "药师与玩家的关系/好感度：好感度 0（陌生）"
+
+
+def test_finish_npc_reference_survives_line_source_failure(env, monkeypatch):
+    """台词读取失败只丢台词段，情绪与关系照常拼（不让参考整体消失）。"""
+    import services.dialogue.view as view_module
+
+    def _boom(**kwargs):
+        raise RuntimeError("对话数据读取失败")
+
+    monkeypatch.setattr(view_module, "build_view", _boom)
+    orch = _orch(env)
+    ctx = SimpleNamespace(
+        npc_states={"药师": SimpleNamespace(
+            favorability=10, relationship_level="陌生", emotions=["普通"],
+        )},
+        save_info=None,
+    )
+
+    text = orch._finish_npc_reference(ctx, env.game_data, NPC_B)
+
+    assert text == (
+        "药师的可用情绪标签：[普通]\n\n"
+        "药师与玩家的关系/好感度：好感度 10（陌生）"
+    )

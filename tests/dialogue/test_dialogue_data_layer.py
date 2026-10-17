@@ -168,6 +168,25 @@ def test_daily_groups_read_merged_view_with_overlay_last(dialogue_env):
     assert groups["3"].lines[0].text == "这组没有测试使说话。"  # 进合并视图，只是不进候选
 
 
+def test_npc_line_samples_take_own_lines_only(dialogue_env):
+    """完成 NPC 的台词参考：只取该 NPC 本人说的行，玩家与他人的行跳过。"""
+    _write_overlays(
+        dialogue_env,
+        [_line_entry("2", "覆盖层改写后的第二组台词。")],
+        None,
+    )
+    view = _view(dialogue_env)
+
+    assert view.npc_line_samples(NPC) == [
+        "今天炉子烧得正旺。",
+        "覆盖层改写后的第二组台词。",
+    ]
+    assert view.npc_line_samples(NPC, limit=1) == ["今天炉子烧得正旺。"]
+    assert "给我打把刀。" not in view.npc_line_samples(NPC)          # 玩家行
+    assert "这组没有测试使说话。" not in view.npc_line_samples(NPC)  # 旁人说的行
+    assert view.npc_line_samples("查无此人") == []
+
+
 def test_task_dialogue_reads_merged_text_and_keeps_extra_fields(dialogue_env):
     """任务对话读合并值：覆盖层有就整份用它，且条目附加字段（插图）不丢。"""
     _write_overlays(dialogue_env, None, {

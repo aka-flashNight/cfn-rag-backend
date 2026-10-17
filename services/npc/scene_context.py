@@ -114,17 +114,25 @@ def _fmt_npc(db_name: str, state: NPCState) -> str:
     return f"「{db_name}」" + _fmt_attrs(state)
 
 
+def npc_state_of(
+    npc_states: Optional[dict[str, NPCState]], npc_name: str,
+) -> Optional[NPCState]:
+    """按归一化名字取 NPC 状态（大小写/别名差异对由此对齐）；无记录返回 None。"""
+    if not npc_states or not npc_name:
+        return None
+    target = _norm(npc_name)
+    for db_name, state in npc_states.items():
+        if _norm(db_name) == target:
+            return state
+    return None
+
+
 def npc_attributes_text(
     npc_states: Optional[dict[str, NPCState]], npc_name: str,
 ) -> str:
     """NPC 属性后缀文本（（性别：X）（阵营：Y）（身份或称呼：Z））；无记录返回空串。"""
-    if not npc_states or not npc_name:
-        return ""
-    target = _norm(npc_name)
-    for db_name, state in npc_states.items():
-        if _norm(db_name) == target:
-            return _fmt_attrs(state)
-    return ""
+    state = npc_state_of(npc_states, npc_name)
+    return _fmt_attrs(state) if state is not None else ""
 
 
 def build_scene_supplement(

@@ -45,6 +45,7 @@ from services.dialogue.delegation import (
     delegate_tool_or_none,
 )
 from services.dialogue.models import PLAYER_NAME
+from services.game_data.map_registry import _norm
 from services.llm import (
     ChatRequest,
     LLMClient,
@@ -90,6 +91,7 @@ from services.orchestrator.prompts import (
     build_confirm_args_user_prompt,
     build_confirm_retry_prompt,
     build_empty_reply_user_prompt,
+    build_finish_npc_reference,
     build_finished_task_block,
     build_player_message,
     build_merge_user_prompt,
@@ -1030,6 +1032,39 @@ class TurnOrchestrator:
     # 同步动作
     # ------------------------------------------------------------------
 
+    def _finish_npc_reference(
+        self, ctx: TurnContext, game_data: Any, finish_npc: str,
+    ) -> str:
+        """完成 NPC 的写作参考（过往台词/情绪标签/与玩家的关系）。
+
+        台词取对话合并视图（含本存档覆盖层），只读；读取失败降级为空串。
+        只在完成 NPC ≠ 当前说话人时由调用方触发。
+        """
+        from services.dialogue.view import build_view
+        from services.npc.scene_context import npc_state_of
+
+        name = (finish_npc or "").strip()
+        if not name:
+            return ""
+        state = npc_state_of(getattr(ctx, "npc_states", None), name)
+        lines: list[str] = []
+        save_info = getattr(ctx, "save_info", None)
+        slot_key = (
+            str(save_info.get("slot_key") or "")
+            if isinstance(save_info, dict) else ""
+        )
+        try:
+            lines = build_view(game_data=game_data, slot_key=slot_key).npc_line_samples(name)
+        except Exception as exc:
+            logger.warning("完成 NPC 台词样本读取失败，降级为空: %s", exc)
+        return build_finish_npc_reference(
+            npc_name=name,
+            lines=lines,
+            emotions=list(getattr(state, "emotions", None) or []) if state is not None else [],
+            favorability=state.favorability if state is not None else None,
+            relationship_level=state.relationship_level if state is not None else "",
+        )
+
     async def _generate_confirm_args(
         self,
         llm: LLMClient,
@@ -1047,6 +1082,10 @@ class TurnOrchestrator:
         过渡话与草案详情——保证生成的对话贴合对话脉络。单次、无工具、宽松归一化；
         仅当 LLM 调用整体失败或解析不出 JSON 时回退模板（优先保证发布流程可用）。
 
+        完成 NPC ≠ 当前说话人时，末尾再拼该 NPC 的过往台词/情绪/关系参考：
+        base_messages 里的资料与台词样本全是当前 NPC 的，不补这段模型只能凭名字
+        脑补对方的说话方式。
+
         说话人校验不过时额外做 **一次** 修正重试（带具体问题），仍不通过就降级：
         原两组对话本身合规 → 保留模型产出、关掉回访配对；原两组也不合规 → 整份换
         模板兜底。返回 (args, warnings)，warnings 回给调用方合并进确认结果。
@@ -1055,6 +1094,11 @@ class TurnOrchestrator:
         get_npc, finish_npc = resolve_task_npcs(draft, self.npc_name)
         # 接取与完成同一人时完全走单任务口径：不给模型看任何回访字段
         allow_return = get_npc != finish_npc
+        finish_reference = ""
+        if _norm(finish_npc) != _norm(self.npc_name):
+            finish_reference = await asyncio.to_thread(
+                self._finish_npc_reference, ctx, game_data, finish_npc,
+            )
         summary = _detailed_draft_summary(
             draft, game_data, rag_context_text=ctx.rag_context_text,
             npc_states=ctx.npc_states,
@@ -1067,6 +1111,7 @@ class TurnOrchestrator:
                 spoken_text=spoken_text,
                 emotion=emotion,
                 allow_return=allow_return,
+                finish_npc_reference=finish_reference,
             )
         )
         messages = [*base_messages, {"role": "user", "content": user_prompt}]

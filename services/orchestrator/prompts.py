@@ -725,6 +725,38 @@ def confirm_args_system(*, allow_return: bool) -> str:
     return CONFIRM_ARGS_PAIRING_SYSTEM if allow_return else CONFIRM_ARGS_SYSTEM
 
 
+def build_finish_npc_reference(
+    *,
+    npc_name: str,
+    lines: list[str] | None = None,
+    emotions: list[str] | None = None,
+    favorability: int | None = None,
+    relationship_level: str = "",
+) -> str:
+    """完成 NPC 的写作参考（完成 NPC ≠ 当前说话人时拼在 confirm user 末尾）。
+
+    三段：过往台词（参考说话风格）、可用情绪标签、与玩家的关系/好感度。
+    查不到的段直接省略；三段都为空返回空串（不拼空块）。
+    """
+    name = (npc_name or "").strip()
+    if not name:
+        return ""
+    parts: list[str] = []
+    picked = [str(t).strip() for t in (lines or []) if str(t or "").strip()]
+    if picked:
+        parts.append(
+            f"{name}的过往台词如下（请参考其说话风格编写其对话）：\n"
+            + "\n".join(picked)
+        )
+    pool = [str(e).strip() for e in (emotions or []) if str(e or "").strip()]
+    if pool:
+        parts.append(f"{name}的可用情绪标签：[{'、'.join(pool)}]")
+    if favorability is not None:
+        level = (relationship_level or "").strip() or "陌生"
+        parts.append(f"{name}与玩家的关系/好感度：好感度 {int(favorability)}（{level}）")
+    return "\n\n".join(parts)
+
+
 def build_confirm_args_user_prompt(
     *,
     draft_summary: str,
@@ -732,10 +764,12 @@ def build_confirm_args_user_prompt(
     spoken_text: str = "",
     emotion: str = "",
     allow_return: bool = False,
+    finish_npc_reference: str = "",
 ) -> str:
     """confirm 参数生成（复用聊天 Agent base_messages 前缀后追加的 user 消息）。
 
     ``allow_return``＝接取 NPC 与完成 NPC 不同：只有此时字段清单才列出回访四件套。
+    ``finish_npc_reference`` 是完成 NPC 的台词/情绪/关系参考，按作者要求拼在最下面。
     """
     parts = []
     if (spoken_text or "").strip():
@@ -756,6 +790,9 @@ def build_confirm_args_user_prompt(
         f"现在以你的身份生成发布文本 JSON（{fields}）。"
         "对话中的玩家条目 name 用 $PC。"
     )
+    reference = (finish_npc_reference or "").strip()
+    if reference:
+        parts.append(reference)
     return "\n\n".join(parts)
 
 
