@@ -62,15 +62,8 @@ def test_task_user_context_contains_task_summary_and_player_input():
     assert fx.task_request()["player_input"] in text
 
 
-def test_tool_matrix_is_mode_scoped():
-    task_tools = tool_matrix_for("task")
-    assert "route_search" in task_tools
-    assert "update_long_term_memory" in task_tools
-    assert "route_task_draft" not in task_tools
-    assert "delegate_dialogue_rewrite" not in task_tools
-
-    daily_tools = tool_matrix_for("daily")
-    assert "route_task_draft" in daily_tools
-    assert "delegate_dialogue_rewrite" in daily_tools
-    assert "confirm_agent_task" not in daily_tools
-    assert "confirm_agent_task" in tool_matrix_for("daily", has_draft=True)
+def test_tool_matrix_is_empty_in_b1():
+    """B1 不向模型暴露工具；P2 再按协议矩阵接入。"""
+    assert tool_matrix_for("task") == ()
+    assert tool_matrix_for("daily") == ()
+    assert tool_matrix_for("daily", has_draft=True) == ()

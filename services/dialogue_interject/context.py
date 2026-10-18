@@ -7,7 +7,9 @@ session 历史不参与本轮 prompt 拼装。
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+import logging
+from dataclasses import dataclass
+from typing import Any, Iterable, Sequence
 
 from services.dialogue_interject.schemas import (
     InterjectRequest,
@@ -16,11 +18,23 @@ from services.dialogue_interject.schemas import (
     RemainingLine,
     TaskSummary,
 )
+from services.integration.state import get_integration_state
+from services.llm.meta import DEFAULT_EMOTION
+
+logger = logging.getLogger(__name__)
 
 #: 上下文预算省略标记（协议 4.4：编号仍按原索引，不能打乱）
 OMISSION_MARK = "（中间省略）"
 
 _TASK_KIND_LABEL = {"task_pre": "任务前", "task_post": "任务后"}
+
+
+@dataclass(frozen=True)
+class DailyBlocks:
+    """日常插话的稳定 system 块与情绪白名单（请求现场不进这里）。"""
+
+    system_prompt: str
+    npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
 
 
 def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | None = None) -> list[str]:
@@ -42,14 +56,17 @@ def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | Non
     return rendered
 
 
-def render_remaining(lines: Sequence[RemainingLine], *, max_lines: int | None = None) -> list[str]:
-    """原始剩余台词：`[n] NPC名：…`；任务编号必须保留原 index。"""
+def render_remaining(
+    lines: Sequence[RemainingLine], *, max_lines: int | None = None, numbered: bool = True,
+) -> list[str]:
+    """原始剩余台词：任务模式带 `[n]`；日常只作参考、不编号。"""
     rendered: list[str] = []
     for line in _trim(lines, max_lines):
         if line is None:
             rendered.append(OMISSION_MARK)
             continue
-        rendered.append(f"[{line.index}] {line.name}：{line.text.strip()}")
+        prefix = f"[{line.index}] " if numbered else ""
+        rendered.append(f"{prefix}{line.name}：{line.text.strip()}")
     return rendered
 
 
@@ -95,8 +112,13 @@ def build_user_context(request: InterjectRequest) -> str:
         blocks.append("【本组已播历史】\n" + "\n".join(render_played(dialogue.played, npc=request.npc)))
 
     if dialogue.remaining:
-        header = "【原对话剩余台词（编号仅作定位参考）】" if request.mode == "daily" else "【原始剩余台词（按编号）】"
-        blocks.append(header + "\n" + "\n".join(render_remaining(dialogue.remaining)))
+        if request.mode == "daily":
+            header = "【原对话剩余台词（仅作参考，不要求逐字续写）】"
+            body = render_remaining(dialogue.remaining, numbered=False)
+        else:
+            header = "【原始剩余台词（按编号）】"
+            body = render_remaining(dialogue.remaining, numbered=True)
+        blocks.append(header + "\n" + "\n".join(body))
 
     if dialogue.reference_continuation:
         blocks.append(
@@ -129,3 +151,106 @@ def _trim(items: Sequence, max_lines: int | None) -> Iterable:
     head = min(2, max_lines // 3)
     tail = max_lines - head
     return [*items[:head], None, *items[-tail:]]
+
+
+# ---------------------------------------------------------------------------
+# 日常稳定块装配（B1 真 LLM 最小路径）
+# ---------------------------------------------------------------------------
+
+
+async def assemble_daily_blocks(
+    npc_name: str,
+    *,
+    npc_manager: Any = None,
+    game_data: Any = None,
+    prompt_max: int = 135,
+) -> DailyBlocks:
+    """复用终端的稳定块（世界观/扮演/NPC 状态/场景），拼成日常插话 system。
+
+    不读取 session 历史、草案、路由或说话爆发块；这些属于终端回合逻辑。
+    场景/同阵营块在数据缺失时降级为空串，不影响本轮对话。
+    """
+    if npc_manager is None:
+        from services.npc.manager import get_npc_manager
+
+        npc_manager = await get_npc_manager()
+
+    state = await npc_manager.get(npc_name)
+    states = await npc_manager.all_states()
+
+    if game_data is None:
+        try:
+            from services.game_data.registry import get_game_data_registry
+
+            game_data = get_game_data_registry()
+        except Exception as exc:  # 资源目录缺失/未初始化：降级为无场景块
+            logger.warning("插话场景数据不可用，按无场景处理: %s", exc)
+            game_data = None
+    map_reg = getattr(game_data, "map_registry", None)
+
+    snap = get_integration_state().snapshot()
+    save_info: dict[str, Any] | None = None
+    if snap["bound_slot"] is not None:
+        scene = dict(snap["scene"]) if isinstance(snap["scene"], dict) else {}
+        # 场景段补显示标签：stageFlag → map_definition label；查不到保持空串
+        if map_reg is not None and str(scene.get("stageFlag") or ""):
+            try:
+                scene["label"] = map_reg.label_for_scene_name(str(scene["stageFlag"]))
+            except Exception:
+                scene["label"] = ""
+        save_info = {
+            "slot_key": snap["bound_slot"],
+            "character": snap["character"],
+            "progress": snap["progress"],
+            "scene": scene,
+            "player": snap["player"],
+        }
+
+    scene_block = ""
+    if map_reg is not None:
+        try:
+            from services.npc.scene_context import build_scene_block
+
+            scene_block = build_scene_block(
+                map_reg=map_reg, npc_states=states, npc_name=npc_name,
+            )
+        except Exception as exc:
+            logger.warning("插话场景块装配失败，降级为空: %s", exc)
+
+    same_faction_block = ""
+    try:
+        from services.orchestrator.context import same_faction_npcs_block
+
+        # 稳定块不随玩家这句话变化：不排除任何被提到的角色（前缀缓存友好）
+        same_faction_block = same_faction_npcs_block(
+            npc_name, state.faction, states, set(), map_reg,
+        )
+    except Exception as exc:
+        logger.warning("插话同阵营块装配失败，降级为空: %s", exc)
+
+    progress_desc = ""
+    if save_info is not None:
+        try:
+            from services.game_progress import derive_progress_stage, get_progress_stage_config
+            from services.orchestrator.prompts import progress_stage_desc
+
+            stage = derive_progress_stage(snap["progress"], snap["player"])
+            stage_cfg = get_progress_stage_config(stage) if stage else None
+            progress_desc = progress_stage_desc(stage, stage_cfg)
+        except Exception as exc:
+            logger.warning("插话进度块装配失败，降级为空: %s", exc)
+
+    # 局部导入：prompts 顶层依赖本模块的现场渲染，避免循环导入
+    from services.dialogue_interject.prompts import build_daily_system_prompt
+
+    system_prompt = build_daily_system_prompt(
+        npc_name=npc_name,
+        state=state,
+        scene_block=scene_block,
+        same_faction_block=same_faction_block,
+        save_info=save_info,
+        progress_desc=progress_desc,
+        prompt_max=prompt_max,
+    )
+    emotions = tuple(state.emotions or [DEFAULT_EMOTION])
+    return DailyBlocks(system_prompt=system_prompt, npc_emotions=emotions)

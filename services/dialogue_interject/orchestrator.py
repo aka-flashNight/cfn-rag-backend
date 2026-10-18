@@ -53,6 +53,7 @@ class _DriveState:
     valid_rows: int = 0
     failed: bool = False
     error: Exception | None = None
+    error_code: str = ""
 
 
 class InterjectOrchestrator:
@@ -93,7 +94,7 @@ class InterjectOrchestrator:
 
         if state.failed:
             yield error_event(
-                "stream_failed",
+                state.error_code or "stream_failed",
                 self._error_message(state.error),
                 valid_lines=state.valid_rows,
             )
@@ -110,7 +111,7 @@ class InterjectOrchestrator:
                 yield event
             if repair_state.failed:
                 yield error_event(
-                    "stream_failed",
+                    repair_state.error_code or "stream_failed",
                     self._error_message(repair_state.error),
                     valid_lines=repair_state.valid_rows,
                 )
@@ -164,6 +165,8 @@ class InterjectOrchestrator:
             logger.warning("[interject] 流中断: %s", exc, exc_info=True)
             state.failed = True
             state.error = exc
+            # 配置/上下文类错误带自己的 code（如 llm_not_configured），其余按流中断
+            state.error_code = str(getattr(exc, "code", "") or "")
             return
         if parser.issues:
             logger.info(

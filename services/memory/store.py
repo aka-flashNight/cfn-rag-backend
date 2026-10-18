@@ -294,6 +294,19 @@ class MemoryStore:
                 )
                 """
             )
+            #: 同一 turn_id 重发幂等（协议 6.5）：每轮登记一行，finalize 时置 finalized
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dialogue_interject_turns (
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, turn_id)
+                )
+                """
+            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS session_summaries (
@@ -651,6 +664,7 @@ class MemoryStore:
                 "DELETE FROM session_published_task_highlights WHERE session_id = ?", (session_id,),
             )
             cur.execute("DELETE FROM dialogue_interject_ledger WHERE session_id = ?", (session_id,))
+            cur.execute("DELETE FROM dialogue_interject_turns WHERE session_id = ?", (session_id,))
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -777,50 +791,125 @@ class MemoryStore:
         now = time.time()
         with self._lock:
             cur = self._conn.cursor()
-            for index, row in enumerate(sorted(rows, key=lambda item: int(item["seq"]))):
-                seq = int(row["seq"])
-                role = str(row["role"])
-                content = str(row["content"])
-                if role not in {"user", "assistant"}:
-                    raise ValueError("role 必须是 'user' 或 'assistant'。")
-                if not content.strip():
-                    continue
-                cur.execute(
-                    "SELECT role, content, message_id FROM dialogue_interject_ledger"
-                    " WHERE session_id = ? AND seq = ?",
-                    (session_id, seq),
-                )
-                existing = cur.fetchone()
-                if existing is None:
-                    # 同一批写入用微秒级递增时间戳，保证会话历史顺序与 seq 一致
-                    ts = now + index * 1e-6
+            try:
+                for index, row in enumerate(sorted(rows, key=lambda item: int(item["seq"]))):
+                    seq = int(row["seq"])
+                    role = str(row["role"])
+                    content = str(row["content"])
+                    if role not in {"user", "assistant"}:
+                        raise ValueError("role 必须是 'user' 或 'assistant'。")
+                    if not content.strip():
+                        continue
                     cur.execute(
-                        "INSERT INTO chat_history (session_id, role, content, timestamp)"
-                        " VALUES (?, ?, ?, ?)",
-                        (session_id, role, content, ts),
-                    )
-                    message_id = int(cur.lastrowid)
-                    cur.execute(
-                        "INSERT INTO dialogue_interject_ledger"
-                        " (session_id, seq, role, content, message_id, updated_at)"
-                        " VALUES (?, ?, ?, ?, ?, ?)",
-                        (session_id, seq, role, content, message_id, ts),
-                    )
-                    appended.append(seq)
-                elif str(existing["content"]) != content or str(existing["role"]) != role:
-                    # Host 修正了该 seq 的已播内容：以现场为准，改原消息而不是再插一条
-                    message_id = int(existing["message_id"])
-                    cur.execute(
-                        "UPDATE chat_history SET role = ?, content = ? WHERE id = ?",
-                        (role, content, message_id),
-                    )
-                    cur.execute(
-                        "UPDATE dialogue_interject_ledger SET role = ?, content = ?, updated_at = ?"
+                        "SELECT role, content, message_id FROM dialogue_interject_ledger"
                         " WHERE session_id = ? AND seq = ?",
-                        (role, content, now, session_id, seq),
+                        (session_id, seq),
                     )
-            self._conn.commit()
+                    existing = cur.fetchone()
+                    if existing is None:
+                        # 同一批写入用微秒级递增时间戳，保证会话历史顺序与 seq 一致
+                        ts = now + index * 1e-6
+                        cur.execute(
+                            "INSERT INTO chat_history (session_id, role, content, timestamp)"
+                            " VALUES (?, ?, ?, ?)",
+                            (session_id, role, content, ts),
+                        )
+                        message_id = int(cur.lastrowid)
+                        cur.execute(
+                            "INSERT INTO dialogue_interject_ledger"
+                            " (session_id, seq, role, content, message_id, updated_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (session_id, seq, role, content, message_id, ts),
+                        )
+                        appended.append(seq)
+                    elif str(existing["content"]) != content or str(existing["role"]) != role:
+                        # Host 修正了该 seq 的已播内容：以现场为准，改原消息而不是再插一条
+                        message_id = int(existing["message_id"])
+                        cur.execute(
+                            "UPDATE chat_history SET role = ?, content = ? WHERE id = ?",
+                            (role, content, message_id),
+                        )
+                        cur.execute(
+                            "UPDATE dialogue_interject_ledger SET role = ?, content = ?, updated_at = ?"
+                            " WHERE session_id = ? AND seq = ?",
+                            (role, content, now, session_id, seq),
+                        )
+                self._conn.commit()
+            except Exception:
+                # 不留下半截事务：跨进程并发撞主键时由上层记录并回 409
+                self._conn.rollback()
+                raise
         return appended
+
+    # ------------------------------------------------------------------
+    # 插话轮次登记（同一 turn_id 重发幂等，协议 6.5）
+    # ------------------------------------------------------------------
+
+    def dialogue_turn_register_sync(self, session_id: str, turn_id: str) -> bool:
+        """登记一轮插话；返回 True＝首次，False＝同一 turn_id 重发。"""
+        session_id = (session_id or "").strip()
+        turn_id = (turn_id or "").strip()
+        if not session_id or not turn_id:
+            raise ValueError("session_id / turn_id 不能为空。")
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO dialogue_interject_turns"
+                " (session_id, turn_id, status, created_at, updated_at)"
+                " VALUES (?, ?, 'started', ?, ?)",
+                (session_id, turn_id, now, now),
+            )
+            inserted = cur.rowcount > 0
+            self._conn.commit()
+        return inserted
+
+    def dialogue_turn_mark_finalized_sync(self, session_id: str, turn_id: str) -> None:
+        """把一轮标记为 finalized；不存在则补登记（finalize 先于/独立于请求到达）。"""
+        session_id = (session_id or "").strip()
+        turn_id = (turn_id or "").strip()
+        if not session_id or not turn_id:
+            return
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO dialogue_interject_turns"
+                " (session_id, turn_id, status, created_at, updated_at)"
+                " VALUES (?, ?, 'finalized', ?, ?)"
+                " ON CONFLICT(session_id, turn_id) DO UPDATE SET"
+                " status = 'finalized', updated_at = excluded.updated_at",
+                (session_id, turn_id, now, now),
+            )
+            self._conn.commit()
+
+    def dialogue_turn_count_sync(self, session_id: str) -> int:
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT COUNT(1) FROM dialogue_interject_turns WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def dialogue_turn_status_sync(self, session_id: str, turn_id: str) -> str | None:
+        session_id = (session_id or "").strip()
+        turn_id = (turn_id or "").strip()
+        if not session_id or not turn_id:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT status FROM dialogue_interject_turns"
+                " WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            )
+            row = cur.fetchone()
+        return str(row[0]) if row else None
 
     # ------------------------------------------------------------------
     # 任务草案（bargain_count 独立列，修 D5）
@@ -1524,6 +1613,10 @@ for _name in [
     "dialogue_session_ensure",
     "dialogue_ledger_read",
     "dialogue_played_append",
+    "dialogue_turn_register",
+    "dialogue_turn_mark_finalized",
+    "dialogue_turn_count",
+    "dialogue_turn_status",
     "upsert_draft",
     "get_draft",
     "update_partial",

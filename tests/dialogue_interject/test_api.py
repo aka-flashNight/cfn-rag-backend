@@ -80,6 +80,9 @@ def test_finalize_endpoint_is_idempotent(memory_store):
     first = client.post("/game/dialogue-interject/finalize", json=fx.F01_FINALIZE)
     assert first.status_code == 200
     body = first.json()
+    assert set(body) == {
+        "ok", "dialogue_instance_id", "session_id", "appended", "total",
+    }
     assert body["ok"] is True
     assert body["appended"] == 4
     assert body["total"] == 5
@@ -89,7 +92,9 @@ def test_finalize_endpoint_is_idempotent(memory_store):
     assert second.json()["total"] == 5
 
 
-def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store):
+def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store, monkeypatch):
+    # B1：默认走真 LLM 路径，但测试必须离线——强制判定为未配置
+    monkeypatch.setattr(interject_api, "llm_is_configured", lambda: False)
     client = _client(None)
     response = client.post("/game/dialogue-interject", json=fx.daily_request())
     assert response.status_code == 200
@@ -97,6 +102,17 @@ def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store
     assert [name for name, _ in events] == ["error"]
     assert events[0][1]["code"] == "llm_not_configured"
     assert memory_store.dialogue_session_get_sync(fx.DAILY_DIALOGUE_ID) is None
+
+
+def test_task_mode_without_fake_stream_is_rejected(memory_store):
+    """B1 任务模式不接真模型：明确 error，不建 session、不产 plan。"""
+    client = _client(None)
+    response = client.post("/game/dialogue-interject", json=fx.task_request())
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["error"]
+    assert events[0][1]["code"] == "task_mode_not_ready"
+    assert memory_store.dialogue_session_get_sync(fx.TASK_DIALOGUE_ID) is None
 
 
 @pytest.mark.parametrize("payload", [

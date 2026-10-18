@@ -1,8 +1,9 @@
-"""对话内嵌插话端点（P0 骨架）。
+"""对话内嵌插话端点（B1）。
 
-- `POST /api/game/dialogue-interject`：SSE；真 LLM 编排在 P1，P0 通过
-  `set_stream_factories()` 注入假流做离线契约测试。
-- `POST /api/game/dialogue-interject/finalize`：幂等对账。
+- `POST /api/game/dialogue-interject`（SSE）：
+  - 日常：真 LLM 最小路径（稳定块 + 请求现场 JSONL），测试/联调可注入假流；
+  - 任务：B1 真路径回 `task_mode_not_ready`，注入假流时保留 P0 fixture 路径。
+- `POST /api/game/dialogue-interject/finalize`：幂等对账；跨进程并发冲突回 409。
 
 与终端 `/api/game/ask` 完全独立：不改其路由、不共享 TurnOrchestrator。
 """
@@ -11,10 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from services.dialogue_interject.context import assemble_daily_blocks
+from services.dialogue_interject.llm import llm_is_configured, stream_daily_llm
 from services.dialogue_interject.orchestrator import (
     InterjectOrchestrator,
     StreamFactory,
@@ -25,12 +29,17 @@ from services.dialogue_interject.schemas import (
     InterjectRequest,
     error_event,
 )
-from services.dialogue_interject.sessions import ensure_session, finalize
+from services.dialogue_interject.sessions import (
+    ConcurrentFinalizeError,
+    ensure_session,
+    finalize,
+)
+from services.llm.meta import DEFAULT_EMOTION
 
 logger = logging.getLogger(__name__)
 router: APIRouter = APIRouter()
 
-#: P0 测试注入点；P1 接线真实 LLM 后由启动期设置（或保留供回归假流使用）
+#: 测试/联调注入点；生产默认走真实 LLM。测试 teardown 必须复位。
 _PRIMARY_FACTORY: StreamFactory | None = None
 _REPAIR_FACTORY: StreamFactory | None = None
 
@@ -73,23 +82,48 @@ async def _error_stream(code: str, message: str):
 
 @router.post(
     "/dialogue-interject",
-    summary="对话内嵌插话（SSE；P0 假流骨架）",
+    summary="对话内嵌插话（SSE）",
 )
 async def dialogue_interject(payload: InterjectRequest):
-    if _PRIMARY_FACTORY is None:
-        # P0：不接真模型；未注入假流时明确回 error，绝不静默补台词
-        return StreamingResponse(
-            _error_stream("llm_not_configured", "P0 骨架：未接入真实模型，也未注入假流"),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
+    stream_factory: StreamFactory | None = _PRIMARY_FACTORY
+    npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
+
+    if stream_factory is None:
+        # B1：任务模式不接真模型，回明确 error，不产出半成品 plan
+        if payload.mode == "task":
+            return StreamingResponse(
+                _error_stream("task_mode_not_ready", "任务插话真模型路径尚未接入（B1 仅日常）"),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        # 日常真 LLM：沿用全局 settings；没有 api_key 时不发起调用
+        if not llm_is_configured():
+            return StreamingResponse(
+                _error_stream("llm_not_configured", "未配置 llm_api_key，插话真模型路径不可用"),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        try:
+            blocks = await assemble_daily_blocks(
+                payload.npc, prompt_max=payload.limits.line_prompt_max,
+            )
+        except Exception as exc:  # noqa: BLE001 - 上下文失败按 D-17 回原对话
+            logger.exception("[interject] 日常稳定块装配失败")
+            return StreamingResponse(
+                _error_stream("context_failed", str(exc)[:200]),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        npc_emotions = blocks.npc_emotions
+        stream_factory = partial(stream_daily_llm, blocks=blocks)
 
     binding = await ensure_session(payload)
     orchestrator = InterjectOrchestrator(
         payload,
         session_id=binding.session_id,
-        stream_factory=_PRIMARY_FACTORY,
+        stream_factory=stream_factory,
         repair_factory=_REPAIR_FACTORY,
+        npc_emotions=npc_emotions,
     )
     return StreamingResponse(
         _sse_stream(orchestrator),
@@ -104,4 +138,8 @@ async def dialogue_interject(payload: InterjectRequest):
     summary="对话内嵌插话 · 已播对账（幂等）",
 )
 async def dialogue_interject_finalize(payload: FinalizeRequest) -> FinalizeResponse:
-    return await finalize(payload)
+    try:
+        return await finalize(payload)
+    except ConcurrentFinalizeError as exc:
+        # 跨进程并发撞同一 seq：不静默吞错，让 Host 稍后重发 finalize
+        raise HTTPException(status_code=409, detail="concurrent_finalize_conflict") from exc

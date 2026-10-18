@@ -22,3 +22,15 @@ def memory_store(tmp_path):
     finally:
         store_module.set_memory_store(previous)
         store.close()
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_llm(monkeypatch):
+    """本目录测试一律离线：任何未注入假客户端的真 LLM 调用直接失败。"""
+    from services.llm.client import LLMClient
+
+    def _boom(cls, cfg):
+        raise RuntimeError("测试禁止调用真实 LLM：请注入假流/假客户端")
+
+    monkeypatch.setattr(LLMClient, "for_config", classmethod(_boom))
+    yield

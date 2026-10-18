@@ -86,8 +86,16 @@ class DialogueBlock(BaseModel):
         seqs = [line.seq for line in self.played]
         if len(set(seqs)) != len(seqs):
             raise ValueError("dialogue.played[].seq 不能重复")
-        # reference 的 edit/remove 编号只要求 ≥1；超出当前 N 属于 Host 口径问题，
-        # 后端宽容处理（记录后忽略）。协议 5.1 的 1..N 口径由 Host 保证。
+        # reference 的 edit/remove 编号必须在当前 remaining 的 1..N 内；
+        # 越界属 Host 记账错误，422 拒绝，不做宽容渲染（《协议》5.1 / 实施指引 3.1）
+        remaining_count = len(indexes)
+        for item in self.reference_continuation:
+            if item.kind in ("edit", "remove") and item.index is not None:
+                if item.index > remaining_count:
+                    raise ValueError(
+                        f"reference_continuation.{item.kind}.index={item.index} "
+                        f"超出当前 remaining 的 1..{remaining_count}"
+                    )
         return self
 
 

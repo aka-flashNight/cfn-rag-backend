@@ -7,6 +7,11 @@ P0 已交付：schemas / parser / plan / sessions / context / prompts 骨架 /
 假流端点；真 LLM、工具矩阵与提示词全量在 P1/P2/P4。
 """
 
+from services.dialogue_interject.context import (
+    DailyBlocks,
+    assemble_daily_blocks,
+    build_user_context,
+)
 from services.dialogue_interject.parser import (
     JSONLStreamParser,
     ParseIssue,
@@ -37,6 +42,7 @@ from services.dialogue_interject.schemas import (
     TaskSummary,
 )
 from services.dialogue_interject.sessions import (
+    ConcurrentFinalizeError,
     SessionBinding,
     default_session_title,
     ensure_session,
@@ -45,6 +51,9 @@ from services.dialogue_interject.sessions import (
 )
 
 __all__ = [
+    "DailyBlocks",
+    "assemble_daily_blocks",
+    "build_user_context",
     "JSONLStreamParser",
     "ParseIssue",
     "ParseOptions",
@@ -69,6 +78,7 @@ __all__ = [
     "TaskContext",
     "TaskSummary",
     "SessionBinding",
+    "ConcurrentFinalizeError",
     "default_session_title",
     "ensure_session",
     "finalize",

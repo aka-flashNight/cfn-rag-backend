@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 _TASK_KIND_LABEL = {"task_pre": "任务前", "task_post": "任务后"}
 
 
+class ConcurrentFinalizeError(RuntimeError):
+    """跨进程并发 finalize 撞到同一 (session_id, seq)。
+
+    进程内由 MemoryStore 的单锁串行化；跨进程仍可能同时写同一 seq。
+    此时不静默合并、不吞错：回滚本批事务后向上抛，API 以 409 告知 Host 稍后重发。
+    """
+
+
 @dataclass(frozen=True)
 class SessionBinding:
     """一次插话请求对应的 session 绑定结果。"""
@@ -36,6 +45,7 @@ class SessionBinding:
     session_id: str
     title: str
     created: bool
+    turn_duplicate: bool = False
 
 
 def _now_label() -> str:
@@ -111,6 +121,13 @@ async def ensure_session(
     info, created = await memory.dialogue_session_ensure(
         request.dialogue_instance_id, request.npc, title, slot_key,
     )
+    # 同一 turn_id 重发：只登记一次；不改 session、不重复建会话（协议 6.5）
+    is_new_turn = await memory.dialogue_turn_register(info.session_id, request.turn_id)
+    if not is_new_turn:
+        logger.warning(
+            "[interject] 同一 turn_id 重发，按幂等处理 session=%s dialogue=%s turn=%s",
+            info.session_id, request.dialogue_instance_id, request.turn_id,
+        )
     rows = _map_transcript(request.dialogue.played)
     if rows:
         appended = await memory.dialogue_played_append(info.session_id, rows)
@@ -120,8 +137,8 @@ async def ensure_session(
                 info.session_id, len(appended), appended,
             )
     logger.info(
-        "[interject] session=%s dialogue=%s created=%s mode=%s kind=%s",
-        info.session_id, request.dialogue_instance_id, created,
+        "[interject] session=%s dialogue=%s created=%s turn_dup=%s mode=%s kind=%s",
+        info.session_id, request.dialogue_instance_id, created, not is_new_turn,
         request.mode, request.dialogue.kind,
     )
     return SessionBinding(
@@ -129,6 +146,7 @@ async def ensure_session(
         session_id=info.session_id,
         title=info.title,
         created=created,
+        turn_duplicate=not is_new_turn,
     )
 
 
@@ -174,7 +192,29 @@ async def finalize(
         )
 
     rows = _map_transcript(request.transcript)
-    appended = await memory.dialogue_played_append(info.session_id, rows) if rows else []
+    try:
+        appended = await memory.dialogue_played_append(info.session_id, rows) if rows else []
+    except sqlite3.IntegrityError as exc:
+        # 跨进程同时写同一 seq：不静默合并，回滚已在 store 层完成，这里记录并上抛
+        logger.error(
+            "[interject] finalize 并发冲突 session=%s dialogue=%s turn=%s: %s",
+            info.session_id, request.dialogue_instance_id, request.turn_id, exc,
+        )
+        raise ConcurrentFinalizeError("concurrent_finalize_conflict") from exc
+    except sqlite3.OperationalError as exc:
+        # 另一进程长时间持有写锁（WAL 单写者）：同样不吞错，交 Host 稍后重发
+        if "locked" not in str(exc).lower():
+            raise
+        logger.error(
+            "[interject] finalize 写锁冲突 session=%s dialogue=%s turn=%s: %s",
+            info.session_id, request.dialogue_instance_id, request.turn_id, exc,
+        )
+        raise ConcurrentFinalizeError("concurrent_finalize_conflict") from exc
+
+    if request.turn_id:
+        # 轮次登记：同一 turn 重发/重复 finalize 都只更新状态，不新增行
+        await memory.dialogue_turn_mark_finalized(info.session_id, request.turn_id)
+
     ledger = await memory.dialogue_ledger_read(info.session_id)
     logger.info(
         "[interject] finalize session=%s dialogue=%s transcript=%d appended=%d total=%d",

@@ -284,6 +284,34 @@ async def test_invalid_lines_are_skipped_but_valid_ones_stream():
 
 
 @pytest.mark.asyncio
+async def test_error_valid_lines_counts_model_rows_not_split_segments():
+    """valid_lines 按模型输出行计、拆分前（协议 5.2 / 实施指引 3.3）。"""
+    orchestrator = make_orchestrator(
+        fx.daily_request(),
+        chunks=[fx.F02_JSONL[0]],  # 一条超 165 的 add → 拆成 2 个 line 事件
+        error=RuntimeError("stream broke after long line"),
+    )
+    events = await collect_events(orchestrator)
+    lines = [event for event in events if event.event == "line"]
+    assert len(lines) == 2
+    assert [line.data["split"]["index"] for line in lines] == [0, 1]
+    error = next(event for event in events if event.event == "error")
+    assert error.data["valid_lines"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_valid_lines_does_not_count_mute():
+    orchestrator = make_orchestrator(
+        fx.task_request(),
+        chunks=['{"mute":true}\n', '{"add":"一句","emo":"普通"}\n'],
+        error=RuntimeError("stream broke"),
+    )
+    events = await collect_events(orchestrator)
+    assert _names(events) == ["status", "mute", "line", "error"]
+    assert events[-1].data["valid_lines"] == 1  # mute 不计，add 计 1
+
+
+@pytest.mark.asyncio
 async def test_turn_with_only_mute_is_not_treated_as_zero_valid():
     events = await collect_events(
         make_orchestrator(fx.task_request(), chunks=['{"mute":true}\n'])
