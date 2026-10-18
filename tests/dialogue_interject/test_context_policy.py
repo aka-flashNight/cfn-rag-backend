@@ -62,8 +62,11 @@ def test_task_user_context_contains_task_summary_and_player_input():
     assert fx.task_request()["player_input"] in text
 
 
-def test_tool_matrix_is_empty_in_b1():
-    """B1 不向模型暴露工具；P2 再按协议矩阵接入。"""
+def test_tool_matrix_b2():
+    """B2 日常接工具；任务模式留 P4。"""
     assert tool_matrix_for("task") == ()
-    assert tool_matrix_for("daily") == ()
-    assert tool_matrix_for("daily", has_draft=True) == ()
+    daily = tool_matrix_for("daily")
+    assert "route_task_draft" in daily
+    assert "route_search" in daily
+    assert "update_long_term_memory" in daily
+    assert "route_task_confirm" in tool_matrix_for("daily", has_draft=True)

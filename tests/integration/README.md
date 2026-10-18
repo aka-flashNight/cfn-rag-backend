@@ -31,8 +31,8 @@ GET  http://127.0.0.1:7088/api/integration/status
 
 | 方式 | 行为 |
 |---|---|
-| `--fixture auto`（默认） | task → `F-09`；`player_input` 含「零有效」→ `F-10`；含「部分」→ `F-11`；含「北边」→ `F-02`；其余 → `F-01` |
-| `--fixture F-01` / `F-02` / `F-09` / `F-10` / `F-11` | 所有请求强制回放该 fixture（F-09 需要发 task 请求才看得到 mute） |
+| `--fixture auto`（默认） | task → `F-09`；含「零有效」→ `F-10`；含「部分」→ `F-11`；含「先别说这个」→ `F-04`；含「活儿/委托/任务」→ `F-03`；含「北边」→ `F-02`；其余 → `F-01` |
+| `--fixture F-01` / `F-02` / `F-03` / `F-04` / `F-09` / `F-10` / `F-11` | 所有请求强制回放该 fixture（F-09 需要发 task 请求才看得到 mute） |
 | `--chunk-delay-ms N` | 每个 chunk 之间延迟 N 毫秒，便于观察逐句到达与断连取消 |
 
 ## 断连与 finalize
@@ -47,4 +47,6 @@ GET  http://127.0.0.1:7088/api/integration/status
 python -m pytest tests/integration/ -q
 ```
 
-`test_http_fake_server.py` 覆盖 F-01/09/10/11、finalize 幂等与真实 HTTP 断连取消。
+`test_http_fake_server.py` 覆盖 F-01/03/04/09/10/11、finalize 幂等与真实 HTTP 断连取消。
+
+F-03 在本服务里只回放“草案结果后的最终对话”，不实际创建草案；需要验证工具链请用单元测试的假 LLM/假执行器。

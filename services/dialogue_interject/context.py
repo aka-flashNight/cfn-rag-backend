@@ -7,8 +7,9 @@ session 历史不参与本轮 prompt 拼装。
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from services.dialogue_interject.schemas import (
@@ -31,10 +32,37 @@ _TASK_KIND_LABEL = {"task_pre": "任务前", "task_post": "任务后"}
 
 @dataclass(frozen=True)
 class DailyBlocks:
-    """日常插话的稳定 system 块与情绪白名单（请求现场不进这里）。"""
+    """日常插话的 system/现场块与工具运行所需的只读快照。
+
+    `system_prompt` 只放稳定块；RAG/长期记忆/草案摘要属于现场块，由
+    `build_user_context` 拼进 user；工具运行数据只读，不进入 prompt 之外的地方。
+    """
 
     system_prompt: str
     npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
+    npc_state: Any = None
+    npc_states: dict[str, Any] = field(default_factory=dict)
+    game_data: Any = None
+    engine: Any = None
+    registry: Any = None
+    memory: Any = None
+    session_id: str = ""
+    slot_key: str | None = None
+    progress_stage: int | None = None
+    player_level: int | None = None
+    progress_desc: str = ""
+    has_shop: bool = False
+    shop_reward_types: tuple[str, ...] = ()
+    player_can_challenge: bool = False
+    rag_context_text: str = ""
+    retrieval_bundle: Any = None
+    retrieve_fn: Any = None
+    long_term: Any = None
+    long_term_block: str = ""
+    pending_draft_row: Any = None
+    pending_draft_summary: str = ""
+    recent_dialogue: str = ""
+    task_publish_disabled: bool = False
 
 
 def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | None = None) -> list[str]:
@@ -103,10 +131,25 @@ def render_task_summary(summary: TaskSummary, *, label: str) -> list[str]:
     return lines
 
 
-def build_user_context(request: InterjectRequest) -> str:
-    """按实施指引 §4.2/§4.3 的建议顺序拼装 user 上下文（P0 骨架）。"""
+def build_user_context(
+    request: InterjectRequest,
+    *,
+    rag_context_text: str = "",
+    long_term_block: str = "",
+    pending_draft_summary: str = "",
+) -> str:
+    """按实施指引 §4.2 的建议顺序拼装 user 上下文（请求现场为准）。"""
     blocks: list[str] = []
     dialogue = request.dialogue
+
+    if long_term_block.strip():
+        blocks.append(long_term_block.strip())
+
+    if rag_context_text.strip():
+        blocks.append(
+            "【检索到的设定资料（仅用于保持设定与说话风格，不要逐字复读原文）】\n"
+            + rag_context_text.strip()
+        )
 
     if dialogue.played:
         blocks.append("【本组已播历史】\n" + "\n".join(render_played(dialogue.played, npc=request.npc)))
@@ -140,6 +183,13 @@ def build_user_context(request: InterjectRequest) -> str:
         else:
             blocks.append(f"【任务上下文（{kind_label}）】\n（本次没有可用的已完成/将完成任务摘要）")
 
+    if pending_draft_summary.strip():
+        blocks.append(
+            "【待确认的委托草案（已拟定、尚未发布）】\n"
+            f"{pending_draft_summary.strip()}\n"
+            "玩家可能会接受、拒绝、讨价还价或岔开话题；点头之前不要说已发布。"
+        )
+
     blocks.append("【玩家刚刚说的话】\n" + request.player_input)
     return "\n\n".join(blocks)
 
@@ -154,22 +204,28 @@ def _trim(items: Sequence, max_lines: int | None) -> Iterable:
 
 
 # ---------------------------------------------------------------------------
-# 日常稳定块装配（B1 真 LLM 最小路径）
+# 日常上下文装配（B2：稳定块 + RAG/长期记忆/草案 + 工具运行快照）
 # ---------------------------------------------------------------------------
 
 
 async def assemble_daily_blocks(
-    npc_name: str,
+    request: InterjectRequest,
     *,
     npc_manager: Any = None,
     game_data: Any = None,
+    engine: Any = None,
+    memory: Any = None,
+    registry: Any = None,
     prompt_max: int = 135,
+    rag_enabled: bool = True,
 ) -> DailyBlocks:
-    """复用终端的稳定块（世界观/扮演/NPC 状态/场景），拼成日常插话 system。
+    """装配日常插话的 system/现场块与工具运行快照。
 
-    不读取 session 历史、草案、路由或说话爆发块；这些属于终端回合逻辑。
-    场景/同阵营块在数据缺失时降级为空串，不影响本轮对话。
+    - system：世界观/扮演/NPC 状态/场景/同阵营/输出纪律/工具说明；
+    - user 现场：长期记忆、RAG、played、remaining、reference、草案摘要、玩家输入；
+    - 不读取 session 聊天历史（协议 4.1：session 历史不参与本轮 prompt）。
     """
+    npc_name = request.npc
     if npc_manager is None:
         from services.npc.manager import get_npc_manager
 
@@ -177,6 +233,15 @@ async def assemble_daily_blocks(
 
     state = await npc_manager.get(npc_name)
     states = await npc_manager.all_states()
+
+    if memory is None:
+        from services.memory.store import get_memory_store
+
+        memory = get_memory_store()
+    if registry is None:
+        from services.tools.base import get_tool_registry
+
+        registry = get_tool_registry()
 
     if game_data is None:
         try:
@@ -188,9 +253,19 @@ async def assemble_daily_blocks(
             game_data = None
     map_reg = getattr(game_data, "map_registry", None)
 
+    if engine is None and rag_enabled:
+        try:
+            from services.retrieval import get_retrieval_engine
+
+            engine = get_retrieval_engine()
+        except Exception as exc:  # 检索不可用：本轮按无 RAG 处理
+            logger.warning("插话检索引擎不可用，按无 RAG 处理: %s", exc)
+            engine = None
+
     snap = get_integration_state().snapshot()
+    slot_key = snap["bound_slot"]
     save_info: dict[str, Any] | None = None
-    if snap["bound_slot"] is not None:
+    if slot_key is not None:
         scene = dict(snap["scene"]) if isinstance(snap["scene"], dict) else {}
         # 场景段补显示标签：stageFlag → map_definition label；查不到保持空串
         if map_reg is not None and str(scene.get("stageFlag") or ""):
@@ -199,12 +274,142 @@ async def assemble_daily_blocks(
             except Exception:
                 scene["label"] = ""
         save_info = {
-            "slot_key": snap["bound_slot"],
+            "slot_key": slot_key,
             "character": snap["character"],
             "progress": snap["progress"],
             "scene": scene,
             "player": snap["player"],
         }
+
+    progress_stage = None
+    player_level = None
+    progress_desc = ""
+    if save_info is not None:
+        try:
+            from services.game_progress import (
+                derive_progress_stage,
+                get_player_level,
+                get_progress_stage_config,
+            )
+            from services.orchestrator.prompts import progress_stage_desc
+
+            progress_stage = derive_progress_stage(snap["progress"], snap["player"])
+            player_level = get_player_level(snap["player"]) if snap["player"] else None
+            stage_cfg = get_progress_stage_config(progress_stage) if progress_stage else None
+            progress_desc = progress_stage_desc(progress_stage, stage_cfg)
+        except Exception as exc:
+            logger.warning("插话进度块装配失败，降级为空: %s", exc)
+
+    # ---- RAG：与终端同源的 Tier-1 检索（同步实现放线程池）----
+    from services.orchestrator.context import (
+        build_retrieve_fn,
+        entity_hints_block,
+        forbidden_other_chars,
+        retrieve_tier1,
+    )
+
+    forbidden = forbidden_other_chars(states)
+    titles = list(state.titles or [])
+    last_npc_message = next(
+        (line.text for line in reversed(request.dialogue.played) if line.role in ("npc", "ai")),
+        None,
+    )
+    rag_context_text = ""
+    retrieval_bundle: Any = None
+    retrieve_fn = None
+    if engine is not None and rag_enabled:
+        retrieve_fn = build_retrieve_fn(
+            engine=engine,
+            npc_name=npc_name,
+            npc_titles=titles,
+            npc_faction=state.faction,
+            forbidden=forbidden,
+        )
+
+        def _retrieve() -> tuple[str, Any]:
+            bundle = retrieve_tier1(
+                engine=engine,
+                user_query=request.player_input,
+                npc_name=npc_name,
+                npc_titles=titles,
+                npc_faction=state.faction,
+                npc_last_message=last_npc_message,
+                forbidden=forbidden,
+            )
+            text = ""
+            if bundle is not None and not bundle.is_empty:
+                from services.retrieval import format_retrieval_context
+
+                text = format_retrieval_context(bundle, forbidden)
+            hints = entity_hints_block(bundle, game_data)
+            if hints:
+                text = f"{text}\n\n{hints}" if text else hints
+            return text, bundle
+
+        try:
+            rag_context_text, retrieval_bundle = await asyncio.to_thread(_retrieve)
+        except Exception as exc:
+            logger.warning("插话检索装配失败，降级为空: %s", exc)
+
+    # ---- 长期记忆（跨对话窗口；不是 session 聊天历史）----
+    long_term = None
+    long_term_block = ""
+    try:
+        from services.memory.long_term import format_block, load_snapshot
+
+        long_term = await load_snapshot(memory, slot_key=slot_key, npc=npc_name)
+        long_term_block = format_block(long_term)
+    except Exception as exc:
+        logger.warning("插话长期记忆装配失败，降级为空: %s", exc)
+
+    # ---- 待确认草案（B2 起支持 confirm/cancel/update）----
+    pending_draft_row = None
+    pending_draft_summary = ""
+    if request.dialogue_instance_id:
+        try:
+            pending_draft_row = await memory.get_draft(request.dialogue_instance_id)
+        except Exception as exc:
+            logger.warning("插话草案读取失败，按无草案处理: %s", exc)
+    if pending_draft_row is not None and isinstance(pending_draft_row.draft, dict):
+        try:
+            from services.agent_tools.draft_formatting import _detailed_draft_summary
+
+            pending_draft_summary = _detailed_draft_summary(
+                pending_draft_row.draft,
+                game_data,
+                rag_context_text=rag_context_text,
+                npc_states=states,
+            )
+        except Exception as exc:
+            logger.warning("插话草案摘要装配失败，降级为空: %s", exc)
+
+    # ---- 商店/切磋能力（任务 Agent 选型硬边界）----
+    has_shop = False
+    shop_reward_types: list[str] = []
+    try:
+        shops = getattr(game_data, "shops", None)
+        if shops is not None and shops.has_shop(npc_name):
+            has_shop = True
+            seen: set[str] = set()
+            for item_name in shops.get_npc_shop(npc_name):
+                item = game_data.items.get_by_name(item_name)
+                if item and item.type and item.type not in seen:
+                    seen.add(item.type)
+                    shop_reward_types.append(item.type)
+    except Exception:
+        pass
+
+    player_can_challenge = False
+    try:
+        if (state.challenge or "").strip():
+            from services.agent_tools.context_builder import _build_challenge_targets
+
+            challenge_result = _build_challenge_targets(
+                game_data, npc_name, state.challenge, max(1, min(7, progress_stage or 1)),
+            )
+            player_can_challenge = isinstance(challenge_result, list)
+    except Exception:
+        player_can_challenge = False
 
     scene_block = ""
     if map_reg is not None:
@@ -228,17 +433,9 @@ async def assemble_daily_blocks(
     except Exception as exc:
         logger.warning("插话同阵营块装配失败，降级为空: %s", exc)
 
-    progress_desc = ""
-    if save_info is not None:
-        try:
-            from services.game_progress import derive_progress_stage, get_progress_stage_config
-            from services.orchestrator.prompts import progress_stage_desc
+    from services.npc.task_publish_policy import is_task_publish_disabled
 
-            stage = derive_progress_stage(snap["progress"], snap["player"])
-            stage_cfg = get_progress_stage_config(stage) if stage else None
-            progress_desc = progress_stage_desc(stage, stage_cfg)
-        except Exception as exc:
-            logger.warning("插话进度块装配失败，降级为空: %s", exc)
+    task_publish_disabled = is_task_publish_disabled(npc_name)
 
     # 局部导入：prompts 顶层依赖本模块的现场渲染，避免循环导入
     from services.dialogue_interject.prompts import build_daily_system_prompt
@@ -251,6 +448,37 @@ async def assemble_daily_blocks(
         save_info=save_info,
         progress_desc=progress_desc,
         prompt_max=prompt_max,
+        has_pending_draft=pending_draft_row is not None,
+        task_publish_disabled=task_publish_disabled,
+    )
+    recent_dialogue = "\n".join(
+        render_played(request.dialogue.played, npc=npc_name, max_lines=8)
     )
     emotions = tuple(state.emotions or [DEFAULT_EMOTION])
-    return DailyBlocks(system_prompt=system_prompt, npc_emotions=emotions)
+    return DailyBlocks(
+        system_prompt=system_prompt,
+        npc_emotions=emotions,
+        npc_state=state,
+        npc_states=states,
+        game_data=game_data,
+        engine=engine,
+        registry=registry,
+        memory=memory,
+        session_id=request.dialogue_instance_id,
+        slot_key=slot_key,
+        progress_stage=progress_stage,
+        player_level=player_level,
+        progress_desc=progress_desc,
+        has_shop=has_shop,
+        shop_reward_types=tuple(shop_reward_types),
+        player_can_challenge=player_can_challenge,
+        rag_context_text=rag_context_text,
+        retrieval_bundle=retrieval_bundle,
+        retrieve_fn=retrieve_fn,
+        long_term=long_term,
+        long_term_block=long_term_block,
+        pending_draft_row=pending_draft_row,
+        pending_draft_summary=pending_draft_summary,
+        recent_dialogue=recent_dialogue,
+        task_publish_disabled=task_publish_disabled,
+    )

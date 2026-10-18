@@ -105,7 +105,7 @@ async def dialogue_interject(payload: InterjectRequest):
             )
         try:
             blocks = await assemble_daily_blocks(
-                payload.npc, prompt_max=payload.limits.line_prompt_max,
+                payload, prompt_max=payload.limits.line_prompt_max,
             )
         except Exception as exc:  # noqa: BLE001 - 上下文失败按 D-17 回原对话
             logger.exception("[interject] 日常稳定块装配失败")

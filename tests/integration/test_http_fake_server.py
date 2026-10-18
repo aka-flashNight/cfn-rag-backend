@@ -147,3 +147,33 @@ async def test_http_client_disconnect_cancels_upstream_and_writes_nothing(fake_m
     ledger = fake_memory.dialogue_ledger_read_sync(info.session_id)
     assert [row.seq for row in ledger] == [0]  # 只种入请求 played；AI 台词未落库
     assert slow.calls == ["primary"]
+
+
+@pytest.mark.asyncio
+async def test_http_f04_reference_continuation_request_streams(fake_memory):
+    """F-04：请求带 reference_continuation，假流正常出首句。"""
+    app = build_app(forced="F-04")
+    with run_server(app) as base:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{base}/api/game/dialogue-interject", json=fx.daily_turn_b_request(),
+            )
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["status", "line", "line", "done"]
+    assert events[1][1]["text"] == "任务是吧，我这儿正好有个跑腿的活儿。"
+
+
+@pytest.mark.asyncio
+async def test_http_f03_shape_streams_final_dialogue_after_draft(fake_memory):
+    """F-03 形状：只回放草案结果后的最终对话，不实际建草案（工具链见单测）。"""
+    app = build_app(forced="F-03")
+    payload = fx.daily_request(player_input="有没有什么活儿给我？")
+    with run_server(app) as base:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{base}/api/game/dialogue-interject", json=payload,
+            )
+    events = parse_sse(response.text)
+    assert [name for name, _ in events] == ["status", "line", "line", "line", "done"]
+    assert events[1][1]["text"] == "行，那我直说了。"
+    assert events[3][1]["kind"] == "closing"

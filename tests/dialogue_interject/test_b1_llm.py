@@ -74,9 +74,13 @@ def test_daily_system_prompt_has_stable_blocks_and_jsonl_rules():
     assert "【你的形象】" in system
     assert "好感度是 7" in system
 
-    # 不能混入终端的 meta 行 / 路由 / 草案 / 说话爆发块
-    for forbidden in ("meta", "路由", "任务草案", "route_", "过渡语"):
+    # 不能混入终端的 meta 行 / 说话爆发块；B2 的工具说明必须在
+    for forbidden in ("meta", "说话爆发"):
         assert forbidden not in system
+    assert "route_search" in system
+    assert "route_task_draft" in system
+    assert "本轮只能对话" not in system
+    assert "本轮没有可用工具" not in system
 
 
 def test_daily_user_context_is_un_numbered_and_request_scoped():
@@ -104,9 +108,13 @@ def test_build_messages_is_exactly_system_plus_request_context():
     assert "最近怎么样？" in messages[1]["content"]
 
 
-async def test_assemble_daily_blocks_uses_npc_state_and_emotion_whitelist():
+async def test_assemble_daily_blocks_uses_npc_state_and_emotion_whitelist(memory_store):
     blocks = await assemble_daily_blocks(
-        fx.NPC, npc_manager=FakeNPCManager(), game_data=FakeGameData(),
+        make_request(fx.daily_request()),
+        npc_manager=FakeNPCManager(),
+        game_data=FakeGameData(),
+        memory=memory_store,
+        rag_enabled=False,
     )
     assert isinstance(blocks, DailyBlocks)
     assert blocks.npc_emotions == ("普通", "微笑", "冷漠")
@@ -182,6 +190,10 @@ async def test_real_adapter_feeds_orchestrator_first_line_before_done():
     assert names.index("line") < names.index("done")
 
 
-def test_tool_matrix_remains_empty_until_p2():
-    assert tool_matrix_for("daily") == ()
+def test_tool_matrix_b2_daily_has_tools():
+    assert "route_search" in tool_matrix_for("daily")
+    assert "route_task_draft" in tool_matrix_for("daily")
+    assert "update_long_term_memory" in tool_matrix_for("daily")
+    assert "route_task_confirm" not in tool_matrix_for("daily")
+    assert "route_task_confirm" in tool_matrix_for("daily", has_draft=True)
     assert tool_matrix_for("task") == ()

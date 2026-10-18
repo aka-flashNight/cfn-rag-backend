@@ -9,9 +9,10 @@ MemoryStore 指向临时目录，不写生产 `tools/memory.db`。
     python -m tests.integration.fake_interject_server --port 7088 --fixture auto
 
 fixture 选择：
-- `--fixture auto`（默认）：task→F-09；player_input 含「零有效」→F-10；
-  含「部分」→F-11；含「北边」→F-02；其余→F-01。
-- `--fixture F-01|F-02|F-09|F-10|F-11`：所有请求强制回放该 fixture。
+- `--fixture auto`（默认）：task→F-09；含「零有效」→F-10；含「部分」→F-11；
+  含「先别说这个」→F-04；含「活儿/委托/任务」→F-03；含「北边」→F-02；其余→F-01。
+- `--fixture F-01|F-02|F-03|F-04|F-09|F-10|F-11`：所有请求强制回放该 fixture。
+  F-03 只回放“草案结果后的最终对话”，不实际创建草案。
 - `--chunk-delay-ms N`：每个 chunk 之间延迟 N 毫秒（便于观察逐句/取消）。
 
 端点：
@@ -64,10 +65,12 @@ class FakeFixture:
 
 
 def default_fixtures() -> dict[str, FakeFixture]:
-    """B1 联调固定场景（与游戏侧 G0-3 使用同一组 fixture）。"""
+    """B2 联调固定场景（与游戏侧共享 fixture 同源）。"""
     return {
         "F-01": FakeFixture("F-01", list(fx.F01_JSONL)),
         "F-02": FakeFixture("F-02", list(fx.F02_JSONL)),
+        "F-03": FakeFixture("F-03", list(fx.F03_FINAL_JSONL)),
+        "F-04": FakeFixture("F-04", list(fx.F04_TURN_B_JSONL)),
         "F-09": FakeFixture("F-09", list(fx.F09_JSONL)),
         "F-10": FakeFixture(
             "F-10", list(fx.F10_TEXT), repair_chunks=list(fx.F10_TEXT),
@@ -92,6 +95,10 @@ def select_fixture(
         return fixtures["F-10"]
     if "部分" in text:
         return fixtures["F-11"]
+    if "先别说这个" in text:
+        return fixtures["F-04"]
+    if "活儿" in text or "委托" in text or "任务" in text:
+        return fixtures["F-03"]
     if "北边" in text:
         return fixtures["F-02"]
     return fixtures["F-01"]
