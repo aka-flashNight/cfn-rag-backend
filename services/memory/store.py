@@ -222,6 +222,16 @@ class PublishedTaskHighlight:
     rounds_left: int = 0
 
 
+@dataclass
+class DialogueLedgerRow:
+    """对话内嵌插话的已播台账行：seq 与 chat_history.message_id 一一对应。"""
+
+    seq: int
+    role: str
+    content: str
+    message_id: int
+
+
 class MemoryStore:
     """SQLite 存储访问层（同步实现 + asyncio.to_thread 包装）。"""
 
@@ -266,7 +276,21 @@ class MemoryStore:
                     npc_name TEXT NOT NULL,
                     title TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    slot_key TEXT
+                    slot_key TEXT,
+                    dialogue_instance_id TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dialogue_interject_ledger (
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, seq)
                 )
                 """
             )
@@ -382,13 +406,22 @@ class MemoryStore:
             self._migrate_legacy_schema(cur)
             self._conn.commit()
     def _migrate_legacy_schema(self, cur: sqlite3.Cursor) -> None:
-        """旧库升级：草案补 bargain_count 独立列（修 D5）＋ sessions 补 slot_key（B2-5）。"""
+        """旧库升级：草案补 bargain_count 独立列（修 D5）＋ sessions 补 slot_key（B2-5）
+        ＋ sessions 补 dialogue_instance_id（对话内嵌插话，P0）。"""
         self._migrate_draft_bargain_count(cur)
         cur.execute("PRAGMA table_info(sessions)")
         cols = {str(r[1]) for r in cur.fetchall()}
         if cols and "slot_key" not in cols:
             cur.execute("ALTER TABLE sessions ADD COLUMN slot_key TEXT")
             logger.info("旧库迁移完成：sessions 补 slot_key 列（缺省 NULL＝standalone，不回填）")
+        if cols and "dialogue_instance_id" not in cols:
+            cur.execute("ALTER TABLE sessions ADD COLUMN dialogue_instance_id TEXT")
+            logger.info("旧库迁移完成：sessions 补 dialogue_instance_id 列（对话内嵌插话）")
+        # 一组对话一个 session：dialogue_instance_id 非空时唯一（普通终端会话该列为 NULL）
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_dialogue_instance"
+            " ON sessions(dialogue_instance_id) WHERE dialogue_instance_id IS NOT NULL"
+        )
 
     def _migrate_draft_bargain_count(self, cur: sqlite3.Cursor) -> None:
         """v3 前的旧库升级：session_task_drafts 补 bargain_count 独立列（修 D5），
@@ -617,7 +650,177 @@ class MemoryStore:
             cur.execute(
                 "DELETE FROM session_published_task_highlights WHERE session_id = ?", (session_id,),
             )
+            cur.execute("DELETE FROM dialogue_interject_ledger WHERE session_id = ?", (session_id,))
             self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # 对话内嵌插话：session 映射与已播台账（P0）
+    # ------------------------------------------------------------------
+
+    _SESSION_SELECT_COLS = "session_id, npc_name, title, created_at, slot_key"
+
+    @classmethod
+    def _session_row_to_info(cls, row: sqlite3.Row) -> SessionInfo:
+        return SessionInfo(
+            session_id=str(row["session_id"]),
+            npc_name=str(row["npc_name"]),
+            title=str(row["title"]),
+            created_at=float(row["created_at"]),
+            slot_key=str(row["slot_key"]) if row["slot_key"] is not None else None,
+        )
+
+    def dialogue_session_get_sync(self, dialogue_instance_id: str) -> SessionInfo | None:
+        """按 dialogue_instance_id 取插话 session；未建立＝None。"""
+        key = (dialogue_instance_id or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT {self._SESSION_SELECT_COLS} FROM sessions WHERE dialogue_instance_id = ?",
+                (key,),
+            )
+            row = cur.fetchone()
+        return self._session_row_to_info(row) if row else None
+
+    def dialogue_session_ensure_sync(
+        self,
+        dialogue_instance_id: str,
+        npc_name: str,
+        title: str,
+        slot_key: str | None = None,
+    ) -> tuple[SessionInfo, bool]:
+        """按 dialogue_instance_id 建/取 session；返回 (会话, 是否本次新建)。
+
+        一组对话一个 session（协议 D-04 / 6.1）：同 id 重复请求只复用，不新建。
+        并发/跨进程重复创建由 dialogue_instance_id 唯一索引兜底，读回已存在那条。
+        """
+        key = (dialogue_instance_id or "").strip()
+        if not key:
+            raise ValueError("dialogue_instance_id 不能为空。")
+        npc_name = (npc_name or "").strip()
+        if not npc_name:
+            raise ValueError("npc_name 不能为空。")
+        title = (title or "").strip() or f"对话插话 · {npc_name}"
+        slot_key = str(slot_key).strip() if slot_key is not None else None
+        slot_key = slot_key or None
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT {self._SESSION_SELECT_COLS} FROM sessions WHERE dialogue_instance_id = ?",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return self._session_row_to_info(row), False
+            info = SessionInfo(
+                session_id=str(uuid.uuid4()), npc_name=npc_name, title=title,
+                created_at=time.time(), slot_key=slot_key,
+            )
+            try:
+                cur.execute(
+                    "INSERT INTO sessions"
+                    " (session_id, npc_name, title, created_at, slot_key, dialogue_instance_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (info.session_id, info.npc_name, info.title, info.created_at, info.slot_key, key),
+                )
+            except sqlite3.IntegrityError:
+                # 另一个进程已抢先写入同一 dialogue_instance_id：读回那条
+                self._conn.rollback()
+                cur.execute(
+                    f"SELECT {self._SESSION_SELECT_COLS} FROM sessions WHERE dialogue_instance_id = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise
+                return self._session_row_to_info(row), False
+            self._conn.commit()
+        return info, True
+
+    def dialogue_ledger_read_sync(self, session_id: str) -> list[DialogueLedgerRow]:
+        """读取某插话 session 的已播台账（按 seq 升序）。"""
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return []
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT seq, role, content, message_id FROM dialogue_interject_ledger"
+                " WHERE session_id = ? ORDER BY seq ASC",
+                (session_id,),
+            )
+            rows = cur.fetchall()
+        return [
+            DialogueLedgerRow(
+                seq=int(r["seq"]),
+                role=str(r["role"]),
+                content=str(r["content"]),
+                message_id=int(r["message_id"]),
+            )
+            for r in rows
+        ]
+
+    def dialogue_played_append_sync(
+        self, session_id: str, rows: list[dict[str, Any]],
+    ) -> list[int]:
+        """按 seq 幂等追加已播行：只写缺口；同 seq 内容变化时更新原消息，不重复插入。
+
+        `rows`：`[{"seq": int, "role": "user"|"assistant", "content": str}, ...]`。
+        返回本次**新增**的 seq 列表（内容修正不计入新增）。
+        """
+        session_id = (session_id or "").strip()
+        if not session_id:
+            raise ValueError("session_id 不能为空。")
+        appended: list[int] = []
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            for index, row in enumerate(sorted(rows, key=lambda item: int(item["seq"]))):
+                seq = int(row["seq"])
+                role = str(row["role"])
+                content = str(row["content"])
+                if role not in {"user", "assistant"}:
+                    raise ValueError("role 必须是 'user' 或 'assistant'。")
+                if not content.strip():
+                    continue
+                cur.execute(
+                    "SELECT role, content, message_id FROM dialogue_interject_ledger"
+                    " WHERE session_id = ? AND seq = ?",
+                    (session_id, seq),
+                )
+                existing = cur.fetchone()
+                if existing is None:
+                    # 同一批写入用微秒级递增时间戳，保证会话历史顺序与 seq 一致
+                    ts = now + index * 1e-6
+                    cur.execute(
+                        "INSERT INTO chat_history (session_id, role, content, timestamp)"
+                        " VALUES (?, ?, ?, ?)",
+                        (session_id, role, content, ts),
+                    )
+                    message_id = int(cur.lastrowid)
+                    cur.execute(
+                        "INSERT INTO dialogue_interject_ledger"
+                        " (session_id, seq, role, content, message_id, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (session_id, seq, role, content, message_id, ts),
+                    )
+                    appended.append(seq)
+                elif str(existing["content"]) != content or str(existing["role"]) != role:
+                    # Host 修正了该 seq 的已播内容：以现场为准，改原消息而不是再插一条
+                    message_id = int(existing["message_id"])
+                    cur.execute(
+                        "UPDATE chat_history SET role = ?, content = ? WHERE id = ?",
+                        (role, content, message_id),
+                    )
+                    cur.execute(
+                        "UPDATE dialogue_interject_ledger SET role = ?, content = ?, updated_at = ?"
+                        " WHERE session_id = ? AND seq = ?",
+                        (role, content, now, session_id, seq),
+                    )
+            self._conn.commit()
+        return appended
 
     # ------------------------------------------------------------------
     # 任务草案（bargain_count 独立列，修 D5）
@@ -1317,6 +1520,10 @@ for _name in [
     "list_sessions",
     "update_session_title",
     "delete_session",
+    "dialogue_session_get",
+    "dialogue_session_ensure",
+    "dialogue_ledger_read",
+    "dialogue_played_append",
     "upsert_draft",
     "get_draft",
     "update_partial",
