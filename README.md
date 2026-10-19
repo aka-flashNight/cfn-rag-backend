@@ -108,7 +108,7 @@ TurnOrchestrator（每回合一个实例，纯 asyncio）
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG.exe`
 2. 将 `CFN-RAG.exe` 放在与 `resources` 文件夹同一目录
 3. 双击运行 `CFN-RAG.exe`（首次运行如弹出 Windows 防火墙授权，请点「允许」）
-4. 浏览器自动打开界面，按引导完成模型配置
+4. 浏览器自动打开界面，在设置页填写 API Key / API Base / 模型（打包版只从这里读取配置，不需要创建 `.env`）
 
 **注意**：必须配合 GitHub 上最新版本的 `resources` 游戏资源文件夹。
 
@@ -116,7 +116,7 @@ TurnOrchestrator（每回合一个实例，纯 asyncio）
 
 1. 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 页面下载 `CFN-RAG-Full.zip`
 2. 解压到任意位置，双击运行 `CFN-RAG.exe`
-3. 浏览器自动打开界面，按引导完成模型配置
+3. 浏览器自动打开界面，在设置页填写 API Key / API Base / 模型（打包版只从这里读取配置，不需要创建 `.env`）
 
 **优点**：无需额外下载游戏资源，独立运行
 **注意**：内置资源可能不是最新版本
@@ -252,15 +252,15 @@ LLM_MODEL_NAME=deepseek-v4-flash-vision-exp
 
 ### 配置方式
 
-- **前端界面（推荐）**：启动后在设置页填写 api_key / api_base / model / 代理，按会话即时生效
-- **`.env` 文件**：同目录创建 `.env`（参考 `.env.example`），作为默认配置
+- **页面设置（打包版 exe 唯一方式）**：启动后在前端设置页填写 api_key / api_base / model / 代理，按会话即时生效。打包后的 exe 只使用页面设置里的配置，不读取 `.env`。
+- **`.env` 文件（仅源码开发与测试）**：源码运行时可在同目录创建 `.env`（参考 `.env.example`），作为开发/测试的默认配置；不用于打包版 exe。
 
 ### 代理配置
 
 **如果使用国外模型（如 Gemini、OpenAI）或开启了全局代理，需要配置代理。** 代理仅作用于 LLM 请求（客户端级，不修改进程环境变量）：
 
-- 前端设置页填写代理地址，按会话生效；
-- 或 `.env` 中设置 `LLM_PROXY_URL=http://127.0.0.1:7890`。
+- 打包版 exe 在前端设置页填写代理地址，按会话生效；
+- 源码开发/测试还可在 `.env` 中设置 `LLM_PROXY_URL=http://127.0.0.1:7890`。
 
 常见端口：`http://127.0.0.1:7890`（Clash）、`http://127.0.0.1:10809`（v2rayN）。
 
@@ -372,7 +372,7 @@ A: 检查以下几点：
 
 ### Q: 如何更换其他 LLM 模型？
 
-A: 在前端设置中修改（优先级最高），或修改 `.env` 中的 `LLM_API_BASE` / `LLM_MODEL_NAME`。只要 API 兼容 OpenAI 格式即可。注意：**任务发布/讨价还价功能需要平台支持工具调用（function calling）**，不支持工具调用的平台仅可体验聊天。
+A: 打包版 exe 只在前端设置中修改（不需要 `.env`）；源码开发/测试还可修改 `.env` 中的 `LLM_API_BASE` / `LLM_MODEL_NAME`。只要 API 兼容 OpenAI 格式即可。注意：**任务发布/讨价还价功能需要平台支持工具调用（function calling）**，不支持工具调用的平台仅可体验聊天。
 
 ### Q: 为什么要同步升级前端？
 

@@ -43,6 +43,7 @@ from services.dialogue_interject.sessions import (
     finalize,
 )
 from services.llm.meta import DEFAULT_EMOTION
+from services.llm.recent import get_recent_llm_config
 
 logger = logging.getLogger(__name__)
 router: APIRouter = APIRouter()
@@ -98,8 +99,10 @@ async def dialogue_interject(payload: InterjectRequest):
     binding = None
 
     if stream_factory is None:
-        # 沿用全局 settings；没有 api_key 时不发起调用
-        if not llm_is_configured():
+        # 打包版没有 .env：复用终端 ask 最近一次由页面设置传入的配置；
+        # 没有时再回落全局 settings（源码开发/测试）。
+        recent_llm = get_recent_llm_config()
+        if not llm_is_configured(recent_llm):
             return StreamingResponse(
                 _error_stream("llm_not_configured", "未配置 llm_api_key，插话真模型路径不可用"),
                 media_type="text/event-stream",
@@ -131,6 +134,7 @@ async def dialogue_interject(payload: InterjectRequest):
         stream_factory = partial(
             stream_task_llm if payload.mode == "task" else stream_daily_llm,
             blocks=blocks,
+            llm_config=recent_llm,
         )
 
     if binding is None:

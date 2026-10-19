@@ -94,7 +94,7 @@ def test_finalize_endpoint_is_idempotent(memory_store):
 
 def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store, monkeypatch):
     # B1：默认走真 LLM 路径，但测试必须离线——强制判定为未配置
-    monkeypatch.setattr(interject_api, "llm_is_configured", lambda: False)
+    monkeypatch.setattr(interject_api, "llm_is_configured", lambda *a, **k: False)
     client = _client(None)
     response = client.post("/game/dialogue-interject", json=fx.daily_request())
     assert response.status_code == 200
@@ -106,7 +106,7 @@ def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store
 
 def test_task_mode_without_api_key_returns_llm_not_configured(memory_store, monkeypatch):
     """B4 任务模式接真模型；未配置 key 时明确 error，不建 session、不产 plan。"""
-    monkeypatch.setattr(interject_api, "llm_is_configured", lambda: False)
+    monkeypatch.setattr(interject_api, "llm_is_configured", lambda *a, **k: False)
     client = _client(None)
     response = client.post("/game/dialogue-interject", json=fx.task_request())
     assert response.status_code == 200

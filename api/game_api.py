@@ -17,6 +17,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from core.config import get_settings
 from schemas.knowledge_schema import (
@@ -36,6 +37,12 @@ from schemas.knowledge_schema import (
 )
 from services.integration.state import get_integration_state
 from services.llm import LLMConfig
+from services.llm.recent import (
+    get_recent_llm_config,
+    get_recent_updated_at,
+    remember_llm_config,
+    replace_llm_config,
+)
 from services.memory.store import get_memory_store
 from services.npc.manager import NPCManager, get_npc_manager
 from services.orchestrator import TurnOrchestrator
@@ -71,7 +78,58 @@ def resolve_llm_config(payload: NPCChatRequest) -> LLMConfig:
     )
     with _CONFIG_LOCK:
         _SESSION_LLM_CONFIGS[payload.session_id] = merged
+    # 插话请求没有前端设置可带：记住最近一次有效配置供其复用。
+    remember_llm_config(merged)
     return merged
+
+
+
+# ---------------------------------------------------------------------------
+# LLM 连接配置（localStorage 是唯一持久化位置，后端只保留内存副本）
+# ---------------------------------------------------------------------------
+
+class LlmConfigSaveRequest(BaseModel):
+    api_key: str = ""
+    api_base: str = ""
+    model_name: str = ""
+    proxy_url: str = ""
+    updated_at: int | None = None
+
+
+def _llm_config_view() -> dict:
+    config = get_recent_llm_config()
+    key = config.api_key if config is not None else ""
+    return {
+        "ok": True,
+        "configured": bool(key.strip()),
+        "api_key": key,
+        "api_base": config.api_base if config is not None else "",
+        "model_name": config.model_name if config is not None else "",
+        "proxy_url": config.proxy_url if config is not None else "",
+        "updated_at": get_recent_updated_at(),
+    }
+
+
+@router.get("/llm-config", summary="读取当前进程内生效的 LLM 连接配置")
+async def get_llm_config():
+    return _llm_config_view()
+
+
+@router.post("/llm-config", summary="同步终端 localStorage 中的 LLM 连接配置")
+async def save_llm_config(payload: LlmConfigSaveRequest):
+    existing = get_recent_llm_config()
+    # 配置小窗只有三个字段；不传 proxy 时保留当前进程已有的代理。
+    proxy_url = payload.proxy_url or (existing.proxy_url if existing is not None else "")
+    replace_llm_config(
+        LLMConfig(
+            api_key=payload.api_key.strip(),
+            api_base=payload.api_base.strip(),
+            model_name=payload.model_name.strip(),
+            proxy_url=proxy_url.strip(),
+        ),
+        updated_at=payload.updated_at,
+    )
+    return _llm_config_view()
 
 
 # ---------------------------------------------------------------------------

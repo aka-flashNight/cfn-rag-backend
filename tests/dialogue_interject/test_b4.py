@@ -544,12 +544,12 @@ def test_task_api_wires_task_blocks_and_stream(memory_store, monkeypatch):
         captured["assemble"] = (payload.mode, prompt_max, session_id)
         return blocks
 
-    async def _fake_stream(request, *, blocks=None):
+    async def _fake_stream(request, *, blocks=None, llm_config=None):
         captured["stream"] = (request.mode, blocks)
         for chunk in fx.F05_JSONL:
             yield chunk
 
-    monkeypatch.setattr(interject_api, "llm_is_configured", lambda: True)
+    monkeypatch.setattr(interject_api, "llm_is_configured", lambda *a, **k: True)
     monkeypatch.setattr(interject_api, "assemble_task_blocks", _fake_assemble)
     monkeypatch.setattr(interject_api, "stream_task_llm", _fake_stream)
 
