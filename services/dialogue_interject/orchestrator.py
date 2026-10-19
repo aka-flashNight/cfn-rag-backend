@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 #: 假流/真流统一接口：给请求，返回文本增量迭代器
 StreamFactory = Callable[[InterjectRequest], AsyncIterator[str]]
 
+#: valid_lines 只统计“已接受的有效正文行”（协议 5.2）：日常 add/closing，任务 add/line
+_TEXT_KINDS = ("add", "closing", "line")
+
 
 @dataclass
 class _DriveState:
@@ -188,8 +191,8 @@ class InterjectOrchestrator:
                 yield mute_event()
             return
 
-        # valid_lines 按模型输出行计（拆分前）；mute 是控制标记，不计（协议 5.2）
-        if entry.kind != "mute":
+        # valid_lines 只计有效正文行（拆分前）；mute/nochange/remove/end 是控制标记，不计
+        if entry.kind in _TEXT_KINDS:
             state.valid_rows += 1
 
         if entry.kind in ("add", "closing"):

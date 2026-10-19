@@ -133,6 +133,8 @@ def test_task_prompt_has_discipline_output_and_only_query_tools():
     assert "【任务对话纪律】" in system
     assert "必须回到当前任务对话的原有脉络" in system
     assert "能直接接回原文时必须用 end" in system
+    assert "不输出 end 就是整组替换" in system
+    assert "只有在对原有信息脉络没有依赖、或整组都改完时才允许" in system
     assert "不得漏掉原句里的任务信息" in system
     assert '{"mute":true}' in system
     assert '{"end":4}' in system
@@ -332,15 +334,38 @@ async def test_task_partial_failure_keeps_line_but_never_plans():
     assert "plan" not in [event.event for event in events]
 
 
-async def test_task_valid_lines_counts_model_rows_but_not_mute():
+async def test_task_valid_lines_does_not_count_control_rows_or_mute():
+    """协议 5.2：valid_lines 只计有效正文行（add/line）；remove/end/mute 不计。"""
     events = await collect_events(
         make_orchestrator(
             fx.task_request(),
-            chunks=['{"mute":true}\n', '{"n":2,"remove":true}\n'],
+            chunks=[
+                '{"mute":true}\n',
+                '{"n":2,"remove":true}\n',
+                '{"n":3,"nochange":true}\n',
+                '{"end":4}\n',
+            ],
             error=RuntimeError("stream broke"),
         )
     )
-    assert events[-1].data["valid_lines"] == 1  # remove 计 1；mute 不计
+    assert events[-1].data["valid_lines"] == 0
+
+
+async def test_task_valid_lines_counts_add_and_line_before_split():
+    """正文行按模型输出行计、拆分前：一条超长 add + 一条 line = 2。"""
+    events = await collect_events(
+        make_orchestrator(
+            fx.task_request(),
+            chunks=[
+                '{"add":"' + fx.F05B_LONG_EDIT + '","emo":"普通"}\n',
+                '{"n":2,"line":"北边仓库昨晚丢了一批货。","emo":"普通"}\n',
+            ],
+            error=RuntimeError("stream broke"),
+        )
+    )
+    # 超长 add 被拆成多个 line 事件，但仍只算 1 条模型输出行
+    assert len([event for event in events if event.event == "line"]) >= 2
+    assert events[-1].data["valid_lines"] == 2
 
 
 # ---------------------------------------------------------------------------
