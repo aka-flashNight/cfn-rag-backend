@@ -1,11 +1,11 @@
 """插话提示词与工具策略接口。
 
-B1：日常真 LLM 最小路径使用 `build_daily_system_prompt`——复用终端的稳定块
+日常真 LLM 路径使用 `build_daily_system_prompt`——复用终端的稳定块
 （世界观/说话方式/扮演/NPC 状态/场景/同阵营），但**不**引入终端的 meta 行、
 路由轮、说话爆发、过渡语、任务草案块。
 
-工具：B1 不向模型暴露任何工具（`tool_matrix_for` 返回空表），P2 再按协议 §7.4
-接入查询/记忆/草案；本轮避免半成品任务与委派链。
+工具说明只写行为要求，不解释工具机制（不出现“后台/Host/参数不会出现在台词里”
+这类系统视角描述）；委派只在注册闸放行时出现，且要求“非常必要才调用”。
 """
 
 from __future__ import annotations
@@ -78,20 +78,22 @@ def build_daily_output_rules(prompt_max: int = 135) -> str:
         "3. 想好第一句就立即输出第一行，不要等整段想完。",
         "4. 原对话剩余台词只作参考，不要机械续写；玩家已经切到 AI 聊天。",
         "5. 不要输出说话人名字前缀，说话人由系统决定。",
-        "6. 需要调用工具时按工具说明执行；不要在台词里提工具、后台或系统。",
+        "6. 需要调用工具时按工具说明执行；不要在台词里提工具，也不要解释自己是怎么做到的。",
     ])
 
 
 def build_daily_tool_guide(
-    *, has_pending_draft: bool = False, task_publish_disabled: bool = False,
+    *,
+    has_pending_draft: bool = False,
+    task_publish_disabled: bool = False,
+    delegate_enabled: bool = False,
 ) -> str:
     """日常可用工具说明（协议 7.4 / 实施指引 §5、§10）。
 
-    只写本轮真实注册的工具；委派子 Agent 属 P3，本阶段不出现。
+    只写本轮真实注册的工具；不解释工具机制，不用“后台/Host”等系统词。
     """
     lines = [
         "【工具（本轮可用）】",
-        "工具调用的参数与结果不会出现在台词里；需要调用工具时按下面的规则执行。",
         "- route_search：玩家问设定、人物、关卡或物品，或你需要查证时调用。"
         "调用工具的那一轮不要输出 add/closing；结果回来后用 JSONL 回答。",
         "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
@@ -99,7 +101,7 @@ def build_daily_tool_guide(
     if not task_publish_disabled:
         lines.append(
             "- route_task_draft：玩家明确索要委托/工作/差事，或按你的身份和当下情景你决定主动派活时调用。"
-            "调用这一轮只发工具调用，不要输出任何 add/closing；后台拟好草案后，再用 JSONL 说明委托。"
+            "调用这一轮只发工具调用，不要输出任何 add/closing；草案拟好后，再用 JSONL 说明委托。"
         )
         if has_pending_draft:
             lines.append(
@@ -108,14 +110,19 @@ def build_daily_tool_guide(
             )
         lines.extend([
             "【任务草案纪律】",
-            "1. 触发草案时不要输出“我去准备一下”之类的过渡语；Host 会保持等待。",
-            "2. 草案结果回来后，只输出最终确认对话（add）和结束语（closing）；"
+            "1. 触发草案时不要输出“我去准备一下”之类的过渡语。",
+            "2. 草案拟好后，只输出最终确认对话（add）和结束语（closing）；"
             "结束语表达“不接就算了/这活就搁着”，不要求固定措辞。",
             "3. 草案只是拟定，不是已发布；玩家点头前不要说“任务已发布”。",
-            "4. 确认成功后可以说已交给玩家；任务内容/要求/报酬以草案结果为准，不要编造数字。",
+            "4. 确认成功后可以说已交给玩家；任务内容/要求/报酬以草案为准，不要编造数字。",
         ])
     else:
         lines.append("- 你当前不能发布委托；玩家索要时以角色口吻回应或婉拒。")
+    if delegate_enabled:
+        lines.append(
+            "- delegate_dialogue_rewrite：只有非常必要时才调用（你的长期立场或以后说话方式"
+            "会因此改变时才用）；调用那一轮不要输出 add/closing；不需要就绝不调用。"
+        )
     return "\n".join(lines)
 
 
@@ -130,6 +137,7 @@ def build_daily_system_prompt(
     prompt_max: int = 135,
     has_pending_draft: bool = False,
     task_publish_disabled: bool = False,
+    delegate_enabled: bool = False,
 ) -> str:
     """日常插话 system：稳定块在前，随草案/好感度变化的状态块在后（前缀缓存友好）。"""
     emotions = "、".join(state.emotions or ["普通"])
@@ -147,6 +155,7 @@ def build_daily_system_prompt(
         build_daily_tool_guide(
             has_pending_draft=has_pending_draft,
             task_publish_disabled=task_publish_disabled,
+            delegate_enabled=delegate_enabled,
         ),
         build_session_state_block(
             progress_desc=progress_desc,
@@ -207,15 +216,20 @@ def build_daily_messages(request: InterjectRequest, blocks: Any) -> list[dict[st
     )
 
 
-def tool_matrix_for(mode: str, *, has_draft: bool = False) -> tuple[str, ...]:
+def tool_matrix_for(
+    mode: str, *, has_draft: bool = False, delegate_enabled: bool = False,
+) -> tuple[str, ...]:
     """工具策略接口（协议 §7.4）。
 
-    B2 日常：查询/检索、长期记忆、任务草案及草案存在时的 confirm/cancel/update；
-    委派子 Agent 留 P3；任务模式留 P4（返回空表，真路径由 API 回 task_mode_not_ready）。
+    日常：查询/检索、长期记忆、任务草案及草案存在时的 confirm/cancel/update；
+    委派工具只在注册闸放行（有存档、无并发改写）时加入。任务模式留 P4
+    （返回空表，真路径由 API 回 task_mode_not_ready）。
     """
     if mode != "daily":
         return ()
     names = ["route_task_draft", "route_search", "update_long_term_memory"]
     if has_draft:
         names.extend(["route_task_confirm", "route_task_cancel", "route_task_update"])
+    if delegate_enabled:
+        names.append("delegate_dialogue_rewrite")
     return tuple(names)

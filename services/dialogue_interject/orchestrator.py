@@ -28,6 +28,7 @@ from services.dialogue_interject.schemas import (
     DonePayload,
     InterjectRequest,
     LinePayload,
+    StreamStatus,
     done_event,
     error_event,
     line_event,
@@ -83,6 +84,7 @@ class InterjectOrchestrator:
         )
         self._seq = 0
         self._mute_sent = False
+        self._last_status = "thinking"
 
     async def run(self) -> AsyncIterator:
         """产出 SSEEvent 序列（调用方负责编码/取消）。"""
@@ -151,6 +153,12 @@ class InterjectOrchestrator:
         parser = JSONLStreamParser(self._options)
         try:
             async for chunk in factory(self.request):
+                if isinstance(chunk, StreamStatus):
+                    # 工具轮前的旁路状态：不进解析器、不占 seq；同值不重复推
+                    if chunk.stage and chunk.stage != self._last_status:
+                        self._last_status = chunk.stage
+                        yield status_event(chunk.stage)
+                    continue
                 for entry in parser.feed(chunk):
                     state.entries.append(entry)
                     async for event in self._entry_event(entry, state):

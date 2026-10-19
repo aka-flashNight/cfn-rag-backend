@@ -63,6 +63,8 @@ class DailyBlocks:
     pending_draft_summary: str = ""
     recent_dialogue: str = ""
     task_publish_disabled: bool = False
+    delegate_enabled: bool = False
+    save_info: Any = None
 
 
 def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | None = None) -> list[str]:
@@ -218,12 +220,15 @@ async def assemble_daily_blocks(
     registry: Any = None,
     prompt_max: int = 135,
     rag_enabled: bool = True,
+    session_id: str | None = None,
 ) -> DailyBlocks:
     """装配日常插话的 system/现场块与工具运行快照。
 
     - system：世界观/扮演/NPC 状态/场景/同阵营/输出纪律/工具说明；
     - user 现场：长期记忆、RAG、played、remaining、reference、草案摘要、玩家输入；
-    - 不读取 session 聊天历史（协议 4.1：session 历史不参与本轮 prompt）。
+    - 不读取 session 聊天历史（协议 4.1：session 历史不参与本轮 prompt）；
+    - 草案与工具写盘一律用 MemoryStore 的 session_id（与终端继续聊同一把钥匙），
+      传空时按 dialogue_instance_id 反查，查不到才退回原值。
     """
     npc_name = request.npc
     if npc_manager is None:
@@ -363,13 +368,33 @@ async def assemble_daily_blocks(
         logger.warning("插话长期记忆装配失败，降级为空: %s", exc)
 
     # ---- 待确认草案（B2 起支持 confirm/cancel/update）----
+    # 草案与终端共用一把钥匙：优先 MemoryStore 的 session_id；未建会话时退回
+    # dialogue_instance_id（离线单测/异常降级），并兼容 B2 早期按 instance id 落库的草案。
+    session_id = (session_id or "").strip()
+    if not session_id:
+        session_id = request.dialogue_instance_id
+        try:
+            info = await memory.dialogue_session_get(request.dialogue_instance_id)
+            if info is not None:
+                session_id = info.session_id
+        except Exception as exc:
+            logger.warning("插话 session 反查失败，按 dialogue_instance_id 处理: %s", exc)
+
     pending_draft_row = None
     pending_draft_summary = ""
-    if request.dialogue_instance_id:
+    draft_keys = [session_id]
+    if request.dialogue_instance_id and request.dialogue_instance_id != session_id:
+        draft_keys.append(request.dialogue_instance_id)
+    for draft_key in draft_keys:
+        if not draft_key:
+            continue
         try:
-            pending_draft_row = await memory.get_draft(request.dialogue_instance_id)
+            pending_draft_row = await memory.get_draft(draft_key)
         except Exception as exc:
             logger.warning("插话草案读取失败，按无草案处理: %s", exc)
+            pending_draft_row = None
+        if pending_draft_row is not None:
+            break
     if pending_draft_row is not None and isinstance(pending_draft_row.draft, dict):
         try:
             from services.agent_tools.draft_formatting import _detailed_draft_summary
@@ -436,6 +461,14 @@ async def assemble_daily_blocks(
     from services.npc.task_publish_policy import is_task_publish_disabled
 
     task_publish_disabled = is_task_publish_disabled(npc_name)
+    # 委派工具按终端注册闸（后台有 worker / 未绑定存档时不注册，提示词也不提）
+    delegate_enabled = False
+    try:
+        from services.dialogue.delegation import delegate_tool_or_none
+
+        delegate_enabled = delegate_tool_or_none(include_task_fallback=False) is not None
+    except Exception as exc:
+        logger.warning("插话委派工具判定失败，按不注册处理: %s", exc)
 
     # 局部导入：prompts 顶层依赖本模块的现场渲染，避免循环导入
     from services.dialogue_interject.prompts import build_daily_system_prompt
@@ -450,6 +483,7 @@ async def assemble_daily_blocks(
         prompt_max=prompt_max,
         has_pending_draft=pending_draft_row is not None,
         task_publish_disabled=task_publish_disabled,
+        delegate_enabled=delegate_enabled,
     )
     recent_dialogue = "\n".join(
         render_played(request.dialogue.played, npc=npc_name, max_lines=8)
@@ -464,7 +498,7 @@ async def assemble_daily_blocks(
         engine=engine,
         registry=registry,
         memory=memory,
-        session_id=request.dialogue_instance_id,
+        session_id=session_id,
         slot_key=slot_key,
         progress_stage=progress_stage,
         player_level=player_level,
@@ -481,4 +515,6 @@ async def assemble_daily_blocks(
         pending_draft_summary=pending_draft_summary,
         recent_dialogue=recent_dialogue,
         task_publish_disabled=task_publish_disabled,
+        delegate_enabled=delegate_enabled,
+        save_info=save_info,
     )

@@ -19,7 +19,13 @@ from services.agent_tools.handlers import (
     execute_cancel_agent_task,
     execute_confirm_agent_task,
 )
+from services.dialogue.delegation import (
+    DELEGATE_TOOL_NAME,
+    apply_delegate_calls,
+    delegate_tool_or_none,
+)
 from services.dialogue_interject.context import DailyBlocks
+from services.dialogue_interject.prompts import build_daily_messages
 from services.dialogue_interject.schemas import InterjectRequest
 from services.llm import LLMClient
 from services.memory.long_term import (
@@ -33,7 +39,7 @@ from services.orchestrator.search_prefetch import (
     build_prefetch_result_block,
     run_search_prefetch,
 )
-from services.orchestrator.turn import Route, _parse_route
+from services.orchestrator.turn import Route, _parse_route, generate_confirm_args
 from services.subagents.search_runner import SearchRunner
 from services.subagents.task_runner import TaskRunner
 from services.tools.base import ROUTE_TOOLS_DRAFT, ROUTE_TOOLS_NEW
@@ -106,6 +112,15 @@ class DailyToolRuntime:
         schemas = self.registry.get_openai_tools(names=self._route_names())
         if self.blocks.long_term is not None:
             schemas = [*schemas, build_chat_tool(self.blocks.long_term)]
+        if self.blocks.delegate_enabled:
+            # 注册闸每轮现查：后台 worker 在跑/未绑定存档时不出现（提示词也不提）
+            try:
+                delegate_tool = delegate_tool_or_none(include_task_fallback=False)
+            except Exception as exc:  # 判定失败按不注册处理，不影响主线
+                logger.warning("[interject] 委派工具注册判定失败: %s", exc)
+                delegate_tool = None
+            if delegate_tool is not None:
+                schemas = [*schemas, delegate_tool]
         return schemas or None
 
     # ------------------------------------------------------------------
@@ -121,25 +136,52 @@ class DailyToolRuntime:
 
         tool_messages: list[dict[str, Any]] = []
         memory_results: dict[int, str] = {}
+        delegate_results: dict[int, str] = {}
         for index, call in enumerate(calls):
-            if tool_call_name(call) != CHAT_TOOL_NAME:
-                continue
-            try:
-                result = await apply_chat_tool(
-                    self.memory,
-                    call,
-                    snapshot=self.blocks.long_term,
-                    session_id=self.blocks.session_id,
-                )
-            except Exception as exc:  # 记忆失败不阻断对话
-                logger.warning("[interject] 长期记忆工具失败: %s", exc)
-                result = None
-            memory_results[index] = result or "未记录"
+            name = tool_call_name(call)
+            if name == CHAT_TOOL_NAME:
+                try:
+                    result = await apply_chat_tool(
+                        self.memory,
+                        call,
+                        snapshot=self.blocks.long_term,
+                        session_id=self.blocks.session_id,
+                    )
+                except Exception as exc:  # 记忆失败不阻断对话
+                    logger.warning("[interject] 长期记忆工具失败: %s", exc)
+                    result = None
+                memory_results[index] = result or "未记录"
+            elif name == DELEGATE_TOOL_NAME:
+                delegate_results[index] = await self._run_delegate(call)
 
         route = _parse_route(calls)
         if route is None:
-            # 只有记忆/未知工具：正文已随流推送，无需后续调用
-            return ToolExecutionResult()
+            if not delegate_results:
+                # 只有记忆/未知工具：正文已随流推送，无需后续调用
+                return ToolExecutionResult()
+            # 只发了委派：仍回到无工具轮，让玩家听到正常台词（worker 在后台跑）
+            for index, call in enumerate(calls):
+                content = (
+                    delegate_results.get(index)
+                    or memory_results.get(index)
+                    or "已忽略"
+                )
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or ""),
+                    "content": content,
+                })
+            instruction = "继续用 JSONL 回应当前对话；不要提工具，也不要解释你做了什么处理。"
+            return ToolExecutionResult(
+                requires_followup=True,
+                messages=[
+                    {"role": "assistant", "content": round_text or "", "tool_calls": calls},
+                    *tool_messages,
+                    {"role": "user", "content": instruction},
+                ],
+                instruction=instruction,
+                route_kind="delegate",
+            )
 
         route_index = next(
             (
@@ -149,8 +191,8 @@ class DailyToolRuntime:
             None,
         )
         if route.kind.startswith("task_") and self.blocks.task_publish_disabled:
-            result_block = "【后台结果】你当前不能发布委托，后台没有受理。"
-            instruction = "以角色口吻婉拒，不要编造任务内容，不要提工具或后台。"
+            result_block = "【办理结果】你当前不能发布委托，这件事没有被受理。"
+            instruction = "以角色口吻婉拒，不要编造任务内容，不要提工具，也不要解释办理过程。"
         else:
             try:
                 result_block, instruction = await asyncio.wait_for(
@@ -158,9 +200,9 @@ class DailyToolRuntime:
                 )
             except Exception as exc:  # 工具失败/超时：记录后继续，不拖垮整轮对话
                 logger.exception("[interject] 工具执行失败 route=%s", route.kind)
-                result_block = "【后台结果】后台处理失败或超时，这次未能完成。"
+                result_block = "【办理结果】这件事办理失败或超时，这次未能完成。"
                 instruction = (
-                    "以角色口吻说明这次没办成，不要编造任务内容或数字，不要提工具或后台。"
+                    "以角色口吻说明这次没办成，不要编造任务内容或数字，不要提工具，也不要解释办理过程。"
                 )
 
         route_result = result_block
@@ -170,6 +212,8 @@ class DailyToolRuntime:
                 content = route_result
             elif index in memory_results:
                 content = memory_results[index]
+            elif index in delegate_results:
+                content = delegate_results[index]
             else:
                 content = "已忽略（一轮只处理一个路由工具）"
             tool_messages.append({
@@ -198,6 +242,27 @@ class DailyToolRuntime:
             route_kind=route.kind,
         )
 
+    async def _run_delegate(self, call: dict[str, Any]) -> str:
+        """受理对话改写委派：只提交后台任务，绝不等 worker 跑完。"""
+        try:
+            results = await apply_delegate_calls(
+                [call],
+                npc_name=self.request.npc,
+                session_id=self.blocks.session_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # 委派失败只记日志，不阻断本轮对话
+            logger.warning("[interject] 委派受理失败（忽略）: %s", exc)
+            return "未受理"
+        if not results:
+            return "未受理"
+        logger.info(
+            "[interject] 委派已受理 session=%s detail=%s",
+            self.blocks.session_id, results[0],
+        )
+        return "已记下"
+
     async def _execute_route(self, route: Route) -> tuple[str, str]:
         if route.kind == "search":
             return await self._run_search(route)
@@ -208,8 +273,8 @@ class DailyToolRuntime:
         if route.kind == "task_cancel":
             return await self._run_cancel()
         return (
-            "【后台结果】未能识别的工具调用，已忽略。",
-            "用 JSONL 正常回应当前对话，不要提工具或后台。",
+            "【办理结果】未能识别的工具调用，已忽略。",
+            "用 JSONL 正常回应当前对话，不要提工具，也不要解释办理过程。",
         )
 
     # ------------------------------------------------------------------
@@ -252,7 +317,7 @@ class DailyToolRuntime:
 
         return (
             build_prefetch_result_block(text),
-            "基于上面的资料，用 JSONL 输出最终台词；不要提工具或后台，不要输出动作描写。",
+            "基于上面的资料，用 JSONL 输出最终台词；不要提工具，也不要解释办理过程，不要输出动作描写。",
         )
 
     async def _run_search_runner(self, route: Route, prefetch: Any) -> str:
@@ -321,10 +386,10 @@ class DailyToolRuntime:
         )
         event = await _wait_handle(handle)
         if event.kind == "failed":
-            reason = str((event.payload or {}).get("reason") or "后台未能拟定委托")
+            reason = str((event.payload or {}).get("reason") or "未能拟定委托")
             return (
-                f"【后台结果】{reason}",
-                "以角色口吻说明这次没法准备委托，不要编造任务内容或数字，不要提工具或后台。",
+                f"【办理结果】{reason}",
+                "以角色口吻说明这次没法准备委托，不要编造任务内容或数字，不要提工具，也不要解释办理过程。",
             )
 
         payload = event.payload or {}
@@ -351,7 +416,7 @@ class DailyToolRuntime:
                 summary = ""
         title = "草案已按玩家条件调整" if kind == "task_update" else "委托草案已拟定"
         return (
-            f"【后台结果：{title}，尚未发布】\n{summary or '（草案摘要不可用）'}",
+            f"【办理结果：{title}，尚未发布】\n{summary or '（草案摘要不可用）'}",
             "现在只输出最终确认对话（add）和结束语（closing）：讲清委托内容/要求/报酬并征询是否接取；"
             "不要输出“我去准备一下”之类过渡语；结束语表达“不接就算了/这活就搁着”，不要求固定措辞；"
             "玩家点头前不要说已发布，任务内容/数字以草案结果为准。",
@@ -365,10 +430,14 @@ class DailyToolRuntime:
         draft_row = self.blocks.pending_draft_row
         if draft_row is None:
             return (
-                "【后台结果】当前没有待确认的委托草案，无法发布。",
+                "【办理结果】当前没有待确认的委托草案，无法发布。",
                 "以角色口吻说明没有可确认的委托，不要编造任务内容。",
             )
-        args = fallback_confirm_args(draft_row.draft, self.request.npc)
+        args, warnings, source = await self._build_confirm_args(draft_row)
+        logger.info(
+            "[interject] confirm 文案 dialogue=%s draft=%s source=%s warnings=%d",
+            self.blocks.session_id, draft_row.draft_id, source, len(warnings),
+        )
         outcome = execute_confirm_agent_task(
             args,
             pending_draft=draft_row.draft,
@@ -379,6 +448,7 @@ class DailyToolRuntime:
             rag_context_text=self.blocks.rag_context_text,
             npc_states=self.blocks.npc_states,
             publish_session_id=self.blocks.session_id,
+            generation_warnings=warnings or None,
         )
         payload = outcome.payload or {}
         if payload.get("status") == "confirmed":
@@ -388,22 +458,110 @@ class DailyToolRuntime:
                 )
             except Exception as exc:
                 logger.warning("[interject] 草案删除失败: %s", exc)
+            logger.info(
+                "[interject] confirm applied session=%s draft=%s task=%s",
+                self.blocks.session_id, draft_row.draft_id,
+                payload.get("task_id") or payload.get("id") or "",
+            )
             return (
-                "【后台结果】这份委托已经正式派给玩家了。",
+                "【办理结果】这份委托已经正式派给玩家了。",
                 "以角色口吻确认委托已经交给玩家，给一句结束语（去办吧/别让我等太久），不要重复任务细节。",
             )
         reason = str(payload.get("message") or payload.get("status") or "发布失败")
+        logger.info(
+            "[interject] confirm rejected session=%s draft=%s reason=%s",
+            self.blocks.session_id, draft_row.draft_id, reason,
+        )
         return (
-            f"【后台结果】委托发布失败：{reason}",
+            f"【办理结果】委托发布失败：{reason}",
             "以角色口吻说明暂时没法发布，不要编造任务内容。",
         )
+
+    async def _build_confirm_args(
+        self, draft_row: Any,
+    ) -> tuple[dict[str, Any], list[str], str]:
+        """生成 confirm 发布文本（与终端同源）；失败时回模板并标明 source=fallback。"""
+        draft = draft_row.draft if isinstance(draft_row.draft, dict) else {}
+        summary = self.blocks.pending_draft_summary.strip()
+        if not summary:
+            try:
+                summary = _detailed_draft_summary(
+                    draft,
+                    self.blocks.game_data,
+                    rag_context_text=self.blocks.rag_context_text,
+                    npc_states=self.blocks.npc_states,
+                )
+            except Exception as exc:
+                logger.warning("[interject] 草案摘要回算失败，降级为标题: %s", exc)
+                summary = str(draft.get("title") or "委托草案")
+
+        if self.llm is None:
+            args = fallback_confirm_args(draft, self.request.npc)
+            args["draft_id"] = draft_row.draft_id
+            return args, [], "fallback"
+
+        finish_reference = await asyncio.to_thread(self._finish_npc_reference, draft)
+        try:
+            outcome = await generate_confirm_args(
+                self.llm,
+                draft=draft,
+                npc_name=self.request.npc,
+                base_messages=build_daily_messages(self.request, self.blocks),
+                draft_summary=summary,
+                finish_npc_reference=finish_reference,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[interject] confirm 文案生成失败，用模板兜底: %s", exc)
+            args = fallback_confirm_args(draft, self.request.npc)
+            args["draft_id"] = draft_row.draft_id
+            return args, [], "fallback"
+        args = dict(outcome.args)
+        args["draft_id"] = draft_row.draft_id
+        return args, list(outcome.warnings), outcome.source
+
+    def _finish_npc_reference(self, draft: dict[str, Any]) -> str:
+        """完成 NPC ≠ 当前 NPC 时的说话风格参考（读失败降级为空）。"""
+        try:
+            from services.agent_tools.task_tools import resolve_task_npcs
+            from services.dialogue.view import build_view
+            from services.npc.scene_context import npc_state_of
+            from services.orchestrator.prompts import build_finish_npc_reference
+
+            _, finish_npc = resolve_task_npcs(draft, self.request.npc)
+            name = (finish_npc or "").strip()
+            if not name or name == self.request.npc:
+                return ""
+            state = npc_state_of(self.blocks.npc_states, name)
+            save_info = self.blocks.save_info if isinstance(self.blocks.save_info, dict) else {}
+            slot_key = str(save_info.get("slot_key") or "")
+            try:
+                lines = build_view(
+                    game_data=self.blocks.game_data, slot_key=slot_key,
+                ).npc_line_samples(name)
+            except Exception as exc:
+                logger.warning("[interject] 完成 NPC 台词样本读取失败: %s", exc)
+                lines = []
+            return build_finish_npc_reference(
+                npc_name=name,
+                lines=lines,
+                emotions=(
+                    list(getattr(state, "emotions", None) or []) if state is not None else []
+                ),
+                favorability=state.favorability if state is not None else None,
+                relationship_level=state.relationship_level if state is not None else "",
+            )
+        except Exception as exc:
+            logger.warning("[interject] 完成 NPC 参考装配失败，降级为空: %s", exc)
+            return ""
 
     async def _run_cancel(self) -> tuple[str, str]:
         draft_row = self.blocks.pending_draft_row
         if draft_row is None:
             return (
-                "【后台结果】当前没有待取消的委托草案。",
-                "以角色口吻回应即可，不要提工具或后台。",
+                "【办理结果】当前没有待取消的委托草案。",
+                "以角色口吻回应即可，不要提工具，也不要解释办理过程。",
             )
         execute_cancel_agent_task(
             {"draft_id": draft_row.draft_id}, pending_draft=draft_row.draft,
@@ -415,7 +573,7 @@ class DailyToolRuntime:
         except Exception as exc:
             logger.warning("[interject] 草案删除失败: %s", exc)
         return (
-            "【后台结果】这份委托已经撤销。",
+            "【办理结果】这份委托已经撤销。",
             "以角色口吻确认这事算了，给一句结束语。",
         )
 

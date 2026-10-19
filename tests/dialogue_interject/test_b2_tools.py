@@ -137,8 +137,10 @@ async def test_tool_result_and_args_never_pollute_sse_lines():
         make_request(fx.daily_request()), session_id="s", stream_factory=factory,
     )
     events = await collect_events(orchestrator)
-    assert [event.event for event in events] == ["status", "line", "done"]
-    assert events[1].data["text"] == "真正台词。"
+    # B3：工具轮前会有 status(drafting)，其余形状不变
+    assert [event.event for event in events] == ["status", "status", "line", "done"]
+    assert events[1].data["stage"] == "drafting"
+    assert events[2].data["text"] == "真正台词。"
     assert "后台结果不应出现" not in str(events)
 
 

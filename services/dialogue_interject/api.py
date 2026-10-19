@@ -87,6 +87,7 @@ async def _error_stream(code: str, message: str):
 async def dialogue_interject(payload: InterjectRequest):
     stream_factory: StreamFactory | None = _PRIMARY_FACTORY
     npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
+    binding = None
 
     if stream_factory is None:
         # B1：任务模式不接真模型，回明确 error，不产出半成品 plan
@@ -103,9 +104,13 @@ async def dialogue_interject(payload: InterjectRequest):
                 media_type="text/event-stream",
                 headers=_SSE_HEADERS,
             )
+        # 先建/取 session：草案与工具写盘用同一把钥匙，终端继续聊才接得上
+        binding = await ensure_session(payload)
         try:
             blocks = await assemble_daily_blocks(
-                payload, prompt_max=payload.limits.line_prompt_max,
+                payload,
+                prompt_max=payload.limits.line_prompt_max,
+                session_id=binding.session_id,
             )
         except Exception as exc:  # noqa: BLE001 - 上下文失败按 D-17 回原对话
             logger.exception("[interject] 日常稳定块装配失败")
@@ -117,7 +122,8 @@ async def dialogue_interject(payload: InterjectRequest):
         npc_emotions = blocks.npc_emotions
         stream_factory = partial(stream_daily_llm, blocks=blocks)
 
-    binding = await ensure_session(payload)
+    if binding is None:
+        binding = await ensure_session(payload)
     orchestrator = InterjectOrchestrator(
         payload,
         session_id=binding.session_id,

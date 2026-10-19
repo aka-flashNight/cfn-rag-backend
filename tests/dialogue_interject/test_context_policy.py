@@ -63,10 +63,12 @@ def test_task_user_context_contains_task_summary_and_player_input():
 
 
 def test_tool_matrix_b2():
-    """B2 日常接工具；任务模式留 P4。"""
+    """B2 日常接工具；B3 委派按注册闸可选；任务模式留 P4。"""
     assert tool_matrix_for("task") == ()
     daily = tool_matrix_for("daily")
     assert "route_task_draft" in daily
     assert "route_search" in daily
     assert "update_long_term_memory" in daily
     assert "route_task_confirm" in tool_matrix_for("daily", has_draft=True)
+    assert "delegate_dialogue_rewrite" not in daily
+    assert "delegate_dialogue_rewrite" in tool_matrix_for("daily", delegate_enabled=True)

@@ -4,8 +4,9 @@
 - 工具轮：只把模型正文增量交给 JSONL 解析器；工具调用参数与结果不进入台词，
   也不落 session。工具结果回来后做一次无工具 LLM 调用，只输出最终对话。
 - 日常工具：route_search / route_task_draft / route_task_update /
-  route_task_confirm / route_task_cancel / update_long_term_memory；
-  委派子 Agent 留 P3，任务模式留 P4。
+  route_task_confirm / route_task_cancel / update_long_term_memory /
+  delegate_dialogue_rewrite（委派只提交后台任务，不阻塞最终对话）；
+  任务模式留 P4。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Any, AsyncIterator
 
 from services.dialogue_interject.context import DailyBlocks, assemble_daily_blocks
 from services.dialogue_interject.prompts import build_daily_messages
-from services.dialogue_interject.schemas import InterjectRequest
+from services.dialogue_interject.schemas import InterjectRequest, StreamStatus
 from services.dialogue_interject.tools import (
     TOOL_TIMEOUT_S,
     DailyToolError,
@@ -25,9 +26,15 @@ from services.dialogue_interject.tools import (
     DailyToolRuntime,
 )
 from services.llm import ChatRequest, LLMClient, LLMConfig
+from services.memory.long_term import tool_call_name
 
 
 logger = logging.getLogger(__name__)
+
+#: 工具轮状态映射（只有这两类需要让玩家等；记忆/委派不显式提示）
+_DRAFTING_TOOLS = {
+    "route_task_draft", "route_task_update", "route_task_confirm", "route_task_cancel",
+}
 
 #: 最多两轮：工具轮 + 无工具的最终对话轮；与终端“一轮最多路由一件事”一致
 MAX_CHAT_ROUNDS = 2
@@ -62,7 +69,7 @@ async def stream_daily_llm(
     engine: Any = None,
     memory: Any = None,
     registry: Any = None,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[str | StreamStatus]:
     """真 LLM 的正文增量流（含一次工具轮）。
 
     `client` / `blocks` / `tool_executor` 仅用于离线测试注入；生产路径用全局
@@ -124,6 +131,10 @@ async def stream_daily_llm(
             break
 
         round_text = "".join(round_text_parts)
+        stage = _status_stage_for(tool_calls)
+        if stage:
+            # 工具轮前的旁路状态（协议 5.2 status）：Host 可显示“正在准备…”
+            yield StreamStatus(stage)
         try:
             outcome = await asyncio.wait_for(
                 executor.execute(tool_calls, round_text=round_text),
@@ -157,3 +168,13 @@ async def stream_daily_llm(
         f"{first_content_ms:.0f}" if first_content_ms is not None else "n/a",
         content_chars, tool_rounds, (time.perf_counter() - started) * 1000,
     )
+
+
+def _status_stage_for(tool_calls: list[dict[str, Any]]) -> str:
+    """工具轮前的 status 阶段；未识别/纯记忆/委派返回空串（不发 status）。"""
+    names = {tool_call_name(call) for call in tool_calls or []}
+    if names & _DRAFTING_TOOLS:
+        return "drafting"
+    if "route_search" in names:
+        return "searching"
+    return ""

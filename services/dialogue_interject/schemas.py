@@ -312,6 +312,24 @@ def status_event(stage: str) -> SSEEvent:
     return SSEEvent(event="status", data=StatusPayload(stage=stage).model_dump())
 
 
+class StreamStatus(str):
+    """流内旁路信号：不进入 JSONL 解析，由编排器转成 SSE `status`。
+
+    真 LLM 适配器在进入工具轮前插入；假流（纯文本）不需要也不受影响。
+    继承 str 且内容为空串：调用方若直接 `"".join(chunks)` 不会破坏原文本。
+    """
+
+    stage: str
+
+    def __new__(cls, stage: str) -> "StreamStatus":
+        obj = super().__new__(cls, "")
+        obj.stage = stage
+        return obj
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅调试用
+        return f"StreamStatus(stage={self.stage!r})"
+
+
 def mute_event() -> SSEEvent:
     return SSEEvent(event="mute", data=MutePayload().model_dump())
 
