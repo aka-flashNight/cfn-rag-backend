@@ -43,8 +43,6 @@ logger = logging.getLogger(__name__)
 #: 假流/真流统一接口：给请求，返回文本增量迭代器
 StreamFactory = Callable[[InterjectRequest], AsyncIterator[str]]
 
-_TEXT_KINDS = ("add", "closing", "line")
-
 
 @dataclass
 class _DriveState:
@@ -190,7 +188,8 @@ class InterjectOrchestrator:
                 yield mute_event()
             return
 
-        if entry.kind in _TEXT_KINDS:
+        # valid_lines 按模型输出行计（拆分前）；mute 是控制标记，不计（协议 5.2）
+        if entry.kind != "mute":
             state.valid_rows += 1
 
         if entry.kind in ("add", "closing"):

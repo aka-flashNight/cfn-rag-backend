@@ -4,6 +4,9 @@
 （世界观/说话方式/扮演/NPC 状态/场景/同阵营），但**不**引入终端的 meta 行、
 路由轮、说话爆发、过渡语、任务草案块。
 
+任务真 LLM 路径使用 `build_task_system_prompt`：复用同一套稳定前缀，换成任务
+纪律、任务 JSONL 输出格式与任务工具说明（只有检索与长期记忆）。
+
 工具说明只写行为要求，不解释工具机制（不出现“后台/Host/参数不会出现在台词里”
 这类系统视角描述）；委派只在注册闸放行时出现，且要求“非常必要才调用”。
 """
@@ -176,8 +179,104 @@ def build_daily_system_prompt(
     return "\n\n".join(parts)
 
 
+def build_task_output_rules(prompt_max: int = 135) -> str:
+    """任务 JSONL 输出纪律（协议 4.4 / 5.6）。"""
+    return "\n".join([
+        "【输出格式（最高优先级）】",
+        "一行一个 JSON 对象，不要 Markdown、不要代码围栏、不要解释文字。",
+        '{"mute":true}',
+        '{"add":"台词","emo":"情绪"}',
+        '{"n":1,"nochange":true}',
+        '{"n":2,"line":"改写台词","emo":"情绪"}',
+        '{"n":3,"remove":true}',
+        '{"end":4}',
+        "字段：",
+        "- mute：可选，必须最先输出；表示本组后续不再让玩家说话。",
+        "- add：本轮新增台词，排最前，按顺序播放；可多条。",
+        "- nochange：原第 n 条保持原文。",
+        "- line：用这条替换原第 n 条；同一个 n 可输出多次＝一条拆成多条。",
+        "- remove：移除原第 n 条。",
+        "- end：从原第 n 条开始接回原文；end 之后的编辑/移除一律忽略。",
+        "纪律：",
+        f"1. 单条不超过 {prompt_max} 字；要说得更多就拆成多条 add 或 line。",
+        "2. 你是当前 NPC，只输出角色台词，不写旁白、动作、心理或任何括号内容。",
+        "3. 想好第一句就立即输出第一行，不要等整段想完。",
+        "4. 不要输出说话人名字前缀，说话人由系统决定。",
+        "5. 需要调用工具时按工具说明执行；不要在台词里提工具，也不要解释自己是怎么做到的。",
+    ])
+
+
+def build_task_discipline(npc_name: str) -> str:
+    """任务对话纪律（协议 4.1 / 4.4）：只写行为要求，不解释机制。"""
+    return "\n".join([
+        "【任务对话纪律】",
+        "1. 无论玩家说什么，最后都必须回到当前任务对话的原有脉络，不能聊开就不管后续。",
+        f"2. 只改{npc_name}自己的台词；其他 NPC 的台词一般 nochange，或直接交给 end 覆盖。",
+        "3. 原剩余台词按 1..N 编号；改写/移除必须使用对应原编号，不得跳号或自造编号。",
+        "4. 能直接接回原文时必须用 end，不要做没有实际意义的微调。",
+        "5. end 之前未提到的条目视为保持原文；不确定就不要改。",
+        "6. 任务目标、奖励、完成条件以【任务上下文】为准；改写时不得漏掉原句里的任务信息"
+        "（目标/地点/数量/报酬），也不要编造。",
+        "7. 只有玩家严重无法接话、无法回到主线时才输出 mute；mute 之后仍要给出第一条 add 并接回原文。",
+    ])
+
+
+def build_task_tool_guide() -> str:
+    """任务可用工具说明（协议 4.1 / D-14）：只有检索与长期记忆。"""
+    return "\n".join([
+        "【工具（本轮可用）】",
+        "- route_search：玩家问设定、人物、关卡或物品，或你需要查证任务细节时调用。"
+        "调用工具的那一轮不要输出 add/line；结果回来后用 JSONL 回答。",
+        "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
+    ])
+
+
+def build_task_system_prompt(
+    *,
+    npc_name: str,
+    state: NPCState,
+    scene_block: str = "",
+    same_faction_block: str = "",
+    save_info: Any = None,
+    progress_desc: str = "",
+    prompt_max: int = 135,
+) -> str:
+    """任务插话 system：复用日常稳定前缀，换成任务纪律与任务工具说明。"""
+    emotions = "、".join(state.emotions or ["普通"])
+    tagline = format_npc_role_tagline(
+        npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
+    )
+    parts: list[str] = [
+        worldview_block(),
+        build_task_output_rules(prompt_max),
+        build_task_discipline(npc_name),
+        SPEECH_STYLE_RULES,
+        tagline,
+        f"你的可用情绪标签仅限于以下这些：[{emotions}]。每条输出的 emo 必须从中选择最合适的一种。",
+        "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文说话。",
+        ANTI_HALLUCINATION_RULE,
+        build_task_tool_guide(),
+        build_session_state_block(
+            progress_desc=progress_desc,
+            favorability=state.favorability,
+            relationship_level=state.relationship_level,
+            save_info=save_info,
+        ),
+    ]
+    scene = (scene_block or "").strip()
+    if scene:
+        parts.append(scene)
+    appearance = build_appearance_block(state)
+    if appearance:
+        parts.append(appearance)
+    same = (same_faction_block or "").strip()
+    if same:
+        parts.append(f"【同阵营角色】\n{same}")
+    return "\n\n".join(parts)
+
+
 def build_system_prompt(mode: str) -> str:
-    """按模式返回兜底 system（任务模式 B1 不接真模型）。"""
+    """按模式返回兜底 system（仅在调用方没有传稳定块时使用）。"""
     return TASK_SYSTEM_PROMPT if mode == "task" else DAILY_SYSTEM_PROMPT
 
 
@@ -216,15 +315,30 @@ def build_daily_messages(request: InterjectRequest, blocks: Any) -> list[dict[st
     )
 
 
+def build_task_messages(request: InterjectRequest, blocks: Any) -> list[dict[str, str]]:
+    """P4 任务路径：system 任务块 + user 现场（RAG/长期记忆/任务上下文/played/remaining）。
+
+    任务模式不拼草案摘要；任务上下文由 `build_user_context` 按 mode=task 渲染。
+    """
+    return build_messages(
+        request,
+        daily_system=blocks.system_prompt,
+        rag_context_text=getattr(blocks, "rag_context_text", ""),
+        long_term_block=getattr(blocks, "long_term_block", ""),
+    )
+
+
 def tool_matrix_for(
     mode: str, *, has_draft: bool = False, delegate_enabled: bool = False,
 ) -> tuple[str, ...]:
     """工具策略接口（协议 §7.4）。
 
     日常：查询/检索、长期记忆、任务草案及草案存在时的 confirm/cancel/update；
-    委派工具只在注册闸放行（有存档、无并发改写）时加入。任务模式留 P4
-    （返回空表，真路径由 API 回 task_mode_not_ready）。
+    委派工具只在注册闸放行（有存档、无并发改写）时加入。
+    任务：只有查询/检索与长期记忆；无任务类工具、无委派（协议 4.1）。
     """
+    if mode == "task":
+        return ("route_search", "update_long_term_memory")
     if mode != "daily":
         return ()
     names = ["route_task_draft", "route_search", "update_long_term_memory"]

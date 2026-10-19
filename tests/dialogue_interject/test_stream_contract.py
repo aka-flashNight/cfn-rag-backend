@@ -159,7 +159,8 @@ async def test_f08_task_whole_group_replacement_has_null_end():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F08_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
     assert plan["end"] is None
-    assert [edit["kind"] for edit in plan["edits"]] == ["edit", "remove"]
+    # 整组替换只保留 add/edit；remove 无播放效果，不进 plan
+    assert [edit["kind"] for edit in plan["edits"]] == ["edit"]
 
 
 @pytest.mark.asyncio

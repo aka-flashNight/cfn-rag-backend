@@ -152,7 +152,14 @@ class DailyToolRuntime:
                     result = None
                 memory_results[index] = result or "未记录"
             elif name == DELEGATE_TOOL_NAME:
-                delegate_results[index] = await self._run_delegate(call)
+                if self.blocks.delegate_enabled:
+                    delegate_results[index] = await self._run_delegate(call)
+                else:
+                    # 任务模式/注册闸关闭：委派不可用，按未知工具忽略（协议 4.1）
+                    logger.warning(
+                        "[interject] 未注册的委派工具调用，已忽略 mode=%s",
+                        self.request.mode,
+                    )
 
         route = _parse_route(calls)
         if route is None:
@@ -315,10 +322,14 @@ class DailyToolRuntime:
             except Exception as exc:
                 logger.warning("[interject] 深度检索失败，回落到预取结果: %s", exc)
 
-        return (
-            build_prefetch_result_block(text),
-            "基于上面的资料，用 JSONL 输出最终台词；不要提工具，也不要解释办理过程，不要输出动作描写。",
+        instruction = (
+            "基于上面的资料，按任务 JSONL 格式（add/line/end 等）输出最终结果；"
+            "不要提工具，也不要解释办理过程，不要输出动作描写。"
+            if self.request.mode == "task"
+            else "基于上面的资料，用 JSONL 输出最终台词；"
+                 "不要提工具，也不要解释办理过程，不要输出动作描写。"
         )
+        return build_prefetch_result_block(text), instruction
 
     async def _run_search_runner(self, route: Route, prefetch: Any) -> str:
         handle = SearchRunner.launch(

@@ -6,7 +6,8 @@
 
 关键语义（照协议，不自行解释）：
 - `n` 与请求 `remaining[].index` 同口径（1..N）；越界忽略并记录。
-- 没有 `end` ＝整组替换，本轮新增＋改写构成剩余内容，不再接回原文。
+- 没有 `end` ＝整组替换，本轮新增＋改写构成剩余内容，不再接回原文；
+  nochange/remove 此时没有可作用的对象，不进入 plan.edits（记录后忽略）。
 - `end` 指向被移除条目 → 跳到下一条未移除原文；没有则结束（end=null）。
 - `end` 及之后的编辑/移除一律忽略（协议 4.5：从 end 到组末用原文）。
 - `end` 之前未提及的条目视为隐含 nochange（宽容），但不写进 plan.edits。
@@ -142,8 +143,24 @@ def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> Nor
                 )
             )
         elif bucket.remove:
+            if plan.end is None:
+                # 整组替换时原文不再播放，remove 没有可移除的对象
+                plan.rejected.append(
+                    PlanRejection(
+                        "remove", n, "end 缺省＝整组替换，remove 无播放效果，已忽略",
+                    )
+                )
+                continue
             edits.append(PlanEditPayload(n=n, kind="remove"))
         elif bucket.nochange:
+            if plan.end is None:
+                # 整组替换时原文不再播放，nochange 没有可保持的对象
+                plan.rejected.append(
+                    PlanRejection(
+                        "nochange", n, "end 缺省＝整组替换，nochange 无播放效果，已忽略",
+                    )
+                )
+                continue
             edits.append(PlanEditPayload(n=n, kind="nochange"))
 
     plan.edits = edits

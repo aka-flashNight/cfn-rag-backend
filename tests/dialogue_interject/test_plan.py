@@ -71,6 +71,7 @@ def test_f07_missing_nochange_is_tolerated():
 
 
 def test_f08_no_end_means_whole_group_replacement():
+    """end 缺省＝整组替换：只保留 add/edit；remove/nochange 无播放效果，记录后忽略。"""
     plan, _ = _normalize(fx.F08_JSONL)
     assert plan.end is None
     assert [edit.model_dump() for edit in plan.edits] == [
@@ -79,9 +80,9 @@ def test_f08_no_end_means_whole_group_replacement():
             "kind": "edit",
             "lines": [{"text": "这事我只跟你说一遍。", "emotion": "普通", "split": None}],
         },
-        {"n": 2, "kind": "remove", "lines": []},
     ]
     assert plan.implied_nochange == []
+    assert any(item.kind == "remove" and item.n == 2 for item in plan.rejected)
 
 
 def test_out_of_range_n_is_rejected_without_dropping_other_edits():
@@ -123,7 +124,10 @@ def test_end_pointing_to_last_removed_item_ends_group():
         '{"end":4}\n',
     ])
     assert plan.end is None  # 后面没有可接回的原文＝结束
-    assert [edit.n for edit in plan.edits] == [4]
+    # end 解析为 None 后退回整组替换：remove 没有播放效果，不进入 edits
+    assert plan.edits == []
+    assert any("end 指向被移除条目" in item.reason for item in plan.rejected)
+    assert any(item.kind == "remove" for item in plan.rejected)
 
 
 def test_edit_at_or_after_end_is_ignored():

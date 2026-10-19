@@ -1,4 +1,4 @@
-"""插话上下文的纯文本装配（P0 骨架，P1/P2 接真模型时复用）。
+"""插话上下文的纯文本装配（日常/任务共用稳定块）。
 
 原则（实施指引 §4.1）：请求现场是权威——`played` / `remaining` /
 `reference_continuation` / `player_input` / `task_context` 全部来自游戏；
@@ -32,10 +32,10 @@ _TASK_KIND_LABEL = {"task_pre": "任务前", "task_post": "任务后"}
 
 @dataclass(frozen=True)
 class DailyBlocks:
-    """日常插话的 system/现场块与工具运行所需的只读快照。
+    """插话（日常/任务）的 system/现场块与工具运行所需的只读快照。
 
-    `system_prompt` 只放稳定块；RAG/长期记忆/草案摘要属于现场块，由
-    `build_user_context` 拼进 user；工具运行数据只读，不进入 prompt 之外的地方。
+    `system_prompt` 只放稳定块；RAG/长期记忆/草案摘要/任务上下文属于现场块，
+    由 `build_user_context` 拼进 user；工具运行数据只读，不进入 prompt 之外的地方。
     """
 
     system_prompt: str
@@ -210,7 +210,7 @@ def _trim(items: Sequence, max_lines: int | None) -> Iterable:
 # ---------------------------------------------------------------------------
 
 
-async def assemble_daily_blocks(
+async def assemble_blocks(
     request: InterjectRequest,
     *,
     npc_manager: Any = None,
@@ -222,14 +222,17 @@ async def assemble_daily_blocks(
     rag_enabled: bool = True,
     session_id: str | None = None,
 ) -> DailyBlocks:
-    """装配日常插话的 system/现场块与工具运行快照。
+    """按 `request.mode` 装配插话块（日常/任务共用稳定块与检索/记忆）。
 
     - system：世界观/扮演/NPC 状态/场景/同阵营/输出纪律/工具说明；
-    - user 现场：长期记忆、RAG、played、remaining、reference、草案摘要、玩家输入；
+    - user 现场：长期记忆、RAG、played、remaining、reference、草案摘要（仅日常）、
+      任务上下文（仅任务）、玩家输入；
     - 不读取 session 聊天历史（协议 4.1：session 历史不参与本轮 prompt）；
+    - 任务模式不读草案、不开任务工具、不注册委派（协议 4.1）；
     - 草案与工具写盘一律用 MemoryStore 的 session_id（与终端继续聊同一把钥匙），
       传空时按 dialogue_instance_id 反查，查不到才退回原值。
     """
+    is_task = request.mode == "task"
     npc_name = request.npc
     if npc_manager is None:
         from services.npc.manager import get_npc_manager
@@ -367,7 +370,7 @@ async def assemble_daily_blocks(
     except Exception as exc:
         logger.warning("插话长期记忆装配失败，降级为空: %s", exc)
 
-    # ---- 待确认草案（B2 起支持 confirm/cancel/update）----
+    # ---- 待确认草案（B2 起支持 confirm/cancel/update；任务模式不读）----
     # 草案与终端共用一把钥匙：优先 MemoryStore 的 session_id；未建会话时退回
     # dialogue_instance_id（离线单测/异常降级），并兼容 B2 早期按 instance id 落库的草案。
     session_id = (session_id or "").strip()
@@ -382,9 +385,11 @@ async def assemble_daily_blocks(
 
     pending_draft_row = None
     pending_draft_summary = ""
-    draft_keys = [session_id]
-    if request.dialogue_instance_id and request.dialogue_instance_id != session_id:
-        draft_keys.append(request.dialogue_instance_id)
+    draft_keys: list[str] = []
+    if not is_task:
+        draft_keys = [session_id]
+        if request.dialogue_instance_id and request.dialogue_instance_id != session_id:
+            draft_keys.append(request.dialogue_instance_id)
     for draft_key in draft_keys:
         if not draft_key:
             continue
@@ -460,31 +465,47 @@ async def assemble_daily_blocks(
 
     from services.npc.task_publish_policy import is_task_publish_disabled
 
-    task_publish_disabled = is_task_publish_disabled(npc_name)
+    # 任务插话：禁掉全部任务类工具与委派（协议 4.1），查询/记忆保留
+    task_publish_disabled = True if is_task else is_task_publish_disabled(npc_name)
     # 委派工具按终端注册闸（后台有 worker / 未绑定存档时不注册，提示词也不提）
     delegate_enabled = False
-    try:
-        from services.dialogue.delegation import delegate_tool_or_none
+    if not is_task:
+        try:
+            from services.dialogue.delegation import delegate_tool_or_none
 
-        delegate_enabled = delegate_tool_or_none(include_task_fallback=False) is not None
-    except Exception as exc:
-        logger.warning("插话委派工具判定失败，按不注册处理: %s", exc)
+            delegate_enabled = delegate_tool_or_none(include_task_fallback=False) is not None
+        except Exception as exc:
+            logger.warning("插话委派工具判定失败，按不注册处理: %s", exc)
 
     # 局部导入：prompts 顶层依赖本模块的现场渲染，避免循环导入
-    from services.dialogue_interject.prompts import build_daily_system_prompt
-
-    system_prompt = build_daily_system_prompt(
-        npc_name=npc_name,
-        state=state,
-        scene_block=scene_block,
-        same_faction_block=same_faction_block,
-        save_info=save_info,
-        progress_desc=progress_desc,
-        prompt_max=prompt_max,
-        has_pending_draft=pending_draft_row is not None,
-        task_publish_disabled=task_publish_disabled,
-        delegate_enabled=delegate_enabled,
+    from services.dialogue_interject.prompts import (
+        build_daily_system_prompt,
+        build_task_system_prompt,
     )
+
+    if is_task:
+        system_prompt = build_task_system_prompt(
+            npc_name=npc_name,
+            state=state,
+            scene_block=scene_block,
+            same_faction_block=same_faction_block,
+            save_info=save_info,
+            progress_desc=progress_desc,
+            prompt_max=prompt_max,
+        )
+    else:
+        system_prompt = build_daily_system_prompt(
+            npc_name=npc_name,
+            state=state,
+            scene_block=scene_block,
+            same_faction_block=same_faction_block,
+            save_info=save_info,
+            progress_desc=progress_desc,
+            prompt_max=prompt_max,
+            has_pending_draft=pending_draft_row is not None,
+            task_publish_disabled=task_publish_disabled,
+            delegate_enabled=delegate_enabled,
+        )
     recent_dialogue = "\n".join(
         render_played(request.dialogue.played, npc=npc_name, max_lines=8)
     )
@@ -517,4 +538,56 @@ async def assemble_daily_blocks(
         task_publish_disabled=task_publish_disabled,
         delegate_enabled=delegate_enabled,
         save_info=save_info,
+    )
+
+
+async def assemble_daily_blocks(
+    request: InterjectRequest,
+    *,
+    npc_manager: Any = None,
+    game_data: Any = None,
+    engine: Any = None,
+    memory: Any = None,
+    registry: Any = None,
+    prompt_max: int = 135,
+    rag_enabled: bool = True,
+    session_id: str | None = None,
+) -> DailyBlocks:
+    """日常模式装配（薄包装，保留既有调用点）。"""
+    return await assemble_blocks(
+        request,
+        npc_manager=npc_manager,
+        game_data=game_data,
+        engine=engine,
+        memory=memory,
+        registry=registry,
+        prompt_max=prompt_max,
+        rag_enabled=rag_enabled,
+        session_id=session_id,
+    )
+
+
+async def assemble_task_blocks(
+    request: InterjectRequest,
+    *,
+    npc_manager: Any = None,
+    game_data: Any = None,
+    engine: Any = None,
+    memory: Any = None,
+    registry: Any = None,
+    prompt_max: int = 135,
+    rag_enabled: bool = True,
+    session_id: str | None = None,
+) -> DailyBlocks:
+    """任务模式装配：与日常共用稳定块/检索/记忆，但不读草案、不开任务工具与委派。"""
+    return await assemble_blocks(
+        request,
+        npc_manager=npc_manager,
+        game_data=game_data,
+        engine=engine,
+        memory=memory,
+        registry=registry,
+        prompt_max=prompt_max,
+        rag_enabled=rag_enabled,
+        session_id=session_id,
     )

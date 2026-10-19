@@ -1,8 +1,9 @@
-"""对话内嵌插话端点（B1）。
+"""对话内嵌插话端点（B4：日常 + 任务真模型）。
 
 - `POST /api/game/dialogue-interject`（SSE）：
-  - 日常：真 LLM 最小路径（稳定块 + 请求现场 JSONL），测试/联调可注入假流；
-  - 任务：B1 真路径回 `task_mode_not_ready`，注入假流时保留 P0 fixture 路径。
+  - 日常：`assemble_daily_blocks` + `stream_daily_llm`；
+  - 任务：`assemble_task_blocks` + `stream_task_llm`（工具只有检索/记忆）；
+  - 测试/联调可注入假流，注入时保留 P0 fixture 路径。
 - `POST /api/game/dialogue-interject/finalize`：幂等对账；跨进程并发冲突回 409。
 
 与终端 `/api/game/ask` 完全独立：不改其路由、不共享 TurnOrchestrator。
@@ -17,8 +18,15 @@ from functools import partial
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from services.dialogue_interject.context import assemble_daily_blocks
-from services.dialogue_interject.llm import llm_is_configured, stream_daily_llm
+from services.dialogue_interject.context import (
+    assemble_daily_blocks,
+    assemble_task_blocks,
+)
+from services.dialogue_interject.llm import (
+    llm_is_configured,
+    stream_daily_llm,
+    stream_task_llm,
+)
 from services.dialogue_interject.orchestrator import (
     InterjectOrchestrator,
     StreamFactory,
@@ -90,14 +98,7 @@ async def dialogue_interject(payload: InterjectRequest):
     binding = None
 
     if stream_factory is None:
-        # B1：任务模式不接真模型，回明确 error，不产出半成品 plan
-        if payload.mode == "task":
-            return StreamingResponse(
-                _error_stream("task_mode_not_ready", "任务插话真模型路径尚未接入（B1 仅日常）"),
-                media_type="text/event-stream",
-                headers=_SSE_HEADERS,
-            )
-        # 日常真 LLM：沿用全局 settings；没有 api_key 时不发起调用
+        # 沿用全局 settings；没有 api_key 时不发起调用
         if not llm_is_configured():
             return StreamingResponse(
                 _error_stream("llm_not_configured", "未配置 llm_api_key，插话真模型路径不可用"),
@@ -107,20 +108,30 @@ async def dialogue_interject(payload: InterjectRequest):
         # 先建/取 session：草案与工具写盘用同一把钥匙，终端继续聊才接得上
         binding = await ensure_session(payload)
         try:
-            blocks = await assemble_daily_blocks(
-                payload,
-                prompt_max=payload.limits.line_prompt_max,
-                session_id=binding.session_id,
-            )
+            if payload.mode == "task":
+                blocks = await assemble_task_blocks(
+                    payload,
+                    prompt_max=payload.limits.line_prompt_max,
+                    session_id=binding.session_id,
+                )
+            else:
+                blocks = await assemble_daily_blocks(
+                    payload,
+                    prompt_max=payload.limits.line_prompt_max,
+                    session_id=binding.session_id,
+                )
         except Exception as exc:  # noqa: BLE001 - 上下文失败按 D-17 回原对话
-            logger.exception("[interject] 日常稳定块装配失败")
+            logger.exception("[interject] 插话稳定块装配失败 mode=%s", payload.mode)
             return StreamingResponse(
                 _error_stream("context_failed", str(exc)[:200]),
                 media_type="text/event-stream",
                 headers=_SSE_HEADERS,
             )
         npc_emotions = blocks.npc_emotions
-        stream_factory = partial(stream_daily_llm, blocks=blocks)
+        stream_factory = partial(
+            stream_task_llm if payload.mode == "task" else stream_daily_llm,
+            blocks=blocks,
+        )
 
     if binding is None:
         binding = await ensure_session(payload)

@@ -104,14 +104,15 @@ def test_unconfigured_endpoint_returns_error_and_creates_no_session(memory_store
     assert memory_store.dialogue_session_get_sync(fx.DAILY_DIALOGUE_ID) is None
 
 
-def test_task_mode_without_fake_stream_is_rejected(memory_store):
-    """B1 任务模式不接真模型：明确 error，不建 session、不产 plan。"""
+def test_task_mode_without_api_key_returns_llm_not_configured(memory_store, monkeypatch):
+    """B4 任务模式接真模型；未配置 key 时明确 error，不建 session、不产 plan。"""
+    monkeypatch.setattr(interject_api, "llm_is_configured", lambda: False)
     client = _client(None)
     response = client.post("/game/dialogue-interject", json=fx.task_request())
     assert response.status_code == 200
     events = parse_sse(response.text)
     assert [name for name, _ in events] == ["error"]
-    assert events[0][1]["code"] == "task_mode_not_ready"
+    assert events[0][1]["code"] == "llm_not_configured"
     assert memory_store.dialogue_session_get_sync(fx.TASK_DIALOGUE_ID) is None
 
 

@@ -196,4 +196,4 @@ def test_tool_matrix_b2_daily_has_tools():
     assert "update_long_term_memory" in tool_matrix_for("daily")
     assert "route_task_confirm" not in tool_matrix_for("daily")
     assert "route_task_confirm" in tool_matrix_for("daily", has_draft=True)
-    assert tool_matrix_for("task") == ()
+    assert tool_matrix_for("task") == ("route_search", "update_long_term_memory")
