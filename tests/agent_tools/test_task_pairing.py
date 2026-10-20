@@ -212,6 +212,22 @@ def test_single_task_shape_unchanged(state, fake_game_data, tmp_path):
 # writer：id 边界
 # ---------------------------------------------------------------------------
 
+def test_paired_ids_skip_finished_and_active_history(state, fake_game_data, tmp_path):
+    state.bind(slot_key="slot_a", progress={
+        "tasks_finished": [200001, 200003],
+        "tasks_active": [200002],
+    })
+
+    msg, task_id = _write_paired(_draft(), fake_game_data)
+
+    # 两个 id 各自避让历史占用：200001-200003 已用，任务一 200004、回访 200005。
+    assert task_id == 200004
+    tasks = _read(_slot_paths(tmp_path, "slot_a")[0])["tasks"]
+    assert [t["id"] for t in tasks] == [200004, 200005]
+    assert tasks[0]["next_task_id"] == 200005
+    assert "任务 200004 与回访任务 200005" in msg
+
+
 def test_id2_overflow_downgrades_to_single_task(state, tmp_path):
     game_data = _FakeGameData(tmp_path)
     tasks_path, _ = _shared_paths(tmp_path)

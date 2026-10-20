@@ -18,6 +18,7 @@ from services.dialogue.sources import DialogueSources, resolve_speaker_title, sp
 from services.dialogue.view import shared_sources
 from services.game_data.registry import GameDataRegistry
 from services.integration.save_paths import resolve_task_write_paths, shared_task_paths
+from services.integration.state import get_integration_state
 
 # 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
 MAX_MAINLINE_TASK_PROGRESS: int = 77
@@ -366,9 +367,9 @@ def resolve_task_npcs(
     return _pick("get_npc"), _pick("finish_npc")
 
 
-def _max_agent_task_id(scan_paths: List[Path]) -> int:
-    """扫描给定任务文件中 200001–300000 段的现有最大 id（B2-3：共享 ∪ 本存档）。"""
-    max_agent = AGENT_TASK_ID_BASE
+def _collect_agent_task_ids(scan_paths: List[Path]) -> set[int]:
+    """扫描给定任务文件中 200001–300000 段的现有 id（B2-3：共享 ∪ 本存档）。"""
+    ids: set[int] = set()
     for path in scan_paths:
         doc = _read_json(path, default={"tasks": []})
         tasks = doc.get("tasks", []) if isinstance(doc, dict) else []
@@ -381,9 +382,45 @@ def _max_agent_task_id(scan_paths: List[Path]) -> int:
                 tid = int(t.get("id"))
             except Exception:
                 continue
-            if AGENT_TASK_ID_BASE < tid <= AGENT_TASK_ID_MAX and tid > max_agent:
-                max_agent = tid
-    return max_agent
+            if AGENT_TASK_ID_BASE < tid <= AGENT_TASK_ID_MAX:
+                ids.add(tid)
+    return ids
+
+
+def _history_agent_task_ids(progress: Any) -> set[int]:
+    """存档投影里已完成/已接取的 Agent 任务 id。
+
+    完成任务的任务文件记录可能早已被清理；只扫任务文件会把旧 id 重新分配出去，
+    新任务一落盘就被游戏按 tasks_finished 判成“已完成”，永远无法接取。
+    """
+    ids: set[int] = set()
+    if not isinstance(progress, dict):
+        return ids
+    for key in ("tasks_finished", "tasks_active"):
+        values = progress.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            try:
+                tid = int(value)
+            except (TypeError, ValueError):
+                continue
+            if AGENT_TASK_ID_BASE < tid <= AGENT_TASK_ID_MAX:
+                ids.add(tid)
+    return ids
+
+
+def _next_free_agent_task_id(used: set[int], start: int) -> int:
+    """从 start 起按顺序取第一个未使用的 Agent 任务 id；越界抛 ValueError。"""
+    tid = max(start, AGENT_TASK_ID_BASE + 1)
+    while tid in used:
+        tid += 1
+    if tid > AGENT_TASK_ID_MAX:
+        raise ValueError(
+            f"Agent 任务 id 已超出 {AGENT_TASK_ID_BASE + 1}-{AGENT_TASK_ID_MAX} 区间"
+            f"（当前应分配 {tid}），拒绝写入越界任务。"
+        )
+    return tid
 
 
 def write_confirmed_agent_task_files(
@@ -431,12 +468,16 @@ def write_confirmed_agent_task_files(
         scan_paths = [shared_tasks_path]
         if agent_tasks_path != shared_tasks_path:
             scan_paths.append(agent_tasks_path)
-        task_id_int = _max_agent_task_id(scan_paths) + 1
-        if task_id_int > AGENT_TASK_ID_MAX:
-            raise ValueError(
-                f"Agent 任务 id 已超出 {AGENT_TASK_ID_BASE + 1}-{AGENT_TASK_ID_MAX} 区间"
-                f"（当前应分配 {task_id_int}），拒绝写入越界任务。"
-            )
+        used_ids = _collect_agent_task_ids(scan_paths)
+        start_id = max(used_ids, default=AGENT_TASK_ID_BASE) + 1
+        # 已绑定存档时，完成/接取历史同样占号：任务文件可能已被清理，但游戏仍按
+        # tasks_finished 判重，复用旧 id 会让新任务落盘即“已完成”。
+        if _slot_key is not None:
+            snapshot = get_integration_state().snapshot()
+            if snapshot.get("bound_slot") == _slot_key:
+                used_ids |= _history_agent_task_ids(snapshot.get("progress"))
+        task_id_int = _next_free_agent_task_id(used_ids, start_id)
+        used_ids.add(task_id_int)
         draft["id"] = task_id_int
 
         get_npc, finish_npc = resolve_task_npcs(draft, npc_name_fallback)
@@ -543,16 +584,20 @@ def write_confirmed_agent_task_files(
         tasks = [t for t in tasks if not (isinstance(t, dict) and str(t.get("id")) == str(task_id_int))]
 
         # id2 越界时按单任务写：真实奖励必须全部挂在唯一那条任务上，绝不留下固定的 1000 经验。
-        id_range_downgraded = paired and (task_id_int + 1) > AGENT_TASK_ID_MAX
-        if id_range_downgraded:
-            logger.warning(
-                "回访任务 id 越界（%s），本次按单任务写入，奖励取草稿真实奖励",
-                task_id_int + 1,
-            )
-            paired = False
+        id_range_downgraded = False
+        next_id = 0
+        if paired:
+            try:
+                next_id = _next_free_agent_task_id(used_ids, task_id_int + 1)
+            except ValueError:
+                id_range_downgraded = True
+                paired = False
+                logger.warning(
+                    "回访任务 id 越界或区间耗尽（起始 %s），本次按单任务写入，奖励取草稿真实奖励",
+                    task_id_int + 1,
+                )
 
         if paired:
-            next_id = task_id_int + 1
             record = {
                 "id": task_id_int,
                 "title": f"$AGENT_TITLE_{task_id_int}",
@@ -571,7 +616,6 @@ def write_confirmed_agent_task_files(
                 "next_task_id": next_id,
             }
         else:
-            next_id = 0
             record = {
                 "id": task_id_int,
                 "title": f"$AGENT_TITLE_{task_id_int}",

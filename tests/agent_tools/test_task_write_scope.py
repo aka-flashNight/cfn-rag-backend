@@ -145,6 +145,42 @@ def test_id_scan_reads_shared_when_slot_empty(state, fake_game_data, tmp_path):
     assert task_id == 200043
 
 
+def test_id_skips_finished_and_active_history_when_bound(state, fake_game_data, tmp_path):
+    state.bind(slot_key="slot_a", progress={
+        "tasks_finished": [200001, 200003],
+        "tasks_active": [200002],
+    })
+    _, task_id = write_confirmed_agent_task_files(
+        draft=_draft(), npc_name_fallback=NPC, game_data=fake_game_data,
+    )
+    # 文件里没有任何任务，但完成/接取历史已占号：从 200001 起顺序跳过。
+    assert task_id == 200004
+
+
+def test_id_scans_forward_from_file_max_and_ignores_far_history(state, fake_game_data, tmp_path):
+    shared_tasks, _ = _shared_paths(tmp_path)
+    shared_tasks.parent.mkdir(parents=True, exist_ok=True)
+    shared_tasks.write_text(
+        json.dumps({"tasks": [{"id": 213506}]}, ensure_ascii=False), encoding="utf-8",
+    )
+    slot_tasks, _ = _slot_paths(tmp_path, "slot_a")
+    slot_tasks.parent.mkdir(parents=True, exist_ok=True)
+    slot_tasks.write_text(
+        json.dumps({"tasks": [{"id": 213507}]}, ensure_ascii=False), encoding="utf-8",
+    )
+    state.bind(slot_key="slot_a", progress={
+        "tasks_finished": [213507, 290005],
+        "tasks_active": [213506],
+    })
+
+    _, task_id = write_confirmed_agent_task_files(
+        draft=_draft(), npc_name_fallback=NPC, game_data=fake_game_data,
+    )
+    # 从文件最大 213507 起按顺序取第一个空号；历史里更远的 290005 不抬高起点。
+    assert task_id == 213508
+    assert sorted(t["id"] for t in _read(slot_tasks)["tasks"]) == [213507, 213508]
+
+
 def test_unbound_writes_shared_files(state, fake_game_data, tmp_path):
     _, task_id = write_confirmed_agent_task_files(
         draft=_draft(), npc_name_fallback=NPC, game_data=fake_game_data,
@@ -156,6 +192,16 @@ def test_unbound_writes_shared_files(state, fake_game_data, tmp_path):
     assert _read(shared_tasks)["tasks"][0]["id"] == 200001
     # 槽目录零新增
     assert not (tmp_path / "rag" / "agent_saves").exists()
+
+
+def test_bound_history_does_not_leak_after_unbind(state, fake_game_data, tmp_path):
+    state.bind(slot_key="slot_a", progress={"tasks_finished": [200001, 200002]})
+    state.unbind()
+
+    _, task_id = write_confirmed_agent_task_files(
+        draft=_draft(), npc_name_fallback=NPC, game_data=fake_game_data,
+    )
+    assert task_id == 200001
 
 
 def test_invalid_slot_key_fail_closed(state, fake_game_data, tmp_path):
