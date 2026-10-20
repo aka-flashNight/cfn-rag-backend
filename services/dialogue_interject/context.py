@@ -463,6 +463,17 @@ async def assemble_blocks(
     except Exception as exc:
         logger.warning("插话同阵营块装配失败，降级为空: %s", exc)
 
+    # NPC 固定层装备：与终端静态 system 同源，避免插话时 NPC 不知道自己的装备。
+    equipment_block = ""
+    try:
+        from services.npc.npc_equipment import build_npc_equipment_block
+
+        equipment_block = build_npc_equipment_block(
+            npc_name=npc_name, game_data=game_data,
+        )
+    except Exception as exc:
+        logger.warning("插话装备块装配失败，降级为空: %s", exc)
+
     from services.npc.task_publish_policy import is_task_publish_disabled
 
     # 任务插话：禁掉全部任务类工具与委派（协议 4.1），查询/记忆保留
@@ -492,6 +503,7 @@ async def assemble_blocks(
             save_info=save_info,
             progress_desc=progress_desc,
             prompt_max=prompt_max,
+            equipment_block=equipment_block,
         )
     else:
         system_prompt = build_daily_system_prompt(
@@ -502,6 +514,7 @@ async def assemble_blocks(
             save_info=save_info,
             progress_desc=progress_desc,
             prompt_max=prompt_max,
+            equipment_block=equipment_block,
             has_pending_draft=pending_draft_row is not None,
             task_publish_disabled=task_publish_disabled,
             delegate_enabled=delegate_enabled,

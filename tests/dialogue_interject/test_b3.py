@@ -378,6 +378,18 @@ def test_daily_prompt_is_mechanism_free_and_delegate_is_opt_in():
     assert "只有非常必要时才调用" in with_delegate
 
 
+def test_daily_prompt_injects_player_save_info_and_npc_equipment():
+    system = build_daily_system_prompt(
+        npc_name=fx.NPC,
+        state=STATE,
+        save_info={"character": {"name": "测试玩家"}},
+        equipment_block="【装备】\n- 制式步枪",
+    )
+    assert "玩家的名字是「测试玩家」" in system
+    assert "【装备】" in system
+    assert "制式步枪" in system
+
+
 async def test_search_tool_round_emits_searching_status_before_lines():
     from services.dialogue_interject.tools import ToolExecutionResult
 

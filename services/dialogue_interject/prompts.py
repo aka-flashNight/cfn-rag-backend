@@ -138,6 +138,7 @@ def build_daily_system_prompt(
     save_info: Any = None,
     progress_desc: str = "",
     prompt_max: int = 135,
+    equipment_block: str = "",
     has_pending_draft: bool = False,
     task_publish_disabled: bool = False,
     delegate_enabled: bool = False,
@@ -173,6 +174,9 @@ def build_daily_system_prompt(
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)
+    equipment = (equipment_block or "").strip()
+    if equipment:
+        parts.append(equipment)
     same = (same_faction_block or "").strip()
     if same:
         parts.append(f"【同阵营角色】\n{same}")
@@ -242,6 +246,7 @@ def build_task_system_prompt(
     save_info: Any = None,
     progress_desc: str = "",
     prompt_max: int = 135,
+    equipment_block: str = "",
 ) -> str:
     """任务插话 system：复用日常稳定前缀，换成任务纪律与任务工具说明。"""
     emotions = "、".join(state.emotions or ["普通"])
@@ -271,6 +276,9 @@ def build_task_system_prompt(
     appearance = build_appearance_block(state)
     if appearance:
         parts.append(appearance)
+    equipment = (equipment_block or "").strip()
+    if equipment:
+        parts.append(equipment)
     same = (same_faction_block or "").strip()
     if same:
         parts.append(f"【同阵营角色】\n{same}")
