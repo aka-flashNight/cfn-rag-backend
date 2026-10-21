@@ -49,6 +49,7 @@ from services.orchestrator.turn import Route, _parse_route, generate_confirm_arg
 from services.subagents.search_runner import SearchRunner
 from services.subagents.task_runner import TaskRunner
 from services.tools.base import ROUTE_TOOLS_DRAFT, ROUTE_TOOLS_NEW
+from services.tools.route.route_task_draft import build_description
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,14 @@ class DailyToolRuntime:
         if self.registry is None:
             return None
         schemas = self.registry.get_openai_tools(names=self._route_names())
+        # 可切磋时给 draft 路由补上「切磋/对战」判据：与聊天主 Agent 同一份描述，
+        # 不可切磋时保持静态描述（不出现切磋字样）。
+        if self.blocks.player_can_challenge:
+            for schema in schemas:
+                if schema.get("function", {}).get("name") == "route_task_draft":
+                    schema["function"]["description"] = build_description(
+                        player_can_challenge=True,
+                    )
         if self.blocks.long_term is not None:
             schemas = [*schemas, build_chat_tool(self.blocks.long_term)]
         if self.blocks.delegate_enabled:

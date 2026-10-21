@@ -518,6 +518,9 @@ async def assemble_blocks(
             has_pending_draft=pending_draft_row is not None,
             task_publish_disabled=task_publish_disabled,
             delegate_enabled=delegate_enabled,
+            has_shop=has_shop,
+            shop_reward_types=list(shop_reward_types),
+            player_can_challenge=player_can_challenge,
         )
     recent_dialogue = "\n".join(
         render_played(request.dialogue.played, npc=npc_name, max_lines=8)

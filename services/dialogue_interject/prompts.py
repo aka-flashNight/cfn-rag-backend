@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from services.dialogue_interject.context import build_user_context
 from services.dialogue_interject.schemas import InterjectRequest
@@ -22,7 +22,10 @@ from services.orchestrator.prompts import (
     ANTI_HALLUCINATION_RULE,
     SPEECH_STYLE_RULES,
     build_appearance_block,
+    build_challenge_hint,
+    build_publish_constraint,
     build_session_state_block,
+    build_shop_hint,
     format_npc_role_tagline,
     worldview_block,
 )
@@ -90,10 +93,12 @@ def build_daily_tool_guide(
     has_pending_draft: bool = False,
     task_publish_disabled: bool = False,
     delegate_enabled: bool = False,
+    player_can_challenge: bool = False,
 ) -> str:
     """日常可用工具说明（协议 7.4 / 实施指引 §5、§10）。
 
     只写本轮真实注册的工具；不解释工具机制，不用“后台/Host”等系统词。
+    任务发布三块能力（发布硬约束/商店报酬/切磋）在 system 稳定区，这里只写工具判据。
     """
     lines = [
         "【工具（本轮可用）】",
@@ -102,10 +107,13 @@ def build_daily_tool_guide(
         "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
     ]
     if not task_publish_disabled:
-        lines.append(
+        draft_rule = (
             "- route_task_draft：玩家明确索要委托/工作/差事，或按你的身份和当下情景你决定主动派活时调用。"
-            "调用这一轮只发工具调用，不要输出任何 add/closing；草案拟好后，再用 JSONL 说明委托。"
         )
+        if player_can_challenge:
+            draft_rule += "玩家提出想跟你切磋、对战、比划或直接动手，也走这个入口。"
+        draft_rule += "调用这一轮只发工具调用，不要输出任何 add/closing；草案拟好后，再用 JSONL 说明委托。"
+        lines.append(draft_rule)
         if has_pending_draft:
             lines.append(
                 "- route_task_update / route_task_confirm / route_task_cancel："
@@ -118,6 +126,7 @@ def build_daily_tool_guide(
             "结束语表达“不接就算了/这活就搁着”，不要求固定措辞。",
             "3. 草案只是拟定，不是已发布；玩家点头前不要说“任务已发布”。",
             "4. 确认成功后可以说已交给玩家；任务内容/要求/报酬以草案为准，不要编造数字。",
+            "5. 一轮最多只派一件事；拿不准该不该派时，就正常说话，不要调用工具。",
         ])
     else:
         lines.append("- 你当前不能发布委托；玩家索要时以角色口吻回应或婉拒。")
@@ -142,8 +151,16 @@ def build_daily_system_prompt(
     has_pending_draft: bool = False,
     task_publish_disabled: bool = False,
     delegate_enabled: bool = False,
+    has_shop: bool = False,
+    shop_reward_types: Optional[list[str]] = None,
+    player_can_challenge: Optional[bool] = None,
 ) -> str:
-    """日常插话 system：稳定块在前，随草案/好感度变化的状态块在后（前缀缓存友好）。"""
+    """日常插话 system：稳定块在前，随草案/好感度变化的状态块在后（前缀缓存友好）。
+
+    任务发布能力与聊天主 Agent 共用同一份文本（`build_publish_constraint` /
+    `build_shop_hint` / `build_challenge_hint`）——插话同样能派活，所以「给不给得出
+    什么报酬」「能不能约切磋」这两条边界必须一致；任务发布关闭时不注入。
+    """
     emotions = "、".join(state.emotions or ["普通"])
     tagline = format_npc_role_tagline(
         npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
@@ -156,18 +173,26 @@ def build_daily_system_prompt(
         f"你的可用情绪标签仅限于以下这些：[{emotions}]。每条输出的 emo 必须从中选择最合适的一种。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文说话。",
         ANTI_HALLUCINATION_RULE,
-        build_daily_tool_guide(
-            has_pending_draft=has_pending_draft,
-            task_publish_disabled=task_publish_disabled,
-            delegate_enabled=delegate_enabled,
-        ),
-        build_session_state_block(
-            progress_desc=progress_desc,
-            favorability=state.favorability,
-            relationship_level=state.relationship_level,
-            save_info=save_info,
-        ),
     ]
+    # 层2：单 NPC 恒定项（发布硬约束、商店报酬）→ 稀疏项（切磋可行性随玩家等级变）
+    if not task_publish_disabled:
+        parts.append(build_publish_constraint(
+            npc_name, state.faction or "", mention_system=False,
+        ))
+        parts.append(build_shop_hint(has_shop, shop_reward_types))
+        parts.append(build_challenge_hint(bool(state.challenge), player_can_challenge))
+    parts.append(build_daily_tool_guide(
+        has_pending_draft=has_pending_draft,
+        task_publish_disabled=task_publish_disabled,
+        delegate_enabled=delegate_enabled,
+        player_can_challenge=bool(player_can_challenge),
+    ))
+    parts.append(build_session_state_block(
+        progress_desc=progress_desc,
+        favorability=state.favorability,
+        relationship_level=state.relationship_level,
+        save_info=save_info,
+    ))
     scene = (scene_block or "").strip()
     if scene:
         parts.append(scene)

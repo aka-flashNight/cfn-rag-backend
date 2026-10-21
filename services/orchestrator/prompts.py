@@ -191,6 +191,30 @@ def build_routing_guide(*, has_pending_draft: bool) -> str:
     return "\n".join(lines)
 
 
+def build_publish_constraint(
+    npc_name: str, faction: str, *, mention_system: bool = True,
+) -> str:
+    """任务发布硬约束（聊天主 Agent 与插话 Agent 共用同一份文本）。
+
+    只约束「要不要派、往哪个方向派」；具体怎么拟由任务 Agent 负责。
+    mention_system=False 时省掉标题里的机制说明——插话链路要求提示词不出现
+    「后台」这类系统视角措辞，正文两份完全相同。
+    """
+    heading = (
+        "【任务发布硬约束（具体怎么拟由后台任务系统负责，你只决定要不要派、往哪个方向派）】"
+        if mention_system
+        else "【任务发布硬约束】"
+    )
+    return (
+        heading + "\n\n"
+        f"你作为「{npc_name}」（{faction or '未知阵营'}）："
+        "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
+        "发布动机要自然融入对话；"
+        "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，"
+        "则不要发布任务，并拒绝玩家的发布任务请求；"
+    )
+
+
 def build_static_system(
     *,
     npc_name: str,
@@ -261,14 +285,7 @@ def build_static_system(
     if eq:
         parts.append(eq)
     if can_publish:
-        parts.append("【任务发布硬约束（具体怎么拟由后台任务系统负责，你只决定要不要派、往哪个方向派）】")
-        parts.append(
-            f"你作为「{npc_name}」（{state.faction or '未知阵营'}）："
-            "只发布符合你身份和能力范围的任务；即使玩家进度较高，也不应发布超出你角色定位的高难度任务；"
-            "发布动机要自然融入对话；"
-            "如果你和玩家关系不好/很不熟或你的身份不适合给玩家发布任务，"
-            "则不要发布任务，并拒绝玩家的发布任务请求；"
-        )
+        parts.append(build_publish_constraint(npc_name, state.faction or ""))
         parts.append(build_shop_hint(has_shop, shop_reward_types))
         # ---- 稀疏变动：随玩家等级变（升级跨过切磋门槛时才改写） ----
         parts.append(build_challenge_hint(
