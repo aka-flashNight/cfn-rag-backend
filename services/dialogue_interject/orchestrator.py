@@ -85,7 +85,7 @@ class InterjectOrchestrator:
         )
         self._seq = 0
         self._mute_sent = False
-        self._last_status = "thinking"
+        self._last_status: tuple[str, str] = ("thinking", "")
 
     async def run(self) -> AsyncIterator:
         """产出 SSEEvent 序列（调用方负责编码/取消）。"""
@@ -155,10 +155,12 @@ class InterjectOrchestrator:
         try:
             async for chunk in factory(self.request):
                 if isinstance(chunk, StreamStatus):
-                    # 工具轮前的旁路状态：不进解析器、不占 seq；同值不重复推
-                    if chunk.stage and chunk.stage != self._last_status:
-                        self._last_status = chunk.stage
-                        yield status_event(chunk.stage)
+                    # 工具轮/子 Agent 的旁路状态：不进解析器、不占 seq；
+                    # stage 与 ui_hint 都相同才不重复推（ui_hint 会多次变化）。
+                    signature = (chunk.stage, chunk.ui_hint)
+                    if chunk.stage and signature != self._last_status:
+                        self._last_status = signature
+                        yield status_event(chunk.stage, chunk.ui_hint)
                     continue
                 for entry in parser.feed(chunk):
                     state.entries.append(entry)
@@ -204,6 +206,7 @@ class InterjectOrchestrator:
                     speaker=segment.speaker,
                     seq=self._seq,
                     split=segment.split,
+                    interim=segment.interim,
                 )
                 self._seq += 1
                 yield line_event(payload)

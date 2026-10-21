@@ -206,6 +206,8 @@ class FinalizeResponse(BaseModel):
 
 class StatusPayload(BaseModel):
     stage: Literal["connecting", "thinking", "searching", "drafting", "waiting"]
+    #: 子 Agent 的 ≤12 字进度提示；缺省时 Host 回落 stage 文案。
+    ui_hint: str = ""
 
 
 class MutePayload(BaseModel):
@@ -228,6 +230,8 @@ class LinePayload(BaseModel):
     speaker: str
     seq: int = Field(..., ge=0)
     split: SplitMark | None = None
+    #: 草案等待期的过渡话：Host 据此在玩家越过此句后继续显示 ui_hint 占位。
+    interim: bool = False
 
     def to_wire(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -239,6 +243,8 @@ class LinePayload(BaseModel):
         }
         if self.split is not None:
             data["split"] = self.split.model_dump()
+        if self.interim:
+            data["interim"] = True
         return data
 
 
@@ -308,26 +314,32 @@ class SSEEvent(BaseModel):
         return f"event: {self.event}\ndata: {payload}\n\n".encode("utf-8")
 
 
-def status_event(stage: str) -> SSEEvent:
-    return SSEEvent(event="status", data=StatusPayload(stage=stage).model_dump())
+def status_event(stage: str, ui_hint: str = "") -> SSEEvent:
+    return SSEEvent(
+        event="status",
+        data=StatusPayload(stage=stage, ui_hint=(ui_hint or "").strip()).model_dump(),
+    )
 
 
 class StreamStatus(str):
     """流内旁路信号：不进入 JSONL 解析，由编排器转成 SSE `status`。
 
-    真 LLM 适配器在进入工具轮前插入；假流（纯文本）不需要也不受影响。
-    继承 str 且内容为空串：调用方若直接 `"".join(chunks)` 不会破坏原文本。
+    真 LLM 适配器在进入工具轮前和子 Agent 进度事件到达时插入；假流（纯文本）
+    不需要也不受影响。继承 str 且内容为空串：调用方若直接 `"".join(chunks)`
+    不会破坏原文本。
     """
 
     stage: str
+    ui_hint: str
 
-    def __new__(cls, stage: str) -> "StreamStatus":
+    def __new__(cls, stage: str, ui_hint: str = "") -> "StreamStatus":
         obj = super().__new__(cls, "")
         obj.stage = stage
+        obj.ui_hint = (ui_hint or "").strip()
         return obj
 
     def __repr__(self) -> str:  # pragma: no cover - 仅调试用
-        return f"StreamStatus(stage={self.stage!r})"
+        return f"StreamStatus(stage={self.stage!r}, ui_hint={self.ui_hint!r})"
 
 
 def mute_event() -> SSEEvent:

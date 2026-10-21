@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -27,14 +28,19 @@ from services.dialogue.delegation import (
 from services.dialogue_interject.context import DailyBlocks
 from services.dialogue_interject.prompts import build_daily_messages
 from services.dialogue_interject.schemas import InterjectRequest
-from services.llm import LLMClient
+from services.llm import ChatRequest, LLMClient, split_meta_events
+from services.llm.meta import DEFAULT_EMOTION
 from services.memory.long_term import (
     CHAT_TOOL_NAME,
     apply_chat_tool,
     build_chat_tool,
     tool_call_name,
 )
-from services.orchestrator.prompts import fallback_confirm_args
+from services.orchestrator.prompts import (
+    build_interim_prompt_parts,
+    build_merge_user_prompt,
+    fallback_confirm_args,
+)
 from services.orchestrator.search_prefetch import (
     build_prefetch_result_block,
     run_search_prefetch,
@@ -48,6 +54,8 @@ logger = logging.getLogger(__name__)
 
 #: 工具执行超时（秒）；任务 Agent 自身还有轮数上限
 TOOL_TIMEOUT_S = 120.0
+#: 过渡话单独限时：生成失败/超时只是少一句填充，不得拖住草案终态
+_TRANSITION_TIMEOUT_S = 30.0
 
 
 class DailyToolError(RuntimeError):
@@ -67,6 +75,19 @@ class ToolExecutionResult:
     result_block: str = ""
     instruction: str = ""
     route_kind: str = ""
+
+
+@dataclass
+class ToolProgress:
+    """工具执行期间的旁路进度（不进入工具结果、不落库）。
+
+    `ui_hint` 刷新等待占位；`line` 是已写好的过渡话，由流循环立刻作为一条
+    add 行推给 Host，填住草案拟定期间的空窗。
+    """
+
+    ui_hint: str = ""
+    line: str = ""
+    emotion: str = ""
 
 
 class DailyToolExecutor(Protocol):
@@ -94,6 +115,14 @@ class DailyToolRuntime:
         self.memory = blocks.memory
         self.registry = blocks.registry
         self.llm = llm
+        #: 执行期间的旁路进度；由流循环并发消费（测试注入的执行器没有该队列）
+        self.progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
+
+    def _push_progress(self, progress: ToolProgress) -> None:
+        try:
+            self.progress_queue.put_nowait(progress)
+        except Exception:  # pragma: no cover - 队列无界，仅防御已关闭的事件循环
+            pass
 
     # ------------------------------------------------------------------
     # 工具表
@@ -350,7 +379,10 @@ class DailyToolRuntime:
             first_round_material=prefetch.text if prefetch is not None else "",
             max_rounds=_search_max_rounds(),
         )
-        event = await _wait_handle(handle)
+        event = await self._consume_handle(
+            handle,
+            lambda ev: self._push_progress(ToolProgress(ui_hint=ev.ui_hint)),
+        )
         if event.kind == "failed":
             return prefetch.text if prefetch is not None else ""
         payload = event.payload or {}
@@ -395,13 +427,55 @@ class DailyToolRuntime:
             retrieve_fn=self.blocks.retrieve_fn,
             max_rounds=_task_max_rounds(),
         )
-        event = await _wait_handle(handle)
+        transition_task: asyncio.Task | None = None
+        transition_text = ""
+        final_seen = False
+
+        async def _transition_after(ev: Any) -> None:
+            nonlocal transition_text
+            try:
+                text = await asyncio.wait_for(
+                    self._build_transition_line(ev.vague_note, ev.pool_note),
+                    timeout=_TRANSITION_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[interject] 过渡话生成失败/超时: %s", exc)
+                return
+            # 草案终态已到：这句话已经错过填窗时机，不再追加。
+            if final_seen or not text:
+                return
+            transition_text = text
+            self._push_progress(ToolProgress(line=text, emotion=DEFAULT_EMOTION))
+
+        def _on_progress(ev: Any) -> None:
+            nonlocal transition_task
+            if ev.ui_hint:
+                self._push_progress(ToolProgress(ui_hint=ev.ui_hint))
+            if ev.kind == "intermediate" and transition_task is None:
+                transition_task = asyncio.create_task(_transition_after(ev))
+
+        try:
+            event = await self._consume_handle(handle, _on_progress)
+        finally:
+            final_seen = True
+            if transition_task is not None:
+                if not transition_task.done():
+                    transition_task.cancel()
+                await asyncio.gather(transition_task, return_exceptions=True)
+
         if event.kind == "failed":
             reason = str((event.payload or {}).get("reason") or "未能拟定委托")
-            return (
-                f"【办理结果】{reason}",
-                "以角色口吻说明这次没法准备委托，不要编造任务内容或数字，不要提工具，也不要解释办理过程。",
+            instruction = (
+                "以角色口吻说明这次没法准备委托，不要编造任务内容或数字，"
+                "不要提工具，也不要解释办理过程。"
             )
+            if transition_text:
+                instruction += (
+                    f"你已经对玩家说过过渡话「{transition_text}」，顺着它收场，不要重复这句。"
+                )
+            return f"【办理结果】{reason}", instruction
 
         payload = event.payload or {}
         draft = payload.get("draft")
@@ -426,12 +500,78 @@ class DailyToolRuntime:
             except Exception:
                 summary = ""
         title = "草案已按玩家条件调整" if kind == "task_update" else "委托草案已拟定"
-        return (
-            f"【办理结果：{title}，尚未发布】\n{summary or '（草案摘要不可用）'}",
+        instruction = (
             "现在只输出最终确认对话（add）和结束语（closing）：讲清委托内容/要求/报酬并征询是否接取；"
             "不要输出“我去准备一下”之类过渡语；结束语表达“不接就算了/这活就搁着”，不要求固定措辞；"
-            "玩家点头前不要说已发布，任务内容/数字以草案结果为准。",
+            "玩家点头前不要说已发布，任务内容/数字以草案结果为准。"
         )
+        if transition_text:
+            instruction += (
+                f"你已经对玩家说过过渡话「{transition_text}」，最终确认对话顺着它说，不要重复这句。"
+            )
+        return f"【办理结果：{title}，尚未发布】\n{summary or '（草案摘要不可用）'}", instruction
+
+    async def _build_transition_line(self, vague_note: str, pool_note: str) -> str:
+        """草案拟定期间的过渡话（终端 #2a 同源）：只点方向，不报具体内容。"""
+        if self.llm is None:
+            return ""
+        result_block, instruction = build_interim_prompt_parts(vague_note, pool_note)
+        prompt = build_merge_user_prompt(
+            npc_name=self.request.npc,
+            player_query=self.request.player_input,
+            spoken_text="",
+            emotion=DEFAULT_EMOTION,
+            result_block=result_block,
+            instruction=instruction,
+        )
+        # 插话 system 要求 JSONL；这一轮是单独的填充话，必须明确豁免格式。
+        prompt += (
+            "\n\n【过渡话专用】这一轮不要套用 JSONL 输出格式，只输出过渡话正文本身，"
+            "不要输出任何 JSON、字段名、前缀或引号。"
+        )
+        messages = [
+            *build_daily_messages(self.request, self.blocks),
+            {"role": "user", "content": prompt},
+        ]
+        stream = self.llm.chat_stream(ChatRequest(
+            messages=messages,
+            purpose="chat",
+            send_image=False,
+        ))
+        _meta, events = await split_meta_events(stream, self.blocks.npc_emotions)
+        parts: list[str] = []
+        async for ev in events:
+            if ev.kind == "content" and ev.text:
+                parts.append(ev.text)
+        return _unwrap_transition_text("".join(parts))
+
+    async def _consume_handle(self, handle: Any, on_event: Any) -> Any:
+        """持续消费子 Agent 事件直到 final/failed；期间把 progress/intermediate 交给回调。
+
+        超时/取消时确保后台任务被取消，与旧的 wait_final 语义一致。
+        """
+        from core.config import get_settings
+
+        timeout = float(get_settings().subagent_timeout_s)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                try:
+                    ev = await handle.next_event(remaining)
+                except asyncio.TimeoutError as exc:
+                    raise DailyToolError(
+                        "tool_timeout", f"子 Agent 超时（>{timeout:.0f}s）",
+                    ) from exc
+                if ev.kind in ("final", "failed"):
+                    return ev
+                on_event(ev)
+        finally:
+            if not handle.done:
+                handle.cancel()
 
     # ------------------------------------------------------------------
     # 确认 / 取消
@@ -606,17 +746,25 @@ def _search_max_rounds() -> int:
     return max(1, int(get_settings().subagent_search_max_rounds))
 
 
-async def _wait_handle(handle: Any) -> Any:
-    """等待子 Agent 终态；超时/取消时确保后台任务被取消。"""
-    from core.config import get_settings
-
-    timeout = float(get_settings().subagent_timeout_s)
-    try:
-        return await asyncio.wait_for(handle.wait_final(timeout), timeout=timeout)
-    except asyncio.TimeoutError as exc:
-        raise DailyToolError("tool_timeout", f"子 Agent 超时（>{timeout:.0f}s）") from exc
-    except asyncio.CancelledError:
-        raise
-    finally:
-        if not handle.done:
-            handle.cancel()
+def _unwrap_transition_text(raw: str) -> str:
+    """模型偶尔无视豁免仍输出一行 JSONL：取出正文，避免把 JSON 当成台词。"""
+    text = (raw or "").strip()
+    if not text.startswith("{"):
+        return text
+    candidates = [text]
+    first_line = text.splitlines()[0].strip()
+    if first_line and first_line != text:
+        candidates.insert(0, first_line)
+    for candidate in candidates:
+        if not candidate.startswith("{"):
+            continue
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            for key in ("add", "closing", "line"):
+                value = obj.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return text

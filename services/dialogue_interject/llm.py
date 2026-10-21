@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, AsyncIterator
@@ -32,8 +33,11 @@ from services.dialogue_interject.tools import (
     DailyToolError,
     DailyToolExecutor,
     DailyToolRuntime,
+    ToolExecutionResult,
+    ToolProgress,
 )
 from services.llm import ChatRequest, LLMClient, LLMConfig
+from services.llm.meta import DEFAULT_EMOTION
 from services.memory.long_term import tool_call_name
 
 
@@ -208,13 +212,26 @@ async def _stream_with_blocks(
         if stage:
             # 工具轮前的旁路状态（协议 5.2 status）：Host 可显示“正在准备…”
             yield StreamStatus(stage)
-        try:
-            outcome = await asyncio.wait_for(
-                executor.execute(tool_calls, round_text=round_text),
-                timeout=_TOOL_WAIT_S,
-            )
-        except asyncio.TimeoutError as exc:
-            raise DailyToolError("tool_timeout", "插话工具执行超时") from exc
+        outcome: ToolExecutionResult | None = None
+        async for item in _execute_with_progress(executor, tool_calls, round_text):
+            if isinstance(item, ToolProgress):
+                if item.ui_hint:
+                    yield StreamStatus(stage or "thinking", item.ui_hint)
+                if item.line:
+                    # 过渡话当作一条 add 行走现有 JSONL 解析（拆分/情绪回落同源）；
+                    # 前置换行结束路由轮可能残留的半行，保证它是独立一行。
+                    yield "\n" + json.dumps(
+                        {
+                            "add": item.line,
+                            "emo": item.emotion or DEFAULT_EMOTION,
+                            "interim": True,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                continue
+            outcome = item
+        if outcome is None:  # pragma: no cover - 内部契约：必然产出终态结果
+            raise DailyToolError("tool_failed", "插话工具没有返回结果")
 
         if round_text.strip() and outcome.requires_followup:
             # 协议要求路由轮不说话；模型违规时已推送的正文无法撤回，留痕供走查
@@ -244,6 +261,52 @@ async def _stream_with_blocks(
         f"{first_content_ms:.0f}" if first_content_ms is not None else "n/a",
         content_chars, tool_rounds, (time.perf_counter() - started) * 1000,
     )
+
+
+async def _execute_with_progress(
+    executor: DailyToolExecutor,
+    tool_calls: list[dict[str, Any]],
+    round_text: str,
+) -> AsyncIterator[ToolProgress | ToolExecutionResult]:
+    """执行工具轮并并发吐出旁路进度；最后一条必为 ToolExecutionResult。
+
+    生产执行器暴露 `progress_queue`（子 Agent 进度与过渡话）；测试注入的假执行器
+    没有该队列时退化为原来的单次 await。
+    """
+    queue = getattr(executor, "progress_queue", None)
+    if queue is None:
+        try:
+            outcome = await asyncio.wait_for(
+                executor.execute(tool_calls, round_text=round_text),
+                timeout=_TOOL_WAIT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            raise DailyToolError("tool_timeout", "插话工具执行超时") from exc
+        yield outcome
+        return
+
+    exec_task = asyncio.create_task(executor.execute(tool_calls, round_text=round_text))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TOOL_WAIT_S
+    try:
+        while not exec_task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            try:
+                progress = await asyncio.wait_for(queue.get(), timeout=min(0.1, remaining))
+            except asyncio.TimeoutError:
+                continue
+            yield progress
+        outcome = await exec_task
+        while not queue.empty():
+            yield queue.get_nowait()
+        yield outcome
+    except asyncio.TimeoutError as exc:
+        raise DailyToolError("tool_timeout", "插话工具执行超时") from exc
+    finally:
+        if not exec_task.done():
+            exec_task.cancel()
 
 
 def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:

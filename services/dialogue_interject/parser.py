@@ -43,6 +43,7 @@ class TextSegment:
     emotion: str
     speaker: str
     split: SplitMark | None = None
+    interim: bool = False
 
 
 @dataclass(frozen=True)
@@ -317,8 +318,11 @@ class JSONLStreamParser:
         )
         pieces = split_text(cleaned, self.options.hard_max)
         marks = split_marks(len(pieces))
+        interim = obj.get("interim") is True
         segments = tuple(
-            TextSegment(text=piece, emotion=emotion, speaker=speaker, split=mark)
+            TextSegment(
+                text=piece, emotion=emotion, speaker=speaker, split=mark, interim=interim,
+            )
             for piece, mark in zip(pieces, marks)
         )
         return [ParsedEntry(kind=kind, n=n, segments=segments)]

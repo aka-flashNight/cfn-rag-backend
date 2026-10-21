@@ -39,10 +39,10 @@ from services.orchestrator.prompts import (
     TASK_FAIL_INSTRUCTION,
     TASK_MERGE_INSTRUCTION,
     TASK_UPDATE_MERGE_INSTRUCTION,
+    build_interim_prompt_parts,
     build_merge_user_prompt,
     task_merge_hint,
 )
-from services.subagents.prompts import DIRECTION_VAGUE_FALLBACK
 
 logger = logging.getLogger(__name__)
 
@@ -190,34 +190,14 @@ class MergeCoordinator:
         """过渡语 #2a：1~2 句报方向的模糊过渡，禁止数字/物品名/金额（03 §3）。"""
         self.spoke_interim = True
         self.outcome.spoke_interim = True
-        direction = (vague_note or "").strip() or DIRECTION_VAGUE_FALLBACK
-        result_block = (
-            "【当前状况】这事是你自己在盘算的：方向你心里有数，只是具体怎么安排还没定下来，"
-            "也还没跟玩家说全。别表现得茫然（这不是谁塞给你的活），"
-            "也别假装细节已经敲定了。"
-            "硬性要求：本轮**绝对不要**说出任何具体数字、物品名、金额、人名、地名或任务细节。"
-        )
-        scope_note = (pool_note or "").strip()
-        if scope_note:
-            result_block += (
-                f"\n【本次的考量范围（心里有数就行，可以顺着说一句这件事的路数，别照念）】{scope_note}"
-            )
+        result_block, instruction = build_interim_prompt_parts(vague_note, pool_note)
         prompt = build_merge_user_prompt(
             npc_name=self.npc_name,
             player_query=self.player_query,
             spoken_text=self.spoken_text,
             emotion=self.emotion,
             result_block=result_block,
-            instruction=(
-                f"只输出 1~2 句过渡话，把方向点到为止：{direction}。"
-                "用你自己的口吻说，不要照搬固定句式，不要许诺稍后再细讲"
-                "（紧接着你就会把这件事讲完，许诺了就是自相矛盾），"
-                "不要带动作描写，说完就停，不要展开、不要追问玩家、不要许诺任何具体内容。准确的说是不要涉及任何具体内容，此时你脑海中只有个大致方向，还没想好任何任务细节。不要把关注点放在任务内容上，而是要放在上下过渡上，核心是表述你确实【有】个任务/委托/需求/想法等，而不是你有【什么】任务。"
-                + (
-                    "范围那一行只用来帮你把语气对准路数，不要把它复述出来，也不要提到具体关卡、物品或人名。"
-                    if scope_note else ""
-                )
-            ),
+            instruction=instruction,
         )
         before = self.outcome.reply_text
         async for ev in self._stream_reply(prompt):

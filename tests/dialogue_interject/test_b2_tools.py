@@ -275,9 +275,15 @@ async def test_draft_runtime_uses_task_runner_and_returns_final_dialogue_instruc
             self.drafts.append((session_id, draft, bargain_count))
 
     class FakeHandle:
-        done = True
+        def __init__(self):
+            self._sent = False
+            self.done = False
 
-        async def wait_final(self, timeout):
+        async def next_event(self, timeout):
+            if self._sent:
+                raise asyncio.TimeoutError()
+            self._sent = True
+            self.done = True
             return SimpleNamespace(
                 kind="final",
                 payload={
@@ -288,7 +294,7 @@ async def test_draft_runtime_uses_task_runner_and_returns_final_dialogue_instruc
             )
 
         def cancel(self):
-            pass
+            self.done = True
 
     captured = {}
 
