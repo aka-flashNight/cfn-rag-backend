@@ -44,9 +44,11 @@ from services.memory.long_term import tool_call_name
 logger = logging.getLogger(__name__)
 
 #: 工具轮状态映射（只有这两类需要让玩家等；记忆/委派不显式提示）
-_DRAFTING_TOOLS = {
-    "route_task_draft", "route_task_update", "route_task_confirm", "route_task_cancel",
-}
+#: 草案侧只含 draft/update：改稿之后还要重新确认，仍属「拟定」阶段。
+_DRAFTING_TOOLS = {"route_task_draft", "route_task_update"}
+#: 确认/撤销是对既有草案的落地动作，阶段单列 publishing：游戏侧据此不再弹「接不接」，
+#: 也不再把它当成又拟了一版草案。
+_PUBLISHING_TOOLS = {"route_task_confirm", "route_task_cancel"}
 
 #: 最多两轮：工具轮 + 无工具的最终对话轮；与终端“一轮最多路由一件事”一致
 MAX_CHAT_ROUNDS = 2
@@ -313,10 +315,13 @@ def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
     """工具轮前的 status 阶段；未识别/纯记忆/委派返回空串（不发 status）。
 
     任务模式只可能检索，绝不发 drafting（任务工具与委派本就不注册）。
+    confirm/cancel 归 publishing（派发/撤销既有草案），draft/update 才归 drafting。
     """
     names = {tool_call_name(call) for call in tool_calls or []}
     if mode == "task":
         return "searching" if "route_search" in names else ""
+    if names & _PUBLISHING_TOOLS:
+        return "publishing"
     if names & _DRAFTING_TOOLS:
         return "drafting"
     if "route_search" in names:

@@ -205,7 +205,9 @@ class FinalizeResponse(BaseModel):
 
 
 class StatusPayload(BaseModel):
-    stage: Literal["connecting", "thinking", "searching", "drafting", "waiting"]
+    stage: Literal[
+        "connecting", "thinking", "searching", "drafting", "publishing", "waiting",
+    ]
     #: 子 Agent 的 ≤12 字进度提示；缺省时 Host 回落 stage 文案。
     ui_hint: str = ""
 

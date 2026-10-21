@@ -593,6 +593,9 @@ class DailyToolRuntime:
                 "【办理结果】当前没有待确认的委托草案，无法发布。",
                 "以角色口吻说明没有可确认的委托，不要编造任务内容。",
             )
+        # 确认不跑子 Agent，没有子 Agent 的 ui_hint 可透传：这里直接推一条固定提示，
+        # 游戏侧据此把等待文案从「拟定委托中」换成「派发委托中」。
+        self._push_progress(ToolProgress(ui_hint="派发委托中"))
         args, warnings, source = await self._build_confirm_args(draft_row)
         logger.info(
             "[interject] confirm 文案 dialogue=%s draft=%s source=%s warnings=%d",
@@ -723,6 +726,8 @@ class DailyToolRuntime:
                 "【办理结果】当前没有待取消的委托草案。",
                 "以角色口吻回应即可，不要提工具，也不要解释办理过程。",
             )
+        # 同样没有子 Agent：直接推一条提示，免得 publishing 阶段回落成「派发委托中」
+        self._push_progress(ToolProgress(ui_hint="撤销委托中"))
         execute_cancel_agent_task(
             {"draft_id": draft_row.draft_id}, pending_draft=draft_row.draft,
         )
