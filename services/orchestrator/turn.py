@@ -125,6 +125,8 @@ SUBAGENT_RECENT_MESSAGES = 8
 _ROUTE_PREFIX = "route_"
 _ROUTE_NOTE_MAX_CHARS = 60
 _ROUTE_QUERY_MAX_CHARS = 40
+#: 路由工具自带的进度提示（给玩家看的等待文案）：与子 Agent 的 ui_hint 同口径
+_ROUTE_UI_HINT_MAX_CHARS = 12
 _ROUTE_KEYWORDS_MAX_CHARS = 80
 
 
@@ -138,6 +140,8 @@ class Route:
     keywords: str = ""
     sources: tuple[str, ...] = ()
     deep_search: bool = False
+    #: 模型在调用时自带的进度提示（≤12 字）；空＝由后台回落固定文案
+    ui_hint: str = ""
 
 
 def _as_bool(value: Any) -> bool:
@@ -168,6 +172,7 @@ def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
         note = str(args.get("note") or "").strip()[:_ROUTE_NOTE_MAX_CHARS]
         query = str(args.get("query") or "").strip()[:_ROUTE_QUERY_MAX_CHARS]
         keywords = str(args.get("keywords") or "").strip()[:_ROUTE_KEYWORDS_MAX_CHARS]
+        ui_hint = str(args.get("ui_hint") or "").strip()[:_ROUTE_UI_HINT_MAX_CHARS]
         raw_sources = args.get("sources")
         if isinstance(raw_sources, str):
             sources = (raw_sources.strip().lower(),) if raw_sources.strip() else ()
@@ -184,6 +189,7 @@ def _parse_route(tool_calls: list[dict[str, Any]]) -> Optional[Route]:
             keywords=keywords,
             sources=sources,
             deep_search=_as_bool(args.get("deep_search")),
+            ui_hint=ui_hint,
         )
     return None
 
@@ -770,7 +776,7 @@ class TurnOrchestrator:
                 # ---- SYNC_ACTION：路由轮按契约不说话，后端办完再让 NPC 开口 ----
                 is_confirm = route.kind == "task_confirm"
                 tool_name = "confirm_agent_task" if is_confirm else "cancel_agent_task"
-                ui_hint = "发布委托" if is_confirm else "取消委托"
+                ui_hint = route.ui_hint or ("发布委托" if is_confirm else "取消委托")
                 draft_row = ctx.pending_draft_row
                 yield tool_status_event(tool_name, "running", ui_hint=ui_hint)
 

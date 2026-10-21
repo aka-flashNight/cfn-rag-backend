@@ -314,9 +314,9 @@ class DailyToolRuntime:
         if route.kind in ("task_draft", "task_update"):
             return await self._run_task_runner(route)
         if route.kind == "task_confirm":
-            return await self._run_confirm()
+            return await self._run_confirm(route)
         if route.kind == "task_cancel":
-            return await self._run_cancel()
+            return await self._run_cancel(route)
         return (
             "【办理结果】未能识别的工具调用，已忽略。",
             "用 JSONL 正常回应当前对话，不要提工具，也不要解释办理过程。",
@@ -586,16 +586,17 @@ class DailyToolRuntime:
     # 确认 / 取消
     # ------------------------------------------------------------------
 
-    async def _run_confirm(self) -> tuple[str, str]:
+    async def _run_confirm(self, route: Any = None) -> tuple[str, str]:
         draft_row = self.blocks.pending_draft_row
         if draft_row is None:
             return (
                 "【办理结果】当前没有待确认的委托草案，无法发布。",
                 "以角色口吻说明没有可确认的委托，不要编造任务内容。",
             )
-        # 确认不跑子 Agent，没有子 Agent 的 ui_hint 可透传：这里直接推一条固定提示，
-        # 游戏侧据此把等待文案从「拟定委托中」换成「派发委托中」。
-        self._push_progress(ToolProgress(ui_hint="派发委托中"))
+        # 确认不跑子 Agent，没有子 Agent 的 ui_hint 可透传：优先用模型在调用里自带的
+        # 进度提示（≤12 字），没给才回落到固定文案。游戏侧据此把等待文案从
+        # 「拟定委托中」换成「派发委托中」这类说法。
+        self._push_progress(ToolProgress(ui_hint=_route_hint(route, "派发委托中")))
         args, warnings, source = await self._build_confirm_args(draft_row)
         logger.info(
             "[interject] confirm 文案 dialogue=%s draft=%s source=%s warnings=%d",
@@ -719,15 +720,15 @@ class DailyToolRuntime:
             logger.warning("[interject] 完成 NPC 参考装配失败，降级为空: %s", exc)
             return ""
 
-    async def _run_cancel(self) -> tuple[str, str]:
+    async def _run_cancel(self, route: Any = None) -> tuple[str, str]:
         draft_row = self.blocks.pending_draft_row
         if draft_row is None:
             return (
                 "【办理结果】当前没有待取消的委托草案。",
                 "以角色口吻回应即可，不要提工具，也不要解释办理过程。",
             )
-        # 同样没有子 Agent：直接推一条提示，免得 publishing 阶段回落成「派发委托中」
-        self._push_progress(ToolProgress(ui_hint="撤销委托中"))
+        # 同 confirm：模型自带提示优先，免得 publishing 阶段回落成「派发委托中」
+        self._push_progress(ToolProgress(ui_hint=_route_hint(route, "撤销委托中")))
         execute_cancel_agent_task(
             {"draft_id": draft_row.draft_id}, pending_draft=draft_row.draft,
         )
@@ -746,6 +747,15 @@ class DailyToolRuntime:
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
+
+
+def _route_hint(route: Any, default: str) -> str:
+    """路由工具自带的进度提示；模型没给（或给了空白）时回落固定文案。
+
+    解析阶段已截到 12 字，这里再兜一次，防止测试或旁路构造绕过解析。
+    """
+    hint = str(getattr(route, "ui_hint", "") or "").strip()
+    return hint[:12] or default
 
 
 def _task_max_rounds() -> int:

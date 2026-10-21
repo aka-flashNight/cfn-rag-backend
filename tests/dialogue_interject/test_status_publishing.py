@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,9 @@ from services.dialogue_interject.llm import _status_stage_for
 from services.dialogue_interject.schemas import StatusPayload
 from services.dialogue_interject.tools import DailyToolRuntime
 from services.npc.manager import NPCState
+from services.orchestrator.turn import _parse_route
+from services.tools.route.route_task_cancel import tool as cancel_tool
+from services.tools.route.route_task_confirm import tool as confirm_tool
 from tests.dialogue_interject import fixtures as fx
 from tests.dialogue_interject.helpers import make_request
 
@@ -117,3 +121,62 @@ async def test_confirm_without_draft_does_not_push_hint():
     runtime = _runtime(_blocks(pending_draft_row=None))
     await runtime._run_confirm()
     assert _drain_hints(runtime) == []
+
+
+# ---------------------------------------------------------------------------
+# 模型自带的 ui_hint：优先于固定文案
+# ---------------------------------------------------------------------------
+
+def test_route_tools_accept_optional_ui_hint():
+    for route_tool in (confirm_tool, cancel_tool):
+        props = route_tool.parameters_schema["properties"]
+        assert "ui_hint" in props, route_tool.name
+        assert props["ui_hint"]["maxLength"] == 12
+        assert route_tool.parameters_schema.get("required", []) == []
+
+
+def test_parse_route_extracts_and_caps_ui_hint():
+    def _route_call(hint: str) -> list[dict]:
+        return [{
+            "type": "function",
+            "function": {
+                "name": "route_task_confirm",
+                "arguments": json.dumps({"ui_hint": hint}, ensure_ascii=False),
+            },
+        }]
+
+    assert _parse_route(_route_call("登记委托中")).ui_hint == "登记委托中"
+    # 超过 12 字按解析口径截断，避免把长句塞进等待占位
+    assert _parse_route(_route_call("正在把这个委托登记到名册里")).ui_hint == "正在把这个委托登记到名册"
+
+
+@pytest.mark.asyncio
+async def test_confirm_prefers_model_hint(monkeypatch):
+    monkeypatch.setattr(
+        tools_module,
+        "execute_confirm_agent_task",
+        lambda *a, **k: SimpleNamespace(payload={"status": "confirmed"}),
+    )
+    runtime = _runtime(_blocks())
+    await runtime._run_confirm(SimpleNamespace(ui_hint="登记委托中"))
+    assert _drain_hints(runtime) == ["登记委托中"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_prefers_model_hint(monkeypatch):
+    monkeypatch.setattr(tools_module, "execute_cancel_agent_task", lambda *a, **k: None)
+    runtime = _runtime(_blocks())
+    await runtime._run_cancel(SimpleNamespace(ui_hint="收回委托中"))
+    assert _drain_hints(runtime) == ["收回委托中"]
+
+
+@pytest.mark.asyncio
+async def test_blank_model_hint_falls_back(monkeypatch):
+    monkeypatch.setattr(
+        tools_module,
+        "execute_confirm_agent_task",
+        lambda *a, **k: SimpleNamespace(payload={"status": "confirmed"}),
+    )
+    runtime = _runtime(_blocks())
+    await runtime._run_confirm(SimpleNamespace(ui_hint="   "))
+    assert _drain_hints(runtime) == ["派发委托中"]

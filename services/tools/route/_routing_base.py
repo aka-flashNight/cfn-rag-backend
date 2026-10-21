@@ -29,3 +29,22 @@ class RoutingTool(BaseTool):
 
 
 _NO_ARG_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
+
+#: 带「模型自带进度提示」的路由工具 schema（confirm/cancel 用）。
+#: 提示会直接显示给玩家当等待文案，所以限制长度与口径；缺省时后台回落固定文案。
+_UI_HINT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "ui_hint": {
+            "type": "string",
+            "maxLength": 12,
+            "description": (
+                "给玩家看的进度提示，一句话、不超过 12 字。"
+                "以NPC的身份，按你这一轮实际在做的事写，要符合剧情和人物设定，不要涉及后端名词；"
+                "格式参考「派发委托中」「登记委托中」「撤销委托中」这类动宾短语。"
+                "不要写任务内容、报酬数字或玩家还看不到的信息；拿不准就省略。"
+            ),
+        },
+    },
+    "additionalProperties": False,
+}
