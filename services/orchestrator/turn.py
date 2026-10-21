@@ -686,6 +686,7 @@ class TurnOrchestrator:
                 self._routing_tools(
                     deps.registry,
                     has_pending_draft=self._routing_enabled and ctx.pending_draft_row is not None,
+                    player_can_challenge=ctx.player_can_challenge,
                 )
                 if self._routing_enabled else []
             )
@@ -1212,7 +1213,9 @@ class TurnOrchestrator:
 
     @staticmethod
     def _routing_tools(
-        registry: ToolRegistry, *, has_pending_draft: bool,
+        registry: ToolRegistry, *,
+        has_pending_draft: bool,
+        player_can_challenge: bool = False,
     ) -> list[dict[str, Any]]:
         """聊天主 Agent 的工具表 = 路由表（判据写在工具 description 里）。
 
@@ -1222,12 +1225,22 @@ class TurnOrchestrator:
         也不提前过期草案）。
         顺序固定（ROUTE_TOOLS_* 的定义序），保证 system/tools 前缀稳定，
         有利于前缀缓存与逐轮 diff。
+
+        player_can_challenge 只作用于 route_task_draft：可切磋时它的描述多一句
+        「切磋/对战也能路由」，不可切磋时描述里不出现切磋字样（见该工具模块）。
+        该值是稀疏量（玩家升级跨过切磋门槛才翻），不会逐轮抖动。
         """
         names = ROUTE_TOOLS_DRAFT if has_pending_draft else ROUTE_TOOLS_NEW
         out: list[dict[str, Any]] = []
         for name in names:
             tool = registry.get(name)
-            if tool is not None:
+            if tool is None:
+                continue
+            if name == "route_task_draft":
+                out.append(tool.to_openai_tool(
+                    player_can_challenge=player_can_challenge,
+                ))
+            else:
                 out.append(tool.to_openai_tool())
         return out
 

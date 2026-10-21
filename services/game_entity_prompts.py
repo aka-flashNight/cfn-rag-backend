@@ -254,9 +254,14 @@ def format_stage_monster_block(monsters: list[StageMonster]) -> str:
         top_by_s = [m.displayname for m in graded if m.strength == s_max]
         parts.append(f"强度最高的是{'、'.join(top_by_s)}。")
     parts.append(
-        "根据你的身份，你可能知道也可能不知道这个关卡的详情，"
+        "根据你的身份，你可能知道也可能不知道这个关卡的详情；"
+        "如果你所扮演的NPC看起来不擅长情报或战斗，或者没有这方面的资料，"
+        "那你就表现得不知道具体的关卡怪物分布，只知道模糊的大概，"
+        "例如那里是有僵尸还是有盗贼等；"
         "但绝对不要编造信息，要么表现的不清楚，要么根据实际信息去说话，"
         "不能编造未提供的信息。"
+        "上面提到的数量只是让你心里有数，不要向玩家复述具体个数；"
+        "需要说数量时用模糊的概括，例如“数十个”“很多”“不少”“大量”“较多”。"
     )
     return "".join(parts)
 
