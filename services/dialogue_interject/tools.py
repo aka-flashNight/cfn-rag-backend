@@ -328,6 +328,9 @@ class DailyToolRuntime:
 
     async def _run_search(self, route: Route) -> tuple[str, str]:
         keywords = (route.keywords or route.query or self.request.player_input).strip()
+        # 等待提示优先用模型自带的（「回忆中」「翻查记录中」这类），没给才回落「查资料中」：
+        # 工具是同一个，但「想起来」和「去查」在戏里是两件事。
+        self._push_progress(ToolProgress(ui_hint=_route_hint(route, "查资料中")))
         from services.orchestrator.context import forbidden_other_chars
 
         forbidden = forbidden_other_chars(self.blocks.npc_states)
@@ -387,6 +390,7 @@ class DailyToolRuntime:
             existing_material=self.blocks.rag_context_text,
             first_round_material=prefetch.text if prefetch is not None else "",
             max_rounds=_search_max_rounds(),
+            ui_hint=route.ui_hint,
         )
         event = await self._consume_handle(
             handle,

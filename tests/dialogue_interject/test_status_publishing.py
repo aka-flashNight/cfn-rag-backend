@@ -18,6 +18,7 @@ from services.dialogue_interject.schemas import StatusPayload
 from services.dialogue_interject.tools import DailyToolRuntime
 from services.npc.manager import NPCState
 from services.orchestrator.turn import _parse_route
+from services.tools.route.route_search import tool as search_tool
 from services.tools.route.route_task_cancel import tool as cancel_tool
 from services.tools.route.route_task_confirm import tool as confirm_tool
 from tests.dialogue_interject import fixtures as fx
@@ -180,3 +181,39 @@ async def test_blank_model_hint_falls_back(monkeypatch):
     runtime = _runtime(_blocks())
     await runtime._run_confirm(SimpleNamespace(ui_hint="   "))
     assert _drain_hints(runtime) == ["派发委托中"]
+
+
+# ---------------------------------------------------------------------------
+# 检索：模型按「想起来」还是「去查」自选提示
+# ---------------------------------------------------------------------------
+
+def test_search_schema_accepts_optional_ui_hint():
+    schema = search_tool.parameters_schema
+    assert schema["properties"]["ui_hint"]["maxLength"] == 12
+    assert schema["required"] == ["keywords"]
+
+
+def _search_route(**over) -> SimpleNamespace:
+    payload = dict(
+        keywords="旧事", sources=(), deep_search=False, query="", ui_hint="",
+    )
+    payload.update(over)
+    return SimpleNamespace(**payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_hint", "expected"),
+    [("回忆中", "回忆中"), ("翻查记录中", "翻查记录中"), ("", "查资料中")],
+)
+async def test_search_pushes_model_hint_or_lookup_default(
+    monkeypatch, model_hint, expected,
+):
+    monkeypatch.setattr(
+        tools_module, "run_search_prefetch",
+        lambda **kwargs: SimpleNamespace(text=""),
+    )
+    monkeypatch.setattr(tools_module, "build_prefetch_result_block", lambda text: "BLOCK")
+    runtime = _runtime(_blocks())
+    await runtime._run_search(_search_route(ui_hint=model_hint))
+    assert _drain_hints(runtime) == [expected]

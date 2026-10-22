@@ -67,6 +67,7 @@ class SearchRunner(SubagentBase):
         first_round_material: str = "",
         max_rounds: int = 3,
         skill_registry: Optional[SkillRegistry] = None,
+        ui_hint: str = "",
     ) -> SubagentHandle:
         ctx = ToolContext(
             npc_name=npc_name,
@@ -96,4 +97,9 @@ class SearchRunner(SubagentBase):
             max_rounds=max(1, max_rounds),
             queue=asyncio.Queue(),
         )
+        # 模型自带的等待提示（「回忆中」「翻查记录中」这类）：有就用它替换默认
+        # 「查资料中」，让等待文案跟这一轮实际在做的事、跟 NPC 人设对得上。
+        hint = (ui_hint or "").strip()[:12]
+        if hint:
+            runner.default_ui_hint = hint
         return SubagentHandle(kind="search", agent="search", coro=runner.run(), events=runner.queue)

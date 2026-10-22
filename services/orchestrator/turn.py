@@ -869,7 +869,8 @@ class TurnOrchestrator:
 
             elif route.kind == "search":
                 # ---- 检索：编排层先做关键词预取（检索子 Agent 的第一步）----
-                yield agent_status_event("search", "searching", "查资料中")
+                # 等待文案优先用模型自带的（「回忆中」「翻查记录中」），没给才回落「查资料中」
+                yield agent_status_event("search", "searching", route.ui_hint or "查资料中")
                 prefetch = await self._run_search_prefetch(route, ctx, deps)
 
                 deep = route.deep_search and bool(route.query.strip())
@@ -1674,6 +1675,7 @@ class TurnOrchestrator:
                 existing_material=ctx.rag_context_text,
                 first_round_material=(prefetch.text if prefetch is not None else ""),
                 max_rounds=deps.search_max_rounds,
+                ui_hint=route.ui_hint,
             )
 
         task_kwargs: dict[str, Any] = dict(
