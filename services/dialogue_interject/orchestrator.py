@@ -179,6 +179,12 @@ class InterjectOrchestrator:
             # 配置/上下文类错误带自己的 code（如 llm_not_configured），其余按流中断
             state.error_code = str(getattr(exc, "code", "") or "")
             return
+        if parser.plain_text_fallbacks:
+            logger.info(
+                "[interject] 裸台词兜底 %d 行（无 JSON 特征，按 add 接收）：%s",
+                len(parser.plain_text_fallbacks),
+                [line[:80] for line in parser.plain_text_fallbacks],
+            )
         if parser.issues:
             logger.info(
                 "[interject] 跳过 %d 行无效输出：%s",

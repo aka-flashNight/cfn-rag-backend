@@ -1,8 +1,9 @@
 """逐行 JSONL 解析、括号剥离、165 拆分与情绪回落。
 
 对应《协议》§5.3 / §5.4 / §5.5 / §5.6 与实施指引 §7。
-原则：宽容解析，不整段打回——非 JSON 行、未知字段、越界编号一律记录后跳过；
-正文只做结构处理（括号、字数、情绪），不做内容层面的漏信息校验。
+原则：宽容解析，不整段打回——完全没有 JSON 特征的裸台词按 add 兜底接收
+（情绪留空，由 Host 回落默认表情）；带 JSON 残片的坏行、未知字段、越界编号
+记录后跳过；正文只做结构处理（括号、字数、情绪），不做内容层面的漏信息校验。
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ from services.llm.meta import DEFAULT_EMOTION, default_emotion_for
 
 #: 括号内容剥离：全角/半角成对括号，重复应用直到稳定（不做嵌套深度解析）
 _BRACKET_RE = re.compile(r"[（(][^（）()]*[）)]")
+#: JSON 特征探针：花括号/方括号、以及 `"key":` 形式的键值残片。
+#: 只有完全不命中才按裸台词兜底，避免把截断的 JSON 当台词接收。
+_JSON_FEATURE_RE = re.compile(r"[{}\[\]]|\"[^\"\n]*\"\s*:")
 #: 拆分优先级（协议 5.6）：句号 → 感叹/问号/省略/分号 → 逗号/顿号/冒号 → 硬切
 _SPLIT_PRIORITIES: tuple[str, ...] = ("。", "！？…；", "，、：")
 
@@ -165,6 +169,8 @@ class JSONLStreamParser:
     def __init__(self, options: ParseOptions) -> None:
         self.options = options
         self.issues: list[ParseIssue] = []
+        #: 无 JSON 特征、按裸台词兜底接收的原始行（仅用于日志观测）
+        self.plain_text_fallbacks: list[str] = []
         self._buffer = ""
 
     def feed(self, chunk: str) -> list[ParsedEntry]:
@@ -198,6 +204,10 @@ class JSONLStreamParser:
         if stripped.startswith("```"):
             return []
         if not (stripped.startswith("{") and stripped.endswith("}")):
+            # 模型偶尔完全无视 JSONL，直接输出裸台词：没有任何 JSON 特征时按 add 兜底，
+            # 情绪留空交给 Host 回落默认表情；带括号/键值残片的截断 JSON 仍按坏行跳过。
+            if not _JSON_FEATURE_RE.search(stripped):
+                return self._plain_text_entry(stripped)
             self._issue(stripped, "非 JSON 行")
             return []
         try:
@@ -291,6 +301,21 @@ class JSONLStreamParser:
         return n_raw
 
     # ------------------------------------------------------------------
+
+    def _plain_text_entry(self, text: str) -> list[ParsedEntry]:
+        """裸台词兜底：按当前 NPC 的 add 接收，情绪留空由 Host 回落默认表情。"""
+        cleaned = clean_text(text)
+        if not cleaned:
+            self._issue(text, "剥离括号后正文为空")
+            return []
+        self.plain_text_fallbacks.append(text[:500])
+        pieces = split_text(cleaned, self.options.hard_max)
+        marks = split_marks(len(pieces))
+        segments = tuple(
+            TextSegment(text=piece, emotion="", speaker=self.options.npc, split=mark)
+            for piece, mark in zip(pieces, marks)
+        )
+        return [ParsedEntry(kind="add", segments=segments)]
 
     def _text_entry(
         self,

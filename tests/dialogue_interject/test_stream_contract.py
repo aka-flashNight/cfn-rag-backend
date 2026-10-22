@@ -60,6 +60,26 @@ async def test_f01_daily_add_add_closing_in_order():
 
 
 @pytest.mark.asyncio
+async def test_plain_text_stream_is_accepted_as_add_with_empty_emotion():
+    events = await collect_events(
+        make_orchestrator(
+            fx.daily_request(),
+            chunks=["我是A兵团的线人，在这基地里打探消息。\n第二句。\n"],
+        )
+    )
+
+    assert _names(events) == ["status", "line", "line", "done"]
+    lines = [event.data for event in events if event.event == "line"]
+    assert [line["kind"] for line in lines] == ["add", "add"]
+    assert [line["text"] for line in lines] == [
+        "我是A兵团的线人，在这基地里打探消息。",
+        "第二句。",
+    ]
+    assert [line["speaker"] for line in lines] == [fx.NPC, fx.NPC]
+    assert [line["emotion"] for line in lines] == ["", ""]
+
+
+@pytest.mark.asyncio
 async def test_f02_long_add_is_split_with_marks_and_reassembles():
     payload = fx.daily_request(player_input="北边那条路还能走吗？", turn_id=fx.DAILY_TURN_B)
     events = await collect_events(make_orchestrator(payload, chunks=fx.F02_JSONL))
@@ -271,7 +291,7 @@ async def test_first_line_is_emitted_before_stream_finishes():
 @pytest.mark.asyncio
 async def test_invalid_lines_are_skipped_but_valid_ones_stream():
     chunks = [
-        "模型的前言\n",
+        '{"add":"模型的前言\n',
         '{"add":"（叹气）好吧。","emo":"普通"}\n',
         "```\n",
         '{"add":"（沉默）","emo":"普通"}\n',

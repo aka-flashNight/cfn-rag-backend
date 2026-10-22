@@ -18,20 +18,73 @@ def _daily_parser() -> JSONLStreamParser:
     )
 
 
-def test_daily_skips_fence_blank_and_non_json():
+def test_daily_skips_fence_blank_and_broken_json_fragment():
     parser = _daily_parser()
     entries = parser.feed(
         "```jsonl\n"
         '{"add":"甲","emo":"普通"}\n'
         "\n"
-        "这不是 JSON\n"
+        '{"add":"未闭合"\n'
         '{"closing":"乙","emo":"普通"}\n'
         "```\n"
     )
     assert [entry.kind for entry in entries] == ["add", "closing"]
     assert [entry.segments[0].text for entry in entries] == ["甲", "乙"]
-    assert len(parser.issues) == 1  # 只有“这不是 JSON”；围栏行静默跳过
+    assert len(parser.issues) == 1  # 只有截断的 JSON；围栏行静默跳过
     assert "非 JSON" in parser.issues[0].reason
+
+
+def test_pure_text_line_falls_back_to_add_with_empty_emotion():
+    parser = _daily_parser()
+    entries = parser.feed("我是A兵团的线人，在这基地里打探消息、传个话。\n")
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "add"
+    assert entry.n is None
+    assert entry.segments[0].text == "我是A兵团的线人，在这基地里打探消息、传个话。"
+    assert entry.segments[0].emotion == ""
+    assert entry.segments[0].speaker == fx.NPC
+    assert parser.issues == []
+    assert parser.plain_text_fallbacks == ["我是A兵团的线人，在这基地里打探消息、传个话。"]
+
+
+def test_pure_text_fallback_still_strips_brackets_and_splits():
+    parser = _daily_parser()
+    long_line = "（压低声音）" + "甲" * 200
+    entries = parser.feed(long_line + "\n")
+
+    assert len(entries) == 1
+    segments = entries[0].segments
+    assert len(segments) == 2
+    assert "".join(segment.text for segment in segments) == "甲" * 200
+    assert [segment.split.index for segment in segments] == [0, 1]
+    assert all(segment.emotion == "" for segment in segments)
+
+
+def test_json_key_fragment_without_braces_is_not_treated_as_text():
+    parser = _daily_parser()
+    entries = parser.feed('"add":"你好"\n[1,2]\n')
+
+    assert entries == []
+    assert [issue.reason for issue in parser.issues] == ["非 JSON 行", "非 JSON 行"]
+    assert parser.plain_text_fallbacks == []
+
+
+def test_task_pure_text_line_falls_back_to_add():
+    parser = JSONLStreamParser(
+        ParseOptions(
+            mode="task",
+            npc=fx.NPC,
+            remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
+        )
+    )
+    entries = parser.feed("这句是任务对话里的裸台词。\n")
+
+    assert len(entries) == 1
+    assert entries[0].kind == "add"
+    assert entries[0].segments[0].speaker == fx.NPC
+    assert entries[0].segments[0].emotion == ""
 
 
 def test_line_split_across_chunks_waits_for_newline():
