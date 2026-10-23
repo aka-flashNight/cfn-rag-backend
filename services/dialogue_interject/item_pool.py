@@ -96,6 +96,12 @@ def build_gift_pool(game_data: Any) -> list[str]:
     return sorted(name for name in names if is_pool_name(game_data, name, direction="give"))
 
 
+def giftable_names(game_data: Any, pool: Sequence[str], cap: int) -> list[str]:
+    """随机候选池：剔除单价已超过赠送上限的物品（数量 1 也不可送）。"""
+    limit = int(cap)
+    return [name for name in pool if 0 < item_price(game_data, name) <= limit]
+
+
 def build_take_pool(game_data: Any, player_item_names: Sequence[str] = ()) -> list[str]:
     """索取池＝有正常来源的物品 ∪ 金币 ∪ 玩家持有名；金币固定排第一。"""
     names: set[str] = {GOLD}

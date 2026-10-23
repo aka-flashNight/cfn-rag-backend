@@ -141,3 +141,97 @@ async def test_empty_pool_returns_none():
     assert await picker.pick(
         direction="give", name="", keyword="", instruction="", pool=[], game_data=_game_data(),
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_exact_name_missing_fails_without_random_fallback():
+    """玩家指定的物品不在池内：判失败，不调用模型、不改选随机物品。"""
+    called = False
+
+    async def caller(_messages):
+        nonlocal called
+        called = True
+        return '{"action":"pick","name":"普通hp药剂"}'
+
+    picker = ItemPicker(caller=caller)
+    result = await picker.pick_result(
+        direction="give", name="牛肉罐头", keyword="", instruction="",
+        pool=["普通hp药剂"], game_data=_game_data(),
+    )
+    assert result.name is None
+    assert result.reason == "not_found"
+    assert result.target == "牛肉罐头"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_exact_name_over_cap_fails_before_picker():
+    async def caller(_messages):  # pragma: no cover - 不应被调用
+        raise AssertionError("超上限的精确物品不应进入选择模型")
+
+    picker = ItemPicker(caller=caller)
+    result = await picker.pick_result(
+        direction="give", name="高级治疗药剂", keyword="", instruction="",
+        pool=["普通hp药剂", "高级治疗药剂"], game_data=_game_data(), cap=500,
+    )
+    assert result.name is None
+    assert result.reason == "value_exceeded"
+    assert result.target == "高级治疗药剂"
+
+
+@pytest.mark.asyncio
+async def test_keyword_hit_over_cap_is_annotated_and_can_fail():
+    seen = []
+
+    async def caller(messages):
+        seen.append(messages)
+        return '{"action":"fail","reason":"value_exceeded"}'
+
+    picker = ItemPicker(caller=caller)
+    result = await picker.pick_result(
+        direction="give", name="", keyword="高级", instruction="",
+        pool=["普通hp药剂", "高级治疗药剂"], random_pool=["普通hp药剂"],
+        game_data=_game_data(), cap=500,
+        player_text="给我高级治疗药剂", recent_dialogue="玩家：给我高级治疗药剂",
+    )
+
+    user = seen[0][1]["content"]
+    assert "高级治疗药剂" in user
+    assert "该物品价值超出可赠送范围，不可赠送" in user
+    assert "玩家原话：给我高级治疗药剂" in user
+    assert "玩家近期对话" in user
+    assert result.name is None
+    assert result.reason == "value_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_pick_over_cap_candidate_is_rejected():
+    async def caller(_messages):
+        return '{"action":"pick","name":"高级治疗药剂"}'
+
+    picker = ItemPicker(caller=caller)
+    result = await picker.pick_result(
+        direction="give", name="", keyword="高级", instruction="",
+        pool=["普通hp药剂", "高级治疗药剂"], random_pool=["普通hp药剂"],
+        game_data=_game_data(), cap=500,
+    )
+    assert result.name is None
+    assert result.reason == "value_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_random_pool_excludes_over_cap_items():
+    seen = []
+
+    async def caller(messages):
+        seen.append(messages)
+        return '{"action":"pick","name":"普通hp药剂"}'
+
+    picker = ItemPicker(caller=caller)
+    result = await picker.pick_result(
+        direction="give", name="", keyword="", instruction="",
+        pool=["普通hp药剂", "高级治疗药剂"], random_pool=["普通hp药剂"],
+        game_data=_game_data(), cap=500,
+    )
+    assert result.name == "普通hp药剂"
+    assert "高级治疗药剂" not in seen[0][1]["content"]

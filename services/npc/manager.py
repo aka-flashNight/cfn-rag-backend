@@ -97,12 +97,21 @@ class NPCManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    async def load(cls, state_path: Path | None = None) -> "NPCManager":
-        """从本地 JSON 初始化（一次全量读入内存）。文件不存在时从对话数据初始化 NPC 列表。"""
+    async def load(
+        cls,
+        state_path: Path | None = None,
+        seed_path: Path | None = None,
+    ) -> "NPCManager":
+        """从本地 JSON 初始化（一次全量读入内存）。文件不存在时从对话数据初始化 NPC 列表。
+
+        seed_path 为随 exe 分发的设定种子：只补运行时文件缺失的 NPC 与空字段，
+        绝不覆盖已有的 favorability / relationship_level，也不碰 saves 作用域。
+        """
         path = state_path or get_npc_state_path()
         raw_global: dict[str, dict[str, Any]] = {}
         raw_saves: dict[str, dict[str, dict[str, Any]]] = {}
-        if path.exists():
+        runtime_exists = path.exists()
+        if runtime_exists:
             try:
                 text = await asyncio.to_thread(path.read_text, "utf-8")
                 parsed = json.loads(text) if text.strip() else {}
@@ -111,17 +120,82 @@ class NPCManager:
             except (json.JSONDecodeError, OSError) as exc:
                 logger.error("npc_state_db.json 读取失败，按空状态启动: %s", exc)
 
+        seed_state = (
+            await cls._read_global_scope(Path(seed_path)) if seed_path is not None else {}
+        )
         state = {name: cls._state_from_item(item) for name, item in raw_global.items()}
+        if not runtime_exists and seed_state:
+            state = seed_state
         saves = {
             slot: {name: cls._state_from_item(item) for name, item in entries.items()}
             for slot, entries in raw_saves.items()
         }
 
         manager = cls(state=state, state_path=path, saves=saves)
-        if not path.exists():
-            await manager._init_from_dialogues()
+        changed = manager._merge_seed_global(seed_state) if seed_state else False
+        if not runtime_exists:
+            if not seed_state:
+                await manager._init_from_dialogues()
+            await manager.flush()
+        elif changed:
             await manager.flush()
         return manager
+
+    @classmethod
+    async def _read_global_scope(cls, path: Path) -> dict[str, "NPCState"]:
+        """读种子文件的 global 作用域；读不到按空处理（不阻断启动）。"""
+        try:
+            text = await asyncio.to_thread(path.read_text, "utf-8")
+            parsed = json.loads(text) if text.strip() else {}
+            if not isinstance(parsed, dict):
+                return {}
+            raw_global, _ = cls._split_scopes(parsed)
+            return {
+                name: cls._state_from_item(item) for name, item in raw_global.items()
+            }
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("NPC 设定种子读取失败（忽略）: %s err=%s", path, exc)
+            return {}
+
+    def _merge_seed_global(self, seed: dict[str, "NPCState"]) -> bool:
+        """补缺合并：新增 NPC 整条补入；已有 NPC 只填空字段/缺失列表项/缺失未知字段。"""
+        changed = False
+        by_fold = {name.casefold(): name for name in self._global}
+        for name, seed_state in seed.items():
+            target = name if name in self._global else by_fold.get(name.casefold())
+            if target is None:
+                self._global[name] = replace(seed_state)
+                by_fold[name.casefold()] = name
+                changed = True
+                logger.info("NPC 设定种子补入新 NPC: %s", name)
+                continue
+            current = self._global[target]
+            merged = self._merge_static_fields(current, seed_state)
+            if merged is not current:
+                self._global[target] = merged
+                changed = True
+                logger.info("NPC 设定种子补齐字段: %s", target)
+        return changed
+
+    @staticmethod
+    def _merge_static_fields(current: "NPCState", seed: "NPCState") -> "NPCState":
+        """只补空字段与缺失列表项；好感度/关系等级永远保留运行时值。"""
+        changes: dict[str, Any] = {}
+        for field in ("sex", "challenge", "faction", "appearance"):
+            if not getattr(current, field) and getattr(seed, field):
+                changes[field] = getattr(seed, field)
+        for field in ("emotions", "titles"):
+            existing = list(getattr(current, field))
+            merged = existing + [item for item in getattr(seed, field) if item not in existing]
+            if merged != existing:
+                changes[field] = merged
+        extra = dict(current.extra)
+        for key, value in seed.extra.items():
+            if key not in extra:
+                extra[key] = value
+        if extra != current.extra:
+            changes["extra"] = extra
+        return replace(current, **changes) if changes else current
 
     @staticmethod
     def _split_scopes(

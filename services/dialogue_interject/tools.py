@@ -30,8 +30,16 @@ from services.dialogue_interject.actions import ACTIONS, ACTION_WAIT_TIMEOUT_S, 
 from services.dialogue_interject.context import DailyBlocks
 from services.dialogue_interject.item_claims import ClaimExistsError, ITEM_CLAIMS
 from services.dialogue_interject.item_ledger import GIVE, record_item_ledger
-from services.dialogue_interject.item_picker import ItemPicker
-from services.dialogue_interject.item_pool import build_gift_pool, build_take_pool
+from services.dialogue_interject.item_picker import (
+    REASON_NOT_FOUND,
+    REASON_VALUE_EXCEEDED,
+    ItemPicker,
+)
+from services.dialogue_interject.item_pool import (
+    build_gift_pool,
+    build_take_pool,
+    giftable_names,
+)
 from services.dialogue_interject.item_tools import (
     CANCEL_TOOL,
     GIVE_TOOL,
@@ -480,31 +488,57 @@ class DailyToolRuntime:
 
         self._push_progress(ToolProgress(ui_hint="查找物品中"))
         game_data = self.blocks.game_data
-        pool = build_gift_pool(game_data)
-        picked = await ItemPicker(llm=self.llm).pick(
-            direction="give",
-            name=args.name,
-            keyword=args.keyword,
-            instruction=args.instruction or self.request.player_input,
-            pool=pool,
-            game_data=game_data,
-        )
-        if not picked:
-            ITEM_CLAIMS.record_failure(
-                self._claim_key(),
-                f"赠送「{args.name or args.keyword or '合适物品'}」失败：未找到合适物品",
-            )
-            return _ItemOutcome(
-                f"【办理结果】{gift_not_found_text()}",
-                "以角色口吻拒绝赠送或换个话题，不要声称已经送出，不要提工具。",
-            )
-
         cap = gift_value_cap(
             stage=self.blocks.progress_stage or 1,
             favorability=int(
                 getattr(self.blocks.npc_state, "favorability", 0) or 0
             ),
         )
+        pool = build_gift_pool(game_data)
+        choice = await ItemPicker(llm=self.llm).pick_result(
+            direction="give",
+            name=args.name,
+            keyword=args.keyword,
+            instruction=args.instruction or self.request.player_input,
+            pool=pool,
+            game_data=game_data,
+            random_pool=giftable_names(game_data, pool, cap),
+            cap=cap,
+            player_text=self.request.player_input,
+            recent_dialogue=self.blocks.recent_dialogue,
+        )
+        if not choice.name:
+            target = choice.target or args.name or args.keyword or "合适物品"
+            if choice.reason == REASON_NOT_FOUND:
+                ITEM_CLAIMS.record_failure(
+                    self._claim_key(),
+                    f"赠送「{target}」失败：你没有这个物品",
+                )
+                return _ItemOutcome(
+                    "【办理结果】你没有这个物品，无法赠送。",
+                    "以角色口吻告诉玩家你没有这件物品，这次不能赠送；"
+                    "不要改送别的物品，不要提工具，也不要解释办理过程。",
+                )
+            if choice.reason == REASON_VALUE_EXCEEDED:
+                ITEM_CLAIMS.record_failure(
+                    self._claim_key(),
+                    f"赠送「{target}」失败：物品价值超出可赠送范围",
+                )
+                return _ItemOutcome(
+                    "【办理结果】物品价值超出可赠送范围，不可赠送。",
+                    "以角色口吻说明这件物品太贵重、超出可赠送范围；"
+                    "不要改送别的物品，不要提工具，也不要解释办理过程。",
+                )
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(),
+                f"赠送「{target}」失败：未找到合适物品",
+            )
+            return _ItemOutcome(
+                f"【办理结果】{gift_not_found_text()}",
+                "以角色口吻拒绝赠送或换个话题，不要声称已经送出，不要提工具。",
+            )
+        picked = choice.name
+
         qty, reason = reduce_gift_quantity(
             game_data, picked, args.quantity, cap=cap,
         )
@@ -607,15 +641,17 @@ class DailyToolRuntime:
         pool = build_take_pool(
             game_data, getattr(self.request, "player_item_names", []) or [],
         )
-        picked = await ItemPicker(llm=self.llm).pick(
+        choice = await ItemPicker(llm=self.llm).pick_result(
             direction="take",
             name=args.name,
             keyword=args.keyword,
             instruction=args.instruction or self.request.player_input,
             pool=pool,
             game_data=game_data,
+            player_text=self.request.player_input,
+            recent_dialogue=self.blocks.recent_dialogue,
         )
-        if not picked:
+        if not choice.name:
             ITEM_CLAIMS.record_failure(
                 self._claim_key(),
                 f"索取「{args.name or args.keyword or '物品'}」失败：未找到有效物品",
@@ -627,6 +663,7 @@ class DailyToolRuntime:
                 ),
                 "按上面的失败说明继续聊天，不能索取该物品，不要提工具。",
             )
+        picked = choice.name
 
         quantity = args.quantity
         notes: list[str] = []

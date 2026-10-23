@@ -10,7 +10,7 @@
 
 目标：索引已建时从进程启动到 /api/ask 可服务 ≤ 5s（不含 exe 自解压）。
 已删除：立绘包解压任务、SWF/FFDec 预处理、npc_state_db 脚本生成链
-（保留 backup 复制；缺失时由 NPCManager 从对话数据兜底生成）。
+（保留 backup 复制；NPCManager 启动时与种子补缺合并，缺失时从对话数据兜底生成）。
 """
 
 from __future__ import annotations
@@ -169,7 +169,10 @@ def ensure_task_agent_files_and_lists() -> None:
 
 
 def ensure_npc_state_db() -> bool:
-    """npc_state_db.json：存在跳过 → backup 复制 → （缺失时 NPCManager 从对话数据兜底）。"""
+    """npc_state_db.json：存在跳过 → backup 复制 → （缺失时 NPCManager 从对话数据兜底）。
+
+    复制之后 NPCManager 仍会用同一种子补缺合并，已有好感/关系与 saves 不动。
+    """
     from services.npc.manager import get_npc_state_path
 
     path = get_npc_state_path()
@@ -242,7 +245,8 @@ async def _init_retrieval() -> None:
 async def _init_npc_manager() -> None:
     from services.npc.manager import NPCManager, set_npc_manager
 
-    manager = await NPCManager.load()
+    seed_path = _get_backup_resources_dir() / "data" / "rag" / "npc_state_db.json"
+    manager = await NPCManager.load(seed_path=seed_path if seed_path.exists() else None)
     set_npc_manager(manager)
     state_count = len(await manager.all_states())
     logger.info("NPC 状态库加载完成（%d 个 NPC）", state_count)

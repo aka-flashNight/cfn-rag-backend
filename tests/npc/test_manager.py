@@ -287,3 +287,100 @@ async def test_new_structure_roundtrip_preserves_both_scopes(tmp_path, bound_slo
     assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 0
     assert raw["global"]["铁匠"]["favorability"] == 30
     assert raw["global"]["铁匠"]["faction"] == "A兵团"
+
+
+async def test_seed_fills_missing_npcs_and_fields_without_touching_progress(tmp_path):
+    """种子只补缺：已有好感/关系/人工字段不变，saves 原样保留，新 NPC 按种子补入。"""
+    state_path = tmp_path / "npc_state_db.json"
+    seed_path = tmp_path / "seed.json"
+    _write_state(state_path, {
+        "global": {
+            "铁匠": {
+                "favorability": 42,
+                "relationship_level": "熟悉",
+                "emotions": ["普通"],
+                "titles": ["老铁匠"],
+            }
+        },
+        "saves": {
+            "slot_1": {"铁匠": {"favorability": 42, "relationship_level": "熟悉"}}
+        },
+    })
+    _write_state(seed_path, {
+        "global": {
+            "铁匠": {
+                "favorability": 10,
+                "relationship_level": "陌生",
+                "sex": "男",
+                "faction": "王国",
+                "emotions": ["普通", "微笑"],
+                "titles": ["大师铁匠"],
+                "challenge": "试炼",
+            },
+            "新NPC": {
+                "favorability": 25,
+                "relationship_level": "熟悉",
+                "emotions": ["普通"],
+                "faction": "A兵团",
+            },
+        },
+        "saves": {},
+    })
+
+    manager = await NPCManager.load(state_path=state_path, seed_path=seed_path)
+
+    blacksmith = await manager.get("铁匠")
+    assert blacksmith.favorability == 42                      # 不重置好感
+    assert blacksmith.relationship_level == "熟悉"
+    assert blacksmith.sex == "男"                              # 空字段补齐
+    assert blacksmith.faction == "王国"
+    assert blacksmith.challenge == "试炼"
+    assert blacksmith.emotions == ["普通", "微笑"]             # 列表取并集
+    assert blacksmith.titles == ["老铁匠", "大师铁匠"]
+
+    new_npc = await manager.get("新NPC")
+    assert new_npc.favorability == 25 and new_npc.relationship_level == "熟悉"
+
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["saves"]["slot_1"]["铁匠"]["favorability"] == 42
+
+
+async def test_seed_matches_existing_name_case_insensitively(tmp_path):
+    """扫描名 boy 与已有 Boy 视作同一 NPC，不产生大小写重复条目。"""
+    state_path = tmp_path / "npc_state_db.json"
+    seed_path = tmp_path / "seed.json"
+    _write_state(state_path, {"Boy": {
+        "favorability": 30, "relationship_level": "熟悉", "emotions": ["普通"],
+    }})
+    _write_state(seed_path, {"global": {"boy": {
+        "favorability": 10,
+        "relationship_level": "陌生",
+        "faction": "A兵团元老",
+        "emotions": ["微笑"],
+    }}, "saves": {}})
+
+    manager = await NPCManager.load(state_path=state_path, seed_path=seed_path)
+
+    boy = await manager.get("Boy")
+    assert boy.favorability == 30 and boy.faction == "A兵团元老"
+    assert boy.emotions == ["普通", "微笑"]
+    assert await manager.get("boy") is not None                 # 大小写归一命中同一条
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert list(raw["global"]).count("Boy") == 1
+    assert "boy" not in raw["global"]
+
+
+async def test_seed_initializes_missing_runtime_file(tmp_path):
+    """运行时文件不存在时直接用种子起库，并按新结构落盘。"""
+    state_path = tmp_path / "npc_state_db.json"
+    seed_path = tmp_path / "seed.json"
+    _write_state(seed_path, {"global": {"铁匠": {
+        "favorability": 25, "relationship_level": "熟悉", "faction": "A兵团",
+    }}, "saves": {}})
+
+    manager = await NPCManager.load(state_path=state_path, seed_path=seed_path)
+
+    assert (await manager.get("铁匠")).favorability == 25
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    assert raw["global"]["铁匠"]["favorability"] == 25
+    assert raw["saves"] == {}

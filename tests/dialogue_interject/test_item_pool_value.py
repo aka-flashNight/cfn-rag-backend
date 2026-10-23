@@ -7,6 +7,7 @@ from services.dialogue_interject.item_pool import (
     build_gift_pool,
     build_take_pool,
     category_counts,
+    giftable_names,
     item_category,
     remaining_pool_counts,
     sample_names,
@@ -176,3 +177,12 @@ def test_item_info_block_for_registry_and_pseudo():
     gold = format_item_info(gd, "金币")
     assert gold.startswith("名称：金币；")
     assert "单价：1" in gold
+
+
+def test_giftable_names_excludes_single_over_cap():
+    """单价已超上限的物品（数量 1 也不可送）从随机候选池剔除。"""
+    gd = make_game_data(_items())
+    pool = ["普通hp药剂", "M4A1", "铁甲"]
+
+    assert giftable_names(gd, pool, 500) == ["普通hp药剂", "M4A1"]
+    assert giftable_names(gd, pool, 249) == []

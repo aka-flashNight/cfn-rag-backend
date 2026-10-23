@@ -11,7 +11,7 @@ import services.dialogue_interject.tools as tools_module
 from services.dialogue_interject.actions import ACTIONS, ActionResult
 from services.dialogue_interject.context import DailyBlocks
 from services.dialogue_interject.item_claims import ITEM_CLAIMS
-from services.dialogue_interject.item_picker import ItemPicker
+from services.dialogue_interject.item_picker import ItemPicker, PickerResult
 from services.dialogue_interject.llm import stream_daily_llm
 from services.dialogue_interject.orchestrator import InterjectOrchestrator
 from services.dialogue_interject.schemas import (
@@ -121,10 +121,17 @@ def _blocks(game_data=None, memory=None, registry=None, **kwargs) -> DailyBlocks
 
 
 def _patch_picker(monkeypatch, picked):
-    async def _pick(self, **_kwargs):
-        return picked
+    if isinstance(picked, PickerResult):
+        result = picked
+    elif picked:
+        result = PickerResult(name=picked, target=picked)
+    else:
+        result = PickerResult(reason="none")
 
-    monkeypatch.setattr(ItemPicker, "pick", _pick)
+    async def _pick_result(self, **_kwargs):
+        return result
+
+    monkeypatch.setattr(ItemPicker, "pick_result", _pick_result)
 
 
 async def _drain(queue):
@@ -315,6 +322,34 @@ async def test_gift_not_found_rejects(monkeypatch):
 
     assert all(ev.action is None for ev in events)
     assert "未找到合适的赠送物品" in result.result_block
+
+
+@pytest.mark.asyncio
+async def test_gift_specified_missing_reports_reason(monkeypatch):
+    """玩家指定的物品不在池内：失败理由进办理结果，不再随机改送。"""
+    _patch_picker(monkeypatch, PickerResult(reason="not_found", target="牛肉罐头"))
+    runtime = DailyToolRuntime(_request(), _blocks())
+
+    result, events = await _execute_gift(runtime, GIVE_CALL)
+
+    assert all(ev.action is None for ev in events)
+    assert "你没有这个物品，无法赠送" in result.result_block
+    assert "未找到合适的赠送物品" not in result.result_block
+    assert "赠送「牛肉罐头」失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+
+
+@pytest.mark.asyncio
+async def test_gift_specified_over_cap_reports_reason(monkeypatch):
+    """玩家指定的物品价值超上限：失败理由进办理结果，不再随机改送。"""
+    _patch_picker(monkeypatch, PickerResult(reason="value_exceeded", target="稀有芯片"))
+    runtime = DailyToolRuntime(_request(), _blocks())
+
+    result, events = await _execute_gift(runtime, GIVE_CALL)
+
+    assert all(ev.action is None for ev in events)
+    assert "物品价值超出可赠送范围，不可赠送" in result.result_block
+    assert "未找到合适的赠送物品" not in result.result_block
+    assert "赠送「稀有芯片」失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
 
 
 @pytest.mark.asyncio
@@ -555,3 +590,26 @@ async def test_stream_forwards_claim_pending():
     ]
     assert events[2].data["state"] == "pending"
     assert events[2].data["claim_id"] == "c1"
+
+
+@pytest.mark.asyncio
+async def test_gift_picker_gets_filtered_random_pool_and_dialogue(monkeypatch):
+    """赠送候选随机池剔除超上限物品；选择器拿到玩家原话与近期对话。"""
+    captured = {}
+
+    async def _pick_result(self, **kwargs):
+        captured.update(kwargs)
+        return PickerResult(name="普通hp药剂", target="普通hp药剂")
+
+    monkeypatch.setattr(ItemPicker, "pick_result", _pick_result)
+    blocks = _blocks(recent_dialogue="玩家：给我点药")
+    request = _request()
+    runtime = DailyToolRuntime(request, blocks)
+
+    await _execute_gift(runtime, GIVE_CALL)
+
+    assert captured["game_data"] is blocks.game_data
+    assert captured["cap"] > 0
+    assert "稀有芯片" not in captured["random_pool"]
+    assert captured["player_text"] == request.player_input
+    assert captured["recent_dialogue"] == "玩家：给我点药"
