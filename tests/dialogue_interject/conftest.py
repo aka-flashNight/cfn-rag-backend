@@ -25,6 +25,21 @@ def memory_store(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _reset_item_runtime_state():
+    """物品 claim / action 是进程级状态：每个用例前后都清空，避免跨用例串味。"""
+    from services.dialogue_interject.actions import ACTIONS
+    from services.dialogue_interject.item_claims import ITEM_CLAIMS
+
+    ITEM_CLAIMS.reset_all()
+    ACTIONS.reset()
+    try:
+        yield
+    finally:
+        ITEM_CLAIMS.reset_all()
+        ACTIONS.reset()
+
+
+@pytest.fixture(autouse=True)
 def _forbid_real_llm(monkeypatch):
     """本目录测试一律离线：任何未注入假客户端的真 LLM 调用直接失败。"""
     from services.llm.client import LLMClient

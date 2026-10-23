@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -25,9 +26,41 @@ from services.dialogue.delegation import (
     apply_delegate_calls,
     delegate_tool_or_none,
 )
+from services.dialogue_interject.actions import ACTIONS, ACTION_WAIT_TIMEOUT_S, ActionResult
 from services.dialogue_interject.context import DailyBlocks
+from services.dialogue_interject.item_claims import ClaimExistsError, ITEM_CLAIMS
+from services.dialogue_interject.item_ledger import GIVE, record_item_ledger
+from services.dialogue_interject.item_picker import ItemPicker
+from services.dialogue_interject.item_pool import build_gift_pool, build_take_pool
+from services.dialogue_interject.item_tools import (
+    CANCEL_TOOL,
+    GIVE_TOOL,
+    TAKE_TOOL,
+    gift_not_found_text,
+    is_equipment_item,
+    is_item_tool,
+    item_tool_schemas,
+    parse_item_arguments,
+    take_instruction,
+    take_not_found_text,
+    with_item_info,
+)
+from services.dialogue_interject.item_value import (
+    format_gift_failure,
+    format_gift_no_price,
+    format_gift_result,
+    format_item_info,
+    gift_value_cap,
+    reduce_gift_quantity,
+)
 from services.dialogue_interject.prompts import build_daily_messages
-from services.dialogue_interject.schemas import InterjectRequest
+from services.dialogue_interject.schemas import (
+    ActionPayload,
+    InterjectRequest,
+    ItemClaimPayload,
+    StreamAction,
+    StreamItemClaim,
+)
 from services.llm import ChatRequest, LLMClient, split_meta_events
 from services.llm.meta import DEFAULT_EMOTION
 from services.memory.long_term import (
@@ -76,6 +109,8 @@ class ToolExecutionResult:
     result_block: str = ""
     instruction: str = ""
     route_kind: str = ""
+    #: 最终台词轮要替换的 system（tools=None 时去掉 tool guide）；空串＝沿用原 system
+    system_prompt: str = ""
 
 
 @dataclass
@@ -83,12 +118,21 @@ class ToolProgress:
     """工具执行期间的旁路进度（不进入工具结果、不落库）。
 
     `ui_hint` 刷新等待占位；`line` 是已写好的过渡话，由流循环立刻作为一条
-    add 行推给 Host，填住草案拟定期间的空窗。
+    add 行推给 Host，填住草案拟定期间的空窗；`action`/`claim` 是物品动作的
+    旁路 SSE（发放请求与索取选项开关）。
     """
 
     ui_hint: str = ""
     line: str = ""
     emotion: str = ""
+    action: StreamAction | None = None
+    claim: StreamItemClaim | None = None
+
+
+@dataclass
+class _ItemOutcome:
+    result_block: str
+    instruction: str
 
 
 class DailyToolExecutor(Protocol):
@@ -129,7 +173,32 @@ class DailyToolRuntime:
     # 工具表
     # ------------------------------------------------------------------
 
+    def _request_mode(self) -> str:
+        return str(getattr(self.request, "mode", "daily") or "daily")
+
+    def _request_action(self) -> Any:
+        return getattr(self.request, "action", None)
+
+    def _claim_key(self) -> str:
+        return str(getattr(self.request, "dialogue_instance_id", "") or "")
+
+    def _pending_claim(self) -> Any:
+        if self._request_mode() != "daily" or self._request_action() is not None:
+            return None
+        return ITEM_CLAIMS.pending(self._claim_key())
+
+    def _item_tools_enabled(self) -> bool:
+        return (
+            self._request_mode() == "daily"
+            and self._request_action() is None
+            and self._pending_claim() is None
+            and self.blocks.pending_draft_row is None
+        )
+
     def _route_names(self) -> list[str]:
+        # 有索取待处理时先处理索取：任务草案/确认/取消一律不注册
+        if self._pending_claim() is not None:
+            return ["route_search"]
         if self.blocks.task_publish_disabled:
             return ["route_search"]
         if self.blocks.pending_draft_row is not None:
@@ -150,7 +219,11 @@ class DailyToolRuntime:
                     )
         if self.blocks.long_term is not None:
             schemas = [*schemas, build_chat_tool(self.blocks.long_term)]
-        if self.blocks.delegate_enabled:
+        if self._pending_claim() is not None:
+            schemas = [*schemas, *item_tool_schemas((CANCEL_TOOL,))]
+        elif self._item_tools_enabled():
+            schemas = [*schemas, *item_tool_schemas((GIVE_TOOL, TAKE_TOOL))]
+        if self.blocks.delegate_enabled and self._pending_claim() is None:
             # 注册闸每轮现查：后台 worker 在跑/未绑定存档时不出现（提示词也不提）
             try:
                 delegate_tool = delegate_tool_or_none(include_task_fallback=False)
@@ -171,6 +244,17 @@ class DailyToolRuntime:
         calls = list(tool_calls or [])
         if not calls:
             return ToolExecutionResult()
+
+        # 物品动作先于路由分派：一轮只处理一个，其余忽略（协议 §7.5.2）
+        item_index = next(
+            (
+                index for index, call in enumerate(calls)
+                if is_item_tool(tool_call_name(call))
+            ),
+            None,
+        )
+        if item_index is not None:
+            return await self._execute_item_round(calls, item_index, round_text)
 
         tool_messages: list[dict[str, Any]] = []
         memory_results: dict[int, str] = {}
@@ -226,6 +310,7 @@ class DailyToolRuntime:
                 ],
                 instruction=instruction,
                 route_kind="delegate",
+                system_prompt=self.blocks.tool_free_system_prompt,
             )
 
         route_index = next(
@@ -285,6 +370,368 @@ class DailyToolRuntime:
             result_block=result_block,
             instruction=instruction,
             route_kind=route.kind,
+            system_prompt=self.blocks.tool_free_system_prompt,
+        )
+
+    # ------------------------------------------------------------------
+    # 物品赠送 / 索取
+    # ------------------------------------------------------------------
+
+    async def _execute_item_round(
+        self,
+        calls: list[dict[str, Any]],
+        item_index: int,
+        round_text: str,
+    ) -> ToolExecutionResult:
+        """一轮最多处理一个物品动作；其余调用回“已忽略”，记忆工具可并行。"""
+        name = tool_call_name(calls[item_index])
+        memory_results: dict[int, str] = {}
+        for index, call in enumerate(calls):
+            if index == item_index:
+                continue
+            if tool_call_name(call) != CHAT_TOOL_NAME:
+                continue
+            try:
+                result = await apply_chat_tool(
+                    self.memory,
+                    call,
+                    snapshot=self.blocks.long_term,
+                    session_id=self.blocks.session_id,
+                )
+            except Exception as exc:  # 记忆失败不阻断物品动作
+                logger.warning("[interject] 长期记忆工具失败: %s", exc)
+                result = None
+            memory_results[index] = result or "未记录"
+
+        try:
+            outcome = await self._run_item_tool(name, calls[item_index])
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # 物品动作失败不能拖垮整轮对话
+            logger.exception("[interject] 物品工具执行失败 tool=%s", name)
+            outcome = _ItemOutcome(
+                "【办理结果】这次物品动作办理失败或超时，未能完成。",
+                "以角色口吻说明这次没办成，不要编造物品或数量，不要提工具，也不要解释办理过程。",
+            )
+
+        tool_messages: list[dict[str, Any]] = []
+        for index, call in enumerate(calls):
+            if index == item_index:
+                content = outcome.result_block
+            elif index in memory_results:
+                content = memory_results[index]
+            else:
+                content = "已忽略（一轮只处理一个物品动作）"
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": str(call.get("id") or ""),
+                "content": content,
+            })
+
+        instruction = outcome.instruction
+        return ToolExecutionResult(
+            requires_followup=True,
+            messages=[
+                {"role": "assistant", "content": round_text or "", "tool_calls": calls},
+                *tool_messages,
+                {"role": "user", "content": f"{outcome.result_block}\n\n{instruction}".strip()},
+            ],
+            result_block=outcome.result_block,
+            instruction=instruction,
+            route_kind=f"item:{name}",
+            system_prompt=self.blocks.tool_free_system_prompt,
+        )
+
+    async def _run_item_tool(self, name: str, call: dict[str, Any]) -> _ItemOutcome:
+        if self._request_mode() != "daily" or self._request_action() is not None:
+            return _ItemOutcome(
+                "【办理结果】当前不能处理物品往来。",
+                "以角色口吻正常回应，不要提工具，也不要解释办理过程。",
+            )
+        if name == CANCEL_TOOL:
+            return self._run_cancel_item()
+        if self._pending_claim() is not None:
+            return _ItemOutcome(
+                "【办理结果】当前还有待处理的索取，先把这件事处理完。",
+                "以角色口吻把话头拉回当前的索取；不要提工具，也不要解释办理过程。",
+            )
+        if self.blocks.pending_draft_row is not None:
+            return _ItemOutcome(
+                "【办理结果】当前有待确认的委托，先把它处理完。",
+                "以角色口吻把话头拉回委托；不要提工具，也不要解释办理过程。",
+            )
+        if name == GIVE_TOOL:
+            return await self._run_gift(call)
+        if name == TAKE_TOOL:
+            return await self._run_take(call)
+        return _ItemOutcome(
+            "【办理结果】未能识别的物品动作，已忽略。",
+            "用 JSONL 正常回应当前对话，不要提工具，也不要解释办理过程。",
+        )
+
+    async def _run_gift(self, call: dict[str, Any]) -> _ItemOutcome:
+        try:
+            args = self._item_args(call)
+        except ValueError as exc:
+            return _ItemOutcome(
+                f"【办理结果】赠送参数无效：{exc}",
+                "以角色口吻正常回应，不要声称送出任何物品，不要提工具。",
+            )
+
+        self._push_progress(ToolProgress(ui_hint="查找物品中"))
+        game_data = self.blocks.game_data
+        pool = build_gift_pool(game_data)
+        picked = await ItemPicker(llm=self.llm).pick(
+            direction="give",
+            name=args.name,
+            keyword=args.keyword,
+            instruction=args.instruction or self.request.player_input,
+            pool=pool,
+            game_data=game_data,
+        )
+        if not picked:
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(),
+                f"赠送「{args.name or args.keyword or '合适物品'}」失败：未找到合适物品",
+            )
+            return _ItemOutcome(
+                f"【办理结果】{gift_not_found_text()}",
+                "以角色口吻拒绝赠送或换个话题，不要声称已经送出，不要提工具。",
+            )
+
+        cap = gift_value_cap(
+            stage=self.blocks.progress_stage or 1,
+            favorability=int(
+                getattr(self.blocks.npc_state, "favorability", 0) or 0
+            ),
+        )
+        qty, reason = reduce_gift_quantity(
+            game_data, picked, args.quantity, cap=cap,
+        )
+        if reason == "no_price":
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(), f"赠送{picked}失败：无法估价",
+            )
+            return _ItemOutcome(
+                f"【办理结果】{format_gift_no_price(picked)}",
+                "以角色口吻说明这次送不了，不要声称已经送出，不要提工具。",
+            )
+        if reason is not None:
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(), f"赠送{picked}失败：价值过高",
+            )
+            return _ItemOutcome(
+                f"【办理结果】{format_gift_failure(picked)}",
+                "以角色口吻拒绝这次赠送，不要声称已经送出，不要提工具。",
+            )
+
+        action_id = uuid.uuid4().hex
+        self._push_progress(ToolProgress(ui_hint="交接物品中"))
+        self._push_progress(ToolProgress(action=StreamAction(ActionPayload(
+            action_id=action_id,
+            kind="item_grant",
+            npc=self.request.npc,
+            item_name=picked,
+            quantity=qty,
+            requested_quantity=args.quantity,
+        ))))
+        try:
+            result = await ACTIONS.wait(
+                action_id,
+                timeout=ACTION_WAIT_TIMEOUT_S,
+                on_late=lambda late: self._on_late_gift(late, picked, qty),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[interject] 赠送回执超时 action_id=%s item=%s qty=%s（可能已发放）",
+                action_id, picked, qty,
+            )
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(), f"赠送{picked}失败：游戏侧没有确认",
+            )
+            return _ItemOutcome(
+                "【办理结果】这次赠送没有收到游戏侧确认，不能当作已经送出。",
+                "以角色口吻说明这次没送成，不要声称已经送出，不要提工具。",
+            )
+        except asyncio.CancelledError:
+            raise
+
+        if not result.success:
+            detail = (result.error or "游戏侧发放失败").strip()
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(), f"赠送{picked}失败：{detail}",
+            )
+            return _ItemOutcome(
+                f"【办理结果】赠送失败：{detail}",
+                "以角色口吻说明没送成，不要声称已经送出，不要提工具。",
+            )
+
+        actual = int(result.actual_quantity or qty)
+        if actual < 1:
+            actual = qty
+        self._record_gift(picked, actual)
+        await record_item_ledger(
+            self.memory,
+            slot_key_value=self.blocks.slot_key,
+            npc=self.request.npc,
+            direction=GIVE,
+            item_name=picked,
+            quantity=actual,
+        )
+        text = "【办理结果】" + format_gift_result(
+            picked,
+            requested=args.quantity,
+            actual=actual,
+            adjusted=actual != args.quantity,
+        )
+        if result.overflow_money:
+            text += f"\n情报溢出额外折算了 {result.overflow_money} 金币。"
+        text = with_item_info(text, format_item_info(game_data, picked))
+        return _ItemOutcome(
+            text,
+            "用 JSONL 说最终的话：确认已经把物品交给玩家，数量以办理结果为准；"
+            "不要提工具，也不要解释办理过程，不要输出动作描写。",
+        )
+
+    async def _run_take(self, call: dict[str, Any]) -> _ItemOutcome:
+        try:
+            args = self._item_args(call)
+        except ValueError as exc:
+            return _ItemOutcome(
+                f"【办理结果】索取参数无效：{exc}",
+                "以角色口吻正常回应，不要索要物品，不要提工具。",
+            )
+
+        self._push_progress(ToolProgress(ui_hint="查找物品中"))
+        game_data = self.blocks.game_data
+        pool = build_take_pool(
+            game_data, getattr(self.request, "player_item_names", []) or [],
+        )
+        picked = await ItemPicker(llm=self.llm).pick(
+            direction="take",
+            name=args.name,
+            keyword=args.keyword,
+            instruction=args.instruction or self.request.player_input,
+            pool=pool,
+            game_data=game_data,
+        )
+        if not picked:
+            ITEM_CLAIMS.record_failure(
+                self._claim_key(),
+                f"索取「{args.name or args.keyword or '物品'}」失败：未找到有效物品",
+            )
+            return _ItemOutcome(
+                "【办理结果】"
+                + take_not_found_text(
+                    args.name, args.quantity, args.keyword, args.instruction,
+                ),
+                "按上面的失败说明继续聊天，不能索取该物品，不要提工具。",
+            )
+
+        quantity = args.quantity
+        notes: list[str] = []
+        if is_equipment_item(game_data, picked):
+            if quantity != 1:
+                notes.append("该物品是装备，索取数量固定为 1 件。")
+            quantity = 1
+
+        try:
+            claim = ITEM_CLAIMS.create(
+                self._claim_key(),
+                npc=self.request.npc,
+                item_name=picked,
+                quantity=quantity,
+                turn_no=(
+                    self.blocks.turn_no
+                    or ITEM_CLAIMS.turn_number(
+                        self._claim_key(), getattr(self.request, "turn_id", ""),
+                    )
+                ),
+            )
+        except ClaimExistsError:
+            return _ItemOutcome(
+                "【办理结果】当前已有待处理的索取，这次不再发起新的索取。",
+                "以角色口吻把话头拉回当前索取，不要提工具。",
+            )
+
+        self._push_progress(ToolProgress(claim=StreamItemClaim(ItemClaimPayload(
+            state="pending",
+            claim_id=claim.claim_id,
+            npc=claim.npc,
+            item_name=claim.item_name,
+            quantity=claim.quantity,
+        ))))
+        lines = [take_instruction(picked, quantity), *notes]
+        return _ItemOutcome(
+            with_item_info(
+                "【办理结果】" + "\n".join(lines),
+                format_item_info(game_data, picked),
+            ),
+            "按上面的索取要求，用 JSONL 向玩家开口；不要提工具，也不要解释办理过程。",
+        )
+
+    def _run_cancel_item(self) -> _ItemOutcome:
+        claim = ITEM_CLAIMS.close(self._claim_key())
+        if claim is None:
+            return _ItemOutcome(
+                "【办理结果】当前没有待处理的索取。",
+                "以角色口吻正常回应，不要提工具，也不要解释办理过程。",
+            )
+        self._push_progress(ToolProgress(claim=StreamItemClaim(ItemClaimPayload(
+            state="closed",
+            claim_id=claim.claim_id,
+            npc=claim.npc,
+            item_name=claim.item_name,
+            quantity=claim.quantity,
+        ))))
+        return _ItemOutcome(
+            "【办理结果】你取消了这次索取。",
+            "以角色口吻回应，不要再索要，不要提工具，也不要解释办理过程。",
+        )
+
+    @staticmethod
+    def _item_args(call: dict[str, Any]) -> Any:
+        function = call.get("function") or {}
+        return parse_item_arguments(function.get("arguments") or {})
+
+    def _record_gift(self, item_name: str, quantity: int) -> None:
+        key = self._claim_key()
+        turn_no = self.blocks.turn_no or ITEM_CLAIMS.turn_number(
+            key, getattr(self.request, "turn_id", ""),
+        )
+        ITEM_CLAIMS.record_gift(
+            key, turn_no=turn_no, item_name=item_name, quantity=quantity,
+        )
+
+    def _on_late_gift(
+        self, result: ActionResult, item_name: str, fallback_qty: int,
+    ) -> None:
+        """回执迟到但物品已真实发放：补记账本，不补发本轮台词。"""
+        if not result.success:
+            return
+        actual = int(result.actual_quantity or fallback_qty)
+        if actual < 1:
+            actual = fallback_qty
+        self._record_gift(item_name, actual)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "[interject] 迟到赠送回执无事件循环，账本未补记 action_id=%s item=%s qty=%s",
+                result.action_id, item_name, actual,
+            )
+            return
+        loop.create_task(record_item_ledger(
+            self.memory,
+            slot_key_value=self.blocks.slot_key,
+            npc=self.request.npc,
+            direction=GIVE,
+            item_name=item_name,
+            quantity=actual,
+        ))
+        logger.info(
+            "[interject] 迟到赠送回执已补记账本 action_id=%s item=%s qty=%s",
+            result.action_id, item_name, actual,
         )
 
     async def _run_delegate(self, call: dict[str, Any]) -> str:
@@ -589,6 +1036,14 @@ class DailyToolRuntime:
     # ------------------------------------------------------------------
     # 确认 / 取消
     # ------------------------------------------------------------------
+
+    async def run_task_accept(self) -> tuple[str, str]:
+        """选项直连：接受委托（不经过路由轮）。"""
+        return await self._run_confirm()
+
+    async def run_task_decline(self) -> tuple[str, str]:
+        """选项直连：拒绝委托（不经过路由轮）。"""
+        return await self._run_cancel()
 
     async def _run_confirm(self, route: Any = None) -> tuple[str, str]:
         draft_row = self.blocks.pending_draft_row

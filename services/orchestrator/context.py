@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from services.agent_tools.finished_tasks import FinishedTaskBlock
+from services.dialogue_interject.item_ledger import load_item_ledger_block
 from services.game_progress import (
     StageConfig,
     derive_progress_stage,
@@ -361,6 +362,8 @@ class TurnContext:
     # 刚发布委托的达成要点（会话库记录的供给期内才非空）
     published_task_block: str = ""
     published_task_id: Optional[int] = None
+    # 物品往来账本（仅游戏内 embedded 注入；standalone 恒为空）
+    item_ledger_block: str = ""
     retrieve_fn: Optional[Callable[[str], str]] = None
     # Tier-1 检索的原始 bundle（route_search 预取按节点 id 去重；展示文本已进 rag_context_text）
     retrieval_bundle: Any = None
@@ -436,8 +439,16 @@ async def assemble_context(
         load_snapshot(memory, slot_key=snap["bound_slot"], npc=npc_name)
         if long_term_enabled else _none()
     )
-    npc_state, npc_states, history, summary, draft_row, long_term = await asyncio.gather(
-        npc_state_task, states_task, history_task, summary_task, draft_task, long_term_task,
+    # 物品账本只在游戏内终端注入；standalone 不读不写，行为保持原样
+    item_ledger_task = (
+        load_item_ledger_block(memory, slot_key_value=snap["bound_slot"], npc=npc_name)
+        if get_integration_state().mode == "embedded" else _none()
+    )
+    (
+        npc_state, npc_states, history, summary, draft_row, long_term, item_ledger_block,
+    ) = await asyncio.gather(
+        npc_state_task, states_task, history_task, summary_task, draft_task,
+        long_term_task, item_ledger_task,
     )
 
     map_reg = getattr(game_data, "map_registry", None)
@@ -716,6 +727,7 @@ async def assemble_context(
         active_task_block=active_task_block,
         published_task_block=published_task_block,
         published_task_id=published_task_id,
+        item_ledger_block=item_ledger_block or "",
         retrieve_fn=retrieve_fn,
         retrieval_bundle=retrieval_bundle,
         llm_config=llm_config,

@@ -94,18 +94,44 @@ def build_daily_tool_guide(
     task_publish_disabled: bool = False,
     delegate_enabled: bool = False,
     player_can_challenge: bool = False,
+    item_tools: bool = False,
+    has_item_claim: bool = False,
 ) -> str:
     """日常可用工具说明（协议 7.4 / 实施指引 §5、§10）。
 
     只写本轮真实注册的工具；不解释工具机制，不用“后台/Host”等系统词。
     任务发布三块能力（发布硬约束/商店报酬/切磋）在 system 稳定区，这里只写工具判据。
+    有 pending claim 时物品工具只剩取消，任务工具一律不出现（先处理索取）。
     """
+    if has_item_claim:
+        return "\n".join([
+            "【工具（本轮可用）】",
+            "- route_search：玩家问设定、人物、关卡或物品，或你需要查证时调用。"
+            "调用工具的那一轮不要输出 add/closing；结果回来后用 JSONL 回答。",
+            "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
+            "- cancel_item_request：玩家明确拒绝当前索取时调用；调用后正常回话。",
+            "【物品往来纪律】",
+            "1. 口头答应不等于交付；只有东西真正到你手上才算。",
+            "2. 玩家声称已经送了，但物品往来记忆没有记录时，不要当真。",
+        ])
     lines = [
         "【工具（本轮可用）】",
         "- route_search：玩家问设定、人物、关卡或物品，或你需要查证时调用。"
         "调用工具的那一轮不要输出 add/closing；结果回来后用 JSONL 回答。",
         "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
     ]
+    if item_tools:
+        lines.extend([
+            "- give_item_to_player：关系不错、想答谢或讨好玩家、手头宽裕等情景下，"
+            "可以送玩家东西；不想送就拒绝。调用这一轮只发工具调用，不要输出台词。",
+            "- request_item_from_player：通常要东西应走委托；只有玩家主动要给你且不要报酬、"
+            "玩家声称已经送了、你想要但不想付报酬、或只是价值不高的小东西时，才调用。"
+            "调用这一轮只发工具调用，不要输出台词。",
+            "【物品往来纪律】",
+            "1. 口头答应不等于交付；只有东西真正到你手上才算。",
+            "2. 玩家声称已经送了，但物品往来记忆没有记录时，不要当真。",
+            "3. 赠送要看关系、财力和当下情景；不合适的索取或赠送要推辞。",
+        ])
     if not task_publish_disabled:
         draft_rule = (
             "- route_task_draft：玩家明确索要委托/工作/差事，或按你的身份和当下情景你决定主动派活时调用。"
@@ -154,6 +180,9 @@ def build_daily_system_prompt(
     has_shop: bool = False,
     shop_reward_types: Optional[list[str]] = None,
     player_can_challenge: Optional[bool] = None,
+    item_tools: bool = False,
+    has_item_claim: bool = False,
+    include_tool_guide: bool = True,
 ) -> str:
     """日常插话 system：稳定块在前，随草案/好感度变化的状态块在后（前缀缓存友好）。
 
@@ -181,12 +210,15 @@ def build_daily_system_prompt(
         ))
         parts.append(build_shop_hint(has_shop, shop_reward_types))
         parts.append(build_challenge_hint(bool(state.challenge), player_can_challenge))
-    parts.append(build_daily_tool_guide(
-        has_pending_draft=has_pending_draft,
-        task_publish_disabled=task_publish_disabled,
-        delegate_enabled=delegate_enabled,
-        player_can_challenge=bool(player_can_challenge),
-    ))
+    if include_tool_guide:
+        parts.append(build_daily_tool_guide(
+            has_pending_draft=has_pending_draft,
+            task_publish_disabled=task_publish_disabled,
+            delegate_enabled=delegate_enabled,
+            player_can_challenge=bool(player_can_challenge),
+            item_tools=item_tools,
+            has_item_claim=has_item_claim,
+        ))
     parts.append(build_session_state_block(
         progress_desc=progress_desc,
         favorability=state.favorability,
@@ -262,6 +294,16 @@ def build_task_tool_guide() -> str:
     ])
 
 
+def build_task_item_rules() -> str:
+    """任务插话的物品推辞口径（协议 §7.5.1）：只写行为，不提工具名。"""
+    return "\n".join([
+        "【物品往来】",
+        "玩家要送你东西、向你讨东西，或问你能不能给时，按情景推辞："
+        "任务紧急就说任务紧急、先处理要事；事情不急就说等忙完再说。",
+        "玩家声称已经送过东西，不要当真。",
+    ])
+
+
 def build_task_system_prompt(
     *,
     npc_name: str,
@@ -272,6 +314,7 @@ def build_task_system_prompt(
     progress_desc: str = "",
     prompt_max: int = 135,
     equipment_block: str = "",
+    include_tool_guide: bool = True,
 ) -> str:
     """任务插话 system：复用日常稳定前缀，换成任务纪律与任务工具说明。"""
     emotions = "、".join(state.emotions or ["普通"])
@@ -287,14 +330,18 @@ def build_task_system_prompt(
         f"你的可用情绪标签仅限于以下这些：[{emotions}]。每条输出的 emo 必须从中选择最合适的一种。",
         "请始终以符合该角色身份、口吻、记忆、立场、当前好感度和所选情绪的语气，用简体中文说话。",
         ANTI_HALLUCINATION_RULE,
-        build_task_tool_guide(),
+    ]
+    if include_tool_guide:
+        parts.append(build_task_tool_guide())
+    parts.extend([
+        build_task_item_rules(),
         build_session_state_block(
             progress_desc=progress_desc,
             favorability=state.favorability,
             relationship_level=state.relationship_level,
             save_info=save_info,
         ),
-    ]
+    ])
     scene = (scene_block or "").strip()
     if scene:
         parts.append(scene)
@@ -322,6 +369,10 @@ def build_messages(
     rag_context_text: str = "",
     long_term_block: str = "",
     pending_draft_summary: str = "",
+    item_memory_block: str = "",
+    gift_detail_block: str = "",
+    item_recent_block: str = "",
+    pending_claim_block: str = "",
 ) -> list[dict[str, str]]:
     """组装本轮 messages：稳定 system + 现场 user（session 历史不参与）。"""
     system = daily_system or build_system_prompt(request.mode)
@@ -334,6 +385,10 @@ def build_messages(
                 rag_context_text=rag_context_text,
                 long_term_block=long_term_block,
                 pending_draft_summary=pending_draft_summary,
+                item_memory_block=item_memory_block,
+                gift_detail_block=gift_detail_block,
+                item_recent_block=item_recent_block,
+                pending_claim_block=pending_claim_block,
             ),
         },
     ]
@@ -347,38 +402,53 @@ def build_daily_messages(request: InterjectRequest, blocks: Any) -> list[dict[st
         rag_context_text=getattr(blocks, "rag_context_text", ""),
         long_term_block=getattr(blocks, "long_term_block", ""),
         pending_draft_summary=getattr(blocks, "pending_draft_summary", ""),
+        item_memory_block=getattr(blocks, "item_memory_block", ""),
+        gift_detail_block=getattr(blocks, "gift_detail_block", ""),
+        item_recent_block=getattr(blocks, "item_recent_block", ""),
+        pending_claim_block=getattr(blocks, "pending_claim_block", ""),
     )
 
 
 def build_task_messages(request: InterjectRequest, blocks: Any) -> list[dict[str, str]]:
     """P4 任务路径：system 任务块 + user 现场（RAG/长期记忆/任务上下文/played/remaining）。
 
-    任务模式不拼草案摘要；任务上下文由 `build_user_context` 按 mode=task 渲染。
+    任务模式不拼草案摘要与组内物品块；跨对话物品账本进入 user 现场。
     """
     return build_messages(
         request,
         daily_system=blocks.system_prompt,
         rag_context_text=getattr(blocks, "rag_context_text", ""),
         long_term_block=getattr(blocks, "long_term_block", ""),
+        item_memory_block=getattr(blocks, "item_memory_block", ""),
     )
 
 
 def tool_matrix_for(
-    mode: str, *, has_draft: bool = False, delegate_enabled: bool = False,
+    mode: str,
+    *,
+    has_draft: bool = False,
+    delegate_enabled: bool = False,
+    item_tools: bool = False,
+    has_item_claim: bool = False,
 ) -> tuple[str, ...]:
-    """工具策略接口（协议 §7.4）。
+    """工具策略接口（协议 §7.4 / §7.5.2）。
 
     日常：查询/检索、长期记忆、任务草案及草案存在时的 confirm/cancel/update；
+    无 claim 且无草案时注册赠送/索取，有 claim 时只留取消索取；
     委派工具只在注册闸放行（有存档、无并发改写）时加入。
-    任务：只有查询/检索与长期记忆；无任务类工具、无委派（协议 4.1）。
+    任务：只有查询/检索与长期记忆；无任务类工具、无物品工具、无委派（协议 4.1）。
     """
     if mode == "task":
         return ("route_search", "update_long_term_memory")
     if mode != "daily":
         return ()
+    if has_item_claim:
+        return ("route_search", "update_long_term_memory", "cancel_item_request")
     names = ["route_task_draft", "route_search", "update_long_term_memory"]
     if has_draft:
         names.extend(["route_task_confirm", "route_task_cancel", "route_task_update"])
+    elif item_tools:
+        names.extend(["give_item_to_player", "request_item_from_player"])
     if delegate_enabled:
         names.append("delegate_dialogue_rewrite")
     return tuple(names)

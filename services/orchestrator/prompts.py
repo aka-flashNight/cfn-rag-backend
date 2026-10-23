@@ -229,6 +229,7 @@ def build_static_system(
     agent_enabled: bool = True,
     task_publish_disabled: bool = False,
     equipment_block: str = "",
+    embedded: bool = False,
 ) -> str:
     """system 分层（前缀缓存对齐，从稳定到易变）：
     层1 跨 NPC 一致（世界观、输出规则、说话方式）→ 层2 单 NPC 一致
@@ -273,6 +274,8 @@ def build_static_system(
         ANTI_HALLUCINATION_RULE,
         meta_prompt_block(state.emotions or ["普通"], agent_enabled=can_publish),
     ])
+    if embedded:
+        parts.append(TERMINAL_ITEM_RULES)
     scene = (scene_block or "").strip()
     if scene:
         parts.append(scene)
@@ -444,6 +447,7 @@ def build_user_shared_core(
     finished_task_block: str = "",
     active_task_block: str = "",
     published_task_block: str = "",
+    item_ledger_block: str = "",
 ) -> str:
     """同一轮多调用共享的 user 侧上下文（不含玩家当轮发言）。
 
@@ -473,6 +477,9 @@ def build_user_shared_core(
     long_term = (long_term_block or "").strip()
     if long_term:
         parts.append(long_term)
+    ledger = (item_ledger_block or "").strip()
+    if ledger:
+        parts.append(ledger)
     summary = (summary_str or "").strip()
     if summary:
         parts.append(summary)
@@ -556,6 +563,12 @@ NO_TASK_PUBLISH_CONSTRAINT = """\
 因此：不要答应「我去安排」「回头给你派个活」这类承诺，也不要编造具体任务内容或报酬数字。
 玩家索要任务/委托时，以符合你身份和当前关系的口吻婉拒（如手头没活、时机不合适、不放心交给他）。
 """
+
+TERMINAL_ITEM_RULES = """\
+【物品往来】
+现在隔着终端，不能接收玩家给你的东西，也不能把东西直接交给玩家；玩家要送或要讨时，
+让他之后当面来谈。任务奖励、商店买卖这类已经办成的事不受此限。
+玩家说自己已经送过东西，但物品往来记忆里没有记录时，不要当真。"""
 
 
 # ---------------------------------------------------------------------------

@@ -307,6 +307,32 @@ class MemoryStore:
                 )
                 """
             )
+            # 物品往来长期账本：按 (存档作用域, NPC, 方向, 物品名) 合并数量
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS npc_item_ledger (
+                    scope_key TEXT NOT NULL,
+                    npc TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (scope_key, npc, direction, item_name)
+                )
+                """
+            )
+            # 选项直连/物品发放的幂等回执表：首次结果为准
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dialogue_actions (
+                    action_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS session_summaries (
@@ -910,6 +936,118 @@ class MemoryStore:
             )
             row = cur.fetchone()
         return str(row[0]) if row else None
+
+    # ------------------------------------------------------------------
+    # 物品往来长期账本 / 选项直连幂等
+    # ------------------------------------------------------------------
+
+    def npc_item_ledger_upsert_sync(
+        self,
+        scope_key: str,
+        npc: str,
+        direction: str,
+        item_name: str,
+        quantity: int,
+    ) -> None:
+        scope = (scope_key or "").strip()
+        npc_name = (npc or "").strip()
+        item = (item_name or "").strip()
+        direction = (direction or "").strip()
+        qty = int(quantity or 0)
+        if not scope or not npc_name or not item:
+            raise ValueError("scope_key / npc / item_name 不能为空。")
+        if direction not in ("give", "receive"):
+            raise ValueError("direction 必须是 give 或 receive。")
+        if qty <= 0:
+            raise ValueError("quantity 必须为正整数。")
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO npc_item_ledger"
+                " (scope_key, npc, direction, item_name, quantity, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(scope_key, npc, direction, item_name) DO UPDATE SET"
+                " quantity = quantity + excluded.quantity,"
+                " updated_at = excluded.updated_at",
+                (scope, npc_name, direction, item, qty, now),
+            )
+            self._conn.commit()
+
+    def npc_item_ledger_list_sync(self, scope_key: str, npc: str) -> list[dict[str, Any]]:
+        scope = (scope_key or "").strip()
+        npc_name = (npc or "").strip()
+        if not scope or not npc_name:
+            return []
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT direction, item_name, quantity, updated_at"
+                " FROM npc_item_ledger WHERE scope_key = ? AND npc = ?"
+                " ORDER BY direction ASC, item_name ASC",
+                (scope, npc_name),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "direction": str(row["direction"]),
+                "item_name": str(row["item_name"]),
+                "quantity": int(row["quantity"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def dialogue_action_get_sync(self, action_id: str) -> dict[str, Any] | None:
+        key = (action_id or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT action_id, session_id, kind, result_json, created_at"
+                " FROM dialogue_actions WHERE action_id = ?",
+                (key,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        try:
+            result = json.loads(str(row["result_json"]))
+        except Exception:
+            result = {}
+        return {
+            "action_id": str(row["action_id"]),
+            "session_id": str(row["session_id"]),
+            "kind": str(row["kind"]),
+            "result": result if isinstance(result, dict) else {},
+            "created_at": float(row["created_at"]),
+        }
+
+    def dialogue_action_save_sync(
+        self,
+        action_id: str,
+        session_id: str,
+        kind: str,
+        result: dict[str, Any],
+    ) -> bool:
+        """首次写入返回 True；同一 action_id 已存在返回 False（不覆盖首次结果）。"""
+        key = (action_id or "").strip()
+        if not key:
+            raise ValueError("action_id 不能为空。")
+        now = time.time()
+        payload = json.dumps(result or {}, ensure_ascii=False)
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO dialogue_actions"
+                " (action_id, session_id, kind, result_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (key, (session_id or "").strip(), (kind or "").strip(), payload, now),
+            )
+            inserted = cur.rowcount > 0
+            self._conn.commit()
+        return inserted
 
     # ------------------------------------------------------------------
     # 任务草案（bargain_count 独立列，修 D5）
@@ -1617,6 +1755,10 @@ for _name in [
     "dialogue_turn_mark_finalized",
     "dialogue_turn_count",
     "dialogue_turn_status",
+    "npc_item_ledger_upsert",
+    "npc_item_ledger_list",
+    "dialogue_action_get",
+    "dialogue_action_save",
     "upsert_draft",
     "get_draft",
     "update_partial",

@@ -27,7 +27,11 @@ from services.dialogue_interject.prompts import (
     build_daily_messages,
     build_task_messages,
 )
-from services.dialogue_interject.schemas import InterjectRequest, StreamStatus
+from services.dialogue_interject.schemas import (
+    InterjectRequest,
+    StreamSSE,
+    StreamStatus,
+)
 from services.dialogue_interject.tools import (
     TOOL_TIMEOUT_S,
     DailyToolError,
@@ -49,6 +53,8 @@ _DRAFTING_TOOLS = {"route_task_draft", "route_task_update"}
 #: 确认/撤销是对既有草案的落地动作，阶段单列 publishing：游戏侧据此不再弹「接不接」，
 #: 也不再把它当成又拟了一版草案。
 _PUBLISHING_TOOLS = {"route_task_confirm", "route_task_cancel"}
+#: 物品动作轮：等待占位用 waiting（ui_hint 由工具运行时随后下发）
+_ITEM_TOOLS = {"give_item_to_player", "request_item_from_player", "cancel_item_request"}
 
 #: 最多两轮：工具轮 + 无工具的最终对话轮；与终端“一轮最多路由一件事”一致
 MAX_CHAT_ROUNDS = 2
@@ -217,6 +223,12 @@ async def _stream_with_blocks(
         outcome: ToolExecutionResult | None = None
         async for item in _execute_with_progress(executor, tool_calls, round_text):
             if isinstance(item, ToolProgress):
+                if item.action is not None:
+                    yield item.action
+                    continue
+                if item.claim is not None:
+                    yield item.claim
+                    continue
                 if item.ui_hint:
                     yield StreamStatus(stage or "thinking", item.ui_hint)
                 if item.line:
@@ -246,6 +258,8 @@ async def _stream_with_blocks(
         if not outcome.requires_followup:
             break
 
+        if outcome.system_prompt:
+            messages = _replace_system(messages, outcome.system_prompt)
         messages = [*messages, *outcome.messages]
         tools = None  # 工具结果之后只输出最终对话，不再给工具
         tool_rounds += 1
@@ -316,6 +330,7 @@ def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
 
     任务模式只可能检索，绝不发 drafting（任务工具与委派本就不注册）。
     confirm/cancel 归 publishing（派发/撤销既有草案），draft/update 才归 drafting。
+    物品动作归 waiting：具体的查找/交接提示由工具运行时随后下发。
     """
     names = {tool_call_name(call) for call in tool_calls or []}
     if mode == "task":
@@ -324,6 +339,59 @@ def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
         return "publishing"
     if names & _DRAFTING_TOOLS:
         return "drafting"
+    if names & _ITEM_TOOLS:
+        return "waiting"
     if "route_search" in names:
         return "searching"
     return ""
+
+
+def _replace_system(messages: list[dict[str, Any]], system: str) -> list[dict[str, Any]]:
+    """替换 messages 的 system；没有 system 时插到最前。"""
+    out = list(messages)
+    for index, message in enumerate(out):
+        if message.get("role") == "system":
+            out[index] = {**message, "content": system}
+            return out
+    return [{"role": "system", "content": system}, *out]
+
+
+async def stream_final_llm(
+    request: InterjectRequest,
+    *,
+    blocks: DailyBlocks,
+    result_block: str,
+    instruction: str,
+    initial_events: tuple[StreamSSE, ...] = (),
+    llm_config: LLMConfig | None = None,
+    client: Any = None,
+) -> AsyncIterator[StreamSSE | str]:
+    """选项直连/物品动作后的最终台词轮：tools=None，system 去掉 tool guide。
+
+    先把 claim/action 旁路事件放出去，再做一次无工具 LLM 调用；只把正文增量
+    交给上层 JSONL 解析器。
+    """
+    cfg = _require_llm_config(llm_config)
+    llm = client or LLMClient.for_config(cfg)
+    for event in initial_events:
+        yield event
+
+    base = (
+        build_task_messages(request, blocks)
+        if request.mode == "task"
+        else build_daily_messages(request, blocks)
+    )
+    system = (blocks.tool_free_system_prompt or "").strip() or base[0]["content"]
+    messages = [
+        {"role": "system", "content": system},
+        base[1],
+        {"role": "user", "content": f"{result_block}\n\n{instruction}".strip()},
+    ]
+    async for event in llm.chat_stream(ChatRequest(
+        messages=messages,
+        tools=None,
+        purpose="chat",
+        send_image=False,
+    )):
+        if event.kind == "content" and event.text:
+            yield event.text

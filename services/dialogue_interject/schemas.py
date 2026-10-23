@@ -9,20 +9,30 @@ P0 边界：请求/事件/plan 的形状先立起来，提示词与真 LLM 编�
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 #: 协议 5.1：dialogue_instance_id 只允许 UUID/hex 一类安全字符，长度受限
 DIALOGUE_INSTANCE_ID_PATTERN = r"^[A-Za-z0-9_-]{8,128}$"
 #: 协议 5.1：turn_id 非空；同一 turn 重发幂等
 TURN_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
+#: 选项直连/物品动作的幂等键
+ACTION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
 
 #: 协议 D-11：玩家输入上限 150 字
 PLAYER_INPUT_MAX = 150
 #: 协议 D-11：单条台词与结束语硬上限 165，提示词上限 135
 LINE_HARD_MAX = 165
 LINE_PROMPT_MAX = 135
+#: 索取池快照：Host 最多带 200 个名字，单名 ≤ 100 字
+PLAYER_ITEM_NAMES_MAX = 200
+PLAYER_ITEM_NAME_MAX = 100
+#: 工具动作数量上限（防御畸形输入）
+ITEM_QUANTITY_MAX = 9999
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +134,40 @@ class Limits(BaseModel):
     line_prompt_max: int = Field(default=LINE_PROMPT_MAX, ge=1, le=1000)
 
 
+class InterjectAction(BaseModel):
+    """选项直连（任务接受/拒绝、玩家点赠送/不赠送）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal[
+        "task_accept", "task_decline", "item_take_accept", "item_take_decline",
+    ]
+    action_id: str = Field(..., pattern=ACTION_ID_PATTERN)
+    claim_id: str | None = Field(default=None, pattern=ACTION_ID_PATTERN)
+    item_name: str = ""
+    quantity: int | None = Field(default=None, ge=1, le=ITEM_QUANTITY_MAX)
+    #: 装备实际扣掉那件的强化度；仅 item_take_accept 使用
+    item_level: int | None = Field(default=None, ge=0, le=999)
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "InterjectAction":
+        if self.kind.startswith("item_take_"):
+            if not (self.claim_id or "").strip():
+                raise ValueError(f"action.kind={self.kind} 必须带 claim_id")
+            if not (self.item_name or "").strip():
+                raise ValueError(f"action.kind={self.kind} 必须带 item_name")
+            if self.quantity is None:
+                raise ValueError(f"action.kind={self.kind} 必须带 quantity")
+        else:
+            if self.item_level is not None:
+                raise ValueError("item_level 只允许用于 item_take_accept")
+            if self.claim_id or self.item_name or self.quantity is not None:
+                raise ValueError("task_accept/task_decline 不接受物品字段")
+        if self.kind != "item_take_accept" and self.item_level is not None:
+            raise ValueError("item_level 只允许用于 item_take_accept")
+        return self
+
+
 class InterjectRequest(BaseModel):
     """`POST /api/game/dialogue-interject` 请求体（协议 5.1）。"""
 
@@ -138,6 +182,9 @@ class InterjectRequest(BaseModel):
     dialogue: DialogueBlock
     task_context: TaskContext | None = None
     limits: Limits = Field(default_factory=Limits)
+    action: InterjectAction | None = None
+    #: 仅 daily 索取池使用；只带名字，不带数量
+    player_item_names: list[str] = Field(default_factory=list)
 
     @field_validator("npc", "player_input")
     @classmethod
@@ -159,6 +206,32 @@ class InterjectRequest(BaseModel):
     def _strip_title(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("player_item_names")
+    @classmethod
+    def _normalize_item_names(cls, values: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        truncated = 0
+        for raw in values or []:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            if len(name) > PLAYER_ITEM_NAME_MAX:
+                name = name[:PLAYER_ITEM_NAME_MAX]
+                truncated += 1
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+            if len(out) >= PLAYER_ITEM_NAMES_MAX:
+                break
+        if len(values or []) > len(out) or truncated:
+            logger.info(
+                "[interject] player_item_names 归一化：原 %d 条，采用 %d 条，截断 %d 条",
+                len(values or []), len(out), truncated,
+            )
+        return out
+
     @model_validator(mode="after")
     def _check_mode_kind(self) -> "InterjectRequest":
         # 协议 5.1：mode=daily 只能 daily；mode=task 只能 task_pre/task_post
@@ -169,6 +242,14 @@ class InterjectRequest(BaseModel):
         # 协议 5.1：任务模式必须有 task_context（两段都可为空，但对象必须在）
         if self.mode == "task" and self.task_context is None:
             raise ValueError("mode=task 时必须提供 task_context")
+        if self.action is not None:
+            is_task_action = self.action.kind.startswith("task_")
+            if is_task_action and self.mode != "task":
+                raise ValueError(f"action.kind={self.action.kind} 只允许 mode=task")
+            if not is_task_action and self.mode != "daily":
+                raise ValueError(f"action.kind={self.action.kind} 只允许 mode=daily")
+        if self.player_item_names and self.mode != "daily":
+            raise ValueError("player_item_names 只允许 mode=daily")
         return self
 
 
@@ -303,10 +384,56 @@ class ErrorPayload(BaseModel):
     valid_lines: int = Field(default=0, ge=0)
 
 
+class ActionPayload(BaseModel):
+    """SSE `action`：请求 Host 执行真实物品发放并回执。"""
+
+    action_id: str
+    kind: Literal["item_grant"] = "item_grant"
+    npc: str
+    item_name: str
+    quantity: int = Field(..., ge=1)
+    requested_quantity: int = Field(..., ge=1)
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class ItemClaimPayload(BaseModel):
+    """SSE `item_claim`：索取选项的开启/关闭；不是终态。"""
+
+    state: Literal["pending", "closed"]
+    claim_id: str
+    npc: str
+    item_name: str
+    quantity: int = Field(..., ge=1)
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class ActionResultRequest(BaseModel):
+    """`POST /api/game/dialogue-interject/action-result` 请求体。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_id: str = Field(..., pattern=ACTION_ID_PATTERN)
+    success: bool
+    error: str = ""
+    actual_quantity: int | None = Field(default=None, ge=0, le=ITEM_QUANTITY_MAX)
+    overflow_money: int | None = Field(default=None, ge=0)
+
+
+class ActionResultResponse(BaseModel):
+    ok: bool = True
+    applied: bool = False
+
+
 class SSEEvent(BaseModel):
     """一条 SSE 帧：event 名 + data 对象（编码见 `encode`）。"""
 
-    event: Literal["status", "mute", "line", "plan", "done", "error"]
+    event: Literal[
+        "status", "mute", "line", "plan", "done", "error", "action", "item_claim",
+    ]
     data: dict[str, Any]
 
     def encode(self) -> bytes:
@@ -344,6 +471,42 @@ class StreamStatus(str):
         return f"StreamStatus(stage={self.stage!r}, ui_hint={self.ui_hint!r})"
 
 
+class StreamSSE(str):
+    """流内旁路 SSE 事件（action/item_claim）：不进 JSONL 解析，不占 seq。
+
+    继承 str 且内容为空串，保持现有 `str | StreamStatus` 流接口的兼容性。
+    """
+
+    event: str
+    data: dict[str, Any]
+
+    def __new__(cls, event: str, data: dict[str, Any]) -> "StreamSSE":
+        obj = super().__new__(cls, "")
+        obj.event = event
+        obj.data = dict(data)
+        return obj
+
+    def to_event(self) -> SSEEvent:
+        return SSEEvent(event=self.event, data=self.data)
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅调试用
+        return f"StreamSSE(event={self.event!r}, data={self.data!r})"
+
+
+class StreamAction(StreamSSE):
+    """等待 Host 执行物品发放的旁路事件。"""
+
+    def __new__(cls, payload: ActionPayload) -> "StreamAction":
+        return super().__new__(cls, "action", payload.to_wire())
+
+
+class StreamItemClaim(StreamSSE):
+    """索取 claim 开启/关闭的旁路事件。"""
+
+    def __new__(cls, payload: ItemClaimPayload) -> "StreamItemClaim":
+        return super().__new__(cls, "item_claim", payload.to_wire())
+
+
 def mute_event() -> SSEEvent:
     return SSEEvent(event="mute", data=MutePayload().model_dump())
 
@@ -354,6 +517,14 @@ def line_event(payload: LinePayload) -> SSEEvent:
 
 def plan_event(payload: PlanPayload) -> SSEEvent:
     return SSEEvent(event="plan", data=payload.to_wire())
+
+
+def action_event(payload: ActionPayload) -> SSEEvent:
+    return SSEEvent(event="action", data=payload.to_wire())
+
+
+def item_claim_event(payload: ItemClaimPayload) -> SSEEvent:
+    return SSEEvent(event="item_claim", data=payload.to_wire())
 
 
 def done_event(payload: DonePayload) -> SSEEvent:

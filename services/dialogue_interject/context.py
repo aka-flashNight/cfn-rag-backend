@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from services.dialogue_interject.item_claims import ITEM_CLAIMS
+from services.dialogue_interject.item_ledger import load_item_ledger_block
 from services.dialogue_interject.schemas import (
     InterjectRequest,
     PlayedLine,
@@ -39,6 +41,8 @@ class DailyBlocks:
     """
 
     system_prompt: str
+    #: 工具结果后的最终台词轮 system：不含 tool guide（tools=None 时不描述工具）
+    tool_free_system_prompt: str = ""
     npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
     npc_state: Any = None
     npc_states: dict[str, Any] = field(default_factory=dict)
@@ -65,6 +69,14 @@ class DailyBlocks:
     task_publish_disabled: bool = False
     delegate_enabled: bool = False
     save_info: Any = None
+    #: 物品往来现场块（跨组账本进 daily/task；其余仅 daily）
+    item_memory_block: str = ""
+    gift_detail_block: str = ""
+    item_recent_block: str = ""
+    pending_claim_block: str = ""
+    pending_item_claim: Any = None
+    item_tools_enabled: bool = False
+    turn_no: int = 0
 
 
 def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | None = None) -> list[str]:
@@ -139,13 +151,26 @@ def build_user_context(
     rag_context_text: str = "",
     long_term_block: str = "",
     pending_draft_summary: str = "",
+    item_memory_block: str = "",
+    gift_detail_block: str = "",
+    item_recent_block: str = "",
+    pending_claim_block: str = "",
 ) -> str:
-    """按实施指引 §4.2 的建议顺序拼装 user 上下文（请求现场为准）。"""
+    """按实施指引 §4.2 的建议顺序拼装 user 上下文（请求现场为准）。
+
+    物品块紧跟长期记忆：跨组账本（daily/task）、本组赠送明细/最近往来/待处理索取
+    （仅 daily）。它们是易变现场，不进 system 稳定前缀。
+    """
     blocks: list[str] = []
     dialogue = request.dialogue
 
     if long_term_block.strip():
         blocks.append(long_term_block.strip())
+    for item_block in (
+        item_memory_block, gift_detail_block, item_recent_block, pending_claim_block,
+    ):
+        if item_block.strip():
+            blocks.append(item_block.strip())
 
     if rag_context_text.strip():
         blocks.append(
@@ -370,6 +395,29 @@ async def assemble_blocks(
     except Exception as exc:
         logger.warning("插话长期记忆装配失败，降级为空: %s", exc)
 
+    # ---- 物品往来（跨组账本进 daily/task；claim 与组内明细仅 daily）----
+    item_memory_block = await load_item_ledger_block(
+        memory, slot_key_value=slot_key, npc=npc_name,
+    )
+    pending_item_claim = None
+    gift_detail_block = ""
+    item_recent_block = ""
+    pending_claim_block = ""
+    turn_no = 0
+    if not is_task:
+        turn_no = ITEM_CLAIMS.turn_number(request.dialogue_instance_id, request.turn_id)
+        gift_detail_block = ITEM_CLAIMS.gift_detail_block(request.dialogue_instance_id)
+        item_recent_block = ITEM_CLAIMS.recent_block(request.dialogue_instance_id)
+        # 选项直连请求正在解决 claim：不再把它当待处理项注入本轮现场
+        if request.action is None:
+            pending_item_claim = ITEM_CLAIMS.pending(request.dialogue_instance_id)
+        if pending_item_claim is not None:
+            pending_claim_block = "\n".join([
+                "【待处理的索取】",
+                f"你正在向玩家索取 {pending_item_claim.quantity} 个 "
+                f"{pending_item_claim.item_name}，玩家还没有交付。",
+            ])
+
     # ---- 待确认草案（B2 起支持 confirm/cancel/update；任务模式不读）----
     # 草案与终端共用一把钥匙：优先 MemoryStore 的 session_id；未建会话时退回
     # dialogue_instance_id（离线单测/异常降级），并兼容 B2 早期按 instance id 落库的草案。
@@ -494,33 +542,51 @@ async def assemble_blocks(
         build_task_system_prompt,
     )
 
+    # 物品工具与任务草案互斥；pending claim 时只留取消索取；选项直连轮不再给物品工具
+    item_tools_enabled = (
+        not is_task
+        and request.action is None
+        and pending_item_claim is None
+        and pending_draft_row is None
+    )
+    common_system = dict(
+        npc_name=npc_name,
+        state=state,
+        scene_block=scene_block,
+        same_faction_block=same_faction_block,
+        save_info=save_info,
+        progress_desc=progress_desc,
+        prompt_max=prompt_max,
+        equipment_block=equipment_block,
+    )
     if is_task:
-        system_prompt = build_task_system_prompt(
-            npc_name=npc_name,
-            state=state,
-            scene_block=scene_block,
-            same_faction_block=same_faction_block,
-            save_info=save_info,
-            progress_desc=progress_desc,
-            prompt_max=prompt_max,
-            equipment_block=equipment_block,
+        system_prompt = build_task_system_prompt(**common_system)
+        tool_free_system_prompt = build_task_system_prompt(
+            **common_system, include_tool_guide=False,
         )
     else:
         system_prompt = build_daily_system_prompt(
-            npc_name=npc_name,
-            state=state,
-            scene_block=scene_block,
-            same_faction_block=same_faction_block,
-            save_info=save_info,
-            progress_desc=progress_desc,
-            prompt_max=prompt_max,
-            equipment_block=equipment_block,
+            **common_system,
             has_pending_draft=pending_draft_row is not None,
             task_publish_disabled=task_publish_disabled,
             delegate_enabled=delegate_enabled,
             has_shop=has_shop,
             shop_reward_types=list(shop_reward_types),
             player_can_challenge=player_can_challenge,
+            item_tools=item_tools_enabled,
+            has_item_claim=pending_item_claim is not None,
+        )
+        tool_free_system_prompt = build_daily_system_prompt(
+            **common_system,
+            has_pending_draft=pending_draft_row is not None,
+            task_publish_disabled=task_publish_disabled,
+            delegate_enabled=delegate_enabled,
+            has_shop=has_shop,
+            shop_reward_types=list(shop_reward_types),
+            player_can_challenge=player_can_challenge,
+            item_tools=False,
+            has_item_claim=False,
+            include_tool_guide=False,
         )
     recent_dialogue = "\n".join(
         render_played(request.dialogue.played, npc=npc_name, max_lines=8)
@@ -528,6 +594,7 @@ async def assemble_blocks(
     emotions = tuple(state.emotions or [DEFAULT_EMOTION])
     return DailyBlocks(
         system_prompt=system_prompt,
+        tool_free_system_prompt=tool_free_system_prompt,
         npc_emotions=emotions,
         npc_state=state,
         npc_states=states,
@@ -554,6 +621,13 @@ async def assemble_blocks(
         task_publish_disabled=task_publish_disabled,
         delegate_enabled=delegate_enabled,
         save_info=save_info,
+        item_memory_block=item_memory_block,
+        gift_detail_block=gift_detail_block,
+        item_recent_block=item_recent_block,
+        pending_claim_block=pending_claim_block,
+        pending_item_claim=pending_item_claim,
+        item_tools_enabled=item_tools_enabled,
+        turn_no=turn_no,
     )
 
 

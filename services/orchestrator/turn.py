@@ -1021,6 +1021,9 @@ class TurnOrchestrator:
         # 路由闸门关闭时待确认草案不进 prompt：模型既无法确认也无法取消，
         # 摆在它面前只会诱导它空口答应。草案仍照常装配，交给过期计数清理。
         has_pending_draft = self._routing_enabled and ctx.pending_draft_row is not None
+        from services.integration.state import get_integration_state
+
+        embedded = get_integration_state().mode == "embedded"
         system = build_static_system(
             npc_name=self.npc_name,
             state=ctx.npc_state,
@@ -1034,6 +1037,7 @@ class TurnOrchestrator:
             agent_enabled=self.agent_enabled,
             task_publish_disabled=self.task_publish_disabled,
             equipment_block=self._equipment_block(),
+            embedded=embedded,
         )
         # 发布轮已经把这块拼进 result_block 了：同一轮若再重建消息，不能在这里再来一遍
         published_block = ctx.published_task_block
@@ -1062,6 +1066,7 @@ class TurnOrchestrator:
             ),
             active_task_block=ctx.active_task_block,
             published_task_block=published_block,
+            item_ledger_block=ctx.item_ledger_block,
         )
         return [
             {"role": "system", "content": system},

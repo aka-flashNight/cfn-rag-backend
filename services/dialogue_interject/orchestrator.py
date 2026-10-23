@@ -23,14 +23,19 @@ from services.dialogue_interject.parser import (
     ParsedEntry,
     ParseOptions,
 )
+from services.dialogue_interject.item_claims import ITEM_CLAIMS
 from services.dialogue_interject.plan import normalize_task_plan
 from services.dialogue_interject.schemas import (
     DonePayload,
     InterjectRequest,
+    ItemClaimPayload,
     LinePayload,
+    SSEEvent,
+    StreamSSE,
     StreamStatus,
     done_event,
     error_event,
+    item_claim_event,
     line_event,
     mute_event,
     plan_event,
@@ -40,8 +45,8 @@ from services.llm.meta import DEFAULT_EMOTION
 
 logger = logging.getLogger(__name__)
 
-#: 假流/真流统一接口：给请求，返回文本增量迭代器
-StreamFactory = Callable[[InterjectRequest], AsyncIterator[str]]
+#: 假流/真流统一接口：给请求，返回文本增量/旁路事件迭代器
+StreamFactory = Callable[[InterjectRequest], AsyncIterator[str | StreamStatus | StreamSSE]]
 
 #: valid_lines 只统计“已接受的有效正文行”（协议 5.2）：日常 add/closing，任务 add/line
 _TEXT_KINDS = ("add", "closing", "line")
@@ -96,6 +101,9 @@ class InterjectOrchestrator:
             yield event
 
         if state.failed:
+            closed = self._claim_closed_event()
+            if closed is not None:
+                yield closed
             yield error_event(
                 state.error_code or "stream_failed",
                 self._error_message(state.error),
@@ -113,6 +121,9 @@ class InterjectOrchestrator:
             async for event in self._drive(self._repair_factory, repair_state):
                 yield event
             if repair_state.failed:
+                closed = self._claim_closed_event()
+                if closed is not None:
+                    yield closed
                 yield error_event(
                     repair_state.error_code or "stream_failed",
                     self._error_message(repair_state.error),
@@ -122,6 +133,9 @@ class InterjectOrchestrator:
             state = repair_state
 
         if not state.entries:
+            closed = self._claim_closed_event()
+            if closed is not None:
+                yield closed
             yield error_event(
                 "no_valid_lines",
                 "模型没有产出可解析的 JSONL 行",
@@ -161,6 +175,10 @@ class InterjectOrchestrator:
                     if chunk.stage and signature != self._last_status:
                         self._last_status = signature
                         yield status_event(chunk.stage, chunk.ui_hint)
+                    continue
+                if isinstance(chunk, StreamSSE):
+                    # action/item_claim：旁路事件，不进入 JSONL/seq；也不是终态。
+                    yield chunk.to_event()
                     continue
                 for entry in parser.feed(chunk):
                     state.entries.append(entry)
@@ -216,6 +234,19 @@ class InterjectOrchestrator:
                 )
                 self._seq += 1
                 yield line_event(payload)
+
+    def _claim_closed_event(self) -> SSEEvent | None:
+        """本轮在最终台词前以 error 收尾：补发 closed 并清 claim（协议 21.8）。"""
+        claim = ITEM_CLAIMS.close(self.request.dialogue_instance_id)
+        if claim is None:
+            return None
+        return item_claim_event(ItemClaimPayload(
+            state="closed",
+            claim_id=claim.claim_id,
+            npc=claim.npc,
+            item_name=claim.item_name,
+            quantity=claim.quantity,
+        ))
 
     @staticmethod
     def _error_message(exc: Exception | None) -> str:

@@ -15,13 +15,16 @@ import asyncio
 import logging
 from functools import partial
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from services.dialogue_interject.actions import is_loopback_host, resolve_action_result
 from services.dialogue_interject.context import (
     assemble_daily_blocks,
     assemble_task_blocks,
 )
+from services.dialogue_interject.item_claims import ITEM_CLAIMS
+from services.dialogue_interject.item_actions import stream_action_direct
 from services.dialogue_interject.llm import (
     llm_is_configured,
     stream_daily_llm,
@@ -32,10 +35,14 @@ from services.dialogue_interject.orchestrator import (
     StreamFactory,
 )
 from services.dialogue_interject.schemas import (
+    ActionResultRequest,
+    ActionResultResponse,
     FinalizeRequest,
     FinalizeResponse,
     InterjectRequest,
+    ItemClaimPayload,
     error_event,
+    item_claim_event,
 )
 from services.dialogue_interject.sessions import (
     ConcurrentFinalizeError,
@@ -82,6 +89,15 @@ async def _sse_stream(orchestrator: InterjectOrchestrator):
         raise
     except Exception as exc:  # noqa: BLE001 - 兜底，避免半截流无终止事件
         logger.exception("[interject] SSE 流意外中断")
+        claim = ITEM_CLAIMS.close(orchestrator.request.dialogue_instance_id)
+        if claim is not None:
+            yield item_claim_event(ItemClaimPayload(
+                state="closed",
+                claim_id=claim.claim_id,
+                npc=claim.npc,
+                item_name=claim.item_name,
+                quantity=claim.quantity,
+            )).encode()
         yield error_event("internal_error", str(exc)[:200]).encode()
 
 
@@ -131,11 +147,19 @@ async def dialogue_interject(payload: InterjectRequest):
                 headers=_SSE_HEADERS,
             )
         npc_emotions = blocks.npc_emotions
-        stream_factory = partial(
-            stream_task_llm if payload.mode == "task" else stream_daily_llm,
-            blocks=blocks,
-            llm_config=recent_llm,
-        )
+        # 选项直连（任务接受/拒绝、索取赠送/拒绝）跳过路由轮，直接进结果轮
+        if payload.action is not None:
+            stream_factory = partial(
+                stream_action_direct,
+                blocks=blocks,
+                llm_config=recent_llm,
+            )
+        else:
+            stream_factory = partial(
+                stream_task_llm if payload.mode == "task" else stream_daily_llm,
+                blocks=blocks,
+                llm_config=recent_llm,
+            )
 
     if binding is None:
         binding = await ensure_session(payload)
@@ -164,3 +188,19 @@ async def dialogue_interject_finalize(payload: FinalizeRequest) -> FinalizeRespo
     except ConcurrentFinalizeError as exc:
         # 跨进程并发撞同一 seq：不静默吞错，让 Host 稍后重发 finalize
         raise HTTPException(status_code=409, detail="concurrent_finalize_conflict") from exc
+
+
+@router.post(
+    "/dialogue-interject/action-result",
+    response_model=ActionResultResponse,
+    summary="对话内嵌插话 · Host 动作回执（幂等）",
+)
+async def dialogue_interject_action_result(
+    payload: ActionResultRequest,
+    request: Request,
+) -> ActionResultResponse:
+    client_host = request.client.host if request.client is not None else None
+    if not is_loopback_host(client_host):
+        raise HTTPException(status_code=403, detail="loopback_only")
+    applied = resolve_action_result(payload)
+    return ActionResultResponse(ok=True, applied=applied)
