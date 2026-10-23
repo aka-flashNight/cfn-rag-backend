@@ -44,7 +44,8 @@ def item_tool_schemas(names: tuple[str, ...] | None = None) -> list[dict[str, An
             "function": {
                 "name": TAKE_TOOL,
                 "description": (
-                    "你决定向玩家索要/询问是否给一件物品时调用。name 只能填你确定的精确物品名；"
+                    "你决定向玩家索要/询问是否给一件物品时调用；玩家主动要给你东西时也必须调用，"
+                    "不得只口头收下。name 只能填你确定的精确物品名；"
                     "不确定就留空，用 keyword/instruction 描述你要找的东西。quantity 必填。"
                     "调用这一轮不要输出台词。"
                 ),

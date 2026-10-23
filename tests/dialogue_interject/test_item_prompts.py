@@ -28,6 +28,7 @@ def test_daily_tool_guide_variants():
     assert "request_item_from_player" in with_items
     assert "cancel_item_request" not in with_items
     assert "口头答应不等于交付" in with_items
+    assert "玩家主动说要送你东西时，必须调用 request_item_from_player" in with_items
 
     with_claim = _daily(has_item_claim=True)
     assert "cancel_item_request" in with_claim
@@ -49,6 +50,7 @@ def test_task_prompt_refuses_items_without_tool_names():
     assert "不要当真" in system
     assert "give_item_to_player" not in system
     assert "request_item_from_player" not in system
+    assert "玩家主动说要送你东西时" not in system
 
     tool_free = build_task_system_prompt(
         npc_name=fx.NPC, state=NPCState(), include_tool_guide=False,
@@ -78,6 +80,7 @@ def test_embedded_terminal_prompt_has_item_refusal():
     system = build_static_system(npc_name=fx.NPC, state=NPCState(), embedded=True)
     assert "不能接收玩家给你的东西" in system
     assert "物品往来记忆里没有记录" in system
+    assert "request_item_from_player" not in system
 
     standalone = build_static_system(npc_name=fx.NPC, state=NPCState())
     assert "不能接收玩家给你的东西" not in standalone

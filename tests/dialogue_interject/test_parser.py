@@ -34,6 +34,42 @@ def test_daily_skips_fence_blank_and_broken_json_fragment():
     assert "非 JSON" in parser.issues[0].reason
 
 
+def test_daily_salvages_objects_glued_on_one_line():
+    parser = _daily_parser()
+    entries = parser.feed('{"add":"甲","emo":"微笑"}{"add":"乙","emo":"普通"}\n')
+
+    assert [entry.kind for entry in entries] == ["add", "add"]
+    assert [entry.segments[0].text for entry in entries] == ["甲", "乙"]
+    assert parser.issues == []
+
+
+def test_daily_salvages_complete_objects_before_truncated_tail():
+    parser = _daily_parser()
+    entries = parser.feed(
+        '{"add":"一瓶hp药剂，拿好了。","emo":"微笑"}'
+        '{"add":"要补货的话，The Girl那边储备不少。","emo":"普通"}'
+        '{"add":"第三句被截断","emo":"普\n'
+    )
+
+    assert [entry.segments[0].text for entry in entries] == [
+        "一瓶hp药剂，拿好了。",
+        "要补货的话，The Girl那边储备不少。",
+    ]
+    assert len(parser.issues) == 1
+    assert "截断" in parser.issues[0].reason
+
+
+def test_task_structural_marker_in_glued_line_drops_whole_line():
+    parser = JSONLStreamParser(
+        ParseOptions(mode="task", npc=fx.NPC, npc_emotions=("普通",))
+    )
+    entries = parser.feed('{"add":"甲","n":1}{"end":2}\n')
+
+    assert entries == []
+    assert len(parser.issues) == 1
+    assert "JSON 解析失败" in parser.issues[0].reason
+
+
 def test_pure_text_line_falls_back_to_add_with_empty_emotion():
     parser = _daily_parser()
     entries = parser.feed("我是A兵团的线人，在这基地里打探消息、传个话。\n")

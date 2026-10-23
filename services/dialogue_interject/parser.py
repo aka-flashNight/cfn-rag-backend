@@ -2,7 +2,8 @@
 
 对应《协议》§5.3 / §5.4 / §5.5 / §5.6 与实施指引 §7。
 原则：宽容解析，不整段打回——完全没有 JSON 特征的裸台词按 add 兜底接收
-（情绪留空，由 Host 回落默认表情）；带 JSON 残片的坏行、未知字段、越界编号
+（情绪留空，由 Host 回落默认表情）；一行里粘了多个完整对象（模型漏换行）或末尾截断时，
+先逐个抢救正文类对象、残尾记录后跳过；结构标记遇粘连行整行丢弃；未知字段、越界编号
 记录后跳过；正文只做结构处理（括号、字数、情绪），不做内容层面的漏信息校验。
 """
 
@@ -203,25 +204,61 @@ class JSONLStreamParser:
         # 代码围栏（```json / ```jsonl / ```）整行跳过
         if stripped.startswith("```"):
             return []
-        if not (stripped.startswith("{") and stripped.endswith("}")):
-            # 模型偶尔完全无视 JSONL，直接输出裸台词：没有任何 JSON 特征时按 add 兜底，
-            # 情绪留空交给 Host 回落默认表情；带括号/键值残片的截断 JSON 仍按坏行跳过。
-            if not _JSON_FEATURE_RE.search(stripped):
-                return self._plain_text_entry(stripped)
-            self._issue(stripped, "非 JSON 行")
+        if stripped.startswith("{"):
+            closed = stripped.endswith("}")
+            try:
+                obj = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                obj = None
+            if obj is not None:
+                if not isinstance(obj, dict):
+                    self._issue(stripped, "JSON 不是对象")
+                    return []
+                return self._dispatch(obj, stripped)
+            # 模型偶尔漏换行把多个对象粘在一行、或末尾被截断：逐个取完整对象抢救正文。
+            salvaged, rest = self._salvage_objects(stripped)
+            if salvaged:
+                if rest.strip():
+                    self._issue(rest.strip(), "行内残余 JSON 截断")
+                return salvaged
+            self._issue(stripped, "JSON 解析失败" if closed else "非 JSON 行")
             return []
-        try:
-            obj = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            self._issue(stripped, "JSON 解析失败")
-            return []
-        if not isinstance(obj, dict):
-            self._issue(stripped, "JSON 不是对象")
-            return []
+        # 模型偶尔完全无视 JSONL，直接输出裸台词：没有任何 JSON 特征时按 add 兜底，
+        # 情绪留空交给 Host 回落默认表情；带括号/键值残片的截断 JSON 仍按坏行跳过。
+        if not _JSON_FEATURE_RE.search(stripped):
+            return self._plain_text_entry(stripped)
+        self._issue(stripped, "非 JSON 行")
+        return []
 
+    def _dispatch(self, obj: dict, raw: str) -> list[ParsedEntry]:
         if self.options.mode == "daily":
-            return self._parse_daily(obj, stripped)
-        return self._parse_task(obj, stripped)
+            return self._parse_daily(obj, raw)
+        return self._parse_task(obj, raw)
+
+    def _salvage_objects(self, text: str) -> tuple[list[ParsedEntry], str]:
+        """从粘连/截断的一行里逐个取完整 JSON 对象，只接受正文类。
+
+        结构标记（mute/nochange/remove/end）一旦出现在粘连行里就整行不抢救，
+        避免半解析在任务改写上提前截断或误删原台词。
+        """
+        decoder = json.JSONDecoder()
+        entries: list[ParsedEntry] = []
+        rest = text
+        while rest.startswith("{"):
+            try:
+                obj, end = decoder.raw_decode(rest)
+            except ValueError:
+                break
+            if not isinstance(obj, dict) or not self._salvageable(obj):
+                return [], text
+            entries.extend(self._dispatch(obj, rest[:end]))
+            rest = rest[end:].lstrip(" \t\r")
+        return entries, rest
+
+    def _salvageable(self, obj: dict) -> bool:
+        if self.options.mode == "daily":
+            return isinstance(obj.get("add"), str) or isinstance(obj.get("closing"), str)
+        return isinstance(obj.get("add"), str) or isinstance(obj.get("line"), str)
 
     # ------------------------------------------------------------------
     # 日常：只接受 add / closing

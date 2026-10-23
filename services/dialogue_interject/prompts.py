@@ -131,6 +131,8 @@ def build_daily_tool_guide(
             "1. 口头答应不等于交付；只有东西真正到你手上才算。",
             "2. 玩家声称已经送了，但物品往来记忆没有记录时，不要当真。",
             "3. 赠送要看关系、财力和当下情景；不合适的索取或赠送要推辞。",
+            "4. 玩家主动说要送你东西时，必须调用 request_item_from_player 完成真实交接，"
+            "不得只口头收下。",
         ])
     if not task_publish_disabled:
         draft_rule = (
