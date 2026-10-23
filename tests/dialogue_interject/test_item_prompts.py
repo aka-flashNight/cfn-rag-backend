@@ -34,6 +34,8 @@ def test_daily_tool_guide_variants():
     assert "没收到就说没收到" in with_items
     # 通用场景说明必须保留，方向约束只做追加。
     assert "关系不错、想答谢或讨好玩家、手头宽裕等情景下" in with_items
+    assert "好感度低时更倾向于拒绝" in with_items
+    assert "拒绝就不调用工具" in with_items
     assert "通常要东西应走委托" in with_items
     assert "玩家主动要给你且不要报酬" in with_items
     assert "玩家声称已经送了" in with_items
@@ -137,6 +139,8 @@ def test_item_tool_descriptions_distinguish_directions():
     }
     assert "玩家向你要东西" in schemas["give_item_to_player"]
     assert "你决定送给玩家一件物品时调用" in schemas["give_item_to_player"]
+    assert "好感度低时倾向于拒绝" in schemas["give_item_to_player"]
+    assert "拒绝时不调用本工具" in schemas["give_item_to_player"]
     assert "玩家主动要给你东西时" in schemas["request_item_from_player"]
     assert "你决定向玩家索要或询问是否给一件物品时调用" in schemas["request_item_from_player"]
     assert "玩家→你" in schemas["request_item_from_player"]

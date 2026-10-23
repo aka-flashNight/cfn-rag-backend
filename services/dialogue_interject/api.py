@@ -113,6 +113,13 @@ async def dialogue_interject(payload: InterjectRequest):
     stream_factory: StreamFactory | None = _PRIMARY_FACTORY
     npc_emotions: tuple[str, ...] = (DEFAULT_EMOTION,)
     binding = None
+    logger.info(
+        "[interject] request mode=%s action=%s dialogue=%s turn=%s",
+        payload.mode,
+        payload.action.kind if payload.action is not None else "-",
+        payload.dialogue_instance_id,
+        payload.turn_id,
+    )
 
     if stream_factory is None:
         # 打包版没有 .env：复用终端 ask 最近一次由页面设置传入的配置；

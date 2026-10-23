@@ -491,7 +491,7 @@ class DailyToolRuntime:
                 "不要声称送出任何物品，不要提工具。",
             )
 
-        self._push_progress(ToolProgress(ui_hint="查找物品中"))
+        self._push_progress(ToolProgress(ui_hint="确认物品中"))
         game_data = self.blocks.game_data
         cap = gift_value_cap(
             stage=self.blocks.progress_stage or 1,
@@ -653,7 +653,7 @@ class DailyToolRuntime:
                 "不要索要物品，不要提工具。",
             )
 
-        self._push_progress(ToolProgress(ui_hint="查找物品中"))
+        self._push_progress(ToolProgress(ui_hint="确认物品中"))
         game_data = self.blocks.game_data
         pool = build_take_pool(
             game_data, getattr(self.request, "player_item_names", []) or [],
