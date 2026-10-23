@@ -149,7 +149,7 @@ def test_gift_cap_and_reduce():
     assert reduce_gift_quantity(gd, "金币", 50000, cap=cap) == (30000, None)
     assert reduce_gift_quantity(gd, "M4A1", 1, cap=100) == (0, "value_exceeded")
     assert reduce_gift_quantity(gd, "未知物品", 1, cap=cap) == (0, "no_price")
-    assert format_gift_failure("M4A1") == "你选择了赠送M4A1，因价值过高，赠送失败。"
+    assert format_gift_failure("M4A1") == "你向玩家赠送「M4A1」，但价值过高，赠送失败。"
 
 
 def test_enhancement_description_boundaries():

@@ -99,6 +99,10 @@ TOOL_TIMEOUT_S = 120.0
 #: 过渡话单独限时：生成失败/超时只是少一句填充，不得拖住草案终态
 _TRANSITION_TIMEOUT_S = 30.0
 
+# 物品办理结果必须自带方向，避免“你给玩家”被模型讲成“玩家虚报领取”。
+_GIVE_LABEL = "【办理结果·你给玩家】"
+_TAKE_LABEL = "【办理结果·接收玩家物品】"
+
 
 class DailyToolError(RuntimeError):
     """工具执行失败/超时；带 code 供 SSE error 使用。"""
@@ -482,8 +486,9 @@ class DailyToolRuntime:
             args = self._item_args(call)
         except ValueError as exc:
             return _ItemOutcome(
-                f"【办理结果】赠送参数无效：{exc}",
-                "以角色口吻正常回应，不要声称送出任何物品，不要提工具。",
+                f"{_GIVE_LABEL}你向玩家赠送，但这次参数无效：{exc}",
+                "你刚才是要向玩家赠送东西。以角色口吻说明这次没给成；"
+                "不要声称送出任何物品，不要提工具。",
             )
 
         self._push_progress(ToolProgress(ui_hint="查找物品中"))
@@ -512,30 +517,33 @@ class DailyToolRuntime:
             if choice.reason == REASON_NOT_FOUND:
                 ITEM_CLAIMS.record_failure(
                     self._claim_key(),
-                    f"赠送「{target}」失败：你没有这个物品",
+                    f"你赠送「{target}」给玩家失败：你没有这个物品",
                 )
                 return _ItemOutcome(
-                    "【办理结果】你没有这个物品，无法赠送。",
-                    "以角色口吻告诉玩家你没有这件物品，这次不能赠送；"
+                    f"{_GIVE_LABEL}你向玩家赠送「{target}」，"
+                    "但你没有这个物品，无法赠送。",
+                    "你刚才是要向玩家赠送这件物品。以角色口吻说明你这边没有、给不了；"
                     "不要改送别的物品，不要提工具，也不要解释办理过程。",
                 )
             if choice.reason == REASON_VALUE_EXCEEDED:
                 ITEM_CLAIMS.record_failure(
                     self._claim_key(),
-                    f"赠送「{target}」失败：物品价值超出可赠送范围",
+                    f"你赠送「{target}」给玩家失败：物品价值超出可赠送范围",
                 )
                 return _ItemOutcome(
-                    "【办理结果】物品价值超出可赠送范围，不可赠送。",
-                    "以角色口吻说明这件物品太贵重、超出可赠送范围；"
+                    f"{_GIVE_LABEL}你向玩家赠送「{target}」，"
+                    "但这件物品价值超出可赠送范围，不可赠送。",
+                    "你刚才是要向玩家赠送这件物品。以角色口吻说明这件太贵重、不能给；"
                     "不要改送别的物品，不要提工具，也不要解释办理过程。",
                 )
             ITEM_CLAIMS.record_failure(
                 self._claim_key(),
-                f"赠送「{target}」失败：未找到合适物品",
+                f"你赠送「{target}」给玩家失败：未找到合适物品",
             )
             return _ItemOutcome(
-                f"【办理结果】{gift_not_found_text()}",
-                "以角色口吻拒绝赠送或换个话题，不要声称已经送出，不要提工具。",
+                f"{_GIVE_LABEL}{gift_not_found_text()}",
+                "你刚才是要向玩家赠送东西。以角色口吻拒绝或换个话题；"
+                "不要声称已经送出，不要提工具。",
             )
         picked = choice.name
 
@@ -544,19 +552,23 @@ class DailyToolRuntime:
         )
         if reason == "no_price":
             ITEM_CLAIMS.record_failure(
-                self._claim_key(), f"赠送{picked}失败：无法估价",
+                self._claim_key(),
+                f"你赠送「{picked}」给玩家失败：无法估价",
             )
             return _ItemOutcome(
-                f"【办理结果】{format_gift_no_price(picked)}",
-                "以角色口吻说明这次送不了，不要声称已经送出，不要提工具。",
+                f"{_GIVE_LABEL}{format_gift_no_price(picked)}",
+                "你刚才是要向玩家赠送这件物品。以角色口吻说明这次给不了；"
+                "不要声称已经送出，不要提工具。",
             )
         if reason is not None:
             ITEM_CLAIMS.record_failure(
-                self._claim_key(), f"赠送{picked}失败：价值过高",
+                self._claim_key(),
+                f"你赠送「{picked}」给玩家失败：价值过高",
             )
             return _ItemOutcome(
-                f"【办理结果】{format_gift_failure(picked)}",
-                "以角色口吻拒绝这次赠送，不要声称已经送出，不要提工具。",
+                f"{_GIVE_LABEL}{format_gift_failure(picked)}",
+                "你刚才是要向玩家赠送这件物品。以角色口吻拒绝这次赠送；"
+                "不要声称已经送出，不要提工具。",
             )
 
         action_id = uuid.uuid4().hex
@@ -581,11 +593,14 @@ class DailyToolRuntime:
                 action_id, picked, qty,
             )
             ITEM_CLAIMS.record_failure(
-                self._claim_key(), f"赠送{picked}失败：游戏侧没有确认",
+                self._claim_key(), f"你赠送「{picked}」给玩家失败：游戏侧没有确认",
             )
             return _ItemOutcome(
-                "【办理结果】这次赠送没有收到游戏侧确认，不能当作已经送出。",
-                "以角色口吻说明这次没送成，不要声称已经送出，不要提工具。",
+                f"{_GIVE_LABEL}你向玩家赠送「{picked}」，这次没有交付成功"
+                "（没有收到游戏侧确认），不能当作已经送出。",
+                "你刚才是要向玩家赠送这件物品。以角色口吻说明这次没给成；"
+                "只说明这次没交付成功；"
+                "不要提工具，也不要解释办理过程。",
             )
         except asyncio.CancelledError:
             raise
@@ -593,11 +608,12 @@ class DailyToolRuntime:
         if not result.success:
             detail = (result.error or "游戏侧发放失败").strip()
             ITEM_CLAIMS.record_failure(
-                self._claim_key(), f"赠送{picked}失败：{detail}",
+                self._claim_key(), f"你赠送「{picked}」给玩家失败：{detail}",
             )
             return _ItemOutcome(
-                f"【办理结果】赠送失败：{detail}",
-                "以角色口吻说明没送成，不要声称已经送出，不要提工具。",
+                f"{_GIVE_LABEL}你向玩家赠送「{picked}」，赠送失败：{detail}",
+                "你刚才是要向玩家赠送这件物品。以角色口吻说明这次没给成；"
+                "不要声称已经送出，不要提工具。",
             )
 
         actual = int(result.actual_quantity or qty)
@@ -612,7 +628,7 @@ class DailyToolRuntime:
             item_name=picked,
             quantity=actual,
         )
-        text = "【办理结果】" + format_gift_result(
+        text = _GIVE_LABEL + format_gift_result(
             picked,
             requested=args.quantity,
             actual=actual,
@@ -623,8 +639,8 @@ class DailyToolRuntime:
         text = with_item_info(text, format_item_info(game_data, picked))
         return _ItemOutcome(
             text,
-            "用 JSONL 说最终的话：确认已经把物品交给玩家，数量以办理结果为准；"
-            "不要提工具，也不要解释办理过程，不要输出动作描写。",
+            "用 JSONL 说最终的话：你刚才是要向玩家赠送东西，你确认已经把物品交给他，"
+            "数量以办理结果为准；不要提工具，也不要解释办理过程，不要输出动作描写。",
         )
 
     async def _run_take(self, call: dict[str, Any]) -> _ItemOutcome:
@@ -632,8 +648,9 @@ class DailyToolRuntime:
             args = self._item_args(call)
         except ValueError as exc:
             return _ItemOutcome(
-                f"【办理结果】索取参数无效：{exc}",
-                "以角色口吻正常回应，不要索要物品，不要提工具。",
+                f"{_TAKE_LABEL}这次物品交接参数无效：{exc}",
+                "玩家刚才是要把东西交给你。以角色口吻说明这次收不了；"
+                "不要索要物品，不要提工具。",
             )
 
         self._push_progress(ToolProgress(ui_hint="查找物品中"))
@@ -654,14 +671,15 @@ class DailyToolRuntime:
         if not choice.name:
             ITEM_CLAIMS.record_failure(
                 self._claim_key(),
-                f"索取「{args.name or args.keyword or '物品'}」失败：未找到有效物品",
+                f"玩家向你赠送「{args.name or args.keyword or '物品'}」失败：未找到有效物品",
             )
             return _ItemOutcome(
-                "【办理结果】"
+                _TAKE_LABEL
                 + take_not_found_text(
                     args.name, args.quantity, args.keyword, args.instruction,
                 ),
-                "按上面的失败说明继续聊天，不能索取该物品，不要提工具。",
+                "玩家刚才是要把东西交给你（或你刚向玩家开口）。"
+                "以角色口吻说明这次没收到，不要提工具。",
             )
         picked = choice.name
 
@@ -687,7 +705,7 @@ class DailyToolRuntime:
             )
         except ClaimExistsError:
             return _ItemOutcome(
-                "【办理结果】当前已有待处理的索取，这次不再发起新的索取。",
+                f"{_TAKE_LABEL}当前已有待处理的索取，这次不再发起新的索取。",
                 "以角色口吻把话头拉回当前索取，不要提工具。",
             )
 
@@ -701,17 +719,18 @@ class DailyToolRuntime:
         lines = [take_instruction(picked, quantity), *notes]
         return _ItemOutcome(
             with_item_info(
-                "【办理结果】" + "\n".join(lines),
+                _TAKE_LABEL + "\n".join(lines),
                 format_item_info(game_data, picked),
             ),
-            "按上面的索取要求，用 JSONL 向玩家开口；不要提工具，也不要解释办理过程。",
+            "按上面的交接要求，用 JSONL 向玩家开口；不要声称已经收到，"
+            "不要提工具，也不要解释办理过程。",
         )
 
     def _run_cancel_item(self) -> _ItemOutcome:
         claim = ITEM_CLAIMS.close(self._claim_key())
         if claim is None:
             return _ItemOutcome(
-                "【办理结果】当前没有待处理的索取。",
+                f"{_TAKE_LABEL}当前没有待处理的索取。",
                 "以角色口吻正常回应，不要提工具，也不要解释办理过程。",
             )
         self._push_progress(ToolProgress(claim=StreamItemClaim(ItemClaimPayload(
@@ -722,7 +741,7 @@ class DailyToolRuntime:
             quantity=claim.quantity,
         ))))
         return _ItemOutcome(
-            "【办理结果】你取消了这次索取。",
+            f"{_TAKE_LABEL}你取消了这次索取。",
             "以角色口吻回应，不要再索要，不要提工具，也不要解释办理过程。",
         )
 

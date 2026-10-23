@@ -136,8 +136,9 @@ async def _run_item_take_action(
             action.kind, action.action_id, action.claim_id,
         )
         return (
-            "【办理结果】这次索取与当前待处理的东西对不上，没有接收物品。",
-            "以角色口吻回应，不要声称收到物品，不要提工具，也不要解释办理过程。",
+            "【办理结果·玩家给你】这次交接与当前待处理的东西对不上，没有接收物品。",
+            "玩家刚才是要把东西交给你。以角色口吻说明这次没收成；"
+            "不要声称收到物品，不要提工具，也不要解释办理过程。",
             None,
         )
 
@@ -157,9 +158,12 @@ async def _run_item_take_action(
     else:
         if claim is not None:
             ITEM_CLAIMS.close(key, claim_id=claim.claim_id)
-            ITEM_CLAIMS.record_failure(key, f"玩家拒绝赠送{item_name}")
-        result_block = f"【办理结果】玩家拒绝赠送{item_name}。"
-        instruction = "以角色口吻回应，不要再索要，不要提工具，也不要解释办理过程。"
+            ITEM_CLAIMS.record_failure(key, f"玩家拒绝向你赠送{item_name}")
+        result_block = f"【办理结果·玩家给你】玩家拒绝把{item_name}交给你。"
+        instruction = (
+            "玩家刚才是要把东西交给你，但这次拒绝了。"
+            "以角色口吻回应，承认玩家开过口，不要再索要，不要提工具，也不要解释办理过程。"
+        )
         closed_payload = _closed_payload(request, action.claim_id, item_name, quantity)
 
     closed = StreamItemClaim(closed_payload)
@@ -215,7 +219,7 @@ async def _accept_item(
         quantity=quantity,
     )
 
-    text = "【办理结果】" + format_take_completion(
+    text = "【办理结果·玩家给你】" + format_take_completion(
         item_name, quantity, item_level=level,
     )
     info = format_item_info(blocks.game_data, item_name)
@@ -227,7 +231,7 @@ async def _accept_item(
     if info:
         text += "\n物品信息：\n" + info
     instruction = (
-        "用 JSONL 回应玩家：你已经收下这件物品；"
+        "用 JSONL 回应玩家：玩家刚才是要把东西交给你，你确认已经收下这件物品；"
         "不要提工具，也不要解释办理过程，不要输出动作描写。"
     )
     return text, instruction

@@ -125,11 +125,11 @@ async def test_item_take_decline_closes_and_records_failure():
 
     result, _, closed = await _run_item_take_action(request, _blocks(memory=memory))
 
-    assert "玩家拒绝赠送M4A1" in result
+    assert "玩家拒绝把M4A1交给你" in result
     assert closed is not None and closed.data["state"] == "closed"
     assert ITEM_CLAIMS.pending(fx.DAILY_DIALOGUE_ID) is None
     assert memory.ledger == []
-    assert "玩家拒绝赠送M4A1" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+    assert "玩家拒绝向你赠送M4A1" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
 
 
 @pytest.mark.asyncio

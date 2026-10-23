@@ -262,7 +262,7 @@ async def test_gift_success_emits_action_and_records_ledger(monkeypatch):
 
     assert result.requires_followup is True
     assert result.system_prompt == "FREE_SYS"
-    assert "已成功赠送 2 个 普通hp药剂" in result.result_block
+    assert "已成功赠送给玩家 2 个 普通hp药剂" in result.result_block
     assert "名称：普通hp药剂" in result.result_block
     assert memory.ledger == [("slot-1", fx.NPC, "give", "普通hp药剂", 2)]
     assert "第1轮：2个普通hp药剂" in ITEM_CLAIMS.gift_detail_block(fx.DAILY_DIALOGUE_ID)
@@ -308,9 +308,9 @@ async def test_gift_value_exceeded_rejects_without_action(monkeypatch):
     result, events = await _execute_gift(runtime, call)
 
     assert all(ev.action is None for ev in events)
-    assert "因价值过高，赠送失败" in result.result_block
+    assert "价值过高，赠送失败" in result.result_block
     assert memory.ledger == []
-    assert "赠送稀有芯片失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+    assert "你赠送「稀有芯片」给玩家失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
 
 
 @pytest.mark.asyncio
@@ -321,7 +321,8 @@ async def test_gift_not_found_rejects(monkeypatch):
     result, events = await _execute_gift(runtime, GIVE_CALL)
 
     assert all(ev.action is None for ev in events)
-    assert "未找到合适的赠送物品" in result.result_block
+    assert "你没有找到合适的物品" in result.result_block
+    assert "你向玩家赠送" in result.result_block
 
 
 @pytest.mark.asyncio
@@ -333,9 +334,10 @@ async def test_gift_specified_missing_reports_reason(monkeypatch):
     result, events = await _execute_gift(runtime, GIVE_CALL)
 
     assert all(ev.action is None for ev in events)
-    assert "你没有这个物品，无法赠送" in result.result_block
+    assert "你向玩家赠送「牛肉罐头」" in result.result_block
+    assert "没有这个物品，无法赠送" in result.result_block
     assert "未找到合适的赠送物品" not in result.result_block
-    assert "赠送「牛肉罐头」失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+    assert "你赠送「牛肉罐头」给玩家失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
 
 
 @pytest.mark.asyncio
@@ -349,7 +351,7 @@ async def test_gift_specified_over_cap_reports_reason(monkeypatch):
     assert all(ev.action is None for ev in events)
     assert "物品价值超出可赠送范围，不可赠送" in result.result_block
     assert "未找到合适的赠送物品" not in result.result_block
-    assert "赠送「稀有芯片」失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+    assert "你赠送「稀有芯片」给玩家失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
 
 
 @pytest.mark.asyncio
@@ -372,6 +374,10 @@ async def test_late_gift_ack_still_records_ledger(monkeypatch):
     result = await task
 
     assert "没有收到游戏侧确认" in result.result_block
+    assert "你向玩家赠送「普通hp药剂」" in result.result_block
+    instructions = "".join(str(m.get("content") or "") for m in result.messages)
+    assert "你刚才是要向玩家赠送这件物品" in instructions
+    assert "只说明这次没交付成功" in instructions
     assert memory.ledger == []
 
     ACTIONS.resolve(ActionResult(action_id=action_id, success=True, actual_quantity=2))
@@ -416,8 +422,24 @@ async def test_take_creates_pending_claim(monkeypatch):
 
     claim = ITEM_CLAIMS.pending(fx.DAILY_DIALOGUE_ID)
     assert claim is not None and claim.item_name == "普通hp药剂" and claim.quantity == 3
-    assert "你现在要索取物品：3个普通hp药剂" in result.result_block
+    assert "这次要交接的物品：3个普通hp药剂" in result.result_block
     assert result.system_prompt == "FREE_SYS"
+
+
+@pytest.mark.asyncio
+async def test_take_missing_acknowledges_player_offer(monkeypatch):
+    """玩家说要送东西、但核实找不到时，不能当作没提过。"""
+    _patch_picker(monkeypatch, PickerResult(reason="not_found", target="牛肉罐头"))
+    runtime = DailyToolRuntime(
+        _request(player_item_names=["普通hp药剂"]), _blocks(),
+    )
+
+    result = await runtime.execute([TAKE_CALL])
+
+    assert "这次物品交接没有完成" in result.result_block
+    instructions = "".join(str(m.get("content") or "") for m in result.messages)
+    assert "玩家刚才是要把东西交给你" in instructions
+    assert "以角色口吻说明这次没收到" in instructions
 
 
 @pytest.mark.asyncio
@@ -473,7 +495,7 @@ async def test_only_one_item_action_per_round(monkeypatch):
 
     tool_messages = [m for m in result.messages if m.get("role") == "tool"]
     assert len(tool_messages) == 2
-    assert "未找到合适的赠送物品" in tool_messages[0]["content"]
+    assert "你没有找到合适的物品" in tool_messages[0]["content"]
     assert tool_messages[1]["content"] == "已忽略（一轮只处理一个物品动作）"
 
 

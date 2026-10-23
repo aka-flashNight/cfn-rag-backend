@@ -106,16 +106,16 @@ def format_gift_result(
     adjusted: bool,
 ) -> str:
     if adjusted:
-        return f"已成功赠送 {actual} 个 {name}（原请求 {requested}，因价值上限调整）"
-    return f"已成功赠送 {actual} 个 {name}"
+        return f"已成功赠送给玩家 {actual} 个 {name}（原请求 {requested}，因价值上限调整）"
+    return f"已成功赠送给玩家 {actual} 个 {name}"
 
 
 def format_gift_failure(name: str) -> str:
-    return f"你选择了赠送{name}，因价值过高，赠送失败。"
+    return f"你向玩家赠送「{name}」，但价值过高，赠送失败。"
 
 
 def format_gift_no_price(name: str) -> str:
-    return f"你选择了赠送{name}，无法估价，赠送失败。"
+    return f"你向玩家赠送「{name}」，但这件物品无法估价，赠送失败。"
 
 
 def format_take_completion(

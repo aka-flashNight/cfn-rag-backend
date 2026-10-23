@@ -28,7 +28,17 @@ def test_daily_tool_guide_variants():
     assert "request_item_from_player" in with_items
     assert "cancel_item_request" not in with_items
     assert "口头答应不等于交付" in with_items
-    assert "玩家主动说要送你东西时，必须调用 request_item_from_player" in with_items
+    assert "玩家向你要东西：给不给由你决定" in with_items
+    assert "玩家说要送你东西：必须调用 request_item_from_player" in with_items
+    assert "拒绝也要承认玩家开过口" in with_items
+    assert "没收到就说没收到" in with_items
+    # 通用场景说明必须保留，方向约束只做追加。
+    assert "关系不错、想答谢或讨好玩家、手头宽裕等情景下" in with_items
+    assert "通常要东西应走委托" in with_items
+    assert "玩家主动要给你且不要报酬" in with_items
+    assert "玩家声称已经送了" in with_items
+    assert "你想要但不想付报酬" in with_items
+    assert "只是价值不高的小东西" in with_items
 
     with_claim = _daily(has_item_claim=True)
     assert "cancel_item_request" in with_claim
@@ -116,3 +126,17 @@ def test_daily_user_context_places_item_blocks_after_long_term():
     ]
     positions = [text.index(marker) for marker in order]
     assert positions == sorted(positions)
+
+
+def test_item_tool_descriptions_distinguish_directions():
+    from services.dialogue_interject.item_tools import item_tool_schemas
+
+    schemas = {
+        schema["function"]["name"]: schema["function"]["description"]
+        for schema in item_tool_schemas()
+    }
+    assert "玩家向你要东西" in schemas["give_item_to_player"]
+    assert "你决定送给玩家一件物品时调用" in schemas["give_item_to_player"]
+    assert "玩家主动要给你东西时" in schemas["request_item_from_player"]
+    assert "你决定向玩家索要或询问是否给一件物品时调用" in schemas["request_item_from_player"]
+    assert "玩家→你" in schemas["request_item_from_player"]

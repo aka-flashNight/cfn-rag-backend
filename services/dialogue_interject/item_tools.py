@@ -32,7 +32,8 @@ def item_tool_schemas(names: tuple[str, ...] | None = None) -> list[dict[str, An
             "function": {
                 "name": GIVE_TOOL,
                 "description": (
-                    "你决定送给玩家一件物品时调用。name 只能填你确定的精确物品名；"
+                    "你决定送给玩家一件物品时调用；玩家向你要东西且你决定给他时也用它。物品流向是你→玩家。"
+                    "name 只能填你确定的精确物品名；"
                     "不确定就留空，用 keyword/instruction 描述你要找的东西。quantity 必填。"
                     "调用这一轮不要输出台词。"
                 ),
@@ -44,8 +45,9 @@ def item_tool_schemas(names: tuple[str, ...] | None = None) -> list[dict[str, An
             "function": {
                 "name": TAKE_TOOL,
                 "description": (
-                    "你决定向玩家索要/询问是否给一件物品时调用；玩家主动要给你东西时也必须调用，"
-                    "不得只口头收下。name 只能填你确定的精确物品名；"
+                    "你决定向玩家索要或询问是否给一件物品时调用；玩家主动要给你东西时"
+                    "也必须调用，不得只口头收下或口头答应。物品流向是玩家→你。"
+                    "name 只能填你确定的精确物品名；"
                     "不确定就留空，用 keyword/instruction 描述你要找的东西。quantity 必填。"
                     "调用这一轮不要输出台词。"
                 ),
@@ -129,8 +131,10 @@ def is_equipment_item(game_data: Any, name: str) -> bool:
 
 def take_instruction(name: str, quantity: int) -> str:
     return (
-        f"你现在要索取物品：{quantity}个{name}，该物品确认有效，可以索取。"
-        "现在，请用符合你身份且符合上下文的语句，向玩家索要物品或询问玩家是否要把该物品给你。"
+        f"这次要交接的物品：{quantity}个{name}，该物品确认有效。"
+        "玩家若已经表示要给你，就用符合你身份且符合上下文的话让他把东西交给你；"
+        "若是你主动开口，就向玩家索要或询问是否愿意给。"
+        "不要声称已经收到，只有实际交付后才算。"
     )
 
 
@@ -142,13 +146,14 @@ def take_not_found_text(name: str, quantity: int, keyword: str, instruction: str
         f"指示={instruction or '空'}",
     ])
     return (
-        "未找到有效的物品，你要求的索取任务执行失败，无法索取，"
-        "请在不能索取物品的前提下继续聊天。" + detail
+        "这次物品交接没有完成：没有找到可接收的物品"
+        "（该物品可能不存在）。"
+        "只说明这次没收到。" + detail
     )
 
 
 def gift_not_found_text() -> str:
-    return "未找到合适的赠送物品，这次赠送没有发生；请以角色口吻拒绝或换个话题。"
+    return "你向玩家赠送，但你没有找到合适的物品，这次赠送没有发生。"
 
 
 def with_item_info(text: str, info: str) -> str:
