@@ -78,12 +78,17 @@ def test_item_level_only_for_accept_and_no_item_fields_for_task_actions():
         }))
 
 
-def test_action_kind_bound_to_mode():
-    with pytest.raises(ValidationError):
-        InterjectRequest.model_validate(_daily(action={
-            "kind": "task_accept",
-            "action_id": "a1",
-        }))
+@pytest.mark.parametrize("request_factory", [_daily, _task], ids=["daily", "task"])
+@pytest.mark.parametrize("kind", ["task_accept", "task_decline"])
+def test_task_actions_allowed_in_daily_and_task_mode(request_factory, kind):
+    request = InterjectRequest.model_validate(request_factory(action={
+        "kind": kind,
+        "action_id": "a1",
+    }))
+    assert request.action is not None and request.action.kind == kind
+
+
+def test_item_take_action_requires_daily_mode():
     with pytest.raises(ValidationError):
         InterjectRequest.model_validate(_task(action={
             "kind": "item_take_accept",

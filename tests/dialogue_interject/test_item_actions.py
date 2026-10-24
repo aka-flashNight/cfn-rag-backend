@@ -133,7 +133,8 @@ async def test_item_take_decline_closes_and_records_failure():
 
 
 @pytest.mark.asyncio
-async def test_task_accept_direct_loads_pending_draft(monkeypatch):
+@pytest.mark.parametrize("request_factory", [fx.task_request, fx.daily_request], ids=["task", "daily"])
+async def test_task_accept_direct_loads_pending_draft(monkeypatch, request_factory):
     row = SimpleNamespace(draft={"draft_id": "d1"}, draft_id="d1", bargain_count=0)
     captured = {}
 
@@ -146,7 +147,7 @@ async def test_task_accept_direct_loads_pending_draft(monkeypatch):
         return "【办理结果】已发布", "收尾"
 
     monkeypatch.setattr(DailyToolRuntime, "run_task_accept", _accept)
-    request = make_request(fx.task_request(action={
+    request = make_request(request_factory(action={
         "kind": "task_accept",
         "action_id": "task-act-draft",
     }))
@@ -157,7 +158,8 @@ async def test_task_accept_direct_loads_pending_draft(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_task_accept_direct_is_idempotent(monkeypatch):
+@pytest.mark.parametrize("request_factory", [fx.task_request, fx.daily_request], ids=["task", "daily"])
+async def test_task_accept_direct_is_idempotent(monkeypatch, request_factory):
     calls = []
 
     async def _accept(self):
@@ -166,7 +168,7 @@ async def test_task_accept_direct_is_idempotent(monkeypatch):
 
     monkeypatch.setattr(DailyToolRuntime, "run_task_accept", _accept)
     memory = FakeMemory()
-    request = make_request(fx.task_request(action={
+    request = make_request(request_factory(action={
         "kind": "task_accept",
         "action_id": "task-act-1",
     }))
@@ -180,3 +182,24 @@ async def test_task_accept_direct_is_idempotent(monkeypatch):
     saved = memory.actions["task-act-1"]
     assert saved["kind"] == "task_accept"
     assert saved["result"]["result_block"] == first[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_factory", [fx.task_request, fx.daily_request], ids=["task", "daily"])
+async def test_task_decline_direct_uses_cancel(monkeypatch, request_factory):
+    calls = []
+
+    async def _decline(self):
+        calls.append(1)
+        return "【办理结果】这份委托已经撤销。", "收尾一句话"
+
+    monkeypatch.setattr(DailyToolRuntime, "run_task_decline", _decline)
+    request = make_request(request_factory(action={
+        "kind": "task_decline",
+        "action_id": "task-decline-1",
+    }))
+
+    result = await _run_task_action(request, _blocks(), llm=None)
+
+    assert result == ("【办理结果】这份委托已经撤销。", "收尾一句话")
+    assert len(calls) == 1

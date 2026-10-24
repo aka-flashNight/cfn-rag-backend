@@ -272,8 +272,6 @@ class InterjectRequest(BaseModel):
             raise ValueError("mode=task 时必须提供 task_context")
         if self.action is not None:
             is_task_action = self.action.kind.startswith("task_")
-            if is_task_action and self.mode != "task":
-                raise ValueError(f"action.kind={self.action.kind} 只允许 mode=task")
             if not is_task_action and self.mode != "daily":
                 raise ValueError(f"action.kind={self.action.kind} 只允许 mode=daily")
         if self.player_item_names and self.mode != "daily":
