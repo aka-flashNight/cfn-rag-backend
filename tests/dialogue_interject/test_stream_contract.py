@@ -11,6 +11,7 @@ import asyncio
 import pytest
 
 from services.dialogue_interject.orchestrator import InterjectOrchestrator
+from services.dialogue_interject.schemas import StreamTaskPublish, TaskPublishPayload
 from tests.dialogue_interject import fixtures as fx
 from tests.dialogue_interject.helpers import (
     collect_events,
@@ -339,3 +340,43 @@ async def test_turn_with_only_mute_is_not_treated_as_zero_valid():
     )
     assert _names(events) == ["status", "mute", "plan", "done"]
     assert events[-2].data == {"mute": True, "end": None, "edits": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_factory", [fx.daily_request, fx.task_request], ids=["daily", "task"])
+async def test_task_publish_marker_folds_into_done_and_skips_repair(request_factory):
+    """自动接取轮零台词：只发 status+done，task_publish 随终态下发。"""
+    repair_calls = []
+
+    async def _stream(_request):
+        yield StreamTaskPublish(TaskPublishPayload(
+            task_id=9, npc=fx.NPC, slot_key="slot-1",
+        ))
+
+    async def _repair(_request):
+        repair_calls.append(1)
+        yield fx.F01_JSONL
+
+    orchestrator = InterjectOrchestrator(
+        make_request(request_factory()),
+        session_id="session-test",
+        stream_factory=_stream,
+        repair_factory=_repair,
+    )
+    events = await collect_events(orchestrator)
+
+    # 任务模式也不发 plan：本轮没有台词，不让 Host 把空计划当成「整组替换」
+    assert _names(events) == ["status", "done"]
+    assert events[-1].data["task_publish"] == {
+        "task_id": 9, "npc": fx.NPC, "slot_key": "slot-1", "auto_accept": True,
+    }
+    assert repair_calls == []
+
+
+@pytest.mark.asyncio
+async def test_done_omits_task_publish_on_normal_turns():
+    events = await collect_events(
+        make_orchestrator(fx.daily_request(), chunks=fx.F01_JSONL)
+    )
+
+    assert "task_publish" not in events[-1].data

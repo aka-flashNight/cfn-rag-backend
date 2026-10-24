@@ -14,6 +14,12 @@ from types import SimpleNamespace
 import pytest
 
 from services.memory.store import TaskDraftRow
+from services.orchestrator.prompts import (
+    CONFIRM_ARGS_SYSTEM,
+    TASK_CONFIRM_MERGE_INSTRUCTION,
+    confirm_args_system,
+    task_confirm_merge_instruction,
+)
 from services.orchestrator.turn import TurnOrchestrator
 from tests.orchestrator.conftest import NPC_NAME
 
@@ -404,4 +410,35 @@ def test_finish_npc_reference_survives_line_source_failure(env, monkeypatch):
     assert text == (
         "药师的可用情绪标签：[普通]\n\n"
         "药师与玩家的关系/好感度：好感度 10（陌生）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 发布后接取衔接（自动接取轮）
+# ---------------------------------------------------------------------------
+
+def test_coherence_requirement_only_in_auto_accept_confirm_prompt():
+    """「我接了」自动接取轮才追加承接要求，其他 confirm 调用逐字不变。"""
+    base = confirm_args_system(allow_return=False)
+    assert base == CONFIRM_ARGS_SYSTEM
+    accepted = confirm_args_system(allow_return=False, player_just_accepted=True)
+    assert accepted.startswith(base)
+    assert "我接了" in accepted
+    assert "不要再问一遍要不要接" in accepted
+    assert "我接了" not in CONFIRM_ARGS_SYSTEM
+
+
+def test_confirm_merge_instruction_routes_to_publish_npc():
+    same = task_confirm_merge_instruction(publish_npc=NPC_A, current_npc=NPC_A)
+    other = task_confirm_merge_instruction(publish_npc=NPC_B, current_npc=NPC_A)
+
+    assert same == TASK_CONFIRM_MERGE_INSTRUCTION
+    assert "还没真正接下" in same
+    assert NPC_B in other
+    assert "来找你接取" not in other
+
+
+def test_missing_publish_npc_falls_back_to_same_npc_instruction():
+    assert task_confirm_merge_instruction(publish_npc="", current_npc=NPC_A) == (
+        TASK_CONFIRM_MERGE_INSTRUCTION
     )

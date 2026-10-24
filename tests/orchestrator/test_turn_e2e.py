@@ -318,9 +318,10 @@ async def test_task_confirm_success(env, monkeypatch):
     assert "".join(contents_of(events)) == "这事就这么定了，去办吧。"
     assert notices_of(events) == ["委托已发布"]
 
-    # 动作后回复的指令：不许再问一次接不接
+    # 动作后回复的指令：登记好了但还没接下，让他等归档后再来接
     reply_prompt = env.fake.stream_requests[1].messages[-1]["content"]
-    assert "不要再问一次他接不接" in reply_prompt
+    assert "还没真正接下" in reply_prompt
+    assert "再过来找你接取" in reply_prompt
 
     # 草案清除 + 任务文件原子写入临时目录
     assert await env.store.get_draft(env.session_id) is None
@@ -373,7 +374,7 @@ async def test_confirm_reply_falls_back_when_llm_silent(env, monkeypatch):
     env.fake.add_stream(text="")  # 模型没吐出任何正文
 
     events = await collect(_orch(env, "接！"))
-    assert "".join(contents_of(events)) == "这事就这么定了，去办吧。"
+    assert "".join(contents_of(events)) == "委托登记好了，你过来找我接一下。"
     assert notices_of(events) == ["委托已发布"]
 
 

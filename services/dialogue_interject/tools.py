@@ -21,6 +21,7 @@ from services.agent_tools.handlers import (
     execute_cancel_agent_task,
     execute_confirm_agent_task,
 )
+from services.agent_tools.task_tools import resolve_task_npcs
 from services.dialogue.delegation import (
     DELEGATE_TOOL_NAME,
     apply_delegate_calls,
@@ -68,6 +69,7 @@ from services.dialogue_interject.schemas import (
     ItemClaimPayload,
     StreamAction,
     StreamItemClaim,
+    TaskPublishPayload,
 )
 from services.llm import ChatRequest, LLMClient, split_meta_events
 from services.llm.meta import DEFAULT_EMOTION
@@ -174,6 +176,10 @@ class DailyToolRuntime:
         self.llm = llm
         #: 执行期间的旁路进度；由流循环并发消费（测试注入的执行器没有该队列）
         self.progress_queue: asyncio.Queue[ToolProgress] = asyncio.Queue()
+        #: 发布成功且需要游戏侧自动接取时填写（选项直连才可能非空）
+        self.publish_meta: TaskPublishPayload | None = None
+        #: 本次确认是否来自「我接了」选项（决定接取台词是否承接玩家原话）
+        self._auto_accept = False
 
     def _push_progress(self, progress: ToolProgress) -> None:
         try:
@@ -817,7 +823,8 @@ class DailyToolRuntime:
         if route.kind in ("task_draft", "task_update"):
             return await self._run_task_runner(route)
         if route.kind == "task_confirm":
-            return await self._run_confirm(route)
+            text, instruction, _meta = await self._run_confirm(route)
+            return text, instruction
         if route.kind == "task_cancel":
             return await self._run_cancel(route)
         return (
@@ -1093,20 +1100,25 @@ class DailyToolRuntime:
     # 确认 / 取消
     # ------------------------------------------------------------------
 
-    async def run_task_accept(self) -> tuple[str, str]:
+    async def run_task_accept(self) -> tuple[str, str, TaskPublishPayload | None]:
         """选项直连：接受委托（不经过路由轮）。"""
-        return await self._run_confirm()
+        return await self._run_confirm(allow_auto_accept=True)
 
     async def run_task_decline(self) -> tuple[str, str]:
         """选项直连：拒绝委托（不经过路由轮）。"""
         return await self._run_cancel()
 
-    async def _run_confirm(self, route: Any = None) -> tuple[str, str]:
+    async def _run_confirm(
+        self, route: Any = None, *, allow_auto_accept: bool = False,
+    ) -> tuple[str, str, TaskPublishPayload | None]:
+        self.publish_meta = None
+        self._auto_accept = allow_auto_accept
         draft_row = self.blocks.pending_draft_row
         if draft_row is None:
             return (
                 "【办理结果】当前没有待确认的委托草案，无法发布。",
                 "以角色口吻说明没有可确认的委托，不要编造任务内容。",
+                None,
             )
         # 确认不跑子 Agent，没有子 Agent 的 ui_hint 可透传：优先用模型在调用里自带的
         # 进度提示（≤12 字），没给才回落到固定文案。游戏侧据此把等待文案从
@@ -1142,9 +1154,32 @@ class DailyToolRuntime:
                 self.blocks.session_id, draft_row.draft_id,
                 payload.get("task_id") or payload.get("id") or "",
             )
+            get_npc, _finish_npc = resolve_task_npcs(draft_row.draft, self.request.npc)
+            same_npc = get_npc == (self.request.npc or "").strip()
+            task_id = payload.get("task_id") or payload.get("id")
+            if allow_auto_accept and same_npc and task_id is not None:
+                try:
+                    self.publish_meta = TaskPublishPayload(
+                        task_id=int(task_id),
+                        npc=get_npc,
+                        slot_key=self.blocks.slot_key,
+                        auto_accept=True,
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[interject] 发布任务 id 非法，无法自动接取: %r", task_id,
+                    )
+            instruction = (
+                "以角色口吻确认委托已经登记，但玩家还没接下："
+                "让他等你这边归档好再找你接取，别让他现在就去办，不要重复任务细节。"
+                if same_npc
+                else f"以角色口吻确认委托已经登记，并提醒玩家到「{get_npc}」那里接取；"
+                "不要重复任务细节。"
+            )
             return (
                 "【办理结果】这份委托已经正式派给玩家了。",
-                "以角色口吻确认委托已经交给玩家，给一句结束语（去办吧/别让我等太久），不要重复任务细节。",
+                instruction,
+                self.publish_meta,
             )
         reason = str(payload.get("message") or payload.get("status") or "发布失败")
         logger.info(
@@ -1154,6 +1189,7 @@ class DailyToolRuntime:
         return (
             f"【办理结果】委托发布失败：{reason}",
             "以角色口吻说明暂时没法发布，不要编造任务内容。",
+            None,
         )
 
     async def _build_confirm_args(
@@ -1188,6 +1224,7 @@ class DailyToolRuntime:
                 base_messages=build_daily_messages(self.request, self.blocks),
                 draft_summary=summary,
                 finish_npc_reference=finish_reference,
+                player_just_accepted=self._auto_accept,
             )
         except asyncio.CancelledError:
             raise

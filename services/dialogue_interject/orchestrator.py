@@ -33,6 +33,8 @@ from services.dialogue_interject.schemas import (
     SSEEvent,
     StreamSSE,
     StreamStatus,
+    StreamTaskPublish,
+    TaskPublishPayload,
     done_event,
     error_event,
     item_claim_event,
@@ -61,6 +63,8 @@ class _DriveState:
     failed: bool = False
     error: Exception | None = None
     error_code: str = ""
+    # 自动接取模式：发布成功但本轮不产出台词，终态改由 done.task_publish 表达
+    task_publish: TaskPublishPayload | None = None
 
 
 class InterjectOrchestrator:
@@ -112,7 +116,7 @@ class InterjectOrchestrator:
             return
 
         # 协议 5.4-8：整轮零条有效输出，可做一次修复性重试（不阻塞已收到的句子）
-        if not state.entries and self._repair_factory is not None:
+        if not state.entries and state.task_publish is None and self._repair_factory is not None:
             logger.warning(
                 "[interject] 零有效输出，做一次修复性重试 dialogue=%s turn=%s",
                 self.request.dialogue_instance_id, self.request.turn_id,
@@ -132,7 +136,7 @@ class InterjectOrchestrator:
                 return
             state = repair_state
 
-        if not state.entries:
+        if not state.entries and state.task_publish is None:
             closed = self._claim_closed_event()
             if closed is not None:
                 yield closed
@@ -143,7 +147,7 @@ class InterjectOrchestrator:
             )
             return
 
-        if self.request.mode == "task":
+        if self.request.mode == "task" and state.task_publish is None:
             plan = normalize_task_plan(state.entries, len(self.request.dialogue.remaining))
             logger.info(
                 "[interject] plan dialogue=%s turn=%s end=%s edits=%d implied_nochange=%s rejected=%s",
@@ -158,6 +162,9 @@ class InterjectOrchestrator:
                 dialogue_instance_id=self.request.dialogue_instance_id,
                 session_id=self.session_id,
                 usage={},
+                task_publish=(
+                    state.task_publish.to_wire() if state.task_publish is not None else None
+                ),
             )
         )
 
@@ -175,6 +182,10 @@ class InterjectOrchestrator:
                     if chunk.stage and signature != self._last_status:
                         self._last_status = signature
                         yield status_event(chunk.stage, chunk.ui_hint)
+                    continue
+                if isinstance(chunk, StreamTaskPublish):
+                    # 自动接取标记：只折叠进 done，不单独成 SSE 事件
+                    state.task_publish = chunk.payload
                     continue
                 if isinstance(chunk, StreamSSE):
                     # action/item_claim：旁路事件，不进入 JSONL/seq；也不是终态。

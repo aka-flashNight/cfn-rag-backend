@@ -666,10 +666,24 @@ TASK_FAIL_INSTRUCTION = (
 )
 
 TASK_CONFIRM_MERGE_INSTRUCTION = (
-    "这份委托已经正式派给玩家了（结果见上）。请以你的口吻把这事定下来："
-    "简短交代他要做什么、办完回来找你，语气按你和他的关系与当下情景来。"
-    "不要再问一次他接不接（他已经接了），也不要提系统/后台/草案这类词。"
+    "这份委托已经登记好了，但玩家还没真正接下。请以你的口吻把这事说清楚："
+    "委托登记好了，要他等你这边整理完再过来找你接取；不要让他现在就去办，"
+    "也不要提系统/后台/草案这类词。"
 )
+
+TASK_CONFIRM_MERGE_INSTRUCTION_OTHER_NPC = (
+    "这份委托已经登记好了，但玩家还没真正接下，而且接取不在你这里。"
+    "请以你的口吻把这事说清楚：委托要到「{npc}」那里接取，提醒玩家去找{npc}；"
+    "不要让他现在就去办，也不要提系统/后台/草案这类词。"
+)
+
+
+def task_confirm_merge_instruction(*, publish_npc: str = "", current_npc: str = "") -> str:
+    """确认发布后的收尾指令：接取 NPC 不是当前说话人时改成「去找 X 接」。"""
+    npc = (publish_npc or "").strip()
+    if npc and npc != (current_npc or "").strip():
+        return TASK_CONFIRM_MERGE_INSTRUCTION_OTHER_NPC.format(npc=npc)
+    return TASK_CONFIRM_MERGE_INSTRUCTION
 
 TASK_CANCEL_MERGE_INSTRUCTION = (
     "这份委托已经撤掉了（结果见上）。请以你的口吻自然收场，"
@@ -800,12 +814,19 @@ CONFIRM_ARGS_PAIRING_SYSTEM = (
 )
 
 
-def confirm_args_system(*, allow_return: bool) -> str:
+def confirm_args_system(*, allow_return: bool, player_just_accepted: bool = False) -> str:
     """按「接取 NPC 与完成 NPC 是否不同」选取 confirm 系统提示词。
 
     相同时走单任务版（无任何回访字段），避免模型被不存在的选项误导。
+    player_just_accepted：插话「我接了」的自动接取轮，接取对话要承接玩家原话。
     """
-    return CONFIRM_ARGS_PAIRING_SYSTEM if allow_return else CONFIRM_ARGS_SYSTEM
+    base = CONFIRM_ARGS_PAIRING_SYSTEM if allow_return else CONFIRM_ARGS_SYSTEM
+    if not player_just_accepted:
+        return base
+    return base + (
+        "\n本次接取对话会在玩家说完「我接了」之后立刻播放："
+        "第一句直接承接他的应承，不要再问一遍要不要接，也不要重复征询。"
+    )
 
 
 def build_finish_npc_reference(

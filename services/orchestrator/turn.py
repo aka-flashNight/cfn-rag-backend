@@ -87,7 +87,7 @@ from services.orchestrator.prompts import (
     SEARCH_MERGE_INSTRUCTION,
     TASK_CANCEL_MERGE_INSTRUCTION,
     TASK_CANCEL_NOOP_INSTRUCTION,
-    TASK_CONFIRM_MERGE_INSTRUCTION,
+    task_confirm_merge_instruction,
     build_confirm_args_user_prompt,
     build_confirm_retry_prompt,
     build_empty_reply_user_prompt,
@@ -353,6 +353,7 @@ async def generate_confirm_args(
     spoken_text: str = "",
     emotion: str = "",
     finish_npc_reference: str = "",
+    player_just_accepted: bool = False,
 ) -> ConfirmArgsOutcome:
     """生成 confirm 发布文本（title/description/两组或四组对话）。
 
@@ -364,7 +365,10 @@ async def generate_confirm_args(
     get_npc, finish_npc = resolve_task_npcs(draft, npc_name)
     allow_return = get_npc != finish_npc
     user_prompt = (
-        confirm_args_system(allow_return=allow_return) + "\n\n"
+        confirm_args_system(
+            allow_return=allow_return,
+            player_just_accepted=player_just_accepted,
+        ) + "\n\n"
         + build_confirm_args_user_prompt(
             draft_summary=draft_summary,
             npc_name=npc_name,
@@ -843,10 +847,20 @@ class TurnOrchestrator:
                         )
                         if published_block:
                             base_text = f"{base_text}\n\n{published_block}"
+                        publish_npc, _publish_finish_npc = resolve_task_npcs(
+                            draft_row.draft, self.npc_name,
+                        )
+                        same_publish_npc = (
+                            (publish_npc or "").strip() == (self.npc_name or "").strip()
+                        )
                         reply = (
                             base_text,
-                            TASK_CONFIRM_MERGE_INSTRUCTION,
-                            "这事就这么定了，去办吧。",
+                            task_confirm_merge_instruction(
+                                publish_npc=publish_npc, current_npc=self.npc_name,
+                            ),
+                            "委托登记好了，你过来找我接一下。"
+                            if same_publish_npc
+                            else f"委托登记好了，你去找{publish_npc}接一下。",
                             "委托已发布",
                         )
                     else:

@@ -404,6 +404,20 @@ class DonePayload(BaseModel):
     dialogue_instance_id: str
     session_id: str
     usage: dict[str, Any] = Field(default_factory=dict)
+    # 自动接取模式才带：本轮没有 AI 收尾台词，Host 据此推任务发布包给游戏侧。
+    task_publish: dict[str, Any] | None = None
+
+
+class TaskPublishPayload(BaseModel):
+    """`done.task_publish`：插话发布成功、需要游戏侧自动接取的任务信息。"""
+
+    task_id: int = Field(..., gt=0)
+    npc: str
+    slot_key: str | None = None
+    auto_accept: bool = True
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump()
 
 
 class ErrorPayload(BaseModel):
@@ -533,6 +547,17 @@ class StreamItemClaim(StreamSSE):
 
     def __new__(cls, payload: ItemClaimPayload) -> "StreamItemClaim":
         return super().__new__(cls, "item_claim", payload.to_wire())
+
+
+class StreamTaskPublish(StreamSSE):
+    """发布成功、需要游戏侧自动接取的标记（不进 SSE，折叠进 `done`）。"""
+
+    payload: TaskPublishPayload
+
+    def __new__(cls, payload: TaskPublishPayload) -> "StreamTaskPublish":
+        obj = super().__new__(cls, "task_publish", payload.to_wire())
+        obj.payload = payload
+        return obj
 
 
 def mute_event() -> SSEEvent:

@@ -7,11 +7,14 @@ from types import SimpleNamespace
 import pytest
 
 from services.dialogue_interject.context import DailyBlocks
+from services.dialogue_interject import item_actions
 from services.dialogue_interject.item_actions import (
     _run_item_take_action,
     _run_task_action,
+    stream_action_direct,
 )
 from services.dialogue_interject.item_claims import ITEM_CLAIMS
+from services.dialogue_interject.schemas import StreamTaskPublish, TaskPublishPayload
 from services.dialogue_interject.tools import DailyToolRuntime
 from tests.dialogue_interject import fixtures as fx
 from tests.dialogue_interject.helpers import make_request
@@ -144,7 +147,7 @@ async def test_task_accept_direct_loads_pending_draft(monkeypatch, request_facto
 
     async def _accept(self):
         captured["row"] = self.blocks.pending_draft_row
-        return "【办理结果】已发布", "收尾"
+        return "【办理结果】已发布", "收尾", None
 
     monkeypatch.setattr(DailyToolRuntime, "run_task_accept", _accept)
     request = make_request(request_factory(action={
@@ -164,7 +167,7 @@ async def test_task_accept_direct_is_idempotent(monkeypatch, request_factory):
 
     async def _accept(self):
         calls.append(1)
-        return "【办理结果】这份委托已经正式派给玩家了。", "收尾一句话"
+        return "【办理结果】这份委托已经正式派给玩家了。", "收尾一句话", None
 
     monkeypatch.setattr(DailyToolRuntime, "run_task_accept", _accept)
     memory = FakeMemory()
@@ -201,5 +204,93 @@ async def test_task_decline_direct_uses_cancel(monkeypatch, request_factory):
 
     result = await _run_task_action(request, _blocks(), llm=None)
 
-    assert result == ("【办理结果】这份委托已经撤销。", "收尾一句话")
+    assert result == ("【办理结果】这份委托已经撤销。", "收尾一句话", None)
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_accept_publish_meta_is_saved_and_replayed(monkeypatch):
+    calls = []
+    meta = TaskPublishPayload(task_id=321, npc=fx.NPC, slot_key="slot-1")
+
+    async def _accept(self):
+        calls.append(1)
+        return "【办理结果】这份委托已经正式派给玩家了。", "收尾", meta
+
+    monkeypatch.setattr(DailyToolRuntime, "run_task_accept", _accept)
+    memory = FakeMemory()
+    request = make_request(fx.daily_request(action={
+        "kind": "task_accept",
+        "action_id": "task-act-meta",
+    }))
+    blocks = _blocks(memory=memory)
+
+    first = await _run_task_action(request, blocks, llm=None)
+    second = await _run_task_action(request, blocks, llm=None)
+
+    assert first[2] == meta
+    assert second[2] == meta  # 重试沿用首次落库的发布标记
+    assert len(calls) == 1
+    saved = memory.actions["task-act-meta"]
+    assert saved["result"]["task_publish"] == {
+        "task_id": 321, "npc": fx.NPC, "slot_key": "slot-1", "auto_accept": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_action_direct_auto_accept_skips_final_llm(monkeypatch):
+    meta = TaskPublishPayload(task_id=654, npc=fx.NPC, slot_key="slot-1")
+    final_calls = []
+
+    async def _run_task(*_args, **_kwargs):
+        return "【办理结果】这份委托已经正式派给玩家了。", "收尾", meta
+
+    async def _final(*_args, **_kwargs):
+        final_calls.append(1)
+        yield '{"add":"去办吧。","emo":"普通"}\n'
+
+    monkeypatch.setattr(item_actions, "_run_task_action", _run_task)
+    monkeypatch.setattr(item_actions, "stream_final_llm", _final)
+    request = make_request(fx.daily_request(action={
+        "kind": "task_accept",
+        "action_id": "task-act-stream",
+    }))
+
+    chunks = [
+        chunk async for chunk in stream_action_direct(
+            request, blocks=_blocks(), client=object(),
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], StreamTaskPublish)
+    assert chunks[0].payload.task_id == 654
+    assert final_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stream_action_direct_keeps_final_llm_when_publish_meta_absent(monkeypatch):
+    final_calls = []
+
+    async def _run_task(*_args, **_kwargs):
+        return "【办理结果】这份委托已经正式派给玩家了。", "收尾", None
+
+    async def _final(*_args, **_kwargs):
+        final_calls.append(1)
+        yield '{"add":"去办吧。","emo":"普通"}\n'
+
+    monkeypatch.setattr(item_actions, "_run_task_action", _run_task)
+    monkeypatch.setattr(item_actions, "stream_final_llm", _final)
+    request = make_request(fx.daily_request(action={
+        "kind": "task_accept",
+        "action_id": "task-act-stream-2",
+    }))
+
+    chunks = [
+        chunk async for chunk in stream_action_direct(
+            request, blocks=_blocks(), client=object(),
+        )
+    ]
+
+    assert chunks == ['{"add":"去办吧。","emo":"普通"}\n']
+    assert final_calls == [1]

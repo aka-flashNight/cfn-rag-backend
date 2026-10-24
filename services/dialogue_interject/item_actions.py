@@ -26,6 +26,8 @@ from services.dialogue_interject.schemas import (
     InterjectRequest,
     ItemClaimPayload,
     StreamItemClaim,
+    StreamTaskPublish,
+    TaskPublishPayload,
 )
 from services.dialogue_interject.tools import DailyToolRuntime
 from services.llm import LLMClient, LLMConfig
@@ -45,12 +47,13 @@ async def stream_action_direct(
     """选项直连流：先处理动作，再用 tools=None 的最终轮生成台词。"""
     llm = client or LLMClient.for_config(resolve_llm_config(llm_config))
     action = request.action
+    publish = None
     if action is None:
         result_block = "【办理结果】没有可执行的动作。"
         instruction = "以角色口吻正常回应，不要提工具。"
         initial: tuple[StreamItemClaim, ...] = ()
     elif action.kind in ("task_accept", "task_decline"):
-        result_block, instruction = await _run_task_action(request, blocks, llm)
+        result_block, instruction, publish = await _run_task_action(request, blocks, llm)
         initial = ()
     elif action.kind in _ITEM_TAKE_KINDS:
         result_block, instruction, closed = await _run_item_take_action(request, blocks)
@@ -59,6 +62,11 @@ async def stream_action_direct(
         result_block = "【办理结果】未能识别的动作，已忽略。"
         instruction = "以角色口吻正常回应，不要提工具。"
         initial = ()
+
+    if publish is not None:
+        # 自动接取：不再生成收尾台词，游戏侧拿 done.task_publish 直接接取
+        yield StreamTaskPublish(publish)
+        return
 
     async for chunk in stream_final_llm(
         request,
@@ -76,13 +84,14 @@ async def _run_task_action(
     request: InterjectRequest,
     blocks: DailyBlocks,
     llm: Any,
-) -> tuple[str, str]:
+) -> tuple[str, str, TaskPublishPayload | None]:
     action = request.action
     assert action is not None
     memory = blocks.memory
     saved = await _load_saved(memory, action.action_id)
     if saved is not None:
-        return _saved_text(saved)
+        result_block, instruction = _saved_text(saved)
+        return result_block, instruction, _saved_publish(saved)
 
     # 任务装配不读草案（工具轮也不需要），选项直连必须在这里补读
     get_draft = getattr(memory, "get_draft", None)
@@ -96,8 +105,9 @@ async def _run_task_action(
             blocks = replace(blocks, pending_draft_row=draft_row)
 
     runtime = DailyToolRuntime(request, blocks, llm=llm)
+    publish: TaskPublishPayload | None = None
     if action.kind == "task_accept":
-        result_block, instruction = await runtime.run_task_accept()
+        result_block, instruction, publish = await runtime.run_task_accept()
     else:
         result_block, instruction = await runtime.run_task_decline()
     await _save_action(
@@ -105,9 +115,13 @@ async def _run_task_action(
         action.action_id,
         blocks.session_id,
         action.kind,
-        {"result_block": result_block, "instruction": instruction},
+        {
+            "result_block": result_block,
+            "instruction": instruction,
+            "task_publish": publish.to_wire() if publish is not None else None,
+        },
     )
-    return result_block, instruction
+    return result_block, instruction, publish
 
 
 async def _run_item_take_action(
@@ -293,3 +307,16 @@ def _saved_text(saved: dict[str, Any]) -> tuple[str, str]:
         str(result.get("result_block") or "【办理结果】这个动作之前已经处理过了。"),
         str(result.get("instruction") or "以角色口吻正常回应，不要重复办理，不要提工具。"),
     )
+
+
+def _saved_publish(saved: dict[str, Any]) -> TaskPublishPayload | None:
+    """重试同一 action_id 时补发 `done.task_publish`，别再走一次自动接取流程。"""
+    result = saved.get("result") if isinstance(saved, dict) else None
+    data = result.get("task_publish") if isinstance(result, dict) else None
+    if not isinstance(data, dict) or not data:
+        return None
+    try:
+        return TaskPublishPayload(**data)
+    except Exception as exc:
+        logger.warning("[interject] 历史 task_publish 解析失败: %s", exc)
+        return None
