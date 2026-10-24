@@ -1139,6 +1139,7 @@
   "虎妙": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "女",
    "emotions": [
     "普通"
    ],
@@ -1150,6 +1151,7 @@
   "人修罗": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "男",
    "emotions": [
     "普通"
    ],
@@ -1161,6 +1163,7 @@
   "三蝶": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "女",
    "emotions": [
     "普通"
    ],
@@ -1172,6 +1175,7 @@
   "阿卡": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "男",
    "emotions": [
     "普通"
    ],
@@ -1183,6 +1187,7 @@
   "researcher": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "女",
    "emotions": [
     "普通"
    ],
@@ -1194,6 +1199,7 @@
   "调酒师": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "女",
    "emotions": [
     "普通"
    ],
@@ -1205,6 +1211,7 @@
   "武器大师": {
    "favorability": 10,
    "relationship_level": "陌生",
+   "sex": "男",
    "emotions": [
     "普通"
    ],
