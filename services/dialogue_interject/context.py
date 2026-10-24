@@ -412,11 +412,21 @@ async def assemble_blocks(
         if request.action is None:
             pending_item_claim = ITEM_CLAIMS.pending(request.dialogue_instance_id)
         if pending_item_claim is not None:
-            pending_claim_block = "\n".join([
+            claim_lines = [
                 "【待处理的索取】",
                 f"你正在向玩家索取 {pending_item_claim.quantity} 个 "
                 f"{pending_item_claim.item_name}，玩家还没有交付。",
-            ])
+            ]
+            counts = getattr(request, "player_item_counts", None) or {}
+            try:
+                have = int(counts.get(pending_item_claim.item_name, 0) or 0)
+            except (TypeError, ValueError):
+                have = 0
+            if have <= 0:
+                claim_lines.append("玩家看起来没有这个物品。")
+            elif have < int(pending_item_claim.quantity or 0):
+                claim_lines.append("玩家看起来拥有该物品的数量不足。")
+            pending_claim_block = "\n".join(claim_lines)
 
     # ---- 待确认草案（B2 起支持 confirm/cancel/update；任务模式不读）----
     # 草案与终端共用一把钥匙：优先 MemoryStore 的 session_id；未建会话时退回

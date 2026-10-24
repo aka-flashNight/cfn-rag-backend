@@ -122,6 +122,44 @@ async def test_assemble_daily_blocks_uses_npc_state_and_emotion_whitelist(memory
     assert "好感度是 7" in blocks.system_prompt
 
 
+async def test_pending_claim_block_reports_inventory_shortage_on_reply_turn(memory_store):
+    from services.dialogue_interject.item_claims import ITEM_CLAIMS
+
+    async def _blocks(counts):
+        return await assemble_daily_blocks(
+            make_request(fx.daily_request(player_item_counts=counts)),
+            npc_manager=FakeNPCManager(),
+            game_data=FakeGameData(),
+            memory=memory_store,
+            rag_enabled=False,
+        )
+
+    # 索取还没发生时（NPC 发问那一轮）不提示玩家持有情况。
+    blocks = await _blocks({})
+    assert blocks.pending_claim_block == ""
+
+    ITEM_CLAIMS.create(
+        fx.DAILY_DIALOGUE_ID, npc=fx.NPC, item_name="普通hp药剂", quantity=2, turn_no=1,
+    )
+    blocks = await _blocks({"普通hp药剂": 1})
+    assert "【待处理的索取】" in blocks.pending_claim_block
+    assert "玩家看起来拥有该物品的数量不足。" in blocks.pending_claim_block
+
+    ITEM_CLAIMS.close(fx.DAILY_DIALOGUE_ID)
+    ITEM_CLAIMS.create(
+        fx.DAILY_DIALOGUE_ID, npc=fx.NPC, item_name="普通hp药剂", quantity=1, turn_no=1,
+    )
+    blocks = await _blocks({})
+    assert "玩家看起来没有这个物品。" in blocks.pending_claim_block
+
+    ITEM_CLAIMS.close(fx.DAILY_DIALOGUE_ID)
+    ITEM_CLAIMS.create(
+        fx.DAILY_DIALOGUE_ID, npc=fx.NPC, item_name="普通hp药剂", quantity=1, turn_no=1,
+    )
+    blocks = await _blocks({"普通hp药剂": 1})
+    assert "玩家看起来" not in blocks.pending_claim_block
+
+
 async def test_stream_daily_llm_filters_content_and_exposes_no_tools():
     client = FakeLLMClient(['{"add":"你', '好","emo":"普通"}\n'])
     request = make_request(fx.daily_request())

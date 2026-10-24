@@ -185,6 +185,8 @@ class InterjectRequest(BaseModel):
     action: InterjectAction | None = None
     #: 仅 daily 索取池使用；只带名字，不带数量
     player_item_names: list[str] = Field(default_factory=list)
+    #: 仅 daily 索取回复轮使用；玩家当前持有数量快照（含“金币”），只作提示
+    player_item_counts: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("npc", "player_input")
     @classmethod
@@ -232,6 +234,32 @@ class InterjectRequest(BaseModel):
             )
         return out
 
+    @field_validator("player_item_counts")
+    @classmethod
+    def _normalize_item_counts(cls, values: dict[str, int]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        truncated = 0
+        for raw_name, raw_count in (values or {}).items():
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            if len(name) > PLAYER_ITEM_NAME_MAX:
+                name = name[:PLAYER_ITEM_NAME_MAX]
+                truncated += 1
+            count = max(0, int(raw_count or 0))
+            if name in out:
+                out[name] = max(out[name], count)
+                continue
+            out[name] = count
+            if len(out) >= PLAYER_ITEM_NAMES_MAX:
+                break
+        if len(values or {}) > len(out) or truncated:
+            logger.info(
+                "[interject] player_item_counts 归一化：原 %d 条，采用 %d 条，截断 %d 条",
+                len(values or {}), len(out), truncated,
+            )
+        return out
+
     @model_validator(mode="after")
     def _check_mode_kind(self) -> "InterjectRequest":
         # 协议 5.1：mode=daily 只能 daily；mode=task 只能 task_pre/task_post
@@ -250,6 +278,8 @@ class InterjectRequest(BaseModel):
                 raise ValueError(f"action.kind={self.action.kind} 只允许 mode=daily")
         if self.player_item_names and self.mode != "daily":
             raise ValueError("player_item_names 只允许 mode=daily")
+        if self.player_item_counts and self.mode != "daily":
+            raise ValueError("player_item_counts 只允许 mode=daily")
         return self
 
 

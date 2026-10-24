@@ -105,6 +105,19 @@ def test_player_item_names_normalized_and_daily_only():
         InterjectRequest.model_validate(_task(player_item_names=["M4A1"]))
 
 
+def test_player_item_counts_normalized_and_daily_only():
+    counts = {"负数": -2, " 长" + "字" * 120: 3}
+    for i in range(250):
+        counts[f"物品{i}"] = i
+    request = InterjectRequest.model_validate(_daily(player_item_counts=counts))
+    assert len(request.player_item_counts) == 200
+    assert request.player_item_counts["负数"] == 0
+    assert all(len(name) <= 100 for name in request.player_item_counts)
+
+    with pytest.raises(ValidationError):
+        InterjectRequest.model_validate(_task(player_item_counts={"M4A1": 1}))
+
+
 def test_stream_action_and_claim_shapes():
     action = StreamAction(ActionPayload(
         action_id="a1", npc=fx.NPC, item_name="普通hp药剂",
