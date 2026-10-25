@@ -1,8 +1,4 @@
-"""全局配置（仅 local 本地打包路线）。
-
-对应 docs/v3-developer/01-总体架构与核心决策.md §8。Server Profile 的全部
-配置项（Redis/Qdrant/Postgres/arq/后端选择）随该路线整体下线。
-"""
+"""全局配置（本地单用户形态，exe / 源码共用）。"""
 
 from __future__ import annotations
 

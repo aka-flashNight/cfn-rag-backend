@@ -1,8 +1,7 @@
 # CFN-RAG MCP Server — 游戏数据查询与创作辅助
 #
 # 【当前状态：代码保留，未启用】
-# 9679ffe（v3/P0）曾将本目录随 server profile 一并删除，但 MCP 与 server profile
-# 无关（走 stdio，不依赖 Redis/Postgres/Qdrant），属误伤，故从 master 取回。
+# MCP 走 stdio，不依赖外部服务，与本地 exe 运行形态无关。
 #
 # 未启用的原因与后续方向：
 # - main.py 不引用本包，exe 打包清单亦不含，故对本地 exe 用户零影响；
