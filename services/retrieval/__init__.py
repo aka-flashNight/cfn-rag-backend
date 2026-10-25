@@ -4,8 +4,9 @@
 - OnnxEmbedder / get_default_embedder
 - VectorStore / Node / IndexStaleError
 - RetrievalEngine / RetrievalInput / RetrievalBundle / rrf_fuse / cjk_tokenizer
-- load_corpus / compute_corpus_fingerprint
 - format_retrieval_context
+语料装配与指纹（load_corpus / compute_corpus_fingerprint）不在本包再导出，
+按子模块取：``from services.retrieval.loader import ...``。
 """
 
 from services.retrieval.embedder import OnnxEmbedder, get_default_embedder, set_default_embedder

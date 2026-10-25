@@ -369,11 +369,8 @@ async def delete_session(session_id: str) -> None:
 )
 async def reset_knowledge_base_endpoint() -> ResetKnowledgeBaseResponse:
     try:
-        from services.retrieval import (
-            compute_corpus_fingerprint,
-            get_retrieval_engine,
-            load_corpus,
-        )
+        from services.retrieval import get_retrieval_engine
+        from services.retrieval.loader import compute_corpus_fingerprint, load_corpus
 
         def _rebuild() -> int:
             engine = get_retrieval_engine()
