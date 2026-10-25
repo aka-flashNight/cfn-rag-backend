@@ -182,6 +182,47 @@ def test_finish_npc_without_record_or_states_gets_plain_name(game_data):
     ) in no_states
 
 
+def test_third_party_get_npc_gets_attrs_scene_after_finish_block(game_data):
+    text = _detailed_draft_summary(
+        _draft(get_npc="武器大师", finish_npc="lochan"), game_data, npc_states=STATES,
+    )
+    lines = text.splitlines()
+    finish_idx = lines.index(
+        "完成NPC: lochan（性别：女）（阵营：闲杂人等）（身份或称呼：谜之兔女郎）"
+    )
+    get_line = (
+        "接取NPC: 武器大师（性别：男）（阵营：闲杂人等）（身份或称呼：武器大师）；所在场景："
+        "健身房（基地场景-健身房）、第一防线（地图-第一防线防区）"
+    )
+    assert lines.index(get_line) > finish_idx
+    assert text.count("接取NPC:") == 1
+
+
+def test_get_npc_already_in_rag_context_is_not_repeated(game_data):
+    text = _detailed_draft_summary(
+        _draft(get_npc="武器大师", finish_npc="lochan"),
+        game_data,
+        npc_states=STATES,
+        rag_context_text="【你提到的角色】「武器大师」（身份或称呼：武器大师）；所在场景：健身房。",
+    )
+    assert "接取NPC: 武器大师" in text.splitlines()
+    assert "接取NPC: 武器大师（性别" not in text
+
+
+def test_get_npc_same_as_finish_or_publisher_has_no_extra_block(game_data):
+    same_finish = _detailed_draft_summary(
+        _draft(get_npc="武器大师", finish_npc="武器大师"), game_data, npc_states=STATES,
+    )
+    assert "接取NPC: 武器大师" in same_finish.splitlines()
+    assert same_finish.count("接取NPC:") == 1
+
+    same_publisher = _detailed_draft_summary(
+        _draft(get_npc="Pig", finish_npc="lochan"), game_data, npc_states=STATES,
+    )
+    assert "接取NPC: Pig" in same_publisher.splitlines()
+    assert "接取NPC: Pig（性别" not in same_publisher
+
+
 # ---------------------------------------------------------------------------
 # B8-3 草案摘要：逐关卡怪物块
 # ---------------------------------------------------------------------------

@@ -33,6 +33,16 @@ def _draft_item_role_notes(draft: dict[str, Any], item_name: str) -> list[str]:
     return notes
 
 
+def _npc_in_text(npc_name: str, text: Optional[str]) -> bool:
+    """NPC 名是否已出现在前文（大小写/空白归一），避免重复补信息块。"""
+
+    def _norm(value: Any) -> str:
+        return "".join(str(value or "").lower().split())
+
+    name = _norm(npc_name)
+    return bool(name) and name in _norm(text)
+
+
 def _npc_shop_marker(
     game_data: Optional[GameDataRegistry],
     npc_name: str,
@@ -215,9 +225,29 @@ def _detailed_draft_summary(
     npc_name_fallback = draft.get("npc_name") or "?"
     # 商店归属＝发布 NPC：奖励/提交/持有里由他自己在售的物品要标出来，避免聊天侧信息遗漏
     shop_owner = str(draft.get("npc_name") or "")
-    lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
-    # 完成 NPC ≠ 发布 NPC 时补其属性与所在场景（B8-3）：无记录/查不到时对应片段省略、不附指示句
+    get_npc = (draft.get("get_npc") or "").strip() or str(npc_name_fallback)
     finish_npc = (draft.get("finish_npc") or "").strip() or str(npc_name_fallback)
+    # 三方任务：接取 NPC 既不是当前说话人、也不是完成 NPC，且检索上下文没出现过时，
+    # 把属性/场景补在完成 NPC 块后面，避免模型只看到名字却不知道去哪找人。
+    get_attrs = ""
+    get_scene = ""
+    get_line_deferred = False
+    if (
+        get_npc != npc_name_fallback
+        and get_npc != finish_npc
+        and not _npc_in_text(get_npc, rag_context_text)
+    ):
+        from services.npc.scene_context import npc_attributes_text, npc_scene_text
+
+        get_attrs = npc_attributes_text(npc_states, get_npc)
+        if game_data is not None:
+            map_reg = getattr(game_data, "map_registry", None)
+            if map_reg is not None:
+                get_scene = npc_scene_text(map_reg, get_npc)
+        get_line_deferred = bool(get_attrs or get_scene)
+    if not get_line_deferred:
+        lines.append(f"接取NPC: {get_npc}")
+    # 完成 NPC ≠ 发布 NPC 时补其属性与所在场景（B8-3）：无记录/查不到时对应片段省略、不附指示句
     finish_attrs = ""
     finish_scene = ""
     if finish_npc != npc_name_fallback:
@@ -233,6 +263,9 @@ def _detailed_draft_summary(
         lines.append("非同阵营npc你未必知道准确场景名，但知道大致情况，根据你的人设决定。")
     else:
         lines.append(f"完成NPC: {finish_npc}{finish_attrs}")
+    if get_line_deferred:
+        get_suffix = f"；所在场景：{get_scene}" if get_scene else ""
+        lines.append(f"接取NPC: {get_npc}{get_attrs}{get_suffix}")
 
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:

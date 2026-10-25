@@ -154,4 +154,4 @@ def test_confirm_instruction_names_publish_npc_only_when_different():
 
     assert "台词里要指明具体名字" not in same
     assert "「researcher」" in other
-    assert "台词里要指明具体名字，让玩家知道找谁接任务" in other
+    assert "台词里要指明具体名字和大概位置，让玩家知道找谁接任务" in other

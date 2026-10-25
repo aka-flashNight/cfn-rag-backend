@@ -436,7 +436,7 @@ def test_confirm_merge_instruction_routes_to_publish_npc():
     assert "还没真正接下" in same
     assert NPC_B in other
     assert "来找你接取" not in other
-    assert "台词里要指明具体名字" in other
+    assert "台词里要指明具体名字和大概位置" in other
     assert "台词里要指明具体名字" not in same
 
 
