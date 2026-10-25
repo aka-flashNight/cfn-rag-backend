@@ -404,6 +404,14 @@ async def generate_confirm_args(
     if args:
         issues = validate_confirm_dialogues(args, get_npc=get_npc, finish_npc=finish_npc)
         if issues:
+            # 这次重试会完整重生成一遍，是接取等待翻倍的实际来源；成功重试不会再
+            # 走到降级分支，所以必须在这里把校验问题和首轮原文留下，否则只剩
+            # warnings=0，事后无法判断模型首轮错在哪个场次/说话人。
+            logger.warning(
+                "confirm 对话校验未通过，触发一次修正重试: issues=%s raw=%r",
+                issues,
+                raw_text[:4000],
+            )
             # 只对可机器判定的校验问题重试一次；调用异常/解析失败不重试（已在上方兜底）
             retry_messages = [
                 *messages,

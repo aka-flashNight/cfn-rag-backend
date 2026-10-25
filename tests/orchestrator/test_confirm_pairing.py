@@ -196,6 +196,24 @@ async def test_retry_once_then_accept_pairing(env):
     assert "$PC" in retry_messages[-1]["content"]
 
 
+async def test_retry_logs_validation_issue_and_first_output(env, caplog):
+    with caplog.at_level("WARNING", logger="services.orchestrator.turn"):
+        args, warnings = await _run(env, [_bad_speaker_args(), _valid_args()])
+
+    assert warnings == []
+    assert args["finish_dialogue"][0]["name"] == NPC_B
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "confirm 对话校验未通过" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "finish_dialogue" in messages[0]
+    assert NPC_A in messages[0]
+    assert NPC_B in messages[0]
+    assert "raw=" in messages[0]
+
+
 async def test_retry_usage_accumulates_twice(env):
     orch = _orch(env)
     env.fake.add_chat(
