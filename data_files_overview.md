@@ -740,6 +740,72 @@
     - 将某个或若干插件作为任务目标（例如“收集某类插件”）；结合 `items` 系统中的价格与插件稀有度，为此类任务设置更高但受控的奖励区间。
     - 也可以作为任务奖励，但要根据玩家的进度来匹配。阶段1-7之中，低级对应1-2，中级对应2-3，高级对应4及以上。
 
+### 4.6 NPC 装备数据（`units/units.json`）与物品 `title`
+
+> 2026-10-17 新增口径。后端用途：聊天 system 的 NPC 固定层拼「你身上的装备是：…」
+> （`services/npc/npc_equipment.py`，插在 appearance 之后、任务发布硬约束之前）。
+
+**文件**：`data/units/units.json`，顶层数组，共 463 条；`"NPC": true` 的只有 **24 条**（不是 36）。
+
+**单条结构**：
+
+```json
+{
+  "id": 0,
+  "spritename": "...",
+  "level": 60,
+  "name": "Andy",
+  "is_hostile": true,
+  "height": 200,
+  "data": {
+    "primary": "黄金QBZ的Andy版",
+    "melee": "绝地武士佩剑",
+    "head": "Andy领子-NPC",
+    "body": "Andy上装-NPC",
+    "leg": "Andy下装-NPC",
+    "hand": "Andy装手套-NPC",
+    "foot": "黑色板鞋",
+    "neck": "东区最强战士项链",
+    "gender": "男", "face": "...", "hairstyle": "..."
+  }
+}
+```
+
+- `data` 的值**直接是物品的 `<name>`**（不是 displayname），要经 `items` 注册表解析出展示字段。
+- 字段 → 中文标签（固定输出顺序，来自游戏仓 `scripts/逻辑系统分区/兵种系统_兼容.as`）：
+  `primary`→长枪、`secondary`→手枪、`secondary2`→副手枪、`melee`→刀、`grenade`→手雷、
+  `head`→头部装备、`body`→上装装备、`leg`→下装装备、`hand`→手部装备、`foot`→脚部装备、`neck`→颈部装备。
+- **`gender` / `face` / `hairstyle` 不是装备**，必须排除。
+- 24 个 NPC：Pig、Boy、King（各重复两条）、终结者改量X1、终结者改量X2、Blue、Andy、The Girl、
+  吉他、键盘、主唱、重装兵、突击兵、弹药兵、翅虎、火凤、黑龙、史诗黑铁、远古牛仔、BYD 小F、ShopGirl。
+  其中吉他、键盘、主唱、重装兵、突击兵、弹药兵、翅虎、火凤、黑龙、史诗黑铁、远古牛仔的 `data` 是空对象，
+  装备块整块不输出。
+- 名字对不齐是常态：`npc_state_db` 的 `Andy Law` ↔ units 的 `Andy`、`Shop Girl` ↔ `ShopGirl`、
+  `小F` ↔ `BYD 小F`（`map_definition` 的 runtimeNames 对这三个帮不上忙，不要依赖）。
+  匹配口径＝casefold + 去全部空白后先精确、再唯一包含；同一名字多条记录载荷相同取任意，载荷不同 fail-closed。
+
+**物品侧新增字段 `Item.title`**：来自 `<data><title>`，含 `<FONT>` 等标签时用 `strip_game_markup` 去标签并压缩空白
+（例：`<title>&lt;FONT COLOR='#C80000'&gt;完美士兵&lt;/FONT&gt;</title>` → `完美士兵`；`K5项链` 的 title 是 `永恒强者`）。
+装备块里以「称号：X」追加，颈部是重点，其他部位有 title 也同样追加。
+
+**块格式**（只输出实际存在的项；每项以「；」结尾）：
+
+```
+你身上的装备是：
+头部装备：Andy领子-NPC，重量0kg，介绍：……；
+颈部装备：东区最强战士项链，重量0kg，介绍：……；称号：完美士兵；
+```
+
+- 展示名用 `displayname`（为空回退 `name`）；重量非数字则省略「重量」；介绍为空则省略「介绍」。
+- 介绍末尾已有的句号/分号先去掉再统一补「；」，避免「。。；」。
+- 不写「（无）」「未装备」这类占位项。
+
+**共用段落（大段重复介绍）**：只处理 ≥20 字符（Python `len`）的重复块，
+`difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks()`；
+共享段按首次出现顺序编号 1、2、3…，首次出现那条用 `<共用段落N开始> … <共用段落N结束>` 包住，
+后续物品同一段替换为 `<此处与共用段落N相同>`；重叠不嵌套；完全相同的两条介绍＝第一条整段标记、
+第二条整条「此处与共用段落N相同」；其余文本逐字保留，**不调模型**。
+
 ### 5. 关卡数据（stages）与解锁条件、资源箱掉落
 
 #### 5.1 关卡解锁配置：`__list__.xml`
@@ -1396,7 +1462,7 @@ Step 3: 玩家接受后调用 confirm_agent_task，传入最终标题、说明�
 | `level_range` | `[int, int]` | 玩家当前阶段的等级区间，如 `[1, 20]` |
 | `main_task_range` | `[int, int]` | 玩家当前阶段的主线任务 ID 区间，如 `[1, 50]` |
 | `reward_budget` | `object` | 仅含 `final_min`、`final_max`（金币等价总价值参考上下限，已含任务类型倍率与好感修正）；校验 V7 不读取本对象，按草案实算；含提交/持有时实际上限常高于 `final_max` |
-| `existing_tasks` | `list` | 当前 NPC 已发布的任务列表 `[{id, title, type}]`，供 LLM 避免重复 |
+| `existing_tasks` | `list` | 当前 NPC 已发布过的 **Agent 委托** `[{title, completion}]`（任务名＋通关条件），供 LLM 避免重复。只含 `get_npc` 等于该 NPC 的记录，按任务 id **倒序**，最多 15 条；超出时另给 `truncated: true`。读取范围＝`data/task/agent_tasks.json` ∪ 当前绑定存档的同名文件（存档覆盖同 id）；**主线/支线任务不在其列**（它们在 `task/*.json`，`TaskRegistry` 也排除了 `agent_tasks.json`） |
 | `reward_item_candidates` | `list` | 根据 `reward_types` 筛选的可选奖励物品 `[{name, type, price, level?, source}]`，`source` 为 `"本NPC商店"` 或 `"任务奖励可选"`（任务侧按主线/前置/佣兵/其余分档，层内随机后截断）；可选 `reward_keywords` 调整优先级；`武器` 类奖励含 `use=手雷` 的消耗品 |
 | `task_rules` | `str` | 该任务类型的思路说明、限制条件、注意事项（纯文本，供 LLM 理解规则） |
 
@@ -1917,3 +1983,28 @@ LLM 不应在每次对话中都尝试发布任务。以下是合理的触发场�
 | Phase 3 | 5-7 天    | LangGraph 与现有 OpenAI 兼容 API 的集成调试    |
 | Phase 4 | 3-5 天    | 任务协商的多轮状态管理；文件原子写入可靠性       |
 | Phase 5 | 持续迭代   | 需要实际游戏测试数据来调优                      |
+
+---
+
+## 7. v3 落地说明：agent_tasks.json / agent_text.json 的写入调用位置
+
+> 本节为 v3 重构后的实现现状记录（2026-09-06）；上文第 6 节的任务规则、格式规范、校验口径继续有效。
+
+v3 中这两个文件的**唯一写入路径**是一条同步动作链，均带原子写入（临时文件 + 替换）：
+
+1. **触发点**：玩家明确接受草案后，聊天主 Agent 的 meta 行委派指令（act）= `task_confirm`，
+   由回合编排器在后台子 Agent 之外**同步执行**（`services/orchestrator/turn.py`，快路径 <300ms）。
+2. **动作入口**：`services/agent_tools/handlers.py` 的 `execute_confirm_agent_task(...)`
+   —— 先做一次轻量 LLM 调用生成发布文本参数（title/description/接取与完成对话；
+   LLM 失败时回退模板文案），宽松归一化后进入写入。
+3. **写入实现**：`services/agent_tools/task_tools.py` —— 读取现有
+   `agent_tasks.json` / `agent_text.json` → 分配 200001+ 递增任务 ID → 按 §4 格式
+   拼装任务与文本 JSON → 原子写入两个文件 → 清除 `session_task_drafts` 中的草案。
+4. **配套规则（v3 新增/收紧）**：
+   - 候选池严格化：任务候选注册表记录来源文件，核心池**排除 `agent_tasks.json` 与
+     `mercenary_tasks.json`**（副本/活动类任务与历史生成任务不再进入候选，见
+     `services/game_data/task_registry.py`）；
+   - 定价卡与校验同源：奖励区间数字直接调用校验器 `_compute_reward_value_range`
+     生成（`services/agent_tools/pricing_rules.py`），含提交品/持有品加成公式；
+   - 校验失败先自动微调数值（对齐奖励阶梯），选择类问题才打回（`services/agent_tools/repair.py`）。
+5. **取消路径**：act = `task_cancel` 走同一同步动作链删除草案，不触碰任何游戏文件。

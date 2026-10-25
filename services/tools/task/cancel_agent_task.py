@@ -1,4 +1,8 @@
-"""cancel_agent_task tool — 清除当前待确认草案。"""
+"""cancel_agent_task tool — 清除当前待确认草案。
+
+v3：cancel 由 orchestrator 的同步动作（meta.act=task_cancel）直接触发，
+本工具保留给兜底路径 / 子 Agent 语义完整性使用。
+"""
 
 from __future__ import annotations
 
@@ -33,11 +37,16 @@ class CancelAgentTaskTool(BaseTool):
     parameters_schema = CANCEL_PARAMETERS_SCHEMA
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        result_json, updated_draft = execute_cancel_agent_task(
+        outcome = execute_cancel_agent_task(
             args,
             pending_draft=ctx.pending_draft,
         )
-        return ToolResult(result_json=result_json, updated_pending_draft=updated_draft)
+        return ToolResult(
+            result_json=outcome.result_json,
+            updated_pending_draft=outcome.draft,
+            bargain_count=outcome.bargain_count,
+            draft_commit_valid=outcome.draft_commit_valid,
+        )
 
 
 tool = CancelAgentTaskTool()

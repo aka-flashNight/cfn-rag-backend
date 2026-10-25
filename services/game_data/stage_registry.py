@@ -6,7 +6,7 @@ from xml.etree import ElementTree as ET
 
 from services.game_progress import get_progress_stage_config, is_valid_stage_root
 
-from .models import LootCrate, LootDrop, StageInfo
+from .models import EnemySpawn, LootCrate, LootDrop, StageInfo
 from .parsers import _safe_int, discover_list_entries, parse_xml
 from .text_utils import strip_game_markup
 
@@ -17,6 +17,7 @@ class StageRegistry:
     - data/stages/list.xml：列出子目录（大区）
     - data/stages/<area>/__list__.xml：列出 StageInfo（含 UnlockCondition）
     - data/stages/<area>/<stage>.xml：扫描箱子掉落（纸箱/资源箱/装备箱）
+      与敌人条目（<Enemy>，供关卡怪物块使用）
     """
 
     def __init__(self, *, data_root: Path):
@@ -25,6 +26,7 @@ class StageRegistry:
 
         self._stage_infos: dict[tuple[str, str], StageInfo] = {}
         self._loot_cache: dict[tuple[str, str], list[LootCrate]] = {}
+        self._enemy_cache: dict[tuple[str, str], list[EnemySpawn]] = {}
 
     def load(self) -> None:
         list_xml = self.stages_root / "list.xml"
@@ -48,6 +50,7 @@ class StageRegistry:
 
         self._stage_infos = infos
         self._loot_cache = {}
+        self._enemy_cache = {}
 
     def _parse_stage_list(self, area: str, list_path: Path) -> list[StageInfo]:
         root = parse_xml(list_path)
@@ -174,4 +177,32 @@ class StageRegistry:
                 crates.append(LootCrate(identifier=identifier, drops=drops, raw={"stage_path": str(stage_path)}))
 
         return crates
+
+    def get_enemy_spawns(self, area: str, stage_name: str) -> list[EnemySpawn]:
+        key = (area, stage_name)
+        if key in self._enemy_cache:
+            return list(self._enemy_cache[key])
+
+        stage_fp = (self.stages_root / area / f"{stage_name}.xml").resolve()
+        if not stage_fp.exists():
+            self._enemy_cache[key] = []
+            return []
+
+        spawns = self._scan_enemy_spawns(stage_fp)
+        self._enemy_cache[key] = spawns
+        return list(spawns)
+
+    @staticmethod
+    def _scan_enemy_spawns(stage_path: Path) -> list[EnemySpawn]:
+        root = parse_xml(stage_path)
+        spawns: list[EnemySpawn] = []
+
+        for el in root.findall(".//Enemy"):
+            unit_type = (el.findtext("Type") or "").strip()
+            if not unit_type:
+                continue
+            quantity = _safe_int(el.findtext("Quantity"), default=0)
+            spawns.append(EnemySpawn(unit_type=unit_type, quantity=quantity))
+
+        return spawns
 

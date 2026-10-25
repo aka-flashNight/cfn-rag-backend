@@ -1,0 +1,739 @@
+"""回合上下文装配（对应 docs/v3-developer/03 §7）。
+
+并行 asyncio.gather：NPC 状态 / 会话记忆（近 N 条 + 滚动摘要 + 待确认草案）/
+Tier-1 检索（≤3 变体单次嵌入，经 to_thread）/ 提及 NPC 子串匹配 / appearance。
+立绘（07 §4）：仅 purpose=chat 且模型 Profile 允许视觉（vision 非 False）且该模型
+未被标记图像不支持时，按 current_emotion（上回合 meta emo；空则「普通」）取图，
+结果放 TurnContext.image_data_url；立绘不可用/任何失败 → None，纯文本不报错。
+save_info 填入集成层绑定投影 {slot_key, character, progress, scene, player}（B2-1）；
+未绑定＝None。阶段判定：绑定存档可推导时以此为准，否则用请求携带的 progress_stage。
+长期记忆（B3-3）：启用时按 (作用域, NPC) 读一份快照进 TurnContext.long_term；
+另外把「本 NPC 发布、当前存档已完成的委托」实时拼成 finished_task_block（直读磁盘）。
+
+任务三块（2026-10-17）：已完成（上面那块）之外再加两块未完成委托——
+① published_task_block：「刚发布的委托」的达成要点，记录在会话库
+   （session_published_task_highlights），每轮装配时递减、归零即删，任务完成即清；
+② active_task_block：绑定投影 progress.tasks_active 里仍在途的委托，每轮实时算、只读、不记账。
+两块都在 data_root ＋ save_info 可用时才尝试；不可用时不消耗轮次。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+from services.agent_tools.finished_tasks import FinishedTaskBlock
+from services.dialogue_interject.item_ledger import load_item_ledger_block
+from services.game_progress import (
+    StageConfig,
+    derive_progress_stage,
+    get_player_level,
+    get_progress_stage_config,
+)
+from services.integration.state import get_integration_state
+from services.llm import LLMConfig
+from services.memory.long_term import LongTermSnapshot, load_snapshot, resolve_enabled
+from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
+from services.npc.manager import NPCManager, NPCState
+from services.npc.scene_context import npc_scene_text
+from services.orchestrator.prompts import (
+    FACTION_ALIASES,
+    PC_CHAR_PLACEHOLDER,
+    SKIP_FACTION_SAME_CAMP,
+    progress_stage_desc,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_text(text: str) -> str:
+    """小写 + 去空白（NPC 名称/阵营/头衔模糊匹配，保留资产）。"""
+    if not text:
+        return ""
+    return "".join(str(text).lower().split())
+
+
+def _scene_suffix(map_reg: Any, name: str) -> str:
+    """行尾的所在场景片段；无驻地或地图缺载时返回空串（有才补，没有不补）。
+
+    结尾带句号：有些模型不把换行当句子边界，缺终止符会把下一行读成同一句。
+    """
+    scene_text = npc_scene_text(map_reg, name)
+    return f"；所在场景：{scene_text}。" if scene_text else ""
+
+
+def find_mentioned_npcs(
+    query: str,
+    current_npc: str,
+    all_states: dict[str, NPCState],
+    map_reg: Any = None,
+) -> tuple[list[str], set[str]]:
+    """从玩家输入中发现提及的其他角色（名称/阵营/头衔子串匹配，保留资产）。
+
+    跳过「成员/彩蛋」阵营（除非当前 NPC 自己属于它们）。
+    返回 (格式化块列表, 被提及 NPC 名集合)。
+    """
+    skip_factions = {"成员", "彩蛋"}
+    current_faction = (all_states.get(current_npc).faction if all_states.get(current_npc) else None)
+    if current_faction in skip_factions:
+        skip_factions = set()
+
+    mentioned: list[str] = []
+    mentioned_names: set[str] = set()
+    normalized_query = _normalize_text(query)
+
+    for name, state in all_states.items():
+        if name == current_npc or name == PC_CHAR_PLACEHOLDER:
+            continue
+        if state.faction in skip_factions:
+            continue
+        terms: list[str] = [name]
+        if state.faction:
+            terms.append(state.faction)
+            for faction_name, aliases in FACTION_ALIASES.items():
+                if state.faction == faction_name:
+                    terms.extend(aliases)
+        terms.extend(state.titles or [])
+        if any(_normalize_text(t) in normalized_query for t in terms if t):
+            mentioned_names.add(name)
+            parts = [f"「{name}」"]
+            if state.sex:
+                parts.append(f"（性别：{state.sex}）")
+            if state.faction:
+                parts.append(f"（阵营：{state.faction}）")
+            if state.titles:
+                parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+            parts.append(_scene_suffix(map_reg, name))
+            mentioned.append("".join(parts))
+    return mentioned, mentioned_names
+
+
+def same_faction_npcs_block(
+    current_npc: str,
+    current_faction: Optional[str],
+    all_states: dict[str, NPCState],
+    exclude_names: set[str],
+    map_reg: Any = None,
+) -> str:
+    """同阵营角色表（system 静态区，保留资产；阵营名完全一致才视为同阵营）。"""
+    if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
+        return ""
+    result: list[str] = []
+    seen: set[str] = set(exclude_names)
+
+    def _fmt(name: str, state: NPCState) -> str:
+        parts = [f"「{name}」"]
+        if state.sex:
+            parts.append(f"（性别：{state.sex}）")
+        if state.faction:
+            parts.append(f"（阵营：{state.faction}）")
+        if state.titles:
+            parts.append(f"（身份或称呼：{'、'.join(state.titles)}）")
+        parts.append(_scene_suffix(map_reg, name))
+        return "".join(parts)
+
+    for name, state in all_states.items():
+        if name == current_npc or name in seen:
+            continue
+        if (state.faction or "").strip() != current_faction.strip():
+            continue
+        result.append(_fmt(name, state))
+        seen.add(name)
+    if not result:
+        return ""
+    return "同阵营角色（设定供参考，不要替他们发言）：\n" + "\n".join(result)
+
+
+def same_faction_names(
+    current_npc: str,
+    current_faction: Optional[str],
+    all_states: dict[str, NPCState],
+) -> set[str]:
+    """同阵营角色名集合（条件与 same_faction_npcs_block 一致，不含排除判定）。"""
+    if not current_faction or current_faction.strip() == SKIP_FACTION_SAME_CAMP:
+        return set()
+    out: set[str] = set()
+    for name, state in all_states.items():
+        if name == current_npc:
+            continue
+        if (state.faction or "").strip() != current_faction.strip():
+            continue
+        out.add(name)
+    return out
+
+
+def forbidden_other_chars(all_states: dict[str, NPCState]) -> set[str]:
+    """彩蛋/成员阵营角色名（小写），检索时从「其他 NPC」池排除。"""
+    out: set[str] = set()
+    for name, state in all_states.items():
+        if (state.faction or "").strip() in {"成员", "彩蛋"}:
+            out.add(name.lower())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 检索
+# ---------------------------------------------------------------------------
+
+def retrieve_tier1(
+    *,
+    engine: Any,
+    user_query: str,
+    npc_name: str,
+    npc_titles: list[str],
+    npc_faction: Optional[str],
+    npc_last_message: Optional[str],
+    forbidden: set[str],
+) -> Any:
+    """单轮 Tier-1 检索（同步实现；调用方用 to_thread 包装）。engine.ready False 时返回 None。
+
+    返回前按当前绑定存档的覆盖层替换结果文本：索引只装基础语料（覆盖层不进向量库，
+    否则每次改对话/发任务都要全量重建），改写后的台词在这一步补回来。
+    """
+    from services.retrieval import RetrievalInput
+
+    if engine is None or not getattr(engine, "ready", False):
+        return None
+    try:
+        bundle = engine.retrieve(RetrievalInput(
+            user_query=user_query,
+            npc_name=npc_name,
+            npc_titles=npc_titles,
+            npc_faction=npc_faction,
+            npc_last_message=npc_last_message,
+            forbidden_other_chars=forbidden,
+        ))
+    except Exception as exc:  # 检索降级不阻断回合（04）
+        logger.warning("Tier-1 检索失败，降级为空上下文: %s", exc)
+        return None
+    from services.retrieval.overlay import apply_slot_overrides
+
+    return apply_slot_overrides(bundle)
+
+
+def entity_hints_block(bundle: Any, game_data: Any) -> str:
+    """从 bundle.entity_items / entity_stages 拼「玩家可能提到的物品类型/关卡」提示。"""
+    if bundle is None or game_data is None:
+        return ""
+    from services.game_entity_prompts import (
+        compute_reward_tags,
+        format_item_prompt_line,
+        format_stage_detail_line,
+    )
+
+    lines: list[str] = []
+    items = [sn.node for sn in (bundle.entity_items or [])][:6]
+    if items:
+        from services.game_data.item_sources import format_item_sources
+
+        lines.append("【玩家可能提到的物品类型】")
+        for node in items:
+            item = game_data.items.get_by_name(node.item_name or "")
+            if item is None:
+                continue
+            tags = compute_reward_tags(item, game_data.equipment_mods)
+            lines.append(format_item_prompt_line(
+                item, reward_tags=tags, price=item.price,
+                sources=format_item_sources(game_data, item.name),
+            ))
+    stages = [sn.node for sn in (bundle.entity_stages or [])][:6]
+    if stages:
+        lines.append("【玩家可能提到的关卡】")
+        for node in stages:
+            si = None
+            for (_area, name), info in getattr(game_data.stages, "_stage_infos", {}).items():
+                if name == (node.stage_name or ""):
+                    si = info
+                    break
+            if si is None:
+                continue
+            lines.append(format_stage_detail_line(si))
+    return "\n".join(lines)
+
+
+def build_retrieve_fn(
+    *,
+    engine: Any,
+    npc_name: str,
+    npc_titles: list[str],
+    npc_faction: Optional[str],
+    forbidden: set[str],
+) -> Callable[[str], str]:
+    """search_knowledge 工具用的检索函数（子 Agent 工具循环内同步执行）。"""
+    from services.retrieval import format_retrieval_context
+
+    def _retrieve(keyword: str) -> str:
+        bundle = retrieve_tier1(
+            engine=engine,
+            user_query=keyword,
+            npc_name=npc_name,
+            npc_titles=npc_titles,
+            npc_faction=npc_faction,
+            npc_last_message=None,
+            forbidden=forbidden,
+        )
+        if bundle is None or bundle.is_empty:
+            return ""
+        return format_retrieval_context(bundle, forbidden)
+
+    return _retrieve
+
+
+# ---------------------------------------------------------------------------
+# 立绘装配（07 §4）
+# ---------------------------------------------------------------------------
+
+def _resolve_effective_model(llm_config: LLMConfig) -> str:
+    """生效模型名（请求覆盖 > 会话记忆由 API 层完成 > 全局默认）。"""
+    try:
+        return llm_config.merged_with_settings().model_name
+    except Exception:
+        return llm_config.model_name or ""
+
+
+def should_send_image(llm_config: LLMConfig) -> bool:
+    """07 §4 带图前置判定（不含「是否有立绘资产」，资产缺失由 provider 兜底 None）：
+
+    - Profile vision=False → 不带（纯文本模型）；
+    - 模型曾被图像不支持错误标记 → 不带（client 降级链写入，02 §3.2.c）；
+    - vision=True 与探测型（None）→ 带图（400 由 client 降级链去图重试并标记）。
+    """
+    from services.llm.client import is_image_unsupported_model
+    from services.llm.profiles import get_profile
+
+    model_name = _resolve_effective_model(llm_config)
+    if not model_name:
+        return False
+    if get_profile(model_name).vision is False:
+        return False
+    return not is_image_unsupported_model(model_name)
+
+
+def load_portrait_image_url(npc_name: str, emotion: Optional[str]) -> Optional[str]:
+    """同步取当前情绪立绘 data URL（调用方经 to_thread 包装）；失败/缺失返回 None。"""
+    from services.portraits import get_portrait_data_url
+
+    try:
+        return get_portrait_data_url(npc_name, emotion or "普通")
+    except Exception as exc:  # 立绘任何异常不阻断回合（07 §1）
+        logger.warning("立绘取图失败，本回合无图: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 装配结果
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TurnContext:
+    """一轮对话装配好的上下文（prompt 消息由 turn.py 组装）。"""
+
+    npc_name: str
+    npc_state: NPCState
+    npc_states: dict[str, NPCState]
+    player_query: str
+    player_identity: str = ""
+    progress_stage: Optional[int] = None
+    # 玩家真实等级（绑定存档投影；None＝没有，装备窗口退化用阶段等级区间）
+    player_level: Optional[int] = None
+    stage_cfg: Optional[StageConfig] = None
+    rag_context_text: str = ""
+    mentioned_npcs_str: str = ""
+    history: list[ChatMessage] = field(default_factory=list)
+    summary: Optional[str] = None
+    pending_draft_row: Optional[TaskDraftRow] = None
+    pending_draft_summary: str = ""
+    same_faction_block: str = ""
+    scene_block: str = ""
+    scene_supplement: str = ""
+    has_shop: bool = False
+    shop_reward_types: list[str] = field(default_factory=list)
+    player_can_challenge: bool = False  # 玩家当前能否挑战该 NPC（与 prepare 切磋判定同源）
+    forbidden: set[str] = field(default_factory=set)
+    save_info: Any = None  # 绑定存档投影 {slot_key, character, progress, scene, player}（B2-1）；未绑定＝None
+    long_term_enabled: bool = False  # 本回合是否启用跨对话长期记忆（B3-3）
+    long_term: Optional[LongTermSnapshot] = None  # 启用时的作用域快照；关闭＝None
+    # 本 NPC 发布且当前存档已完成的委托（含完成对话原文）；has_unmarked 供触发三的条件闸
+    finished_task_block: FinishedTaskBlock = field(default_factory=FinishedTaskBlock)
+    # 绑定投影 tasks_active 里仍在途的委托（每轮实时算，只读、不记账）
+    active_task_block: str = ""
+    # 刚发布委托的达成要点（会话库记录的供给期内才非空）
+    published_task_block: str = ""
+    published_task_id: Optional[int] = None
+    # 物品往来账本（仅游戏内 embedded 注入；standalone 恒为空）
+    item_ledger_block: str = ""
+    retrieve_fn: Optional[Callable[[str], str]] = None
+    # Tier-1 检索的原始 bundle（route_search 预取按节点 id 去重；展示文本已进 rag_context_text）
+    retrieval_bundle: Any = None
+    llm_config: LLMConfig = field(default_factory=LLMConfig)
+    # 当前情绪立绘的 data URL（07 §4；None = 不带图：非 vision / 已标记不支持 / 无立绘）
+    image_data_url: Optional[str] = None
+
+    @property
+    def favorability(self) -> int:
+        return self.npc_state.favorability
+
+    @property
+    def relationship_level(self) -> str:
+        return self.npc_state.relationship_level
+
+    @property
+    def progress_desc(self) -> str:
+        return progress_stage_desc(self.progress_stage, self.stage_cfg)
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+async def assemble_context(
+    *,
+    session_id: str,
+    npc_name: str,
+    player_query: str,
+    player_identity: str = "",
+    progress_stage: Optional[int] = None,
+    current_emotion: Optional[str] = None,
+    llm_config: LLMConfig,
+    memory: MemoryStore,
+    npc_manager: NPCManager,
+    game_data: Any,
+    engine: Any = None,
+    history_limit: int = 20,
+    with_summary: bool = True,
+    send_image: bool = True,
+    long_term_memory_enabled: Optional[bool] = None,
+) -> TurnContext:
+    """并行装配一轮上下文（03 §7；检索/取图经 to_thread，目标 ≤300ms）。
+
+    long_term_memory_enabled 是前端每次请求带的开关原值（None＝未提供）；
+    游戏内（embedded 口径）恒为启用，不受理关闭，判定见 long_term.resolve_enabled。
+    """
+    # 绑定存档投影（B2-1）：未绑定＝None，standalone 行为与现状一致（FR-9）。
+    # 阶段以绑定存档推导值为准：能推导时覆盖请求携带的 progress_stage（前端手选退居兜底）。
+    snap = get_integration_state().snapshot()
+    save_info: Any = None
+    if snap["bound_slot"] is not None:
+        save_info = {
+            "slot_key": snap["bound_slot"],
+            "character": snap["character"],
+            "progress": snap["progress"],
+            "scene": snap["scene"],
+            "player": snap["player"],
+        }
+        derived_stage = derive_progress_stage(snap["progress"], snap["player"])
+        if derived_stage is not None:
+            progress_stage = derived_stage
+
+    stage_cfg = get_progress_stage_config(progress_stage) if progress_stage else None
+
+    npc_state_task = npc_manager.get(npc_name)
+    states_task = npc_manager.all_states()
+    history_task = memory.get_history(session_id, limit=history_limit)
+    summary_task = memory.get_summary(session_id) if with_summary else _none()
+    draft_task = memory.get_draft(session_id)
+    long_term_enabled = resolve_enabled(long_term_memory_enabled)
+    long_term_task = (
+        load_snapshot(memory, slot_key=snap["bound_slot"], npc=npc_name)
+        if long_term_enabled else _none()
+    )
+    # 物品账本只在游戏内终端注入；standalone 不读不写，行为保持原样
+    item_ledger_task = (
+        load_item_ledger_block(memory, slot_key_value=snap["bound_slot"], npc=npc_name)
+        if get_integration_state().mode == "embedded" else _none()
+    )
+    (
+        npc_state, npc_states, history, summary, draft_row, long_term, item_ledger_block,
+    ) = await asyncio.gather(
+        npc_state_task, states_task, history_task, summary_task, draft_task,
+        long_term_task, item_ledger_task,
+    )
+
+    map_reg = getattr(game_data, "map_registry", None)
+    mentioned, mentioned_names = find_mentioned_npcs(
+        player_query, npc_name, npc_states, map_reg,
+    )
+    mentioned_npcs_str = ""
+    if mentioned:
+        mentioned_npcs_str = "【对话中提到的其他角色（设定供参考）】\n" + "\n".join(mentioned)
+    forbidden = forbidden_other_chars(npc_states)
+    same_faction_block = same_faction_npcs_block(
+        npc_name, npc_state.faction, npc_states, mentioned_names, map_reg,
+    )
+
+    # 场景块与场景补充（B8-1）：map_definition.json 缺载/异常时整体降级为空串
+    scene_block = ""
+    scene_supplement = ""
+    # 场景段补显示标签：stageFlag（帧标签）→ map_definition label；查不到保持空串，
+    # 提示词侧回落 stageFlag 原文。拷贝后附加，不污染绑定状态里的原始投影。
+    if save_info is not None and isinstance(save_info.get("scene"), dict):
+        scene = dict(save_info["scene"])
+        label = ""
+        scene_name = str(scene.get("stageFlag") or "")
+        if map_reg is not None and scene_name:
+            try:
+                label = map_reg.label_for_scene_name(scene_name)
+            except Exception:
+                label = ""
+        scene["label"] = label
+        save_info["scene"] = scene
+    if map_reg is not None:
+        try:
+            from services.npc.scene_context import (
+                build_scene_block,
+                build_scene_supplement,
+            )
+
+            scene_block = build_scene_block(
+                map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+            )
+            covered = set(mentioned_names) | same_faction_names(
+                npc_name, npc_state.faction, npc_states,
+            )
+            scene_supplement = build_scene_supplement(
+                map_reg=map_reg, npc_states=npc_states, npc_name=npc_name,
+                exclude_names=covered,
+            )
+        except Exception as exc:
+            logger.warning("场景块/场景补充装配失败，降级为空: %s", exc)
+
+    titles = list(npc_state.titles or [])
+    last_npc_message = next(
+        (m.content for m in reversed(history) if m.role == "assistant"), None,
+    )
+
+    # 本 NPC 发布、当前存档已完成的委托（含完成对话原文）：直读磁盘，缺 data_root
+    # 或读取异常一律降级为空块，不影响本轮对话。
+    finished_task_block = FinishedTaskBlock()
+    data_root = getattr(game_data, "data_root", None)
+    if save_info is not None and data_root is not None:
+        try:
+            from services.agent_tools.finished_tasks import build_finished_task_block
+
+            progress = save_info.get("progress") or {}
+            finished_task_block = await asyncio.to_thread(
+                lambda: build_finished_task_block(
+                    data_root=data_root,
+                    slot_key=save_info.get("slot_key"),
+                    npc_name=npc_name,
+                    finished_ids=progress.get("tasks_finished") if isinstance(progress, dict) else None,
+                )
+            )
+        except Exception as exc:
+            logger.warning("已完成委托拼接失败，降级为空: %s", exc)
+
+    # Tier-1 检索 + 实体提示（同步实现，to_thread）
+    def _retrieve_and_format() -> tuple[str, Any]:
+        bundle = retrieve_tier1(
+            engine=engine,
+            user_query=player_query,
+            npc_name=npc_name,
+            npc_titles=titles,
+            npc_faction=npc_state.faction,
+            npc_last_message=last_npc_message,
+            forbidden=forbidden,
+        )
+        text = ""
+        if bundle is not None and not bundle.is_empty:
+            from services.retrieval import format_retrieval_context
+
+            text = format_retrieval_context(bundle, forbidden)
+        hints = entity_hints_block(bundle, game_data)
+        if hints:
+            text = f"{text}\n\n{hints}" if text else hints
+        return text, bundle
+
+    retrieval_bundle: Any = None
+    try:
+        rag_context_text, retrieval_bundle = await asyncio.to_thread(_retrieve_and_format)
+    except Exception as exc:
+        logger.warning("上下文检索装配失败，降级: %s", exc)
+        rag_context_text = ""
+
+    # 未完成的两块（工作项 1/2）：
+    # ① 「刚发布的委托」——记录在会话库，发布轮已用掉一轮，这里每轮递减、归零即删；
+    #    任务已完成（tasks_finished 命中）立刻清记录、不再注入。
+    # ② 「尚在途中」——按绑定时投影的 tasks_active 每轮实时拼，只读、不记账。
+    # 两块都只在 data_root ＋ save_info 都可用时尝试；不可用时不消耗轮次。
+    # 位置在检索之后：物品详情要拿本轮 RAG 文本做去重（「上面给过就不重复给」）。
+    active_task_block = ""
+    published_task_block = ""
+    published_task_id: Optional[int] = None
+    if save_info is not None and data_root is not None:
+        progress = save_info.get("progress")
+        progress = progress if isinstance(progress, dict) else {}
+        finished_ids = progress.get("tasks_finished")
+        slot_key = save_info.get("slot_key")
+        get_highlight = getattr(memory, "published_task_highlight_read", None)
+        highlight = None
+        if get_highlight is not None:
+            try:
+                highlight = await get_highlight(session_id)
+            except Exception as exc:
+                logger.warning("达成要点记录读取失败，按无记录处理: %s", exc)
+        highlight_task_id: Optional[int] = None
+        if highlight is not None:
+            highlight_task_id = int(highlight.task_id)
+            try:
+                finished_set = {int(v) for v in (finished_ids or [])}
+            except (TypeError, ValueError):
+                finished_set = set()
+            if highlight_task_id in finished_set:
+                # 玩家已经完成：立刻撤掉，别再让模型按「尚未完成」说话
+                try:
+                    await memory.published_task_highlight_clear(session_id)
+                except Exception as exc:
+                    logger.warning("达成要点记录清除失败: %s", exc)
+                highlight_task_id = None
+            else:
+                try:
+                    from services.agent_tools.finished_tasks import build_published_task_block
+
+                    published_task_block = await asyncio.to_thread(
+                        lambda: build_published_task_block(
+                            data_root=data_root,
+                            slot_key=slot_key,
+                            npc_name=npc_name,
+                            task_id=highlight_task_id,
+                            game_data=game_data,
+                            rag_context_text=rag_context_text,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("刚发布委托块拼接失败，降级为空: %s", exc)
+                    published_task_block = ""
+                if published_task_block:
+                    published_task_id = highlight_task_id
+                else:
+                    logger.warning(
+                        "会话 %s：达成要点任务 %s 拼不出内容，本轮不注入并扣掉一轮",
+                        session_id, highlight_task_id,
+                    )
+                # 无论是否拼出内容都消耗一轮，避免读不到数据的记录长期占位
+                next_rounds = int(highlight.rounds_left) - 1
+                try:
+                    if next_rounds <= 0:
+                        await memory.published_task_highlight_clear(session_id)
+                    else:
+                        await memory.published_task_highlight_write(
+                            session_id, highlight_task_id, next_rounds,
+                        )
+                except Exception as exc:
+                    logger.warning("达成要点供给期递减失败（不影响本轮注入）: %s", exc)
+
+        try:
+            from services.agent_tools.finished_tasks import build_active_tasks_block
+
+            active_task_block = await asyncio.to_thread(
+                lambda: build_active_tasks_block(
+                    data_root=data_root,
+                    slot_key=slot_key,
+                    npc_name=npc_name,
+                    active_ids=progress.get("tasks_active"),
+                    finished_ids=finished_ids,
+                    exclude_ids=[highlight_task_id] if highlight_task_id is not None else [],
+                    game_data=game_data,
+                    rag_context_text=rag_context_text,
+                )
+            )
+        except Exception as exc:
+            logger.warning("进行中委托块拼接失败，降级为空: %s", exc)
+            active_task_block = ""
+
+    # 待确认草案摘要
+    pending_draft_summary = ""
+    if draft_row is not None and isinstance(draft_row.draft, dict) and draft_row.draft:
+        try:
+            from services.agent_tools.draft_formatting import _detailed_draft_summary
+
+            pending_draft_summary = _detailed_draft_summary(
+                draft_row.draft, game_data, rag_context_text=rag_context_text,
+                npc_states=npc_states,
+            )
+        except Exception:
+            pending_draft_summary = ""
+
+    has_shop = False
+    shop_reward_types: list[str] = []
+    try:
+        shops = getattr(game_data, "shops", None)
+        if shops is not None and shops.has_shop(npc_name):
+            has_shop = True
+            seen: set[str] = set()
+            for item_name in shops.get_npc_shop(npc_name):
+                item = game_data.items.get_by_name(item_name)
+                if item and item.type and item.type not in seen:
+                    seen.add(item.type)
+                    shop_reward_types.append(item.type)
+    except Exception:
+        pass
+
+    # 切磋可行性：与 prepare_task_context 的 _build_challenge_targets 同源判定
+    # （返回 list=可用；dict error=不可用，原因含无关卡/等级不足等）
+    player_can_challenge = False
+    try:
+        if ctx_npc_challenge := (npc_state.challenge or "").strip():
+            from services.agent_tools.context_builder import _build_challenge_targets
+
+            challenge_result = _build_challenge_targets(
+                game_data, npc_name, ctx_npc_challenge, max(1, min(7, progress_stage or 1)),
+            )
+            player_can_challenge = isinstance(challenge_result, list)
+    except Exception:
+        player_can_challenge = False
+
+    engine_obj = engine
+    retrieve_fn = build_retrieve_fn(
+        engine=engine_obj,
+        npc_name=npc_name,
+        npc_titles=titles,
+        npc_faction=npc_state.faction,
+        forbidden=forbidden,
+    ) if engine_obj is not None else None
+
+    # 立绘（07 §4）：情绪跟随 current_emotion（上回合 meta emo；首轮为空用「普通」）
+    image_data_url: Optional[str] = None
+    if send_image and should_send_image(llm_config):
+        image_data_url = await asyncio.to_thread(load_portrait_image_url, npc_name, current_emotion)
+
+    return TurnContext(
+        npc_name=npc_name,
+        npc_state=npc_state,
+        npc_states=npc_states,
+        player_query=player_query,
+        player_identity=player_identity,
+        progress_stage=progress_stage,
+        player_level=get_player_level(snap["player"]) if snap["player"] else None,
+        stage_cfg=stage_cfg,
+        rag_context_text=rag_context_text,
+        mentioned_npcs_str=mentioned_npcs_str,
+        history=history,
+        summary=summary,
+        pending_draft_row=draft_row,
+        pending_draft_summary=pending_draft_summary,
+        same_faction_block=same_faction_block,
+        scene_block=scene_block,
+        scene_supplement=scene_supplement,
+        has_shop=has_shop,
+        shop_reward_types=shop_reward_types,
+        player_can_challenge=player_can_challenge,
+        forbidden=forbidden,
+        save_info=save_info,
+        long_term_enabled=long_term_enabled,
+        long_term=long_term,
+        finished_task_block=finished_task_block,
+        active_task_block=active_task_block,
+        published_task_block=published_task_block,
+        published_task_id=published_task_id,
+        item_ledger_block=item_ledger_block or "",
+        retrieve_fn=retrieve_fn,
+        retrieval_bundle=retrieval_bundle,
+        llm_config=llm_config,
+        image_data_url=image_data_url,
+    )
+
+
+async def _none() -> None:
+    return None

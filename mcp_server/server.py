@@ -7,8 +7,12 @@ CFN-RAG MCP Server 入口点。
 - Prompts: 任务设计、对话创作、数据探索模板
 
 使用方式:
+    pip install fastmcp                  # 开发期依赖，不在 requirements.txt 中
     python -m mcp_server.server          # stdio 模式（Claude Desktop / Cursor）
     fastmcp dev mcp_server/server.py     # MCP Inspector 调试
+
+【当前状态：代码保留，未启用】详见 mcp_server/__init__.py 顶部说明。
+本模块不被 main.py 引用，也不进入 exe 打包清单；需显式启动才会运行。
 """
 
 from __future__ import annotations

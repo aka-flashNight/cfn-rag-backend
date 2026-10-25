@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Optional
 
 from .crafting_registry import CraftingRegistry
+from .enemy_registry import EnemyRegistry
 from .item_registry import ItemRegistry
 from .kshop_registry import KShopRegistry
+from .map_registry import MapRegistry
 from .mercenary_registry import MercenaryTaskRegistry
 from .paths import get_game_data_root
 from .shop_registry import ShopRegistry
@@ -33,6 +35,8 @@ class GameDataRegistry:
     crafting: CraftingRegistry
     equipment_mods: EquipmentModsRegistry
     mercenary_tasks: MercenaryTaskRegistry
+    map_registry: MapRegistry
+    enemy_registry: EnemyRegistry
 
     @classmethod
     def create(cls, *, data_root: Optional[Path] = None) -> "GameDataRegistry":
@@ -48,6 +52,8 @@ class GameDataRegistry:
             crafting=CraftingRegistry(data_root=root),
             equipment_mods=EquipmentModsRegistry(data_root=root),
             mercenary_tasks=MercenaryTaskRegistry(data_root=root),
+            map_registry=MapRegistry(data_root=root),
+            enemy_registry=EnemyRegistry(data_root=root),
         )
 
     def load_all(self) -> None:
@@ -61,6 +67,8 @@ class GameDataRegistry:
         self.crafting.load()
         self.equipment_mods.load()
         self.mercenary_tasks.load()
+        self.map_registry.load()
+        self.enemy_registry.load()
 
 
 # 全局单例（启动时初始化）

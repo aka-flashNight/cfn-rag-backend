@@ -33,9 +33,38 @@ def _draft_item_role_notes(draft: dict[str, Any], item_name: str) -> list[str]:
     return notes
 
 
+def _npc_in_text(npc_name: str, text: Optional[str]) -> bool:
+    """NPC 名是否已出现在前文（大小写/空白归一），避免重复补信息块。"""
+
+    def _norm(value: Any) -> str:
+        return "".join(str(value or "").lower().split())
+
+    name = _norm(npc_name)
+    return bool(name) and name in _norm(text)
+
+
+def _npc_shop_marker(
+    game_data: Optional[GameDataRegistry],
+    npc_name: str,
+    item_name: str,
+) -> str:
+    """该物品是否由这位 NPC 自己售卖（用于让聊天 Agent 知道东西是哪来的）。"""
+    if not game_data or not npc_name or not item_name:
+        return ""
+    shops = getattr(game_data, "shops", None)
+    if shops is None or not shops.has_shop(npc_name):
+        return ""
+    try:
+        goods = shops.get_npc_shop(npc_name) or []
+    except Exception:  # pragma: no cover - 数据异常时不标注即可
+        return ""
+    return "（本NPC商店在售）" if item_name in goods else ""
+
+
 def _format_items_with_price(
     items: list[dict[str, Any]],
     game_data: Optional[GameDataRegistry] = None,
+    npc_name: str = "",
 ) -> list[str]:
     parts: list[str] = []
     for it in items[:10]:
@@ -47,11 +76,36 @@ def _format_items_with_price(
                 price = game_data.items.get_price(name)
             except Exception:
                 pass
+        marker = _npc_shop_marker(game_data, npc_name, name)
         if price and name != "金币":
-            parts.append(f"{name}x{count}(单价{price})")
+            parts.append(f"{name}x{count}(单价{price}){marker}")
         else:
-            parts.append(f"{name}x{count}")
+            parts.append(f"{name}x{count}{marker}")
     return parts
+
+
+def _stage_monster_text(
+    game_data: Optional[GameDataRegistry], stage_name: str,
+) -> str:
+    """关卡怪物块（B8-3）：查不到关卡/怪物或任何异常时返回空串。"""
+    if game_data is None:
+        return ""
+    try:
+        from services.game_entity_prompts import (
+            format_stage_monster_block,
+            get_stage_info_for_name,
+        )
+
+        si = get_stage_info_for_name(game_data.stages, stage_name)
+        if si is None:
+            return ""
+        enemy_reg = getattr(game_data, "enemy_registry", None)
+        if enemy_reg is None:
+            return ""
+        spawns = game_data.stages.get_enemy_spawns(si.area, si.name)
+        return format_stage_monster_block(enemy_reg.monsters_for_spawns(spawns))
+    except Exception:
+        return ""
 
 
 def _build_draft_entity_context_lines(
@@ -63,6 +117,7 @@ def _build_draft_entity_context_lines(
     """
     与本轮检索上下文中的【玩家可能提到的物品类型】【玩家可能提到的关卡】按名称去重：
     已在 RAG 块出现过的实体不再重复；未出现的实体给出与 RAG 相同格式的完整说明（另附草案数量/难度等）。
+    选关类任务（不含切磋）在每个 [关卡] 行后追加关卡怪物块（B8-3；逐关卡各出一段）。
     """
     if game_data is None:
         return []
@@ -75,6 +130,7 @@ def _build_draft_entity_context_lines(
     )
 
     already_items, already_stages = parse_rag_game_entity_mentions(rag_context_text)
+    need_monsters = str(draft.get("task_type") or "").strip() != "切磋"
 
     lines: list[str] = []
     seen_stage: set[str] = set()
@@ -85,7 +141,11 @@ def _build_draft_entity_context_lines(
         if not sn or sn in seen_stage:
             continue
         seen_stage.add(sn)
+        monster_text = _stage_monster_text(game_data, sn) if need_monsters else ""
         if sn in already_stages:
+            # 关卡详情已在前文 RAG 块出现：怪物块单独锚一行补出，不复述详情
+            if monster_text:
+                lines.append(f"[关卡] {sn}：{monster_text}")
             continue
         diff = (fr.get("difficulty") or "").strip() or None
         si = get_stage_info_for_name(game_data.stages, sn)
@@ -99,6 +159,8 @@ def _build_draft_entity_context_lines(
             if diff:
                 seg += f"；草案要求难度：{diff}"
             lines.append(f"[关卡] {seg}（未在库中解析到详情）")
+        if monster_text:
+            lines.append(monster_text)
 
     item_names: list[str] = []
 
@@ -123,7 +185,13 @@ def _build_draft_entity_context_lines(
         notes = _draft_item_role_notes(draft, nm)
         if it is not None:
             tags = compute_reward_tags(it, game_data.equipment_mods)
-            seg = format_item_prompt_line(it, reward_tags=tags, price=it.price)
+            from services.game_data.item_sources import format_item_sources
+
+            seg = format_item_prompt_line(
+                it, reward_tags=tags, price=it.price,
+                sources=format_item_sources(game_data, nm),
+            )
+            seg += _npc_shop_marker(game_data, str(draft.get("npc_name") or ""), nm)
             if notes:
                 seg += f"；草案涉及：{'；'.join(notes)}"
             lines.append(f"[物品] {seg}")
@@ -139,6 +207,7 @@ def _detailed_draft_summary(
     game_data: Optional[GameDataRegistry] = None,
     *,
     rag_context_text: Optional[str] = None,
+    npc_states: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     生成包含完整字段和物品单价的草案摘要，
@@ -153,11 +222,50 @@ def _detailed_draft_summary(
     _desc = draft.get("description")
     if isinstance(_desc, str) and _desc.strip():
         lines.append(f"描述: {_desc}")
-    else:
-        lines.append("描述: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
     npc_name_fallback = draft.get("npc_name") or "?"
-    lines.append(f"接取NPC: {draft.get('get_npc') or npc_name_fallback}")
-    lines.append(f"完成NPC: {draft.get('finish_npc') or npc_name_fallback}")
+    # 商店归属＝发布 NPC：奖励/提交/持有里由他自己在售的物品要标出来，避免聊天侧信息遗漏
+    shop_owner = str(draft.get("npc_name") or "")
+    get_npc = (draft.get("get_npc") or "").strip() or str(npc_name_fallback)
+    finish_npc = (draft.get("finish_npc") or "").strip() or str(npc_name_fallback)
+    # 三方任务：接取 NPC 既不是当前说话人、也不是完成 NPC，且检索上下文没出现过时，
+    # 把属性/场景补在完成 NPC 块后面，避免模型只看到名字却不知道去哪找人。
+    get_attrs = ""
+    get_scene = ""
+    get_line_deferred = False
+    if (
+        get_npc != npc_name_fallback
+        and get_npc != finish_npc
+        and not _npc_in_text(get_npc, rag_context_text)
+    ):
+        from services.npc.scene_context import npc_attributes_text, npc_scene_text
+
+        get_attrs = npc_attributes_text(npc_states, get_npc)
+        if game_data is not None:
+            map_reg = getattr(game_data, "map_registry", None)
+            if map_reg is not None:
+                get_scene = npc_scene_text(map_reg, get_npc)
+        get_line_deferred = bool(get_attrs or get_scene)
+    if not get_line_deferred:
+        lines.append(f"接取NPC: {get_npc}")
+    # 完成 NPC ≠ 发布 NPC 时补其属性与所在场景（B8-3）：无记录/查不到时对应片段省略、不附指示句
+    finish_attrs = ""
+    finish_scene = ""
+    if finish_npc != npc_name_fallback:
+        from services.npc.scene_context import npc_attributes_text, npc_scene_text
+
+        finish_attrs = npc_attributes_text(npc_states, finish_npc)
+        if game_data is not None:
+            map_reg = getattr(game_data, "map_registry", None)
+            if map_reg is not None:
+                finish_scene = npc_scene_text(map_reg, finish_npc)
+    if finish_scene:
+        lines.append(f"完成NPC: {finish_npc}{finish_attrs}；所在场景：{finish_scene}")
+        lines.append("非同阵营npc你未必知道准确场景名，但知道大致情况，根据你的人设决定。")
+    else:
+        lines.append(f"完成NPC: {finish_npc}{finish_attrs}")
+    if get_line_deferred:
+        get_suffix = f"；所在场景：{get_scene}" if get_scene else ""
+        lines.append(f"接取NPC: {get_npc}{get_attrs}{get_suffix}")
 
     finish_reqs = draft.get("finish_requirements") or []
     if finish_reqs:
@@ -169,17 +277,17 @@ def _detailed_draft_summary(
 
     finish_submit = draft.get("finish_submit_items") or []
     if finish_submit:
-        fs_strs = _format_items_with_price(finish_submit, game_data)
+        fs_strs = _format_items_with_price(finish_submit, game_data, npc_name=shop_owner)
         lines.append(f"提交物品: {', '.join(fs_strs)}")
 
     finish_contain = draft.get("finish_contain_items") or []
     if finish_contain:
-        fc_strs = _format_items_with_price(finish_contain, game_data)
+        fc_strs = _format_items_with_price(finish_contain, game_data, npc_name=shop_owner)
         lines.append(f"持有物品: {', '.join(fc_strs)}")
 
     rewards = draft.get("rewards") or []
     if rewards:
-        rw_strs = _format_items_with_price(rewards, game_data)
+        rw_strs = _format_items_with_price(rewards, game_data, npc_name=shop_owner)
         lines.append(f"奖励: {', '.join(rw_strs)}")
 
     def _summarize_dialogue(dialogue: Any) -> str:
@@ -215,8 +323,6 @@ def _detailed_draft_summary(
         get_text = draft.get("get_conversation_text", "")
         if isinstance(get_text, str) and get_text.strip():
             lines.append(f"接取对话(旧字段): {get_text.strip()[:120]}{'…' if len(get_text.strip()) > 120 else ''}")
-        else:
-            lines.append("接取对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     finish_dialogue = draft.get("finish_dialogue")
     finish_summary = _summarize_dialogue(finish_dialogue)
@@ -226,8 +332,6 @@ def _detailed_draft_summary(
         finish_text = draft.get("finish_conversation_text", "")
         if isinstance(finish_text, str) and finish_text.strip():
             lines.append(f"完成对话(旧字段): {finish_text.strip()[:120]}{'…' if len(finish_text.strip()) > 120 else ''}")
-        else:
-            lines.append("完成对话: （尚未写入；玩家接受时在 confirm_agent_task 中填写）")
 
     entity_lines = _build_draft_entity_context_lines(
         draft, game_data, rag_context_text=rag_context_text,

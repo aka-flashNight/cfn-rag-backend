@@ -1,5 +1,8 @@
-"""
-检索层评估：dense / bm25 / hybrid_rrf 对比，不调 LLM。
+"""检索层评估：dense / bm25 / hybrid_rrf 对比，不调 LLM（v3 口径）。
+
+v3 变更：评估目标从旧 GameRAGService 换为 services.retrieval.RetrievalEngine，
+单池检索走 retrieve_for_eval（type/character 过滤 + 指定打分模式，无阈值——
+评估口径必须放开阈值，否则召回被截断）。
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from ai_engine.bm25_retrieval import metadata_filters_for_golden_row
 from evals.retriever.metrics import (
     aggregate_mean,
     mrr_at,
@@ -26,12 +28,6 @@ from evals.retriever.metrics import (
     precision_at_k,
     recall_at_k,
 )
-from services.game_rag_service import GameRAGService
-
-
-def _node_id(nws: object) -> str:
-    node = getattr(nws, "node", nws)
-    return str(getattr(node, "node_id", "") or "")
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -61,8 +57,23 @@ def _git_short() -> str:
     return "nogit"
 
 
+def _ensure_engine():
+    """加载检索引擎：指纹命中直接加载；否则全量重建（重活）。"""
+    from services.retrieval.embedder import get_default_embedder
+    from services.retrieval.hybrid import get_retrieval_engine
+    from services.retrieval.loader import compute_corpus_fingerprint, load_corpus
+
+    get_default_embedder().warmup()
+    engine = get_retrieval_engine()
+    fingerprint = compute_corpus_fingerprint()
+    if engine.try_load(fingerprint):
+        return engine
+    engine.build_store(load_corpus(), fingerprint)
+    return engine
+
+
 def evaluate_one_mode(
-    service: GameRAGService,
+    engine,
     mode: str,
     rows: list[dict],
     top_k: int = 20,
@@ -78,14 +89,18 @@ def evaluate_one_mode(
 
     for row in rows:
         q = (row.get("retrieve_query") or row.get("question") or "").strip()
-        filters = metadata_filters_for_golden_row(row)
         expected = set(row.get("expected_doc_ids") or [])
         typ = (row.get("type") or row.get("filter_type") or "unknown").strip()
+        character = (row.get("filter_character") or "").strip() or None
 
-        nws_list = service.retrieve_nodes_for_eval(
-            mode, q, filters, top_k=top_k
+        scored = engine.retrieve_for_eval(
+            q,
+            type_filter={typ},
+            character=character,
+            top_k=top_k,
+            mode=mode,
         )
-        retrieved = [_node_id(n) for n in nws_list]
+        retrieved = [s.node.id for s in scored]
 
         metrics_row = {
             "recall": {f"@{k}": recall_at_k(expected, retrieved, k) for k in k_list},
@@ -118,7 +133,7 @@ def _write_report(
     results: list[dict],
 ) -> None:
     lines = [
-        f"# Retriever 评估报告",
+        f"# Retriever 评估报告（v3：RetrievalEngine.retrieve_for_eval，无阈值单池口径）",
         f"",
         f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat()}",
         f"",
@@ -159,7 +174,7 @@ def _write_report(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Retriever-only evaluation")
+    parser = argparse.ArgumentParser(description="Retriever-only evaluation (v3)")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -190,12 +205,12 @@ def main() -> None:
         rows = rows[: args.sample]
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    service = GameRAGService()
+    engine = _ensure_engine()
 
     results: list[dict] = []
     for mode in modes:
         t0 = time.perf_counter()
-        results.append(evaluate_one_mode(service, mode, rows))
+        results.append(evaluate_one_mode(engine, mode, rows))
         print(f"[eval] mode={mode} elapsed={time.perf_counter() - t0:.2f}s")
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

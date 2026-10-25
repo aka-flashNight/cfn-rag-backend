@@ -7,9 +7,6 @@ CFN-RAG 启动器
 import os
 import sys
 
-# 在导入其他模块之前设置，避免 tiktoken 编码问题
-os.environ["LLAMA_INDEX_CACHE_DIR"] = ".llamaindex_cache"
-
 import time
 import threading
 import webbrowser
@@ -24,6 +21,8 @@ _httpd_instance = None
 _splash_root = None
 _splash_main_label = None
 _splash_sub_label = None
+# embedded 模式下由 /api/integration/shutdown 置位：start_backend 返回后据此区分优雅退出
+_backend_shutdown_requested = False
 
 
 
@@ -69,9 +68,46 @@ def is_packaged_environment():
 # 打包 exe 单实例：进程持有期间不关闭，退出时由系统回收
 _single_instance_mutex_handle = None
 
+# 启动模式：main() 解析 --embedded 后置位；置位后一切用户可见提示改为只写日志（FR-3 静默约束）
+_LAUNCH_MODE = "standalone"
+
+
+def _embedded_log_path() -> str:
+    """embedded 日志文件：与后端 setup_logging 同规则（打包＝exe 旁；开发＝项目根）"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "cfn-rag.log")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfn-rag.log")
+
+
+def _embedded_log(message: str) -> None:
+    """embedded 静默模式日志：只写 cfn-rag.log（控制台回显仅开发环境可见），不弹窗、不出声"""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [embedded] {message}"
+    try:
+        with open(_embedded_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+
+
+def _make_stdio_print_safe() -> None:
+    """embedded 下 print 绝不因控制台编码崩溃（GBK 控制台遇到 ✓/emoji 时改替换而非抛错）"""
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
 
 def _show_packaged_notice(message: str, title: str = "CFN-RAG"):
-    """无控制台 exe 下用系统对话框提示"""
+    """无控制台 exe 下用系统对话框提示；embedded 模式改只写日志（静默约束）"""
+    if _LAUNCH_MODE == "embedded":
+        _embedded_log(f"{title}: {message}")
+        return
     if os.name == "nt":
         try:
             import ctypes
@@ -315,77 +351,29 @@ def _bring_packaged_status_window_forward(tk_root):
         pass
 
 
-def _flash_windows_taskbar_for_hwnd(hwnd: int) -> None:
-    """让任务栏上对应窗口按钮闪烁若干次（全屏游戏时任务栏常不可见，仅作辅助）。"""
-    if os.name != "nt" or not hwnd:
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class FLASHWINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.UINT),
-                ("hwnd", wintypes.HANDLE),
-                ("dwFlags", wintypes.DWORD),
-                ("uCount", wintypes.UINT),
-                ("dwTimeout", wintypes.DWORD),
-            ]
-
-        FLASHW_ALL = 0x03
-        user32 = ctypes.windll.user32
-        info = FLASHWINFO()
-        info.cbSize = ctypes.sizeof(FLASHWINFO)
-        info.hwnd = wintypes.HANDLE(hwnd)
-        info.dwFlags = FLASHW_ALL
-        info.uCount = 6
-        info.dwTimeout = 200
-        user32.FlashWindowEx(ctypes.byref(info))
-    except Exception:
-        pass
-
-
 def _notify_browser_opened_user_attention():
     """
-    浏览器由 webbrowser.open 打开后，系统不保证窗口到最前；全屏独占游戏时尤其如此。
+    浏览器由 webbrowser.open 打开后，只留提示音（页面自动弹出即可被感知）。
 
-    补救（无法突破独占全屏，只能提高「被感知」概率）：
-    - Windows：播放 scripts/loading_audio.mp3（winmm MCI）；找不到或失败时回退系统提示音
-    - 打包模式：再次前置启动器 + 任务栏闪烁，与「另开终端打断全屏」类似但更快
-
-    若仍无感知：请退出全屏或切桌面后访问 127.0.0.1:708x。
+    打包模式下不再前置状态窗、不再闪任务栏：状态窗本就在任务栏可点，
+    页面已自动打开，闪动/前置只会干扰用户。
     """
-    if os.name == "nt":
-        played = False
-        audio_path = _find_loading_audio_path()
-        if audio_path:
-            try:
-                played = _play_loading_audio_mp3_windows(audio_path)
-            except Exception:
-                played = False
-        if not played:
-            try:
-                import winsound
-
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            except Exception:
-                pass
-
-    root = _splash_root
-    if not root:
+    if os.name != "nt":
         return
-
-    def _on_main_thread():
+    played = False
+    audio_path = _find_loading_audio_path()
+    if audio_path:
         try:
-            _bring_packaged_status_window_forward(root)
-            _flash_windows_taskbar_for_hwnd(int(root.winfo_id()))
+            played = _play_loading_audio_mp3_windows(audio_path)
+        except Exception:
+            played = False
+    if not played:
+        try:
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
-
-    try:
-        root.after(0, _on_main_thread)
-    except Exception:
-        pass
 
 
 def _exit_packaged_early_notice(message: str) -> None:
@@ -547,7 +535,13 @@ def setup_environment():
 
 
 def start_backend():
-    """启动后端FastAPI服务"""
+    """启动后端FastAPI服务。
+
+    用 uvicorn.Server 实例运行并注册优雅退出回调（/api/integration/shutdown 置位
+    should_exit）；本函数返回即事件循环已停止——正常退出或启动失败由调用方按
+    _backend_shutdown_requested 区分。
+    """
+    global _backend_shutdown_requested
     try:
         import uvicorn
 
@@ -573,14 +567,28 @@ def start_backend():
             traceback.print_exc()
             return
 
-        print("[后端] 正在启动Uvicorn服务器...")
-        uvicorn.run(
+        from services.integration.state import set_process_shutdown_callback
+
+        # timeout_graceful_shutdown：聊天 SSE/WebSocket 长连接未断时最多等 3 秒再强制收尾
+        config = uvicorn.Config(
             "main:app",
             host="127.0.0.1",
             port=7077,
             reload=False,
-            log_level="info"
+            log_level="info",
+            timeout_graceful_shutdown=3,
         )
+        server = uvicorn.Server(config)
+
+        def _on_shutdown_requested():
+            global _backend_shutdown_requested
+            _backend_shutdown_requested = True
+            server.should_exit = True
+
+        set_process_shutdown_callback(_on_shutdown_requested)
+
+        print("[后端] 正在启动Uvicorn服务器...")
+        server.run()
     except Exception as e:
         print(f"[后端] 启动失败: {e}")
         import traceback
@@ -616,11 +624,11 @@ BACKEND_PROXY_TARGET = "http://127.0.0.1:7077"
 API_PREFIX = "/api"
 # 普通接口代理超时（秒），至少 2 分钟
 PROXY_TIMEOUT = 120
-# 长时间任务接口（如立绘导出）代理超时（秒），15 分钟，满足 10min 以上
+# 长时间任务接口代理超时（秒），15 分钟，满足 10min 以上
 PROXY_TIMEOUT_LONG = 900
-# 需要 15 分钟长超时的路径（不含 query），立绘导出、重置向量库等
+# 需要 15 分钟长超时的路径（不含 query），重置向量库等
+# （旧「立绘导出/解压」接口已随 manifest 查表体系删除，见 docs/v3-developer/07 §7）
 LONG_TIMEOUT_PATHS = (
-    API_PREFIX + "/assets/export-illustrations",
     API_PREFIX + "/game/knowledge-base/reset",
 )
 
@@ -884,7 +892,7 @@ def start_builtin_server(dist_path):
                 continue
 
             global _httpd_instance
-            httpd = socketserver.ThreadingTCPServer(("", port), handler)
+            httpd = socketserver.ThreadingTCPServer(("127.0.0.1", port), handler)
             _httpd_instance = httpd
             try:
                 print(f"[前端] 服务地址: http://127.0.0.1:{port}")
@@ -1040,7 +1048,63 @@ def main_packaged_gui():
     shutdown_launcher()
 
 
+def main_embedded():
+    """embedded 模式（游戏拉起，需求 FR-3）：无浏览器、无状态窗、无声音、无 7080 前端服务。
+
+    7077 单口同时伺服 API 与前端页面（B1-1）；失败只写 cfn-rag.log。
+    进程以后台方式存活，退出由游戏侧或进程管理负责。
+    """
+    _ensure_stdio_for_windowed()
+    _configure_stdio_line_buffering()
+    _make_stdio_print_safe()
+
+    if _tcp_local_port_open(7077):
+        # 已有实例在服务（含 standalone 启动者）：静默退出，游戏侧 EnsureReady 会复用并 bind
+        _embedded_log("7077 已在监听，本进程静默退出（游戏侧将复用既有实例）")
+        sys.exit(0)
+
+    if not check_python_environment():
+        _embedded_log("Python 环境检查未通过，退出")
+        sys.exit(1)
+
+    try:
+        setup_environment()
+    except SystemExit:
+        raise
+    except Exception as e:
+        _embedded_log(f"运行环境配置失败: {e}")
+        sys.exit(1)
+
+    # 开屏 icon（pyi_splash）保留至服务即将启动；此后静默，不再有任何可见窗口
+    _close_pyi_splash_if_any()
+
+    try:
+        start_backend()
+    except SystemExit as exc:
+        _embedded_log(f"后端进程退出: {exc}")
+        raise
+    if _backend_shutdown_requested:
+        # 游戏退出链经 /api/integration/shutdown 请求退出：优雅收尾，退出码 0
+        _embedded_log("已收到游戏侧退出请求，服务已停止，进程退出")
+        sys.exit(0)
+    # 正常情况下方不可达（server.run 阻塞至进程结束）；到达即后端未能启动
+    _embedded_log("后端未能启动，退出（详见日志）")
+    sys.exit(1)
+
+
 def main():
+    global _LAUNCH_MODE
+    if "--embedded" in sys.argv[1:]:
+        _LAUNCH_MODE = "embedded"
+        os.environ["CFN_RAG_LAUNCH_MODE"] = "embedded"
+        try:
+            main_embedded()
+        except SystemExit:
+            raise
+        except Exception as e:
+            _embedded_log(f"embedded 启动异常: {e!r}")
+            sys.exit(1)
+        return
     if is_packaged_environment():
         _ensure_stdio_for_windowed()
         if not _try_acquire_packaged_single_instance():

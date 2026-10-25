@@ -30,9 +30,9 @@
 | # | 决策 | 替代掉的旧设计 |
 |---|---|---|
 | D1 | **废弃 LangGraph 与 legacy 路径**，自研轻量 `TurnOrchestrator`（纯 asyncio，单一路径，流式优先） | LangGraph 双路径（B1）、四重失效防护（B4）、`agent_graph/` 死代码（B6） |
-| D2 | **聊天主 Agent 一次调用多产出**：流式首行输出紧凑 meta JSON（情绪/好感/委派指令），其余为对话正文 | supervisor 路由 LLM + 正则解析 JSON（A6）、情绪与正文分离调用 |
+| D2 | **聊天主 Agent 一次调用多产出**：流式首行输出紧凑 meta JSON（只有情绪/好感两个字段），第一行之后要么是台词正文、要么是一个路由工具调用，两者只取其一 | supervisor 路由 LLM + 正则解析 JSON（A6）、情绪与正文分离调用、meta 行内嵌委派指令 `act`（见下 D4 的修订） |
 | D3 | **后台子 Agent（fire-and-steer）**：TaskRunner / SearchRunner 作为 asyncio 后台任务与前台聊天并行；结果分「中间结果/最终结果」回填 | worker 串行硬等（B2） |
-| D4 | 聊天主 Agent **不使用 function calling**做决策（决策全走 meta 行）；**function calling 只保留给后台子 Agent**（工具循环） | 流式+tools 互斥回退矩阵（A1/A2）、正文字符串截断（A4） |
+| D4 | 聊天主 Agent 的 function calling **只用于路由声明**：`services/tools/route/` 下五个零副作用工具（发草案/改草案/确认/取消/搜索），判断依据写在每个工具的 `description` 里；真正的业务工具（prepare/draft/update/confirm/cancel、三个检索）全部留在后台子 Agent 的工具循环里 | 流式+tools 互斥回退矩阵（A1/A2）、正文字符串截断（A4）、把五个 `act` 分支塞进 meta 行由编排层 if-else 分派 |
 | D5 | 统一 `LLMClient`：连接复用、超时重试、模型 Profile 注册表（思考参数/视觉能力）、参数报错自动降级重试、usage 统计 | 每次新建客户端（A5）、400/422 一刀切判不支持工具（A1） |
 | D6 | 嵌入链路换 **ONNX Runtime + int8**（模型不换，仍 bge-small-zh-v1.5）；向量存储改二进制；检索改「单次嵌入 + 全库矩阵乘 + 池内过滤 + BM25 RRF」 | torch+transformers（F1）、LlamaIndex JSON 向量库（50MB→9.1MB）、12~16 次串行检索（C1） |
 | D7 | 校验管线：**全量收集错误 + 结构化修复指引 + 小幅自动修复 + 最终后端兜底** | 串行短路（D1）、无自动修正（D2）、打回信息不足（D3） |

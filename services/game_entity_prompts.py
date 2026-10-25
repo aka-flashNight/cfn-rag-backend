@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from services.game_progress import stage_root_region_hint
 
-from services.game_data.models import Item, StageInfo
+from services.game_data.models import Item, StageMonster, StageInfo
 
 # RAG 中与草案去重共用的块标题（与 game_rag_service 输出一致）
 _RE_ITEM_SECTION_HDR = re.compile(r"【玩家可能提到的物品类型[^】]*】\s*", re.MULTILINE)
@@ -93,10 +93,12 @@ def format_item_prompt_line(
     *,
     reward_tags: list[str],
     price: Optional[int],
+    sources: Optional[str] = None,
 ) -> str:
     """
     对话/RAG 用单行：名称、称呼(若)、任务类型标注、单价 靠前；其余字段随后。
     reward_tags 为空时，用分类/用途作简短替代（语义检索命中的物品等）。
+    sources＝获取途径（如「合成（烹饪）；商店（冷兵器商人）」），有空值时整段省略。
 
     约定（勿改）：每条必须以「名称：{name}；」开头，供 parse_rag_game_entity_mentions 与草案摘要去重。
     """
@@ -126,6 +128,8 @@ def format_item_prompt_line(
         parts.append(f"重量：{item.weight}")
     if item.clipname:
         parts.append(f"弹夹名：{item.clipname}")
+    if sources:
+        parts.append(f"获取途径：{sources}")
     return "；".join(parts)
 
 
@@ -164,10 +168,9 @@ def format_stage_detail_line(si: StageInfo) -> str:
         f"所在区域：{si.area}",
         f"区域说明：{stage_root_region_hint(si.area)}",
     ]
+    # 空描述整段省略（不写「（无）」占位，免得模型把占位当信息）
     if si.description:
         parts.insert(1, f"关卡描述：{si.description}")
-    else:
-        parts.insert(1, "关卡描述：（无）")
     if si.unlock_condition is not None:
         parts.append(f"解锁主线ID：{si.unlock_condition}")
     return "；".join(parts)
@@ -204,4 +207,61 @@ def get_stage_info_for_name(stage_registry: Any, stage_name: str) -> Optional[St
 
 def iter_all_stage_infos(stage_registry: Any) -> list[StageInfo]:
     return [si for si in stage_registry._stage_infos.values()]
+
+
+def _relative_strength_tier(target: float, known: list[float]) -> Optional[str]:
+    """目标强度在本图已知强度中的相对档位（较弱/中等/较强）。
+
+    口径：严格低于目标的占比 ≥2/3 → 较强；严格高于目标的占比 ≥2/3 → 较弱；
+    其余（并列跨段、全相等、单点）→ 中等（优先落中档，最不易误导）。
+    """
+    n = len(known)
+    below = sum(1 for s in known if s < target - 1e-9)
+    above = sum(1 for s in known if s > target + 1e-9)
+    if below / n >= 2 / 3:
+        return "较强"
+    if above / n >= 2 / 3:
+        return "较弱"
+    return "中等"
+
+
+def format_stage_monster_block(monsters: list[StageMonster]) -> str:
+    """关卡怪物块（B8-3，§8.1-④ 逐字格式）：只出现 displayname；
+    数量最多并列全列并附约数句＋相对强度档位；强度最高只统计有阶段×档次系数者，全无则省该句。
+    """
+    if not monsters:
+        return ""
+    names = "，".join(m.displayname for m in monsters)
+    parts = [f"该关卡有以下怪物：{names}。"]
+    q_max = max(m.quantity for m in monsters)
+    top_by_q = [m for m in monsters if m.quantity == q_max]
+    graded = [m for m in monsters if m.strength is not None]
+    known = [m.strength for m in graded]
+    tier = ""
+    top_graded = [m for m in top_by_q if m.strength is not None]
+    if top_graded:
+        tiers = {_relative_strength_tier(m.strength, known) for m in top_graded}
+        if len(tiers) == 1 and len(top_graded) == len(top_by_q):
+            tier = tiers.pop()
+        else:
+            tier = "中等"
+    q_clause = f"其中数量最多的是{'、'.join(m.displayname for m in top_by_q)}，大致数量约{q_max}个"
+    if tier:
+        q_clause += f"，强度{tier}"
+    parts.append(q_clause + "。")
+    if graded:
+        s_max = max(m.strength for m in graded)
+        top_by_s = [m.displayname for m in graded if m.strength == s_max]
+        parts.append(f"强度最高的是{'、'.join(top_by_s)}。")
+    parts.append(
+        "根据你的身份，你可能知道也可能不知道这个关卡的详情；"
+        "如果你所扮演的NPC看起来不擅长情报或战斗，或者没有这方面的资料，"
+        "那你就表现得不知道具体的关卡怪物分布，只知道模糊的大概，"
+        "例如那里是有僵尸还是有盗贼等；"
+        "但绝对不要编造信息，要么表现的不清楚，要么根据实际信息去说话，"
+        "不能编造未提供的信息。"
+        "上面提到的数量只是让你心里有数，不要向玩家复述具体个数；"
+        "需要说数量时用模糊的概括，例如“数十个”“很多”“不少”“大量”“较多”。"
+    )
+    return "".join(parts)
 

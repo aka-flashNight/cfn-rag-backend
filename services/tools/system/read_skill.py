@@ -1,4 +1,8 @@
-"""read_skill tool — 渐进式披露 Level 2：读取 SKILL.md 完整正文。"""
+"""read_skill tool — 渐进式披露 Level 2：读取 SKILL.md 完整正文。
+
+当前暂未使用：不在任何 LLM 工具表内（子 Agent 规则已前置内联）；
+保留待可能的复杂 SOP 场景重启，见 services/skills/__init__.py。
+"""
 
 from __future__ import annotations
 

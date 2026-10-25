@@ -187,17 +187,22 @@ PREPARE_TASK_CONTEXT_PARAMETERS_SCHEMA: dict[str, Any] = {
         "requirement_keywords": {
             "type": "array",
             "items": {"type": "string"},
+            "maxItems": 5,
             "description": (
-                "可选。任务要求的关键词（模糊搜索）：用于将关卡名/区域说明/需提交或持有的物品名/物品类型等相关的候选项排到前面；"
-                "如果你需要玩家给你更具体的某个/某类物品，或者让玩家去某关卡/某区域，请在此填写关键词，可以填多个。示例：「食品」「食材」「抗生素」「矛」「废城」等。"
+                "可选。任务要求的方向词，最多 5 个，按优先级从高到低排列。"
+                "取值只能从系统提示里的「候选标签」清单原样抄写（如「势均力敌」「周边地区」「敌对区域」「酒水」「同阵营」），"
+                "也可以直接填玩家点到的具体名称（区域名/关卡名/物品名/NPC 名）。"
+                "后端按这些词做命中抽选，再随机补足；返回的每条候选都带 matched_by 标明来自哪个词。"
             ),
         },
         "reward_keywords": {
             "type": "array",
             "items": {"type": "string"},
+            "maxItems": 5,
             "description": (
-                "可选。奖励物品的关键词（模糊搜索），作用于 reward_item_candidates；"
-                "如果你想给玩家更具体的某类/某个奖励，请在此填写关键词，可以填多个。示例：「头部装备」「上装装备」「手枪」「增效剂」「罐头」「食材」「霰弹」等。"
+                "可选。奖励物品的方向词，最多 5 个，按优先级从高到低排列。"
+                "取值同样只能从系统提示的「候选标签」清单原样抄写，或直接写具体物品名。"
+                "勾选的单例奖励类型（金币/经验值/K点/技能点/强化石）始终优先保留。"
             ),
         },
     },
@@ -235,23 +240,20 @@ STAGE_REQUIREMENT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-TOP_NPC_EMOTION_HINT: str = "emotion：可选；用于拼接 char（NPC名#情绪 或 $PC_CHAR#情绪）。"
-
 DIALOGUE_ENTRY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "name": {"type": "string", "description": "NPC 名称或固定值 '$PC'（玩家）"},
-        "title": {"type": "string", "description": "称号（NPC 称号或 '$PC_TITLE'）"},
         "emotion": {
             "type": "string",
-            "description": TOP_NPC_EMOTION_HINT + "；允许空字符串表示默认情绪。",
+            "description": "这一行台词的情绪，从该说话人的可用情绪标签里选一个；语气平实、没有表情的行留空。",
         },
         "text": {
             "type": "string",
             "description": "纯对话内容（不要包含动作/神态/旁白/【...】）。"
         },
     },
-    "required": ["name", "title", "text"],
+    "required": ["name", "text"],
     "additionalProperties": False,
 }
 
@@ -349,6 +351,46 @@ CONFIRM_AGENT_TASK_PARAMETERS_SCHEMA: dict[str, Any] = {
             "type": "string",
             "maxLength": 12,
             "description": "前端显示的超短提示（<=12字），为空则后端使用默认提示。",
+        },
+        "dialogue_rewrite": {
+            "type": "boolean",
+            "description": (
+                "这份委托很关键、玩家完成后你的说话方式应当随之改变时填 true，否则填 false。"
+                "填 true 时后台会在玩家完成后自动派子 Agent 修改你的对话。"
+            ),
+        },
+        "dialogue_rewrite_instruction": {
+            "type": "string",
+            "description": "dialogue_rewrite 为 true 时填：你希望自己的对话怎么变（改写指示）。",
+        },
+        "return_for_reward": {
+            "type": "boolean",
+            "description": (
+                "仅当完成 NPC 与接取 NPC 不同、且真实报酬应由接取 NPC 发放时填 true；否则填 false。"
+            ),
+        },
+        "return_description": {
+            "type": "string",
+            "description": (
+                "return_for_reward 为 true 时必填：回访任务（玩家回到接取 NPC 处复命领报酬）的"
+                "任务说明；为 false 时留空。"
+            ),
+        },
+        "return_get_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": (
+                "return_for_reward 为 true 时必填：玩家在完成 NPC 处接取回访时的对话；"
+                "NPC 说话人只能是完成 NPC，玩家用 $PC。"
+            ),
+        },
+        "return_finish_dialogue": {
+            "type": "array",
+            "items": DIALOGUE_ENTRY_SCHEMA,
+            "description": (
+                "return_for_reward 为 true 时必填：玩家回到接取 NPC 处完成回访时的对话；"
+                "NPC 说话人只能是接取 NPC，玩家用 $PC。"
+            ),
         },
     },
     "required": ["draft_id", "title", "description", "get_dialogue", "finish_dialogue"],

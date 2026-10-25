@@ -118,6 +118,10 @@ class ItemRegistry:
             if desc_clean == "":
                 desc_clean = None
 
+            # 称号（data/title）：原始文本带 FONT 等标签，去标签并压缩空白
+            title_raw = attrs.get("title")
+            title_clean = strip_game_markup(title_raw) if title_raw else ""
+
             item = Item(
                 name=str(name),
                 displayname=str(displayname) if displayname is not None else None,
@@ -127,6 +131,7 @@ class ItemRegistry:
                 weapontype=str(attrs.get("weapontype")) if attrs.get("weapontype") is not None else None,
                 price=price,
                 description=desc_clean,
+                title=title_clean or "",
                 weight=(str(attrs["weight"]).strip() if attrs.get("weight") is not None else None),
                 clipname=(str(attrs["clipname"]).strip() if attrs.get("clipname") is not None else None),
                 level=int(attrs.get("level") or 0),

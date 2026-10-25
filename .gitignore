@@ -45,9 +45,17 @@ venv.bak/
 .env.*.local
 
 # Database files (保留目录但忽略db文件)
+# 库文件由程序首启自建（tools/memory.db 等），不随仓库分发；
+# 附属文件按 SQLite 规则＝库文件名后加 -wal / -shm / -journal，同样一律忽略。
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 
 # Logs
 *.log
@@ -76,7 +84,9 @@ models/*/pytorch_model.bin
 models/*/model.safetensors
 
 # Test files and test directory (not packed into exe)
-test_*.py
+# 注：tests/ 是正式 pytest 套件，纳入版本控制（不进 exe 由 PyInstaller excludes 保证）；
+# 仅忽略根目录历史临时测试脚本与 test/ 目录
+/test_*.py
 *_test.py
 test/
 
@@ -107,3 +117,13 @@ illustration.zip
 release_notes_*.md
 
 .cursor
+
+# v3: ONNX 导出产物（由 scripts/export_onnx_int8.py 本地生成）
+models/*/model.onnx
+models/_export_onnx_tmp/
+
+# AI 助手本地工作区（记忆/缓存/临时产物，纯本地状态，不进版本库）
+.workbuddy/
+
+# 调试转储产物（prompt dump / 链路日志，由 scripts/dump_chat_prompt.py 等生成）
+debug/

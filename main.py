@@ -1,130 +1,83 @@
+from __future__ import annotations
+
 import logging
-import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-# 在导入 llama_index 之前设置，避免 tiktoken 编码问题
-os.environ["LLAMA_INDEX_CACHE_DIR"] = ".llamaindex_cache"
-
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api import api_router
-from core.config import Settings, get_settings
+from core.config import get_settings
 from core.exceptions import register_exception_handlers
-from core.startup import run_startup_tasks
+from core.startup import run_startup_tasks, setup_logging
 
-# ---------------------------------------------------------------------------
-# 结构化日志（路线四 · 观测性）
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 
-def _setup_logging(settings: Settings) -> None:
-    """根据 profile 配置日志格式。
+class SPAStaticFiles(StaticFiles):
+    """前端静态层（B1-1）：`/api/*` 由先注册的路由优先命中；未命中的非 API 路径回退 index.html。"""
 
-    - local profile: 标准控制台格式（人类可读）
-    - server profile: JSON 格式（适合 ELK / Loki 采集）
-    """
-    if settings.is_server_profile:
+    async def get_response(self, path: str, scope):
         try:
-            import structlog
-
-            structlog.configure(
-                processors=[
-                    structlog.stdlib.filter_by_level,
-                    structlog.stdlib.add_log_level,
-                    structlog.processors.TimeStamper(fmt="iso"),
-                    structlog.processors.JSONRenderer(),
-                ],
-                wrapper_class=structlog.stdlib.BoundLogger,
-                context_class=dict,
-                logger_factory=structlog.PrintLoggerFactory(),
-            )
-            logging.getLogger("uvicorn.access").handlers = []
-            logging.getLogger("uvicorn.access").addHandler(
-                logging.StreamHandler(sys.stderr)
-            )
-        except ImportError:
-            pass
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            normalized = path.replace("\\", "/").lstrip("/")
+            if exc.status_code != 404 or normalized == "api" or normalized.startswith("api/"):
+                raise
+            return await super().get_response("index.html", scope)
 
 
-# ---------------------------------------------------------------------------
-# Prometheus 指标（路线四 · 观测性）
-# ---------------------------------------------------------------------------
-
-def _setup_metrics(app: FastAPI, settings: Settings) -> None:
-    """为 server profile 启用 Prometheus /metrics 端点。"""
-    if not settings.is_server_profile:
-        return
-    try:
-        from prometheus_fastapi_instrumentator import Instrumentator
-
-        instrumentator = Instrumentator(
-            should_group_status_codes=False,
-            should_ignore_untemplated=True,
-        )
-        instrumentator.add(
-            # 自定义指标：活跃 SSE 连接数
-            instrumentator.metrics.gauge(
-                name="cfn_active_sse_connections",
-                documentation="当前活跃的 SSE 长连接数",
-            )
-        )
-        instrumentator.instrument(app).expose(app, endpoint="/metrics")
-        print("[观测性] Prometheus /metrics 端点已启用")
-    except ImportError:
-        print("[观测性] prometheus-fastapi-instrumentator 未安装，跳过 /metrics")
-
-
-# ---------------------------------------------------------------------------
-# 应用生命周期
-# ---------------------------------------------------------------------------
+def _find_frontend_dist() -> Path | None:
+    """定位前端 dist：打包内嵌（_MEIPASS/dist）→ 开发目录（本文件旁）→ exe 目录旁。"""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "dist")
+    candidates.append(Path(__file__).resolve().parent / "dist")
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "dist")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI 应用生命周期管理。
-
-    在应用启动时执行初始化任务，在应用关闭时清理资源。
-    """
-    # 启动时的初始化任务
+    """应用生命周期：启动时并行初始化（检索/NPC/存储/摘要 worker），关闭时落盘收尾。"""
     await run_startup_tasks()
 
     yield
 
-    # 关闭时的清理任务
-    settings = get_settings()
-    if settings.is_server_profile:
-        print("[关闭] 后端服务正在关闭...")
-    else:
-        print("[关闭] 后端服务正在关闭...")
+    try:
+        from services.npc.manager import get_npc_manager
 
-
-# ---------------------------------------------------------------------------
-# 应用工厂
-# ---------------------------------------------------------------------------
+        manager = await get_npc_manager()
+        await manager.flush()  # 进程退出前落盘好感度（06 §1.1）
+    except Exception:
+        pass
+    print("[关闭] 后端服务正在关闭...")
 
 
 def create_app() -> FastAPI:
-    """
-    FastAPI 应用工厂，负责注册中间件、路由和全局异常处理。
-    """
-
-    settings: Settings = get_settings()
-
-    _setup_logging(settings)
+    """FastAPI 应用工厂：中间件、路由、全局异常处理。"""
+    setup_logging()
+    settings = get_settings()
 
     app = FastAPI(
-        title=settings.app_name,
-        debug=settings.debug,
+        title="CFN-RAG Backend",
         lifespan=lifespan,
     )
 
+    # 本地单用户形态：launcher 同源反代为主，CORS 保持宽松但凭证组合无效（S10 记录在案）
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -133,17 +86,20 @@ def create_app() -> FastAPI:
 
     app.include_router(api_router, prefix="/api")
 
-    _setup_metrics(app, settings)
+    # 前端页面由 7077 同源伺服（内嵌面板 iframe 需要固定 origin；静态层必须最后挂）
+    dist_dir = _find_frontend_dist()
+    if dist_dir is not None:
+        app.mount("/", SPAStaticFiles(directory=dist_dir, html=True), name="frontend")
+    else:
+        logger.warning("未找到前端 dist 目录，7077 只伺服 API（面板 iframe 将不可用）")
 
     return app
 
-
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
 
 app: FastAPI = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=7077, reload=True)
+
+    # reload=False（修 F3：旧版 __main__ 硬编码 reload=True，与 launcher 不一致）
+    uvicorn.run("main:app", host="127.0.0.1", port=7077, reload=False)

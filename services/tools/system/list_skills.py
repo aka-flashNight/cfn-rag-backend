@@ -1,4 +1,8 @@
-"""list_skills tool — Anthropic Skills 渐进式披露 Level 1：skills 简表。"""
+"""list_skills tool — Anthropic Skills 渐进式披露 Level 1：skills 简表。
+
+当前暂未使用：不在任何 LLM 工具表内（子 Agent 规则已前置内联）；
+保留待可能的复杂 SOP 场景重启，见 services/skills/__init__.py。
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "可选，过滤 skill 大类。目前支持："
-                "task-publishing / task-bargaining / knowledge-search / mood-tracking / skill-discovery。"
+                "task-publishing / task-bargaining / knowledge-search / skill-discovery。"
                 "不传则返回全部 skills。"
             ),
         },

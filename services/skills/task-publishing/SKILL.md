@@ -2,7 +2,6 @@
 name: task-publishing
 description: NPC 发布任务给玩家的两步式完整流程（prepare_task_context → draft_agent_task，玩家接受后 → confirm_agent_task）。涵盖任务类型选择、奖励设计、物品/关卡候选抽取与任务发布原则。触发：玩家主动索要任务/奖励/关卡、对话自然延伸到 NPC 需要委托玩家某事时、好感度刚跨越关系等级可考虑初次委托。不触发：玩家正在倾诉烦恼、对话氛围不合适发布任务、当前已有无需修改的任务草案、你的身份不适合给玩家发任务、玩家近期刚拒绝过任务。
 ---
-
 # 任务发布流程（两步式 + 确认）
 
 ## 总览
@@ -55,7 +54,8 @@ prepare_task_context  ──►  draft_agent_task  ──►  （玩家回复）
 - `submit_item_candidates` / `contain_item_candidates`：可供"提交/持有"任务选择的物品
 - `reward_item_candidates`：可供奖励列表选择的物品（结构化，已过滤 reward_types）
 - `reward_budget`：`{final_min, final_max}` 总价值上下限
-- `npc_list`（仅问候/传话）：候选完成 NPC 及其情绪/称号列表
+- `npc_list`（仅问候/传话）：候选完成 NPC 及其情绪/称号列表；有驻地者附 `scene`（所在场景）
+- `publisher_scene`（仅问候/传话，发布 NPC 有驻地时）：你所在场景与同场景 NPC 名单
 - `rule_hint`：该任务类型的人类可读规则摘要
 
 ## Step 2: draft_agent_task
@@ -97,10 +97,10 @@ prepare_task_context  ──►  draft_agent_task  ──►  （玩家回复）
 - `draft_id` 必须与当前 pending_draft 一致。
 - `title`：最终任务标题，会覆盖草案阶段的标题。
 - `description`：任务说明，须与最终关卡/物品/奖励一致。
-- `get_dialogue` / `finish_dialogue`：对话数组，每条 `{name, title, emotion?, text}`。
+- `get_dialogue` / `finish_dialogue`：对话数组，每条 `{name, emotion?, text}`。
   - `text` 必须是**纯对话**，**不要**包含动作/神态/旁白/`【...】`。
   - 神态/情绪放 `emotion` 字段（从可用情绪选，可为空）。
-  - 玩家条目：`name="$PC"`, `title="$PC_TITLE"`，`emotion` 可填玩家情绪。
+  - 玩家条目：`name="$PC"`，`emotion` 可填玩家情绪。
   - 数组顺序按对话发生时间排列。
   - **不要**和已有任务对话高度雷同。
 

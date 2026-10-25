@@ -1,0 +1,105 @@
+"""SearchRunner：检索后台子 Agent（对应 docs/v3-developer/03 §6）。
+
+输入 query + NPC 视角简述 + 两批现成材料（聊天 Agent 已有的 Tier-1 结果、编排层
+按 keywords 预取的结果）；工具循环 ≤3 轮；输出 final：findings（提示词要求 400 字，
+后端允许 1000 字，避免模型多写一点就被砍掉重写）。Tier-1 预检索与关键词预取由
+orchestrator 承担，本 Runner 只负责模型主动发起的深挖。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any, Callable, Optional
+
+from services.llm import LLMClient
+from services.skills import SkillRegistry, get_skill_registry
+from services.subagents.base import (
+    AgentLabel,
+    SubagentBase,
+    SubagentHandle,
+    SubagentKind,
+)
+from services.subagents.prompts import SEARCH_RUNNER_SYSTEM, search_runner_user_prompt
+from services.tools.base import ToolContext, ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+SEARCH_TOOLS = [
+    "search_knowledge",
+    "search_items",
+    "search_stages",
+]
+
+# 提示词仍要求 400 字；这里放宽到 1000，允许模型自然收尾而不是被硬切
+_FINDINGS_MAX_CHARS = 1000
+
+
+class SearchRunner(SubagentBase):
+    kind: SubagentKind = "search"
+    agent: AgentLabel = "search"
+    default_ui_hint = "查资料中"
+
+    def _final_from_text(self, text: str) -> dict[str, Any]:
+        findings = (text or "").strip()
+        if len(findings) > _FINDINGS_MAX_CHARS:
+            findings = findings[:_FINDINGS_MAX_CHARS].rstrip() + "…"
+        return {"findings": findings}
+
+    @classmethod
+    def launch(
+        cls,
+        *,
+        llm: LLMClient,
+        registry: ToolRegistry,
+        query: str,
+        player_query: str = "",
+        npc_name: str,
+        npc_faction: str = "",
+        npc_titles: Optional[list[str]] = None,
+        npc_challenge: Optional[str] = None,
+        player_progress: int = 1,
+        npc_affinity: int = 0,
+        npc_states: Optional[dict] = None,
+        game_data: Any = None,
+        retrieve_fn: Optional[Callable[[str], str]] = None,
+        existing_material: str = "",
+        first_round_material: str = "",
+        max_rounds: int = 3,
+        skill_registry: Optional[SkillRegistry] = None,
+        ui_hint: str = "",
+    ) -> SubagentHandle:
+        ctx = ToolContext(
+            npc_name=npc_name,
+            npc_faction=npc_faction,
+            npc_challenge=npc_challenge,
+            player_progress=max(1, min(7, player_progress or 1)),
+            npc_affinity=npc_affinity,
+            npc_states=npc_states,
+            game_data=game_data,
+            retrieve_fn=retrieve_fn,
+            skill_registry=skill_registry if skill_registry is not None else get_skill_registry(),
+        )
+        user_prompt = search_runner_user_prompt(
+            query=query,
+            npc_name=npc_name,
+            player_query=player_query,
+            existing_material=existing_material,
+            first_round_material=first_round_material,
+        )
+        runner = cls(
+            llm=llm,
+            registry=registry,
+            tool_names=SEARCH_TOOLS,
+            system_prompt=SEARCH_RUNNER_SYSTEM,
+            user_prompt=user_prompt,
+            ctx=ctx,
+            max_rounds=max(1, max_rounds),
+            queue=asyncio.Queue(),
+        )
+        # 模型自带的等待提示（「回忆中」「翻查记录中」这类）：有就用它替换默认
+        # 「查资料中」，让等待文案跟这一轮实际在做的事、跟 NPC 人设对得上。
+        hint = (ui_hint or "").strip()[:12]
+        if hint:
+            runner.default_ui_hint = hint
+        return SubagentHandle(kind="search", agent="search", coro=runner.run(), events=runner.queue)

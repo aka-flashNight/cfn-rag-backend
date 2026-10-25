@@ -172,9 +172,10 @@ def extract_item_attributes(item_el: ET.Element) -> dict[str, Any]:
     """
     提取 items XML 里记录的字段：
     name, displayname, type, use, actiontype, weapontype, price, description,
-    data.level, data.weight, data.clipname
+    data.level, data.weight, data.clipname, data.title
 
-    注意：weapontype 在 <item> 标签属性上（仅枪械有）。
+    注意：weapontype 在 <item> 标签属性上（仅枪械有）；
+    data/title 是称号（多用于颈部装备），原始文本可能带 <FONT> 标签。
     """
 
     attrs: dict[str, Any] = {}
@@ -220,6 +221,12 @@ def extract_item_attributes(item_el: ET.Element) -> dict[str, Any]:
             v = data_el.findtext(key)
             if v is not None and str(v).strip():
                 attrs["clipname"] = str(v).strip()
+                break
+        # 称号（多用于颈部等装备）：原始文本含 FONT 等标签，由调用方 strip_game_markup
+        for key in ("title", "Title"):
+            v = data_el.findtext(key)
+            if v is not None and str(v).strip():
+                attrs["title"] = str(v).strip()
                 break
 
     # price 转 int（保留原始值在 raw 里由上层决定）

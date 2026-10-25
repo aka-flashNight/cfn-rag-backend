@@ -1,24 +1,28 @@
-"""
-游戏知识库 RAG API，供 Web 端调用。
+"""游戏对话 API（v3 重写）。
 
-路线四：Server profile 下自动切换 Postgres / Qdrant / Redis 后端。
+- POST /api/game/ask：**唯一**对话路径，内部全部走 TurnOrchestrator（单一路径，决策 D1）。
+  stream=true → SSE（事件契约见 services/orchestrator/events.py，前端适配见 09）；
+  stream=false → 消费同一事件流聚合为 NPCChatResponse。
+- /ask/confirm 已删除：HITL 走正常对话轮（草案确认 = 玩家下一条消息，03 §4.2）。
+- 代理改为客户端级：proxy_url 进 LLMConfig（httpx 客户端级），不再改进程环境变量（修 E3）。
+- 前端可按请求覆盖 api_key/base/model：仅在内存中按会话保存最近一次配置（01 §8），不再按消息存库。
 """
+
+from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-from typing import Any, Optional
+import threading
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from core.config import get_settings
-from core.startup import ensure_embed_model_ready, trigger_embed_model_preload
 from schemas.knowledge_schema import (
     ChatMessage,
     NPCCandidate,
-    NPCChatConfirmRequest,
     NPCChatRequest,
     NPCChatResponse,
     NPCFavorabilityResponse,
@@ -26,283 +30,219 @@ from schemas.knowledge_schema import (
     SessionCreateRequest,
     SessionCreateResponse,
     SessionHistoryResponse,
-    SessionListResponse,
     SessionInfo,
+    SessionListResponse,
     SessionTitleUpdateRequest,
     SessionTitleUpdateResponse,
 )
-from ai_engine.game_data_loader import reset_knowledge_base
-from services.game_rag_service import GameRAGService
-from services.memory_manager import MemoryManager
-from services.npc_manager import NPCManager
+from services.integration.state import get_integration_state
+from services.llm import LLMConfig
+from services.llm.recent import (
+    get_recent_llm_config,
+    get_recent_updated_at,
+    remember_llm_config,
+    replace_llm_config,
+)
+from services.memory.store import get_memory_store
+from services.npc.manager import NPCManager, get_npc_manager
+from services.orchestrator import TurnOrchestrator
 
 logger = logging.getLogger(__name__)
 router: APIRouter = APIRouter()
 
-
-def apply_proxy_config(proxy_url: str | None) -> None:
-    """
-    设置或清除代理环境变量。
-    - proxy_url 非空：设置代理
-    - proxy_url 为空或空字符串：清除代理
-    """
-    if not proxy_url or not proxy_url.strip():
-        os.environ.pop("HTTP_PROXY", None)
-        os.environ.pop("HTTPS_PROXY", None)
-        print("[代理] 已清除代理配置")
-        return
-
-    proxy = proxy_url.strip()
-    if not proxy.startswith("http://") and not proxy.startswith("https://"):
-        proxy = "http://" + proxy
-
-    os.environ["HTTP_PROXY"] = proxy
-    os.environ["HTTPS_PROXY"] = proxy
-    print(f"[代理] 已设置代理: {proxy}")
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    "X-CFN-Version": "3.0.0",  # 09 §4：前端可据此提示版本配套
+}
 
 
 # ---------------------------------------------------------------------------
-# 单例 + 依赖注入（路线四：profile 感知）
+# 会话级 LLM 配置（内存；01 §8：不再按消息存库）
 # ---------------------------------------------------------------------------
 
-_game_rag_service: GameRAGService | None = None
-_memory_manager: Any = None  # MemoryManager (local) or PostgresBackend (server)
-_server_cache: Any = None    # RedisCache (server), None (local)
+_SESSION_LLM_CONFIGS: dict[str, LLMConfig] = {}
+_CONFIG_LOCK = threading.Lock()
 
 
-def get_game_rag_service() -> GameRAGService:
-    """GameRAGService 单例依赖注入（profile 感知向量后端）。"""
-    global _game_rag_service
-    if _game_rag_service is None:
-        settings = get_settings()
-        if settings.is_server_profile and settings.effective("vector_backend") == "qdrant":
-            from services.storage.qdrant_vector import QdrantBackend
-            vector_backend = QdrantBackend(url=settings.qdrant_url, collection=settings.qdrant_collection)
-            _game_rag_service = GameRAGService(vector_backend=vector_backend)
-        else:
-            _game_rag_service = GameRAGService()
-    return _game_rag_service
+def resolve_llm_config(payload: NPCChatRequest) -> LLMConfig:
+    """请求覆盖 > 会话记忆（最近一次） > 全局默认；并把结果记回会话内存。"""
+    with _CONFIG_LOCK:
+        remembered = _SESSION_LLM_CONFIGS.get(payload.session_id)
+    merged = LLMConfig(
+        api_key=payload.api_key or (remembered.api_key if remembered else ""),
+        api_base=payload.api_base or (remembered.api_base if remembered else ""),
+        model_name=payload.model_name or (remembered.model_name if remembered else ""),
+        proxy_url=payload.proxy_url or (remembered.proxy_url if remembered else ""),
+    )
+    with _CONFIG_LOCK:
+        _SESSION_LLM_CONFIGS[payload.session_id] = merged
+    # 插话请求没有前端设置可带：记住最近一次有效配置供其复用。
+    remember_llm_config(merged)
+    return merged
 
-
-async def get_memory_manager() -> Any:
-    """
-    会话/消息持久化依赖注入（profile 感知），统一返回 dataclass 接口。
-
-    Local  → SqliteBackend（封装 MemoryManager，返回 SessionInfo / ChatMessage）
-    Server → PostgresBackend（返回 SessionInfo / ChatMessage）
-    """
-    global _memory_manager
-    if _memory_manager is not None:
-        return _memory_manager
-
-    settings = get_settings()
-    if settings.is_server_profile and settings.effective("db_backend") == "postgres":
-        from services.storage.postgres_db import PostgresBackend
-
-        backend = PostgresBackend(url=settings.postgres_url)
-        await backend.init()
-        _memory_manager = backend
-        logger.info("[profile] 使用 PostgresBackend (server)")
-    else:
-        from services.storage.db import SqliteBackend
-
-        backend = SqliteBackend()
-        _memory_manager = backend
-        logger.info("[profile] 使用 SqliteBackend (local)")
-    return _memory_manager
-
-
-async def get_server_cache() -> Any | None:
-    """Server profile 下返回 RedisCache 实例，local 返回 None。"""
-    global _server_cache
-    if _server_cache is not None:
-        return _server_cache
-
-    settings = get_settings()
-    if settings.use_redis:
-        from services.storage.cache import RedisCache
-        _server_cache = RedisCache(url=settings.redis_url)
-        logger.info("[profile] Redis 缓存已启用")
-    return _server_cache
-
-
-async def get_npc_manager() -> NPCManager:
-    """NPCManager 依赖注入。"""
-    return await NPCManager.load()
 
 
 # ---------------------------------------------------------------------------
-# 幂等性检查（server profile）
+# LLM 连接配置（localStorage 是唯一持久化位置，后端只保留内存副本）
 # ---------------------------------------------------------------------------
 
-async def check_idempotent(request: Request) -> None:
-    """
-    检查 X-Request-Id header 幂等性（仅 server profile）。
+class LlmConfigSaveRequest(BaseModel):
+    api_key: str = ""
+    api_base: str = ""
+    model_name: str = ""
+    proxy_url: str = ""
+    updated_at: int | None = None
 
-    如果请求带有 X-Request-Id，则用 Redis SETNX 防止重复处理。
-    """
-    settings = get_settings()
-    if not settings.use_redis:
-        return
 
-    request_id = request.headers.get("X-Request-Id")
-    if not request_id:
-        return
+def _llm_config_view() -> dict:
+    config = get_recent_llm_config()
+    key = config.api_key if config is not None else ""
+    return {
+        "ok": True,
+        "configured": bool(key.strip()),
+        "api_key": key,
+        "api_base": config.api_base if config is not None else "",
+        "model_name": config.model_name if config is not None else "",
+        "proxy_url": config.proxy_url if config is not None else "",
+        "updated_at": get_recent_updated_at(),
+    }
 
-    cache = await get_server_cache()
-    if cache is None:
-        return
 
-    key = f"req:{request_id}"
-    is_new = await cache.setnx(key, "1", ttl=60)
-    if not is_new:
-        logger.warning("重复请求被拦截: %s", request_id)
-        # 不抛异常，仅记录——幂等由上层业务决定是否拒绝
+@router.get("/llm-config", summary="读取当前进程内生效的 LLM 连接配置")
+async def get_llm_config():
+    return _llm_config_view()
 
+
+@router.post("/llm-config", summary="同步终端 localStorage 中的 LLM 连接配置")
+async def save_llm_config(payload: LlmConfigSaveRequest):
+    existing = get_recent_llm_config()
+    # 配置小窗只有三个字段；不传 proxy 时保留当前进程已有的代理。
+    proxy_url = payload.proxy_url or (existing.proxy_url if existing is not None else "")
+    replace_llm_config(
+        LLMConfig(
+            api_key=payload.api_key.strip(),
+            api_base=payload.api_base.strip(),
+            model_name=payload.model_name.strip(),
+            proxy_url=proxy_url.strip(),
+        ),
+        updated_at=payload.updated_at,
+    )
+    return _llm_config_view()
+
+
+# ---------------------------------------------------------------------------
+# 对话（单一路径）
+# ---------------------------------------------------------------------------
 
 @router.post(
     "/ask",
-    summary="游戏 NPC RAG + 好感度对话（支持流式）",
+    summary="游戏 NPC 对话（v3 单一路径：聊天 + 任务 + 检索全部经 TurnOrchestrator）",
 )
-async def ask_game_knowledge(
+async def ask(
     payload: NPCChatRequest,
-    stream: bool = Query(False, description="为 true 时返回 SSE 流式响应，前端可做打字机效果"),
-    service: GameRAGService = Depends(get_game_rag_service),
-    memory: MemoryManager = Depends(get_memory_manager),
+    stream: bool = Query(False, description="为 true 时返回 SSE 流式响应（v3 事件契约）"),
     npc_manager: NPCManager = Depends(get_npc_manager),
 ):
-    """
-    基于游戏资料（剧情、人物、世界观设定等）进行 RAG 问答，
-    扮演指定 NPC 与玩家对话，并驱动好感度变化。
-    - stream=false（默认）：返回 JSON 体 NPCChatResponse。
-    - stream=true：返回 text/event-stream，事件类型为 content（正文片段）、可选 mood_update（流式提前下发情绪/好感变化）、done（结尾携带 reply/emotion/favorability 等）。
-    """
-    await ensure_embed_model_ready()
-    apply_proxy_config(payload.proxy_url)
-
-    if not stream:
-        return await service.ask(payload, npc_manager=npc_manager, memory=memory)
-
-    async def sse_generate():
-        # 先发一条 SSE 注释，促使代理/服务器立即刷新缓冲，避免整段响应被缓冲后再返回
-        yield b":\n\n"
-        try:
-            async for event_type, data in service.ask_stream(
-                payload, npc_manager=npc_manager, memory=memory
-            ):
-                if event_type == "content":
-                    line = json.dumps({"delta": data}, ensure_ascii=False)
-                    yield f"event: content\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-                elif event_type == "mood_update":
-                    line = json.dumps(data, ensure_ascii=False)
-                    yield f"event: mood_update\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-                elif event_type == "done":
-                    line = json.dumps(data, ensure_ascii=False)
-                    yield f"event: done\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-                elif event_type in (
-                    "tool_status",
-                    "agent_status",
-                ):
-                    line = json.dumps(data, ensure_ascii=False)
-                    yield f"event: {event_type}\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-        except Exception as e:
-            err_line = json.dumps({"error": str(e)}, ensure_ascii=False)
-            yield f"event: error\ndata: {err_line}\n\n".encode("utf-8")
-
-    return StreamingResponse(
-        sse_generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@router.post(
-    "/ask/confirm",
-    summary="HITL v2：玩家对 pending 任务草案给出 accept/reject/bargain 并继续推进主图",
-)
-async def ask_confirm(
-    payload: NPCChatConfirmRequest,
-    stream: bool = Query(True, description="默认 true，以 SSE 流式返回后续主图推进事件"),
-    service: GameRAGService = Depends(get_game_rag_service),
-    memory: MemoryManager = Depends(get_memory_manager),
-    npc_manager: NPCManager = Depends(get_npc_manager),
-):
-    """
-    推进处于 awaiting_confirmation 状态的 LangGraph 主图：
-    - accept：相当于注入一条"我接受"的玩家消息，后续由 TaskAgent 调 confirm_agent_task。
-    - reject：相当于注入"我拒绝"，后续由 TaskAgent 调 cancel_agent_task。
-    - bargain：把 player_reply 作为新一轮消息再跑一次 supervisor 图（可能改 draft 或换方案）。
-    实际实现上统一做法：把 NPCChatConfirmRequest 映射为一条标准 NPCChatRequest，再走 ask_stream / ask。
-    LangGraph 通过 session_id → thread_id 复用 checkpointer 内的 state（pending_draft 仍在）。
-    """
-    await ensure_embed_model_ready()
-
-    decision = (payload.decision or "").strip().lower()
-    if decision not in ("accept", "reject", "bargain"):
-        return {"error": "decision 必须是 accept / reject / bargain"}
-
-    if decision == "accept":
-        synthetic_query = payload.player_reply or "我接受这个任务。"
-    elif decision == "reject":
-        synthetic_query = payload.player_reply or "我拒绝，算了吧。"
-    else:
-        synthetic_query = payload.player_reply or "我想再改一下。"
-
-    # 构造一条标准 NPCChatRequest，复用现有管线；session_id 保持不变 → thread_id 复用
-    chat_req = NPCChatRequest(
-        query=synthetic_query,
-        npc_name=payload.npc_name,
+    llm_config = resolve_llm_config(payload)
+    orchestrator = TurnOrchestrator(
         session_id=payload.session_id,
-        api_key=payload.api_key,
-        api_base=payload.api_base,
-        model_name=payload.model_name,
-        progress_stage=1,  # confirm endpoint 假定已经是进行中的对话；stage 由具体 session 状态决定
-        agent_enabled=True,
+        npc_name=payload.npc_name,
+        query=payload.query,
+        player_identity=payload.player_identity or "",
+        progress_stage=payload.progress_stage,
+        current_emotion=payload.current_emotion,
+        llm_config=llm_config,
+        # Agent 能力开关与精确短期记忆档位都按请求生效（前端每次都带）；
+        # agent_enabled 缺省（None）按启用处理，即老客户端行为不变
+        agent_enabled=payload.agent_enabled is not False,
+        summarize_interval=payload.summarize_interval,
+        # 跨对话长期记忆开关按请求生效；游戏内（embedded 口径）由后端强制启用，
+        # 这里的原值只在非游戏打开时决定开关（缺省＝关闭）
+        long_term_memory_enabled=payload.long_term_memory_enabled,
+        # send_image 不显式关：是否带图由编排层按 07 §4 判定
+        #（vision Profile + 未被标记图像不支持 + 立绘资产可用，否则纯文本不报错）
     )
 
-    if not stream:
-        return await service.ask(chat_req, npc_manager=npc_manager, memory=memory)
+    if stream:
+        return StreamingResponse(
+            _sse_generate(orchestrator),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
 
-    async def sse_generate():
-        yield b":\n\n"
-        try:
-            async for event_type, data in service.ask_stream(
-                chat_req, npc_manager=npc_manager, memory=memory
-            ):
-                if event_type == "content":
-                    line = json.dumps({"delta": data}, ensure_ascii=False)
-                    yield f"event: content\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-                elif event_type in (
-                    "tool_status",
-                    "agent_status",
-                    "mood_update",
-                    "done",
-                ):
-                    line = json.dumps(data, ensure_ascii=False)
-                    yield f"event: {event_type}\ndata: {line}\n\n".encode("utf-8")
-                    await asyncio.sleep(0)
-        except Exception as e:
-            err_line = json.dumps({"error": str(e)}, ensure_ascii=False)
-            yield f"event: error\ndata: {err_line}\n\n".encode("utf-8")
+    return await _collect_response(orchestrator, payload.npc_name, npc_manager)
 
-    return StreamingResponse(
-        sse_generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+
+async def _sse_generate(orchestrator: TurnOrchestrator):
+    # 首条注释帧促使代理立即刷新缓冲
+    yield b":\n\n"
+    try:
+        async for ev in orchestrator.run():
+            yield ev.encode()
+            await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("SSE 流意外中断")
+        import json as _json
+
+        err = _json.dumps(
+            {"code": "internal_error", "message": str(exc), "retryable": False},
+            ensure_ascii=False,
+        )
+        yield f"event: error\ndata: {err}\n\n".encode("utf-8")
+
+
+async def _collect_response(
+    orchestrator: TurnOrchestrator,
+    npc_name: str,
+    npc_manager: NPCManager,
+) -> NPCChatResponse:
+    """stream=false：消费同一事件流聚合为 JSON（保持单一路径）。"""
+    reply_parts: list[str] = []
+    emotion = ""
+    favorability_change = 0
+    favorability: Optional[int] = None
+    relationship_level = ""
+    error_message: str | None = None
+
+    async for ev in orchestrator.run():
+        if ev.event == "content":
+            reply_parts.append(str(ev.data.get("delta") or ""))
+        elif ev.event == "meta":
+            emotion = str(ev.data.get("emotion") or "")
+            favorability_change = int(ev.data.get("favorability_change") or 0)
+            favorability = int(ev.data.get("favorability") or 0)
+            relationship_level = str(ev.data.get("relationship_level") or "")
+        elif ev.event == "error":
+            error_message = str(ev.data.get("message") or "未知错误")
+
+    if error_message is not None:
+        raise HTTPException(status_code=502, detail=error_message)
+
+    if favorability is None:
+        state = await npc_manager.get(npc_name)
+        favorability = state.favorability
+        relationship_level = relationship_level or state.relationship_level
+
+    return NPCChatResponse(
+        reply="".join(reply_parts),
+        npc_name=npc_name,
+        favorability=favorability,
+        relationship_level=relationship_level or "陌生",
+        favorability_change=favorability_change,
+        emotion=emotion or "普通",
     )
+
+
+# ---------------------------------------------------------------------------
+# 会话管理
+# ---------------------------------------------------------------------------
+
+def _memory():
+    return get_memory_store()
 
 
 @router.get(
@@ -312,18 +252,13 @@ async def ask_confirm(
 )
 async def get_session_history(
     session_id: str,
-    limit: int = Query(50, ge=1, description="单页条数，前端固定 50；分页后不设上限，可逐页查看全部记录"),
-    offset: int = Query(0, ge=0, description="跳过条数，0=最新一页，50=更早一页"),
-    memory: MemoryManager = Depends(get_memory_manager),
+    limit: int = Query(50, ge=1, description="单页条数"),
+    offset: int = Query(0, ge=0, description="跳过条数，0=最新一页"),
 ) -> SessionHistoryResponse:
+    memory = _memory()
     records = await memory.get_history(session_id, limit=limit, offset=offset, order="desc")
-    messages: list[ChatMessage] = [
-        ChatMessage(
-            id=rec.id,
-            role=rec.role,
-            content=rec.content,
-            timestamp=rec.timestamp,
-        )
+    messages = [
+        ChatMessage(id=rec.id, role=rec.role, content=rec.content, timestamp=rec.timestamp)
         for rec in records
     ]
     return SessionHistoryResponse(session_id=session_id, messages=messages)
@@ -332,17 +267,14 @@ async def get_session_history(
 @router.get(
     "/sessions",
     response_model=SessionListResponse,
-    summary="获取所有会话列表及可选 NPC 列表",
+    summary="获取当前存档作用域内的会话列表及可选 NPC 列表",
 )
-async def list_sessions(
-    memory: MemoryManager = Depends(get_memory_manager),
-    npc_manager: NPCManager = Depends(get_npc_manager),
-) -> SessionListResponse:
-    # 触发嵌入模型预加载，但不阻塞返回
-    await trigger_embed_model_preload()
-
-    sessions_raw = await memory.list_sessions()
-    sessions: list[SessionInfo] = [
+async def list_sessions(npc_manager: NPCManager = Depends(get_npc_manager)) -> SessionListResponse:
+    memory = _memory()
+    # B2-5：bind 态只回当前槽位会话；standalone（或未绑定）只回 standalone 会话
+    bound_slot = get_integration_state().snapshot()["bound_slot"]
+    sessions_raw = await memory.list_sessions(slot_key=bound_slot)
+    sessions = [
         SessionInfo(
             session_id=item.session_id,
             npc_name=item.npc_name,
@@ -351,20 +283,12 @@ async def list_sessions(
         )
         for item in sessions_raw
     ]
-
-    npc_candidates: list[NPCCandidate] = [
-        NPCCandidate(
-            npc_name=name,
-            faction=npc_manager.state[name].faction,
-            challenge=getattr(npc_manager.state[name], "challenge", None),
-        )
-        for name in sorted(npc_manager.state.keys())
+    states = await npc_manager.all_states()
+    npc_candidates = [
+        NPCCandidate(npc_name=name, faction=state.faction, challenge=state.challenge)
+        for name, state in sorted(states.items())
     ]
-
-    return SessionListResponse(
-        sessions=sessions,
-        npc_candidates=npc_candidates,
-    )
+    return SessionListResponse(sessions=sessions, npc_candidates=npc_candidates)
 
 
 @router.post(
@@ -372,14 +296,13 @@ async def list_sessions(
     response_model=SessionCreateResponse,
     summary="创建新的 NPC 会话并返回 session_id",
 )
-async def create_session(
-    payload: SessionCreateRequest,
-    memory: MemoryManager = Depends(get_memory_manager),
-) -> SessionCreateResponse:
-    # 设置代理（如果前端传入了 proxy_url）
-    apply_proxy_config(payload.proxy_url)
-
-    info = await memory.create_session(npc_name=payload.npc_name, title=payload.title)
+async def create_session(payload: SessionCreateRequest) -> SessionCreateResponse:
+    memory = _memory()
+    # B2-5：创建时记录当前绑定槽位（未绑定＝NULL，事后换存档不再改归属）
+    bound_slot = get_integration_state().snapshot()["bound_slot"]
+    info = await memory.create_session(
+        npc_name=payload.npc_name, title=payload.title, slot_key=bound_slot,
+    )
     return SessionCreateResponse(
         session_id=info.session_id,
         npc_name=info.npc_name,
@@ -395,30 +318,14 @@ async def create_session(
 )
 async def get_npc_favorability(
     npc_name: str,
-    service: GameRAGService = Depends(get_game_rag_service),
     npc_manager: NPCManager = Depends(get_npc_manager),
 ) -> NPCFavorabilityResponse:
-    """
-    获取指定 NPC 对玩家的好感度、关系等级和当前情绪状态。
-    """
-    from fastapi import HTTPException
-
-    try:
-        npc_name_decoded = npc_name  # FastAPI 会自动进行 URL 解码
-        name, favorability, relationship_level = await service.get_npc_favorability(
-            npc_name_decoded, npc_manager=npc_manager
-        )
-        return NPCFavorabilityResponse(
-            npc_name=name,
-            favorability=favorability,
-            relationship_level=relationship_level,
-        )
-    except ValueError as e:
-        if "不存在" in str(e):
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+    state = await npc_manager.get(npc_name)
+    return NPCFavorabilityResponse(
+        npc_name=npc_name,
+        favorability=state.favorability,
+        relationship_level=state.relationship_level,
+    )
 
 
 @router.put(
@@ -429,25 +336,13 @@ async def get_npc_favorability(
 async def update_session_title(
     session_id: str,
     payload: SessionTitleUpdateRequest,
-    memory: MemoryManager = Depends(get_memory_manager),
 ) -> SessionTitleUpdateResponse:
-    """
-    修改指定会话的标题。
-    """
-    from fastapi import HTTPException
-
+    memory = _memory()
     try:
-        result = await memory.update_title(session_id, payload.title)
-        return SessionTitleUpdateResponse(
-            session_id=result.session_id,
-            title=result.title,
-        )
+        result = await memory.update_session_title(session_id, payload.title)
     except ValueError as e:
-        if "不存在" in str(e):
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return SessionTitleUpdateResponse(session_id=result.session_id, title=result.title)
 
 
 @router.delete(
@@ -455,40 +350,37 @@ async def update_session_title(
     status_code=204,
     summary="删除会话",
 )
-async def delete_session(
-    session_id: str,
-    memory: MemoryManager = Depends(get_memory_manager),
-) -> None:
-    """
-    删除指定的会话及其所有聊天记录。
-    """
-    from fastapi import HTTPException
-
+async def delete_session(session_id: str) -> None:
+    memory = _memory()
     try:
         await memory.delete_session(session_id)
     except ValueError as e:
-        if "不存在" in str(e):
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务器内部错误：{str(e)}")
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
+
+# ---------------------------------------------------------------------------
+# 知识库重建（新检索栈：load_corpus → build_store）
+# ---------------------------------------------------------------------------
 
 @router.post(
     "/knowledge-base/reset",
     response_model=ResetKnowledgeBaseResponse,
-    summary="重置知识库",
+    summary="重置/重建向量知识库",
 )
-async def reset_knowledge_base_endpoint(
-    service: GameRAGService = Depends(get_game_rag_service),
-) -> ResetKnowledgeBaseResponse:
-    """
-    供用户手动重置/重新生成向量库（单 exe 无法在打包时重置时使用）。
-    若 docs 中存在「核心设定与世界合理性补足」文档则强制覆盖重建；
-    否则仅当尚无向量库时生成，已有则返回数据文档不全错误。
-    """
-    await ensure_embed_model_ready()
-    success, message = reset_knowledge_base()
-    if success:
-        service.invalidate_index()
-    return ResetKnowledgeBaseResponse(success=success, message=message)
+async def reset_knowledge_base_endpoint() -> ResetKnowledgeBaseResponse:
+    try:
+        from services.retrieval import get_retrieval_engine
+        from services.retrieval.loader import compute_corpus_fingerprint, load_corpus
+
+        def _rebuild() -> int:
+            engine = get_retrieval_engine()
+            fingerprint = compute_corpus_fingerprint()
+            nodes = load_corpus()
+            engine.build_store(nodes, fingerprint)
+            return len(nodes)
+
+        count = await asyncio.to_thread(_rebuild)
+        return ResetKnowledgeBaseResponse(success=True, message=f"向量库已重建（{count} 条）")
+    except Exception as exc:
+        logger.exception("知识库重建失败")
+        return ResetKnowledgeBaseResponse(success=False, message=str(exc))

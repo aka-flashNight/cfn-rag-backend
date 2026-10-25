@@ -7,13 +7,20 @@ Atomic tool contract + registry.
 - ``services/skills/``（YAML frontmatter + Markdown body）是"复合流程/领域知识"，
   通过 ``list_skills / read_skill / read_skill_file`` 三个元工具按需加载。
 - Tools 与 Skills 完全解耦：同一个工具可能被多个 Skill 文档引用，同一个 Skill 可能只是纯文档、不对应任何独立工具。
+
+v3 再次重构：工具分两类用途——``route`` 类别是聊天主 Agent 的**路由声明**（编排层
+直接读取 tool_calls 分派，不进 dispatch）；其余类别只服务后台子 Agent
+（TaskRunner / SearchRunner）。聊天主 Agent 不再持有 prepare 之类的业务工具。
+``ToolRegistry.dispatch`` 为 async；同批 tool_calls 按 task pipeline 分组并行执行（asyncio.gather，修 B3 串行）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
+import pkgutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +33,28 @@ if TYPE_CHECKING:  # pragma: no cover
     from services.skills import SkillRegistry
 
 
-Category = Literal["task", "query", "mood", "system"]
+Category = Literal["route", "task", "query", "system"]
+
+_VALID_CATEGORIES: tuple[str, ...] = ("route", "task", "query", "system")
+
+# 聊天主 Agent 可用的路由声明工具（编排层按有无待确认草案挑选下发）
+ROUTE_TOOL_NAMES: tuple[str, ...] = (
+    "route_task_draft",
+    "route_task_update",
+    "route_task_confirm",
+    "route_task_cancel",
+    "route_search",
+)
+# 无待确认草案时可路由的目标（confirm/cancel/update 都针对既有草案）
+ROUTE_TOOLS_NEW: tuple[str, ...] = ("route_task_draft", "route_search")
+# 有待确认草案时可路由的目标（草案在途时检索仍可用：查设定不需要先丢掉草案）
+ROUTE_TOOLS_DRAFT: tuple[str, ...] = (
+    "route_task_confirm",
+    "route_task_cancel",
+    "route_task_update",
+    "route_task_draft",
+    "route_search",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,34 +63,48 @@ Category = Literal["task", "query", "mood", "system"]
 
 @dataclass
 class ToolContext:
-    """Tool 执行期上下文（由 LangGraph tool_executor 节点在调用前注入）。"""
+    """Tool 执行期上下文（由子 Agent 在每轮工具执行前构造注入）。"""
 
     npc_name: str = ""
     npc_faction: str = ""
     npc_challenge: Optional[str] = None
     player_progress: int = 1
+    # 玩家等级（绑定存档投影里的真实等级；非游戏内/未绑定＝None，由阶段退化）
+    player_level: Optional[int] = None
     npc_affinity: int = 0
     npc_states: Optional[dict[str, Any]] = None
     game_data: Optional["GameDataRegistry"] = None
     pending_draft: Optional[dict[str, Any]] = None
+    # 草案业务状态（bargain_count/_draft_commit_valid 独立于草案 JSON 传递，修 D5）
+    bargain_count: int = 0
+    draft_commit_valid: bool = False
     retrieve_fn: Optional[Callable[[str], str]] = None
     rag_context_text: Optional[str] = None
     # list_skills / read_skill / read_skill_file 三个元工具运行时需要 skill 注册表
     skill_registry: Optional["SkillRegistry"] = None
+    # 对话修改子 Agent：最近一次查询的编号映射（search_npc_dialogues 写入，
+    # edit_npc_dialogues 消费，跨轮经 _inherit_ctx 传递）
+    dialogue_index: Optional[list[dict[str, Any]]] = None
+    # 对话修改的触发来源（委派方注入，edit_npc_dialogues 只透传给覆盖层条目）
+    dialogue_reason: str = ""
+    dialogue_source_task_id: Optional[int] = None
+    dialogue_source_trigger: str = ""
+    # 存档槽位（委派受理当刻钉死；空＝由工具回落到当前绑定）
+    slot_key: str = ""
 
 
 @dataclass
 class ToolResult:
-    """Tool.run() 返回结构化结果（供 dispatcher 提取 state 更新）。"""
+    """Tool.run() 返回结构化结果（供子 Agent 提取状态更新）。"""
 
     result_json: str
     updated_pending_draft: Optional[dict[str, Any]] = None
     task_write_result: Optional[str] = None
-
-    def as_tuple(
-        self,
-    ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
-        return self.result_json, self.updated_pending_draft, self.task_write_result
+    # draft/update 工具回传的草案业务状态（None = 未触碰）
+    bargain_count: Optional[int] = None
+    draft_commit_valid: Optional[bool] = None
+    # search_npc_dialogues 回传的编号映射（None = 未触碰）
+    dialogue_index: Optional[list[dict[str, Any]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +112,7 @@ class ToolResult:
 # ---------------------------------------------------------------------------
 
 class BaseTool(ABC):
-    """单个原子工具：名称、类别、JSON Schema、同步执行入口。"""
+    """单个原子工具：名称、类别、JSON Schema、同步执行入口（CPU 轻操作，不跑 IO）。"""
 
     name: str
     category: Category
@@ -105,7 +147,7 @@ class ToolRegistry:
     def register(self, tool: BaseTool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"duplicate tool name: {tool.name}")
-        if tool.category not in ("task", "query", "mood", "system"):
+        if tool.category not in _VALID_CATEGORIES:
             raise ValueError(
                 f"tool {tool.name!r} has invalid category: {tool.category!r}"
             )
@@ -117,37 +159,55 @@ class ToolRegistry:
 
         每个 tool 模块必须顶层导出 ``tool``（BaseTool 实例）。
         多次调用幂等：已存在的 tool 会跳过，不会抛异常，方便热重载场景。
+
+        模块枚举经 pkgutil（PyInstaller PYZ 内亦有效）；源码目录扫描仅作
+        兜底，frozen 环境下目录不存在时静默跳过（pkgutil 分支已覆盖）。
         """
         pkg = importlib.import_module(package)
-        pkg_paths = [Path(p) for p in getattr(pkg, "__path__", [])]
-        if not pkg_paths:
-            return
 
+        def _load(mod_name: str) -> None:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception as e:  # pragma: no cover
+                raise ImportError(f"加载 tool 模块失败: {mod_name}: {e}") from e
+            tool_obj = getattr(mod, "tool", None)
+            if not isinstance(tool_obj, BaseTool):
+                return
+            if tool_obj.name in self._tools:
+                return
+            self.register(tool_obj)
+
+        pkg_paths = [Path(p) for p in getattr(pkg, "__path__", [])]
+
+        # 主路径：pkgutil 枚举（frozen PYZ 内同样有效）
+        for _imp, category, ispkg in pkgutil.iter_modules(getattr(pkg, "__path__", [])):
+            if not ispkg or category.startswith("_"):
+                continue
+            sub_name = f"{package}.{category}"
+            sub = importlib.import_module(sub_name)
+            for _imp2, mod_base, _ispkg2 in pkgutil.iter_modules(
+                list(getattr(sub, "__path__", []))
+            ):
+                if not mod_base.startswith("_"):
+                    _load(f"{sub_name}.{mod_base}")
+
+        # 兜底：源码目录扫描（frozen 下 iterdir 失败则跳过）
         for base in pkg_paths:
-            for category_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-                if category_dir.name.startswith("_"):
-                    continue
+            try:
+                category_dirs = sorted(
+                    p for p in base.iterdir()
+                    if p.is_dir() and not p.name.startswith("_")
+                )
+            except OSError:
+                continue
+            for category_dir in category_dirs:
                 for tool_py in sorted(
                     p for p in category_dir.iterdir()
                     if p.is_file()
                     and p.suffix == ".py"
                     and not p.name.startswith("_")
                 ):
-                    mod_name = (
-                        f"{package}.{category_dir.name}.{tool_py.stem}"
-                    )
-                    try:
-                        mod = importlib.import_module(mod_name)
-                    except Exception as e:  # pragma: no cover
-                        raise ImportError(
-                            f"加载 tool 模块失败: {mod_name}: {e}"
-                        ) from e
-                    tool_obj = getattr(mod, "tool", None)
-                    if not isinstance(tool_obj, BaseTool):
-                        continue
-                    if tool_obj.name in self._tools:
-                        continue
-                    self.register(tool_obj)
+                    _load(f"{package}.{category_dir.name}.{tool_py.stem}")
 
     def get(self, name: str) -> Optional[BaseTool]:
         return self._tools.get(name)
@@ -173,35 +233,98 @@ class ToolRegistry:
             out.append(t.to_openai_tool())
         return out
 
-    def dispatch(
+    # ------------------------------------------------------------------
+    # 执行
+    # ------------------------------------------------------------------
+
+    async def dispatch(
         self,
         tool_name: str,
         tool_args: dict[str, Any],
         ctx: ToolContext,
-    ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
+    ) -> ToolResult:
+        """执行单个工具（async；工具本体是同步 CPU 轻操作，直接调用）。"""
         tool = self._tools.get(tool_name)
         if tool is None:
-            return (
-                json.dumps(
-                    {"status": "error", "message": f"未知工具: {tool_name}"},
-                    ensure_ascii=False,
-                ),
-                None,
-                None,
-            )
+            return ToolResult(result_json=json.dumps(
+                {"status": "error", "message": f"未知工具: {tool_name}"},
+                ensure_ascii=False,
+            ))
         try:
-            result = tool.run(tool_args or {}, ctx)
+            return tool.run(tool_args or {}, ctx)
         except Exception as e:
             logger.exception("tool %s 执行异常", tool_name)
-            return (
-                json.dumps(
-                    {"status": "error", "message": f"{tool_name} 执行异常: {e}"},
-                    ensure_ascii=False,
-                ),
-                None,
-                None,
-            )
-        return result.as_tuple()
+            return ToolResult(result_json=json.dumps(
+                {"status": "error", "message": f"{tool_name} 执行异常: {e}"},
+                ensure_ascii=False,
+            ))
+
+    async def dispatch_batch(
+        self,
+        tool_calls: list[dict[str, Any]],
+        ctx: ToolContext,
+    ) -> list[tuple[str, ToolResult, "ToolContext"]]:
+        """执行同批 tool_calls：按 task pipeline 分组，组内并行（asyncio.gather）、组间串行。
+
+        - 并行消除了旧 tool_executor 的逐个串行（修 B3）；
+        - 组间串行保证依赖正确：prepare(10) → draft(20) → update(30) 等任务状态变更
+          不会与依赖它的工具同批乱序（draft 产生的 pending_draft 需先落再跑 update）；
+        - 返回 [(tool_call_id, ToolResult, 本调用后的 ctx)]，ctx 按组间顺序继承
+          （draft/update 对草案的修改向后续组传递）。
+        """
+        normalized: list[tuple[str, str, dict[str, Any]]] = []
+        for tc in tool_calls or []:
+            func = tc.get("function", tc) if isinstance(tc, dict) else {}
+            name = str(func.get("name", "") or "")
+            call_id = str(tc.get("id", "") or "")
+            raw_args = func.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            normalized.append((call_id, name, args))
+
+        groups = _group_by_pipeline_order([name for _, name, _ in normalized])
+        results: list[tuple[str, ToolResult, ToolContext]] = []
+        working_ctx = ctx
+        for group_indexes in groups:
+            coros = [
+                self.dispatch(normalized[i][1], normalized[i][2], working_ctx)
+                for i in group_indexes
+            ]
+            group_results = await asyncio.gather(*coros)
+            for i, res in zip(group_indexes, group_results):
+                call_id, name, _args = normalized[i]
+                # 先继承本结果的状态变更再绑定 ctx：调用方（终态检测）能看到
+                # draft/update 工具写入的 pending_draft / bargain_count
+                working_ctx = _inherit_ctx(working_ctx, res)
+                results.append((call_id, res, working_ctx))
+        return results
+
+
+def _inherit_ctx(ctx: ToolContext, res: ToolResult) -> ToolContext:
+    """工具修改了草案/业务状态时，派生新的 ctx 供后续工具看到。"""
+    if (
+        res.updated_pending_draft is None
+        and res.bargain_count is None
+        and res.draft_commit_valid is None
+        and res.dialogue_index is None
+    ):
+        return ctx
+    import dataclasses
+
+    updates: dict[str, Any] = {}
+    if res.updated_pending_draft is not None:
+        updates["pending_draft"] = res.updated_pending_draft
+    if res.bargain_count is not None:
+        updates["bargain_count"] = res.bargain_count
+    if res.draft_commit_valid is not None:
+        updates["draft_commit_valid"] = res.draft_commit_valid
+    if res.dialogue_index is not None:
+        updates["dialogue_index"] = res.dialogue_index
+    return dataclasses.replace(ctx, **updates)
 
 
 # ---------------------------------------------------------------------------
@@ -220,25 +343,53 @@ def get_tool_registry() -> ToolRegistry:
     return _registry
 
 
-# Pipeline ordering for the task family（同一批 tool_calls 内 sort 用）
-# draft 永远在 confirm 之前、prepare 在最前。
+def set_tool_registry(registry: ToolRegistry | None) -> None:
+    """测试注入用。"""
+    global _registry
+    _registry = registry
+
+
+# Pipeline ordering for the task family（同批 tool_calls 分组并行用）
+# draft 永远在 update 之前、prepare 在最前；同组内工具互不依赖可并行。
 _TASK_TOOL_PIPELINE_ORDER: dict[str, int] = {
+    "list_skills": 5,
+    "read_skill": 5,
+    "read_skill_file": 5,
     "prepare_task_context": 10,
     "search_knowledge": 15,
     "search_stages": 16,
     "search_items": 17,
-    "list_skills": 18,
-    "read_skill": 19,
-    "read_skill_file": 19,
+    "search_npc_dialogues": 18,
     "draft_agent_task": 20,
+    "edit_npc_dialogues": 25,
     "update_task_draft": 30,
     "confirm_agent_task": 40,
     "cancel_agent_task": 50,
 }
 
 
+def _pipeline_order(name: str) -> int:
+    return _TASK_TOOL_PIPELINE_ORDER.get(name, 1000)
+
+
+def _group_by_pipeline_order(names: list[str]) -> list[list[int]]:
+    """按 pipeline 序把索引分组：同序号（可并行）为一组，组间按序号升序。"""
+    order: list[tuple[int, int]] = [
+        (_pipeline_order(n), i) for i, n in enumerate(names)
+    ]
+    order.sort()
+    groups: list[list[int]] = []
+    cur_key: int | None = None
+    for key, i in order:
+        if key != cur_key:
+            groups.append([])
+            cur_key = key
+        groups[-1].append(i)
+    return groups
+
+
 def sort_tool_calls_for_pipeline(pending_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """同一轮 tool_calls 按 task pipeline 排序，避免 confirm 出现在 draft 之前。"""
+    """同轮 tool_calls 按 task pipeline 排序（兼容旧入口；新代码用 dispatch_batch 分组并行）。"""
     if len(pending_calls) <= 1:
         return pending_calls
 
@@ -251,7 +402,7 @@ def sort_tool_calls_for_pipeline(pending_calls: list[dict[str, Any]]) -> list[di
         for _, tc in sorted(
             enumerate(pending_calls),
             key=lambda pair: (
-                _TASK_TOOL_PIPELINE_ORDER.get(_name(pair[1]), 1000),
+                _pipeline_order(_name(pair[1])),
                 pair[0],
             ),
         )

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import argparse
 import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
@@ -12,16 +13,23 @@ if str(_ROOT) not in sys.path:
 
 from services.game_data.paths import RESOURCE_FOLDER_NAMES, pick_existing_or_default_resource_root
 
+#: 不从对话数据补入的 NPC：室友会跟随玩家性别变成两个形象，
+#: 与聊天终端头像未打通（2026-09-26 已从运行库移除），重新生成时保持排除。
+EXCLUDED_NPC_NAMES = {"室友"}
+
+
 # ================= 路径获取函数 =================
 def is_packaged_environment() -> bool:
     """检查是否在PyInstaller打包环境中运行"""
     return hasattr(sys, '_MEIPASS') or getattr(sys, 'frozen', False)
 
 
-def get_resources_dir() -> Path:
+def get_resources_dir(resources_dir: Path | None = None) -> Path:
     """
-    获取 resources 目录的路径。
+    获取 resources 目录的路径。显式传入时直接使用（生成种子时指向游戏仓）。
     """
+    if resources_dir is not None:
+        return Path(resources_dir)
     # 获取基础目录
     if is_packaged_environment():
         # 打包环境：exe 所在目录
@@ -69,11 +77,11 @@ def get_output_db_path(resources_dir: Path) -> Path:
     return db_dir / "npc_state_db.json"
 
 # ================= 配置区域 =================
-def get_config_paths():
+def get_config_paths(resources_dir: Path | None = None):
     """
     获取所有配置文件的路径
     """
-    resources_dir = get_resources_dir()
+    resources_dir = get_resources_dir(resources_dir)
     data_dir = get_data_dir(resources_dir)
     
     # 1. 日常对话配置
@@ -133,9 +141,10 @@ def extract_faction_from_filename(filename):
 
 def is_a兵团_faction(faction):
     """
-    判断是否为 A 兵团相关阵营
+    判断是否为 A 兵团相关阵营（库内实际写法无空格：A兵团 / A兵团元老）
     """
-    return faction in ["A 兵团", "A 兵团元老"]
+    normalized = str(faction or "").replace(" ", "").replace("\u3000", "")
+    return normalized in ["A兵团", "A兵团元老"]
 
 
 def extract_from_dialogue_xml(file_path, npc_data, filename):
@@ -253,101 +262,107 @@ def get_default_favorability_and_relationship(faction):
 
 def load_existing_db(output_db_file):
     """
-    加载已存在的数据库
+    加载已存在的数据库，返回 (global 条目, saves 条目)。
+
+    兼容旧平铺结构与 {"global": ..., "saves": ...} 新结构；saves 原样保留。
     """
     if output_db_file.exists():
         try:
             with open(output_db_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("global"), dict):
+                saves = data.get("saves")
+                return data["global"], saves if isinstance(saves, dict) else {}
+            if isinstance(data, dict):
+                return data, {}
         except Exception as e:
             print(f"[Warning] 加载现有数据库失败：{e}，将创建新数据库")
-    return {}
+    return {}, {}
 
 
 def merge_npc_data(existing_db, new_npc_data):
     """
-    合并现有数据库和新数据
-    只补充缺失的属性，不覆盖已有值
+    把对话扫描结果增量并入库：只补缺失，不覆盖已有好感/关系与人工字段。
+
+    - 名字大小写不敏感（boy 命中已有 Boy，沿用已有 Key）；
+    - EXCLUDED_NPC_NAMES 中的 NPC 永不再补入；
+    - 已有条目的 favorability / relationship_level / challenge 等原样保留；
+    - 新条目按阵营给初始值（A 兵团 25/熟悉，其余 10/陌生）。
     """
     merged_db = {}
-    
-    # 处理现有 NPC
+    existing_by_fold = {}
     for name, existing_data in existing_db.items():
-        merged_db[name] = existing_data.copy()
-        
-        # 如果该 NPC 也在新数据中，补充缺失属性
-        if name in new_npc_data:
-            new_data = new_npc_data[name]
-            
-            # 补充 emotions
-            if 'emotions' in merged_db[name]:
-                existing_emotions = set(merged_db[name]['emotions'])
-                existing_emotions.update(new_data['emotions'])
-                merged_db[name]['emotions'] = sorted(list(existing_emotions))
-            else:
-                merged_db[name]['emotions'] = sorted(list(new_data['emotions']))
-            
-            # 补充 titles（如果不存在则添加）
-            if 'titles' not in merged_db[name] or not merged_db[name]['titles']:
-                merged_db[name]['titles'] = sorted(list(new_data['titles']))
-            else:
-                existing_titles = set(merged_db[name]['titles'])
-                existing_titles.update(new_data['titles'])
-                merged_db[name]['titles'] = sorted(list(existing_titles))
-            
-            # 补充 faction（如果为空则添加）
-            if new_data['faction']:
-                merged_db[name]['faction'] = new_data['faction']
-            
-            # 补充 sex（如果为空则添加）
-            if 'sex' not in merged_db[name] or not merged_db[name]['sex']:
-                merged_db[name]['sex'] = new_data['sex']
-            
-            # 补充 favorability（如果是默认值 0 则更新）
-            if 'favorability' not in merged_db[name] or merged_db[name]['favorability'] == 0:
-                faction = merged_db[name].get('faction', '')
-                default_fav, _ = get_default_favorability_and_relationship(faction)
-                merged_db[name]['favorability'] = default_fav
-            
-            # 补充 relationship_level（如果是默认值"陌生"且阵营是 A 兵团则更新）
-            if 'relationship_level' not in merged_db[name] or merged_db[name]['relationship_level'] == "陌生":
-                faction = merged_db[name].get('faction', '')
-                _, default_rel = get_default_favorability_and_relationship(faction)
-                # 只有当阵营是 A 兵团时才更新为"熟悉"
-                if is_a兵团_faction(faction):
-                    merged_db[name]['relationship_level'] = default_rel
-    
-    # 处理新 NPC（现有数据库中不存在的）
-    for name, new_data in new_npc_data.items():
-        if name not in merged_db:
+        merged_db[name] = dict(existing_data) if isinstance(existing_data, dict) else {}
+        existing_by_fold[str(name).casefold()] = name
+
+    for scan_name, new_data in new_npc_data.items():
+        if scan_name in EXCLUDED_NPC_NAMES:
+            continue
+        target = scan_name if scan_name in merged_db else existing_by_fold.get(scan_name.casefold())
+        if target is None:
             faction = new_data['faction']
             default_fav, default_rel = get_default_favorability_and_relationship(faction)
-            
-            merged_db[name] = {
+            entry = {
                 "favorability": default_fav,
                 "relationship_level": default_rel,
-                "sex": new_data['sex'],
                 "emotions": sorted(list(new_data['emotions'])),
-                "titles": sorted(list(new_data['titles'])),
-                "faction": faction
             }
-    
+            if new_data['sex']:
+                entry["sex"] = new_data['sex']
+            if faction:
+                entry["faction"] = faction
+            titles = sorted(list(new_data['titles']))
+            if titles:
+                entry["titles"] = titles
+            merged_db[scan_name] = entry
+            existing_by_fold[scan_name.casefold()] = scan_name
+            print(f"[Info] 新增 NPC：{scan_name}（{faction or '无阵营'}）")
+            continue
+
+        entry = merged_db[target]
+        emotions = set(entry.get('emotions') or [])
+        emotions.update(new_data['emotions'])
+        entry['emotions'] = sorted(emotions)
+        titles = set(entry.get('titles') or [])
+        titles.update(new_data['titles'])
+        if titles:
+            entry['titles'] = sorted(titles)
+        if new_data['faction'] and not entry.get('faction'):
+            entry['faction'] = new_data['faction']
+        if new_data['sex'] and not entry.get('sex'):
+            entry['sex'] = new_data['sex']
+        if 'favorability' not in entry:
+            entry['favorability'] = get_default_favorability_and_relationship(
+                entry.get('faction', "")
+            )[0]
+        if not entry.get('relationship_level'):
+            entry['relationship_level'] = get_default_favorability_and_relationship(
+                entry.get('faction', "")
+            )[1]
+
     return merged_db
 
 
 def main():
+    parser = argparse.ArgumentParser(description="从对话数据增量更新 NPC 状态库")
+    parser.add_argument("--resources", type=Path, default=None,
+                        help="游戏仓根目录（含 data/）；缺省按脚本位置与当前目录探测")
+    parser.add_argument("--seed-out", type=Path, default=None,
+                        help="改为输出后端种子：去掉 saves 作用域，可指定输出路径")
+    args = parser.parse_args()
+
     print("--- 开始更新 NPC 状态数据库 ---")
-    
+
     # 获取所有路径配置
-    config = get_config_paths()
+    config = get_config_paths(args.resources)
     print(f"Resources 目录：{config['resources_dir']}")
     print(f"输出数据库：{config['output_db_file']}")
-    
+
     # 加载现有数据库（如果存在）
-    existing_db = load_existing_db(config['output_db_file'])
+    existing_db, existing_saves = load_existing_db(config['output_db_file'])
     if existing_db:
         print(f"[Info] 发现现有数据库，包含 {len(existing_db)} 个 NPC，将进行增量更新")
-    
+
     # 使用 defaultdict 积累数据，情绪和身份使用 set 去重
     # 结构：{ "NPC 名": { "emotions": set(), "titles": set(), "faction": str, "sex": str } }
     npc_data = defaultdict(lambda: {
@@ -356,7 +371,7 @@ def main():
         'faction': "",
         'sex': ""
     })
-    
+
     # 1. 处理日常对话文件
     print(f"[1/2] 扫描日常对话列表：{config['dialogue_list_file']}")
     if config['dialogue_list_file'].exists():
@@ -371,7 +386,7 @@ def main():
                 print(f"      [警告] 文件未找到：{file_path}")
     else:
         print(f"      [警告] 对话列表文件不存在")
-    
+
     # 2. 处理任务对话文件
     print(f"[2/2] 扫描任务对话列表：{config['task_list_file']}")
     if config['task_list_file'].exists():
@@ -385,19 +400,28 @@ def main():
                 print(f"      [警告] 文件未找到：{file_path}")
     else:
         print(f"      [警告] 任务列表文件不存在")
-    
+
     # 3. 合并现有数据和新数据
     final_db = merge_npc_data(existing_db, npc_data)
-    
-    # 4. 保存文件
-    config['output_db_file'].parent.mkdir(parents=True, exist_ok=True)
-    with open(config['output_db_file'], 'w', encoding='utf-8') as f:
-        json.dump(final_db, f, ensure_ascii=False, indent=1)
-    
+
+    # 4. 保存文件：运行时文件保留 saves；种子模式去掉 saves
+    if args.seed_out:
+        output_path = Path(args.seed_out)
+        if not output_path.is_absolute():
+            output_path = _ROOT / output_path
+        saves = {}
+    else:
+        output_path = config['output_db_file']
+        saves = existing_saves
+    payload = {"global": final_db, "saves": saves}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+
     print("--- 更新完成 ---")
     print(f"共发现 NPC 数量：{len(final_db)}")
     print(f"新增 NPC 数量：{len(final_db) - len(existing_db)}")
-    print(f"数据库已保存至：{config['output_db_file']}")
+    print(f"数据库已保存至：{output_path}")
 
 
 if __name__ == "__main__":
