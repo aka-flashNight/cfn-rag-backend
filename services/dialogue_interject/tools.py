@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -100,6 +101,11 @@ logger = logging.getLogger(__name__)
 TOOL_TIMEOUT_S = 120.0
 #: 过渡话单独限时：生成失败/超时只是少一句填充，不得拖住草案终态
 _TRANSITION_TIMEOUT_S = 30.0
+_CONFIRM_RETRY_LINES = (
+    "……稍等，我再核对一下。",
+    "别急，我把手续过一遍。",
+    "好，我再核一遍委托文书。",
+)
 
 # 物品办理结果必须自带方向，避免“你给玩家”被模型讲成“玩家虚报领取”。
 _GIVE_LABEL = "【办理结果·你给玩家】"
@@ -1210,6 +1216,12 @@ class DailyToolRuntime:
             return args, [], "fallback"
 
         finish_reference = await asyncio.to_thread(self._finish_npc_reference, draft)
+
+        def _push_retry_transition() -> None:
+            self._push_progress(ToolProgress(
+                line=random.choice(_CONFIRM_RETRY_LINES), emotion=DEFAULT_EMOTION,
+            ))
+
         try:
             outcome = await generate_confirm_args(
                 self.llm,
@@ -1219,6 +1231,7 @@ class DailyToolRuntime:
                 draft_summary=summary,
                 finish_npc_reference=finish_reference,
                 player_just_accepted=self._auto_accept,
+                on_retry=_push_retry_transition,
             )
         except asyncio.CancelledError:
             raise

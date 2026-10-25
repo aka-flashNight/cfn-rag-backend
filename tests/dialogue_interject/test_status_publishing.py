@@ -124,6 +124,25 @@ async def test_confirm_without_draft_does_not_push_hint():
     assert _drain_hints(runtime) == []
 
 
+@pytest.mark.asyncio
+async def test_confirm_retry_pushes_static_transition_line(monkeypatch):
+    async def fake_generate(*args, **kwargs):
+        kwargs["on_retry"]()
+        return SimpleNamespace(args={"title": "城西补给线"}, warnings=[], source="generated")
+
+    monkeypatch.setattr(tools_module, "generate_confirm_args", fake_generate)
+    runtime = DailyToolRuntime(
+        make_request(fx.daily_request()), _blocks(), llm=object(),
+    )
+
+    await runtime._build_confirm_args(DRAFT_ROW)
+
+    progress = runtime.progress_queue.get_nowait()
+    assert progress.line in tools_module._CONFIRM_RETRY_LINES
+    assert progress.emotion == "普通"
+    assert runtime.progress_queue.empty()
+
+
 # ---------------------------------------------------------------------------
 # 模型自带的 ui_hint：优先于固定文案
 # ---------------------------------------------------------------------------

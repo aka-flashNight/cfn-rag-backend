@@ -354,6 +354,7 @@ async def generate_confirm_args(
     emotion: str = "",
     finish_npc_reference: str = "",
     player_just_accepted: bool = False,
+    on_retry: Callable[[], None] | None = None,
 ) -> ConfirmArgsOutcome:
     """生成 confirm 发布文本（title/description/两组或四组对话）。
 
@@ -412,6 +413,11 @@ async def generate_confirm_args(
                 issues,
                 raw_text[:4000],
             )
+            if on_retry is not None:
+                try:
+                    on_retry()
+                except Exception as exc:
+                    logger.warning("confirm 重试过渡话推送失败，继续修正重试: %s", exc)
             # 只对可机器判定的校验问题重试一次；调用异常/解析失败不重试（已在上方兜底）
             retry_messages = [
                 *messages,

@@ -20,7 +20,7 @@ from services.orchestrator.prompts import (
     confirm_args_system,
     task_confirm_merge_instruction,
 )
-from services.orchestrator.turn import TurnOrchestrator
+from services.orchestrator.turn import TurnOrchestrator, generate_confirm_args
 from tests.orchestrator.conftest import NPC_NAME
 
 NPC_A = NPC_NAME       # 接取 NPC（铁匠）
@@ -194,6 +194,44 @@ async def test_retry_once_then_accept_pairing(env):
     assert "上一次输出未通过校验" in retry_messages[-1]["content"]
     assert "finish_dialogue" in retry_messages[-1]["content"]
     assert "$PC" in retry_messages[-1]["content"]
+
+
+async def test_retry_callback_runs_once_before_second_call(env):
+    env.fake.add_chat(content=json.dumps(_bad_speaker_args(), ensure_ascii=False))
+    env.fake.add_chat(content=json.dumps(_valid_args(), ensure_ascii=False))
+    callback_call_counts = []
+
+    await generate_confirm_args(
+        env.fake,
+        draft=DRAFT,
+        npc_name=NPC_A,
+        base_messages=[],
+        draft_summary="带话给药师。",
+        on_retry=lambda: callback_call_counts.append(len(env.fake.chat_requests)),
+    )
+
+    assert callback_call_counts == [1]
+    assert len(env.fake.chat_requests) == 2
+
+
+@pytest.mark.parametrize("response", [_valid_args(), "这不是 JSON"])
+async def test_retry_callback_not_called_without_validation_retry(env, response):
+    env.fake.add_chat(
+        content=response if isinstance(response, str) else json.dumps(response, ensure_ascii=False),
+    )
+    callback_calls = []
+
+    await generate_confirm_args(
+        env.fake,
+        draft=DRAFT,
+        npc_name=NPC_A,
+        base_messages=[],
+        draft_summary="带话给药师。",
+        on_retry=lambda: callback_calls.append(True),
+    )
+
+    assert callback_calls == []
+    assert len(env.fake.chat_requests) == 1
 
 
 async def test_retry_logs_validation_issue_and_first_output(env, caplog):
