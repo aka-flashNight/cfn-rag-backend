@@ -168,7 +168,7 @@ steamapps/common/CRAZYFLASHER7StandAloneStarter/
 从 [Releases](https://github.com/aka-flashNight/cfn-rag-backend/releases) 下载 `CFN-RAG-Full-v3.0.0.zip`，解压到任意位置，双击 `CFN-RAG-v3.0.0.exe`。
 
 ```text
-CFN-RAG-Full-v3.0.0/
+CFN-RAG-v3.0.0/               # 解压出来的顶层目录
 ├── CFN-RAG-v3.0.0.exe
 └── CrazyFlashNight/          # 精简游戏数据 + 立绘 + 头像（随包提供）
 ```
