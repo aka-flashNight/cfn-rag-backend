@@ -1169,13 +1169,7 @@ class DailyToolRuntime:
                     logger.warning(
                         "[interject] 发布任务 id 非法，无法自动接取: %r", task_id,
                     )
-            instruction = (
-                "以角色口吻确认委托已经登记，但玩家还没接下："
-                "让他等你这边归档好再找你接取，别让他现在就去办，不要重复任务细节。"
-                if same_npc
-                else f"以角色口吻确认委托已经登记，并提醒玩家到「{get_npc}」那里接取；"
-                "不要重复任务细节。"
-            )
+            instruction = _confirm_instruction(same_npc=same_npc, get_npc=get_npc)
             return (
                 "【办理结果】这份委托已经正式派给玩家了。",
                 instruction,
@@ -1308,6 +1302,19 @@ def _route_hint(route: Any, default: str) -> str:
     """
     hint = str(getattr(route, "ui_hint", "") or "").strip()
     return hint[:12] or default
+
+
+def _confirm_instruction(*, same_npc: bool, get_npc: str) -> str:
+    """发布成功后的收尾指令；只有接取 NPC 不是当前说话人时才要求点名。"""
+    if same_npc:
+        return (
+            "以角色口吻确认委托已经登记，但玩家还没接下："
+            "让他等你这边归档好再找你接取，别让他现在就去办，不要重复任务细节。"
+        )
+    return (
+        f"以角色口吻确认委托已经登记，并提醒玩家到「{get_npc}」那里接取；"
+        "台词里要指明具体名字，让玩家知道找谁接任务；不要重复任务细节。"
+    )
 
 
 def _task_max_rounds() -> int:

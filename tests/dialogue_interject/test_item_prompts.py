@@ -144,3 +144,14 @@ def test_item_tool_descriptions_distinguish_directions():
     assert "玩家主动要给你东西时" in schemas["request_item_from_player"]
     assert "你决定向玩家索要或询问是否给一件物品时调用" in schemas["request_item_from_player"]
     assert "玩家→你" in schemas["request_item_from_player"]
+
+
+def test_confirm_instruction_names_publish_npc_only_when_different():
+    from services.dialogue_interject.tools import _confirm_instruction
+
+    same = _confirm_instruction(same_npc=True, get_npc="Andy Law")
+    other = _confirm_instruction(same_npc=False, get_npc="researcher")
+
+    assert "台词里要指明具体名字" not in same
+    assert "「researcher」" in other
+    assert "台词里要指明具体名字，让玩家知道找谁接任务" in other
