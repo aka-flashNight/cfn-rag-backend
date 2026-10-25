@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     llm_api_key: str = ""
     llm_api_base: str = "https://api.deepseek.com/v1"
-    llm_model_name: str = "deepseek-v4-flash-vision-exp"
+    llm_model_name: str = "deepseek-flash"
     llm_proxy_url: str = ""  # 仅作用于 LLM 客户端（httpx 客户端级），不改进程环境变量（修 E3）
 
     # ------------------------------------------------------------------

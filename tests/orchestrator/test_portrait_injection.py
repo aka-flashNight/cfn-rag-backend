@@ -59,7 +59,7 @@ def _vision_orch(env, query: str, *, current_emotion=None) -> TurnOrchestrator:
         npc_name=NPC_NAME,
         query=query,
         current_emotion=current_emotion,
-        llm_config=LLMConfig(model_name="deepseek-v4-flash-vision-exp"),
+        llm_config=LLMConfig(model_name="glm-5.3-flash"),
         deps=env.deps,
     )
 
@@ -69,8 +69,8 @@ def _vision_orch(env, query: str, *, current_emotion=None) -> TurnOrchestrator:
 # ---------------------------------------------------------------------------
 
 def test_should_send_image_matrix():
-    assert should_send_image(LLMConfig(model_name="deepseek-v4-flash-vision-exp")) is True
-    assert should_send_image(LLMConfig(model_name="deepseek-v4-flash")) is False  # 纯文本 Profile
+    assert should_send_image(LLMConfig(model_name="glm-5.3-flash")) is True
+    assert should_send_image(LLMConfig(model_name="deepseek-flash")) is False  # 纯文本 Profile
     # 探测型（DEFAULT_PROFILE）允许尝试带图，失败由 client 降级链兜底
     assert should_send_image(LLMConfig(model_name="totally-new-model")) is True
 
@@ -122,7 +122,7 @@ async def test_non_vision_model_never_has_image(env):
         npc_name=NPC_NAME,
         query="你好",
         current_emotion="微笑",
-        llm_config=LLMConfig(model_name="deepseek-v4-flash"),  # vision=False
+        llm_config=LLMConfig(model_name="deepseek-flash"),  # vision=False
         deps=env.deps,
     )
     events = await collect(orch)

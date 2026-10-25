@@ -7,6 +7,7 @@ from services.llm.profiles import DEFAULT_PROFILE, ModelProfile, get_profile
 
 def test_glm_53_flash():
     p = get_profile("glm-5.3-flash")
+    assert p.match == "glm-5.3-flash"  # 更具体的子串先命中，不落到 glm-5.3
     assert p.vision is True
     assert p.thinking_body == {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
 
@@ -17,15 +18,12 @@ def test_glm_53_other_variant():
     assert p.vision is True
 
 
-def test_deepseek_vision_precedence():
-    """更具体的子串必须先命中（vision-exp 不落到纯文本档）。"""
-    p = get_profile("deepseek-v4-flash-vision-exp")
-    assert p.match == "deepseek-v4-flash-vision-exp"
-    assert p.vision is True
-    p2 = get_profile("deepseek-v4-flash")
-    assert p2.match == "deepseek-v4-flash"
-    assert p2.vision is False
-    assert p2.thinking_body == {"thinking": {"type": "disabled"}}
+def test_deepseek_flash_profile():
+    """官方只有 deepseek-flash 一个 flash 模型：纯文本 + 关思考。"""
+    p = get_profile("deepseek-flash")
+    assert p.match == "deepseek-flash"
+    assert p.vision is False
+    assert p.thinking_body == {"thinking": {"type": "disabled"}}
 
 
 def test_qwen_profile():
@@ -64,7 +62,7 @@ def test_empty_model_name_uses_default():
 
 
 def test_case_insensitive_matching():
-    assert get_profile("DeepSeek-V4-Flash-Vision-Exp").match == "deepseek-v4-flash-vision-exp"
+    assert get_profile("DeepSeek-Flash").match == "deepseek-flash"
 
 
 def test_default_profile_is_detection_type():

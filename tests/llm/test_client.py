@@ -252,7 +252,7 @@ async def test_subagent_purpose_forces_no_image():
 
 
 async def test_non_vision_profile_strips_images_without_call_failure():
-    """vision=False 的 Profile（如 deepseek-v4-flash 纯文本档）直接剥图，不浪费调用。"""
+    """vision=False 的 Profile（如 deepseek-flash 纯文本档）直接剥图，不浪费调用。"""
     calls = []
 
     def handler(kwargs):

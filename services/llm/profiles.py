@@ -21,7 +21,7 @@ class ModelProfile:
     note: str = ""
 
 
-# 先匹配先中：更具体的子串放前面（deepseek-v4-flash-vision-exp 必须在 deepseek-v4-flash 前）
+# 先匹配先中：更具体的子串放前面（glm-5.3-flash 必须在 glm-5.3 前）
 PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile(
         match="glm-5.3-flash",
@@ -36,15 +36,11 @@ PROFILES: tuple[ModelProfile, ...] = (
         note="同 glm-5.3-flash",
     ),
     ModelProfile(
-        match="deepseek-v4-flash-vision-exp",
-        vision=True,
-        thinking_body={"thinking": {"type": "disabled"}},
-    ),
-    ModelProfile(
-        match="deepseek-v4-flash",
+        match="deepseek-flash",
         vision=False,
         thinking_body={"thinking": {"type": "disabled"}},
-        note="纯文本版",
+        note="2026-10 官方只有这一个 flash 模型（原 v4-flash 与 v4-flash-vision-exp 已不存在）；"
+             "纯文本，思考参数沿用 V4-Flash 的官方 Chat Completions 口径，未对新名实测，报错走降级链",
     ),
     ModelProfile(
         match="qwen3.8-flash",
