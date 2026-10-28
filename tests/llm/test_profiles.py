@@ -24,6 +24,7 @@ def test_deepseek_flash_profile():
     assert p.match == "deepseek-flash"
     assert p.vision is False
     assert p.thinking_body == {"thinking": {"type": "disabled"}}
+    assert p.retransmit_reasoning is True  # 思考开时工具多轮必须回传
 
 
 def test_qwen_profile():
@@ -41,13 +42,18 @@ def test_gpt_luna_reasoning_none():
 
 def test_doubao_minimax_gemini_kimi():
     assert get_profile("doubao-seed-2-0-lite").thinking_body == {"thinking": {"type": "disabled"}}
-    assert get_profile("minimax-m3").thinking_body == {"thinking": {"type": "disabled"}}
+    minimax = get_profile("minimax-m3")
+    assert minimax.thinking_body == {"thinking": {"type": "disabled"}}
+    assert minimax.retransmit_reasoning is True
     gemini = get_profile("gemini-3-flash")
     assert gemini.match == "gemini-3"
     assert gemini.thinking_body == {"thinking_level": "low"}
+    assert gemini.retransmit_reasoning is False  # 需要的是 thought_signature，不是 reasoning_content
     kimi = get_profile("kimi-k3")
     assert kimi.thinking_body == {}  # 恒开无法关
     assert kimi.vision is True
+    assert kimi.retransmit_reasoning is True
+    assert get_profile("kimi-k3.1-pro").retransmit_reasoning is True
 
 
 def test_unknown_model_falls_back_to_default():

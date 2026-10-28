@@ -14,6 +14,7 @@ from services.dialogue_interject.schemas import FinalizeRequest
 from services.dialogue_interject.sessions import ensure_session, finalize
 from services.dialogue_interject.tools import ToolExecutionResult
 from services.llm import LLMConfig, StreamEvent
+from services.llm.profiles import get_profile
 from tests.dialogue_interject import fixtures as fx
 from tests.dialogue_interject.helpers import collect_events, make_orchestrator, make_request
 
@@ -37,16 +38,21 @@ TOOL_SCHEMA = [{
 
 
 class ScriptedLLM:
-    """按轮回放脚本：每轮是 (content_text, tool_calls) 列表。"""
+    """按轮回放脚本：每轮是 (content_text, tool_calls[, reasoning]) 列表。"""
 
-    def __init__(self, rounds):
+    def __init__(self, rounds, profile=None):
         self.rounds = list(rounds)
         self.requests = []
+        self.profile = profile
 
     async def chat_stream(self, request):
         self.requests.append(request)
         round_items = self.rounds.pop(0) if self.rounds else []
-        for text, tool_calls in round_items:
+        for item in round_items:
+            text, tool_calls = item[0], item[1]
+            reasoning = item[2] if len(item) > 2 else None
+            if reasoning:
+                yield StreamEvent(kind="reasoning", text=reasoning)
             if text:
                 yield StreamEvent(kind="content", text=text)
             if tool_calls is not None:
@@ -111,6 +117,71 @@ async def test_tool_round_then_final_lines_only():
     assert client.requests[0].tools == TOOL_SCHEMA
     assert client.requests[1].tools is None
     assert any("草案已拟定" in str(m.get("content")) for m in client.requests[1].messages)
+
+
+def _followup_executor() -> FakeExecutor:
+    return FakeExecutor(ToolExecutionResult(
+        requires_followup=True,
+        messages=[
+            {"role": "assistant", "content": "", "tool_calls": [TOOL_CALL_DRAFT]},
+            {"role": "tool", "tool_call_id": "call_draft_1", "content": '{"status":"draft_created"}'},
+            {"role": "user", "content": "【后台结果：草案已拟定】\n现在只输出最终确认对话"},
+        ],
+        result_block="【后台结果：草案已拟定】",
+        instruction="现在只输出最终确认对话",
+        route_kind="task_draft",
+    ))
+
+
+async def _run_tool_round_with_reasoning(model: str):
+    client = ScriptedLLM(
+        [
+            [(None, [TOOL_CALL_DRAFT], "先判断这是不是委托")],
+            [('{"add":"真正台词。","emo":"普通"}\n', None)],
+        ],
+        profile=get_profile(model),
+    )
+    executor = _followup_executor()
+    chunks = [
+        chunk async for chunk in stream_daily_llm(
+            make_request(fx.daily_request()),
+            client=client,
+            blocks=DailyBlocks(system_prompt="SYS"),
+            tool_executor=executor,
+            llm_config=_config(),
+        )
+    ]
+    return client, "".join(chunks)
+
+
+def _assistant_tool_message(request):
+    return next(
+        message for message in request.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["kimi-k3", "kimi-k3.1-pro", "deepseek-flash", "minimax-m3", "qwen3.8-flash"],
+)
+async def test_reasoning_is_retransmitted_when_profile_requires_it(model):
+    client, text = await _run_tool_round_with_reasoning(model)
+    assistant = _assistant_tool_message(client.requests[1])
+    assert assistant["reasoning_content"] == "先判断这是不是委托"
+    assert assistant["tool_calls"] == [TOOL_CALL_DRAFT]
+    assert "先判断这是不是委托" not in text  # 思考不进台词流
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["glm-5.3-flash", "doubao-seed-2-0-lite", "gpt-5.6-luna", "gemini-3-flash"],
+)
+async def test_reasoning_is_not_retransmitted_for_other_profiles(model):
+    client, text = await _run_tool_round_with_reasoning(model)
+    assistant = _assistant_tool_message(client.requests[1])
+    assert "reasoning_content" not in assistant
+    assert "先判断这是不是委托" not in text
 
 
 async def test_tool_result_and_args_never_pollute_sse_lines():

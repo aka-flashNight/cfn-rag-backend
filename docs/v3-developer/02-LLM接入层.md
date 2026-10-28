@@ -65,7 +65,7 @@ class StreamEvent:
 ```
 
 - `reasoning_content` delta 一律归入 `kind="reasoning"`，**绝不混入 content**（修 A7）。聊天主 Agent 丢弃 reasoning（不进正文、不进历史、不发前端）；其存在只影响 TTFT，靠 §3 思考参数压制。
-- 多轮回传：仅当模型 Profile 标记 `retransmit_reasoning=True`（Qwen 系开思考时才需要）且本轮开了思考时，才把 reasoning_content 存进 assistant 消息回传；本项目默认全场景关思考/低思考，该路径正常不会触发，但代码要留。
+- 多轮回传：插话工具轮在 `llm.py` 收集本轮 `reasoning` 增量；当 Profile 标记 `retransmit_reasoning=True` 且本轮确有思考内容时，把它挂到回传的 assistant tool_calls 消息上（`_attach_reasoning_content`）。已标记：Kimi K3/K3.1（恒开思考，缺失即 400）、Qwen（开思考时按 `preserve_thinking` 回填）、DeepSeek（V4 思考+工具要求全量回传）、MiniMax（交错思维要求完整 response_message）。GLM 可选；Doubao 未见强制要求；GPT Chat Completions 不暴露 reasoning；Gemini 需要的是 `extra_content.google.thought_signature`，不属于本字段。终端聊天链路不回显 assistant tool_calls，不受影响。
 
 ## 3. 模型 Profile 与降级链（核心）
 
@@ -78,13 +78,13 @@ class StreamEvent:
 | -------------------------------- | -------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `glm-5.3-flash`                | ✅     | `thinking={"type":"enabled"}` + 低强度档 | **不能关**，传 disabled 会报错（官方明确）。`reasoning_effort` 是官方参数（枚举含 `low`），2026-10-16 真机非流式/流式各一次均无 400、未触发降级；将来参数名不被接受时由 §3.2.b 剥掉整个 `extra_body` 重试一次 |
 | `glm-5.3`（其他档）            | ✅     | 同上                                     | 同上                                                                                                                                                                                                           |
-| `deepseek-flash`               | ❌     | `thinking={"type":"disabled"}`           | 2026-10 起官方 flash 系列只有这一个模型（原 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` 已不存在），按纯文本处理不带图；思考参数沿用 V4-Flash 的官方 Chat Completions 口径，未对新模型名实测，报错由 §3.2.b 剥掉整个 `extra_body` 重试一次 |
-| `qwen3.8-flash`                | ✅     | `extra_body={"enable_thinking": False}`  | 百炼默认即关；显式传确保。另有`/no_think` 软开关可写进 prompt 兜底                                                                                                                                             |
+| `deepseek-flash`               | ❌     | `thinking={"type":"disabled"}`           | 2026-10 起官方 flash 系列只有这一个模型（原 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` 已不存在），按纯文本处理不带图；思考参数沿用 V4-Flash 的官方 Chat Completions 口径，未对新模型名实测，报错由 §3.2.b 剥掉整个 `extra_body` 重试一次；思考+工具多轮官方要求回传 `reasoning_content`，当前关思考无内容可回传，Profile 仍标记 `retransmit_reasoning=True` 兜住降级后思考被打开的情况 |
+| `qwen3.8-flash`                | ✅     | `extra_body={"enable_thinking": False}`  | 百炼默认即关；显式传确保。另有`/no_think` 软开关可写进 prompt 兜底；思考开启时工具多轮回传 `reasoning_content` |
 | `gpt-5.6-luna`                 | ✅     | `reasoning_effort="none"`                | none=真·非思考（官方）                                                                                                                                                                                        |
 | `doubao-seed-2-0-lite`         | ✅     | `thinking={"type":"disabled"}`           | 方舟统一参数                                                                                                                                                                                                   |
-| `kimi-k3`                      | ✅     | 不传（恒开，无法关）                     | 不传 temperature                                                                                                                                                                                               |
-| `minimax-m3`                   | ✅     | `thinking={"type":"disabled"}`           |                                                                                                                                                                                                                |
-| `gemini-3`（flash 系）         | ✅     | `extra_body={"thinking_level":"low"}`    | 未见完全关闭档；low 为最低                                                                                                                                                                                     |
+| `kimi-k3`                      | ✅     | 不传（恒开，无法关）                     | 不传 temperature；K3/K3.1 工具多轮必须把 `reasoning_content` 随 assistant tool_calls 原样回传，缺失即 400（`retransmit_reasoning=True`） |
+| `minimax-m3`                   | ✅     | `thinking={"type":"disabled"}`           | 交错思维：思考开启时工具多轮必须保留完整 response_message（含 `reasoning_content`）；当前关思考，无内容可回传（`retransmit_reasoning=True`） |
+| `gemini-3`（flash 系）         | ✅     | `extra_body={"thinking_level":"low"}`    | 未见完全关闭档；low 为最低；Gemini 3 工具多轮另需回传 `extra_content.google.thought_signature`，当前流式聚合未保留该字段，需另行接入 |
 | `DEFAULT_PROFILE`              | 探测   | 不传                                     | 新模型接入零配置可用                                                                                                                                                                                           |
 
 > 上表参数以调研文档为准，但**所有参数都被视为"可能错"**：§3.2 的降级链是正确性的最终保证。Profile 表是集中配置，后续新增/修正模型只改这一处。

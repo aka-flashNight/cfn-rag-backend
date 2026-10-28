@@ -193,6 +193,7 @@ async def _stream_with_blocks(
     for _round_index in range(MAX_CHAT_ROUNDS):
         tool_calls: list[dict[str, Any]] = []
         round_text_parts: list[str] = []
+        round_reasoning_parts: list[str] = []
         chat_request = ChatRequest(
             messages=messages,
             tools=tools,
@@ -206,6 +207,9 @@ async def _stream_with_blocks(
                 content_chars += len(event.text)
                 round_text_parts.append(event.text)
                 yield event.text
+            elif event.kind == "reasoning" and event.text:
+                # 思考增量不进入台词流，只在工具轮后按 profile 决定是否回传。
+                round_reasoning_parts.append(event.text)
             elif event.kind == "finish":
                 tool_calls = list(event.tool_calls or [])
 
@@ -260,7 +264,16 @@ async def _stream_with_blocks(
 
         if outcome.system_prompt:
             messages = _replace_system(messages, outcome.system_prompt)
-        messages = [*messages, *outcome.messages]
+        followup_messages = outcome.messages
+        round_reasoning = "".join(round_reasoning_parts)
+        if round_reasoning and _retransmit_reasoning(llm):
+            followup_messages = _attach_reasoning_content(followup_messages, round_reasoning)
+            logger.info(
+                "[interject] 回传 reasoning_content mode=%s dialogue=%s turn=%s chars=%d",
+                request.mode, request.dialogue_instance_id, request.turn_id,
+                len(round_reasoning),
+            )
+        messages = [*messages, *followup_messages]
         tools = None  # 工具结果之后只输出最终对话，不再给工具
         tool_rounds += 1
     else:
@@ -344,6 +357,28 @@ def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
     if "route_search" in names:
         return "searching"
     return ""
+
+
+def _retransmit_reasoning(llm: Any) -> bool:
+    """按模型 Profile 判断是否回传本轮思考增量（Kimi K3 / DeepSeek / MiniMax 等）。"""
+    profile = getattr(llm, "profile", None)
+    return bool(getattr(profile, "retransmit_reasoning", False))
+
+
+def _attach_reasoning_content(
+    messages: list[dict[str, Any]], reasoning: str
+) -> list[dict[str, Any]]:
+    """把 reasoning_content 挂在 assistant tool_calls 消息上；正文与工具参数原样保留。"""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if (
+            message.get("role") == "assistant"
+            and message.get("tool_calls")
+            and "reasoning_content" not in message
+        ):
+            message = {**message, "reasoning_content": reasoning}
+        out.append(message)
+    return out
 
 
 def _replace_system(messages: list[dict[str, Any]], system: str) -> list[dict[str, Any]]:

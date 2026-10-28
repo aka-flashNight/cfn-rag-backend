@@ -39,8 +39,10 @@ PROFILES: tuple[ModelProfile, ...] = (
         match="deepseek-flash",
         vision=False,
         thinking_body={"thinking": {"type": "disabled"}},
+        retransmit_reasoning=True,
         note="2026-10 官方只有这一个 flash 模型（原 v4-flash 与 v4-flash-vision-exp 已不存在）；"
-             "纯文本，思考参数沿用 V4-Flash 的官方 Chat Completions 口径，未对新名实测，报错走降级链",
+             "纯文本，思考参数沿用 V4-Flash 的官方 Chat Completions 口径，未对新名实测，报错走降级链；"
+             "思考模式下工具多轮必须回传 reasoning_content（官方 2026 文档），关思考时无内容可回传",
     ),
     ModelProfile(
         match="qwen3.8-flash",
@@ -65,18 +67,24 @@ PROFILES: tuple[ModelProfile, ...] = (
         match="kimi-k3",
         vision=True,
         thinking_body={},
-        note="思考恒开无法关；不传 temperature",
+        retransmit_reasoning=True,
+        note="思考恒开无法关；不传 temperature；K3/K3.1 的工具多轮必须把 reasoning_content "
+             "随 assistant tool_calls 原样回传，缺失会 400",
     ),
     ModelProfile(
         match="minimax-m3",
         vision=True,
         thinking_body={"thinking": {"type": "disabled"}},
+        retransmit_reasoning=True,
+        note="交错思维：思考开启时工具多轮必须保留完整 response_message（含 reasoning_content），"
+             "无论本轮是否真有思考内容；当前关思考，无内容可回传",
     ),
     ModelProfile(
         match="gemini-3",
         vision=True,
         thinking_body={"thinking_level": "low"},
-        note="未见完全关闭档；low 为最低",
+        note="未见完全关闭档；low 为最低；Gemini 3 工具多轮另需回传 thought_signature"
+             "（extra_content.google.thought_signature），当前流式聚合未保留该字段",
     ),
 )
 
