@@ -31,6 +31,7 @@ class PrepareTaskContextTool(BaseTool):
             npc_affinity=ctx.npc_affinity,
             npc_states=ctx.npc_states,
             game_data=ctx.game_data,
+            save_info=ctx.save_info,
         )
         return ToolResult(result_json=result)
 

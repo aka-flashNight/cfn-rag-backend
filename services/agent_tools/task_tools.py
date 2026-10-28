@@ -19,9 +19,13 @@ from services.dialogue.view import shared_sources
 from services.game_data.registry import GameDataRegistry
 from services.integration.save_paths import resolve_task_write_paths, shared_task_paths
 from services.integration.state import get_integration_state
+from services.stage_access import (
+    BindingFacts,
+    stage_is_unlocked,
+    stage_unlock_task_ids,
+    stage_unlock_task_ids_unbound,
+)
 
-# 当前最大任务进度常量：写入 get_requirements 时，若计算值大于此值则使用此值
-MAX_MAINLINE_TASK_PROGRESS: int = 77
 # Agent 任务 id 区间（上游 200000 为基准，超出 300000 视为越界）
 AGENT_TASK_ID_BASE: int = 200000
 AGENT_TASK_ID_MAX: int = 300000
@@ -243,13 +247,15 @@ def _stage_reqs_unlock_ids(
     *,
     finish_requirements: Any,
     game_data: GameDataRegistry,
+    facts: Optional[BindingFacts] = None,
 ) -> List[int]:
     """
-    从 finish_requirements 反推对应关卡（stage_name）的主线解锁 id（unlock_condition）。
+    从 finish_requirements 反推对应关卡的前置任务 id。
 
-    规则：
-    - unlock_condition 缺失/为非正数：认为是副本等无主线解锁需求，不写入 get_requirements。
-    - 若同一 stage_name 在多个大区存在多个 unlock_condition：取最小值（更符合“最早解锁前置”）。
+    - 绑定存档：只取该关卡当前真实满足的解锁路径（主线/替代链 OR），
+      并返回玩家已完成、能证明该阈值的最小链节点任务；找不到可信锚点就不写。
+    - 未绑定：按真实链映射返回最早锚点，不声称已完成。
+    - UnlockCondition 是主线链值阈值，不是任务 id；不再抄阈值或截到 77。
     """
     stage_registry = getattr(game_data, "stages", None)
     stage_infos_raw = getattr(stage_registry, "_stage_infos", None) if stage_registry else None
@@ -259,6 +265,7 @@ def _stage_reqs_unlock_ids(
     out: set[int] = set()
     if not isinstance(finish_requirements, list):
         return []
+    tasks = list(game_data.tasks.list_all_tasks())
 
     for sr in finish_requirements:
         if not isinstance(sr, dict):
@@ -267,16 +274,22 @@ def _stage_reqs_unlock_ids(
         if not isinstance(stage_name, str) or not stage_name.strip():
             continue
 
-        unlocks: list[int] = []
-        for (_area, name), si in stage_infos_raw.items():
-            if name != stage_name:
-                continue
-            unlock = getattr(si, "unlock_condition", None)
-            if isinstance(unlock, int) and unlock > 0:
-                unlocks.append(unlock)
-
-        if unlocks:
-            out.add(min(unlocks))
+        matched = [
+            si for (_area, name), si in stage_infos_raw.items() if name == stage_name
+        ]
+        if facts is not None:
+            matched = [si for si in matched if stage_is_unlocked(si, facts)]
+        anchors: list[int] = []
+        for si in matched:
+            ids = (
+                stage_unlock_task_ids(si, facts, tasks)
+                if facts is not None
+                else stage_unlock_task_ids_unbound(si, tasks)
+            )
+            if ids:
+                anchors = ids
+                break
+        out.update(anchors)
 
     return sorted(out)
 
@@ -456,6 +469,7 @@ def write_confirmed_agent_task_files(
     with _WRITE_LOCK:
         data_root = game_data.data_root
         agent_tasks_path, agent_text_path, _slot_key = resolve_task_write_paths(data_root)
+        snapshot = get_integration_state().snapshot()
 
         tasks_doc = _read_json(agent_tasks_path, default={"tasks": []})
         if not isinstance(tasks_doc, dict):
@@ -472,10 +486,8 @@ def write_confirmed_agent_task_files(
         start_id = max(used_ids, default=AGENT_TASK_ID_BASE) + 1
         # 已绑定存档时，完成/接取历史同样占号：任务文件可能已被清理，但游戏仍按
         # tasks_finished 判重，复用旧 id 会让新任务落盘即“已完成”。
-        if _slot_key is not None:
-            snapshot = get_integration_state().snapshot()
-            if snapshot.get("bound_slot") == _slot_key:
-                used_ids |= _history_agent_task_ids(snapshot.get("progress"))
+        if _slot_key is not None and snapshot.get("bound_slot") == _slot_key:
+            used_ids |= _history_agent_task_ids(snapshot.get("progress"))
         task_id_int = _next_free_agent_task_id(used_ids, start_id)
         used_ids.add(task_id_int)
         draft["id"] = task_id_int
@@ -556,24 +568,16 @@ def write_confirmed_agent_task_files(
         if not finish_items:
             finish_items = [_agent_text_item(finish_npc, "", "", sources)]
 
-        # get_req_list = _ensure_int_list(draft.get("get_requirements"))
-        # # 若大模型没填 get_requirements，则由后端根据 finish_requirements 的关卡解锁条件补全。
-        # # 该逻辑不依赖任务类型：只要 finish_requirements 中的关卡有 unlock_condition，就应写入前置主线。
-        # if not get_req_list:
-        #     get_req_list = _stage_reqs_unlock_ids(
-        #         finish_requirements=draft.get("finish_requirements"),
-        #         game_data=game_data,
-        #     )
-
-        # 现在大模型不再传入 finish_requirements
+        write_facts = BindingFacts.from_save_info({
+            "slot_key": _slot_key,
+            "progress": snapshot.get("progress"),
+            "player": snapshot.get("player"),
+        }) if _slot_key is not None and snapshot.get("bound_slot") == _slot_key else None
         get_req_list = _stage_reqs_unlock_ids(
             finish_requirements=draft.get("finish_requirements"),
             game_data=game_data,
+            facts=write_facts,
         )
-        # 限制 get_requirements 不超过当前最大任务进度
-        get_req_list = [
-            min(req_id, MAX_MAINLINE_TASK_PROGRESS) for req_id in get_req_list
-        ]
         finish_reqs = _stage_reqs_to_strings(draft.get("finish_requirements"))
         finish_submit = _reward_items_to_expr(draft.get("finish_submit_items"))
         finish_contain = _reward_items_to_expr(draft.get("finish_contain_items"))
@@ -644,8 +648,7 @@ def write_confirmed_agent_task_files(
         return_record: Optional[Dict[str, Any]] = None
         if paired:
             # 任务二只是回去说话领奖：完成条件、提交品、持有品全部留空（全留在任务一）。
-            # get_requirements 必须在 clamp 之后单独赋 [任务一 id]——把它送进
-            # min(id, 77) 会被压成 77，前置条件直接消失，玩家不做任务一也能接。
+            # get_requirements 单独赋 [任务一 id]，回访链保持真实前置。
             return_record = {
                 "id": next_id,
                 "title": f"$AGENT_TITLE_{next_id}",

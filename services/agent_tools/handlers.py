@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from services.game_data.registry import GameDataRegistry, get_game_data_registry
 from services.game_progress import get_progress_stage_config
+from services.stage_access import BindingFacts
 from services.agent_tools.context_builder import prepare_task_context
 from services.agent_tools.draft_formatting import _detailed_draft_summary
 from services.agent_tools.fallback import build_fallback_draft
@@ -166,6 +167,7 @@ def build_validation_ctx(
     player_progress: int = 1,
     npc_affinity: int = 0,
     bargain_rate: float = 1.0,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> DraftValidationContext:
     cfg = get_progress_stage_config(player_progress)
     main_task_max_id = cfg.main_task_max_id if cfg else 0
@@ -177,6 +179,7 @@ def build_validation_ctx(
         affinity=npc_affinity,
         npc_name=npc_name or None,
         bargain_rate=bargain_rate,
+        binding=BindingFacts.from_save_info(save_info),
     )
 
 
@@ -245,6 +248,7 @@ def execute_prepare_task_context(
     npc_affinity: int = 0,
     npc_states: Optional[dict[str, Any]] = None,
     game_data: Optional[GameDataRegistry] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> str:
     task_type = args.get("task_type", "问候")
     requirement_keywords = args.get("requirement_keywords")
@@ -270,6 +274,7 @@ def execute_prepare_task_context(
         requirement_keywords=requirement_keywords,
         reward_keywords=reward_keywords,
         game_data=game_data,
+        save_info=save_info,
     )
 
 
@@ -288,6 +293,7 @@ def execute_draft_agent_task(
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
     npc_states: Optional[dict[str, Any]] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     if game_data is None:
         game_data = get_game_data_registry()
@@ -307,6 +313,7 @@ def execute_draft_agent_task(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
+        save_info=save_info,
     )
 
     report = validate_task_draft(draft, context=validation_ctx, game_data=game_data)
@@ -379,6 +386,7 @@ def execute_update_task_draft(
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
     npc_states: Optional[dict[str, Any]] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     if pending_draft is None:
         return DraftOpOutcome(result_json=json.dumps({
@@ -432,6 +440,7 @@ def execute_update_task_draft(
         player_progress=player_progress,
         npc_affinity=npc_affinity,
         bargain_rate=1.5 if (is_bargain and reward_actually_changed and draft_commit_valid) else 1.0,
+        save_info=save_info,
     )
     changed = set(modify_fields.keys())
     report = validate_task_draft(
@@ -507,6 +516,7 @@ def execute_confirm_agent_task(
     npc_states: Optional[dict[str, Any]] = None,
     publish_session_id: str = "",
     generation_warnings: Optional[list[str]] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     """校验并写入任务文件。
 
@@ -578,6 +588,7 @@ def execute_confirm_agent_task(
         npc_name=npc_name,
         player_progress=player_progress,
         npc_affinity=npc_affinity,
+        save_info=save_info,
     )
     report = validate_task_draft(draft_for_commit, context=validation_ctx, game_data=game_data)
     if not report.ok and report.issues:
@@ -719,6 +730,7 @@ def execute_fallback_draft(
     npc_states: Optional[dict[str, Any]] = None,
     game_data: Optional[GameDataRegistry] = None,
     rag_context_text: Optional[str] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> DraftOpOutcome:
     """后端兜底草案（05 §5）：保证「拟定了方向就能拿出草案」。"""
     if game_data is None:
@@ -734,6 +746,7 @@ def execute_fallback_draft(
             npc_affinity=npc_affinity,
             npc_states=npc_states,
             game_data=game_data,
+            save_info=save_info,
         )
     except Exception as e:
         logger.warning("兜底草案构造失败: %s", e)

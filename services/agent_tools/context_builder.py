@@ -28,6 +28,11 @@ from services.game_progress import (
     PROGRESS_STAGE_CONFIG,
     stage_root_region_hint,
 )
+from services.stage_access import (
+    BindingFacts,
+    matched_stage_for_tags,
+    stage_is_unlocked,
+)
 
 # 当 challenge 无 llm_hint 时使用的默认提醒（仅在选择该难度时随 challenge_modes 返回，按需占用 token）
 DEFAULT_CHALLENGE_LLM_HINT = "若选择此难度，请在任务介绍中明确说明当前难度，并在对话中提醒具有挑战性。"
@@ -880,18 +885,64 @@ def _build_stage_access_meta(
     *,
     area: str,
     stage_name: str,
-    unlock_condition: int,
+    si: Any,
     mercs_by_stage: dict[str, list[Any]],
     max_level: int,
     main_task_max_id: int,
+    facts: Optional[BindingFacts] = None,
 ) -> Optional[dict[str, Any]]:
     """
     关卡可用性与难度元信息（通关/清理/挑战/通关并收集/通关并持有共用）。
     规则：
-    - 副本(area=副本任务)：必须存在 recommended_min_level 且 <= max_level 才可用；
-    - 非副本：按 unlock_condition <= main_task_max_id 可用。
+    - 绑定存档：只按真实解锁（主线链/替代链 OR）过滤；副本要求本地入口配置存在，
+      推荐等级只作为元信息，不当硬门槛；
+    - 未绑定：沿用旧阶段区间语义（副本按推荐等级、非副本按阈值 ≤ 阶段上限）。
     """
     is_dungeon = area == "副本任务"
+    if facts is not None:
+        if not stage_is_unlocked(si, facts):
+            return None
+        if is_dungeon:
+            merc_tasks = mercs_by_stage.get(stage_name) or []
+            if not merc_tasks:
+                return None
+            allowed_difficulties: set[str] = {"简单"}
+            challenge_modes_map: dict[str, str] = {}
+            for mt in merc_tasks:
+                if not mt.challenge_difficulty or mt.challenge_difficulty == "简单":
+                    continue
+                allowed_difficulties.add(mt.challenge_difficulty)
+                if (
+                    mt.challenge_description
+                    and mt.challenge_difficulty not in challenge_modes_map
+                ):
+                    challenge_modes_map[mt.challenge_difficulty] = mt.challenge_description
+            difficulties = [
+                d for d in ("简单", "冒险", "修罗", "地狱") if d in allowed_difficulties
+            ]
+            challenge_modes = [
+                {"difficulty": diff, "description": desc}
+                for diff, desc in challenge_modes_map.items()
+                if diff in difficulties and diff != "简单"
+            ]
+            return {
+                "is_dungeon": True,
+                "difficulties": difficulties,
+                "recommended_level": min(
+                    (
+                        mt.recommended_min_level
+                        for mt in merc_tasks
+                        if mt.recommended_min_level is not None
+                    ),
+                    default=None,
+                ),
+                "challenge_modes": challenge_modes,
+            }
+        return {
+            "is_dungeon": False,
+            "difficulties": ["简单", "冒险", "修罗", "地狱"],
+        }
+
     if is_dungeon:
         merc_tasks = mercs_by_stage.get(stage_name) or []
         allowed_by_root = [
@@ -937,7 +988,8 @@ def _build_stage_access_meta(
             "challenge_modes": challenge_modes,
         }
 
-    if unlock_condition > main_task_max_id:
+    unlock_condition = si.unlock_condition
+    if unlock_condition is None or int(unlock_condition) > main_task_max_id:
         return None
     return {
         "is_dungeon": False,
@@ -1254,12 +1306,14 @@ def _get_all_stages_for_progress(
     requirement_keywords: Optional[list[str]] = None,
     *,
     npc_faction: str = "",
+    facts: Optional[BindingFacts] = None,
 ) -> list[dict[str, Any]]:
     """
     获取所有有效关卡的二级结构列表（通关/清理/挑战类用）。
 
-    筛选：unlock_condition ≤ main_task_max_id，副本按推荐等级筛选；
-    **中立外交地图（type=外交地图）不是可攻打关卡，直接排除**。
+    绑定存档：只收真实已解锁关卡（主线链/替代链 OR），副本不把推荐等级当硬门槛；
+    未绑定：沿用 unlock_condition ≤ main_task_max_id、副本按推荐等级的旧语义。
+    两路都排除中立外交地图。
     """
     stage_registry = game_data.stages
     mercenary_registry = game_data.mercenary_tasks
@@ -1286,25 +1340,22 @@ def _get_all_stages_for_progress(
 
     rows: list[dict[str, Any]] = []
     for (area, name), si in stage_registry._stage_infos.items():
-        if si.unlock_condition is None:
+        if facts is None and si.unlock_condition is None:
             continue
         if pt.is_diplomatic_stage(si):
             continue  # 外交地图：中立区域，不是可攻打关卡
         meta = _build_stage_access_meta(
             area=area,
             stage_name=name,
-            unlock_condition=int(si.unlock_condition),
+            si=si,
             mercs_by_stage=mercs_by_stage,
             max_level=int(max_level),
             main_task_max_id=int(main_task_max_id),
+            facts=facts,
         )
         if meta is None:
             continue
 
-        below_progress = (
-            not bool(meta.get("is_dungeon"))
-            and si.unlock_condition < main_task_min_id
-        )
         row: dict[str, Any] = {
             "area": area,
             "name": name,
@@ -1318,26 +1369,40 @@ def _get_all_stages_for_progress(
         }
         if si.description:
             row["description"] = si.description
-        if below_progress:
-            row["below_progress"] = True
         if need_loot_tags:
             has_intel, loot_value = _stage_loot_profile(game_data, area, name)
             row["_has_intel_loot"] = has_intel
             row["_loot_value"] = loot_value
-        row["_hit_tags"] = _stage_tag_hits(
-            row, requested_tags=tags, publisher_faction=npc_faction,
-        )
-        row["_hit_words"] = _stage_word_hits(row, words)
         rows.append(row)
+
+    if facts is None:
+        match_min_id = main_task_min_id
+    else:
+        match_cfg = get_progress_stage_config(matched_stage_for_tags(rows, stage=stage))
+        match_min_id = (match_cfg.main_task_min_id if match_cfg else 0) or 0
+    for r in rows:
+        unlock = r.get("unlock_id")
+        if (
+            not r.get("is_dungeon")
+            and isinstance(unlock, int)
+            and unlock < match_min_id
+        ):
+            r["below_progress"] = True
 
     if need_loot_tags:
         values = sorted(float(r.get("_loot_value") or 0) for r in rows)
         median = values[len(values) // 2] if values else 0.0
         for r in rows:
             r["_rich_loot"] = (r.get("_loot_value") or 0) > median
-            if r["_rich_loot"] and "掉落丰厚" in tags:
-                if "掉落丰厚" not in r["_hit_tags"]:
-                    r["_hit_tags"].append("掉落丰厚")
+
+    for r in rows:
+        r["_hit_tags"] = _stage_tag_hits(
+            r, requested_tags=tags, publisher_faction=npc_faction,
+        )
+        if need_loot_tags and r.get("_rich_loot") and "掉落丰厚" in tags:
+            if "掉落丰厚" not in r["_hit_tags"]:
+                r["_hit_tags"].append("掉落丰厚")
+        r["_hit_words"] = _stage_word_hits(r, words)
 
     picked = _pick_stage_rows_n(rows, requirement_keywords=all_wanted)
     return _group_stage_rows_by_area(picked, stage=stage)
@@ -1630,8 +1695,10 @@ def _build_challenge_targets(
     npc_name: str,
     npc_challenge: Optional[str],
     stage: int,
+    *,
+    facts: Optional[BindingFacts] = None,
 ) -> list[dict[str, Any]] | dict[str, str]:
-    """切磋类：当前NPC的切磋关卡列表。"""
+    """切磋类：当前NPC的切磋关卡列表（绑定存档只收真实已解锁关卡）。"""
     if not npc_challenge:
         return {"error": "当前NPC无可用的切磋目标，请选择其他任务类型"}
 
@@ -1641,12 +1708,12 @@ def _build_challenge_targets(
     main_task_range = get_progress_stage_main_task_range(stage) or (0, 77)
     main_task_max_id = int(main_task_range[1]) if main_task_range and len(main_task_range) > 1 else 77
 
-    areas = [
-        area
-        for (area, name), _si in game_data.stages._stage_infos.items()
+    matched_infos = [
+        (area, si)
+        for (area, name), si in game_data.stages._stage_infos.items()
         if name == npc_challenge
     ]
-    if not areas:
+    if not matched_infos:
         return {"error": "当前NPC切磋关卡不存在于可用地图数据，请选择其他任务类型"}
 
     mercs_by_stage: dict[str, list[Any]] = {}
@@ -1656,17 +1723,17 @@ def _build_challenge_targets(
         mercs_by_stage.setdefault(mt.stage_name, []).append(mt)
 
     metas: list[tuple[str, dict[str, Any]]] = []
-    for area in sorted(set(areas)):
-        unlock_id = game_data.stages.get_unlock_condition(area, npc_challenge)
-        if unlock_id <= 0:
+    for area, si in matched_infos:
+        if facts is None and (si.unlock_condition is None or int(si.unlock_condition) <= 0):
             continue
         meta = _build_stage_access_meta(
             area=area,
             stage_name=npc_challenge,
-            unlock_condition=unlock_id,
+            si=si,
             mercs_by_stage=mercs_by_stage,
             max_level=int(max_level),
             main_task_max_id=int(main_task_max_id),
+            facts=facts,
         )
         if meta is not None:
             metas.append((area, meta))
@@ -2299,8 +2366,9 @@ def _build_stage_loot_list(
     requirement_keywords: Optional[list[str]] = None,
     *,
     npc_faction: str = "",
+    facts: Optional[BindingFacts] = None,
 ) -> list[dict[str, Any]]:
-    """通关并收集/通关并持有：仅有箱子掉落的关卡（外交地图同样排除）。"""
+    """通关并收集/通关并持有：仅有箱子掉落的可用关卡（外交地图同样排除）。"""
     stage_registry = game_data.stages
     item_registry = game_data.items
     mercenary_registry = game_data.mercenary_tasks
@@ -2326,7 +2394,7 @@ def _build_stage_loot_list(
     )
 
     for (area, name), si in stage_registry._stage_infos.items():
-        if si.unlock_condition is None:
+        if facts is None and si.unlock_condition is None:
             continue
         if pt.is_diplomatic_stage(si):
             continue  # 外交地图：中立区域，不是可攻打关卡
@@ -2334,10 +2402,11 @@ def _build_stage_loot_list(
         meta = _build_stage_access_meta(
             area=area,
             stage_name=name,
-            unlock_condition=int(si.unlock_condition),
+            si=si,
             mercs_by_stage=mercs_by_stage,
             max_level=int(max_level),
             main_task_max_id=int(main_task_max_id),
+            facts=facts,
         )
         if meta is None:
             continue
@@ -2396,11 +2465,6 @@ def _build_stage_loot_list(
         )
         loot_items = intel_items + non_intel_items[:3]
 
-        below_progress = (
-            not bool(meta.get("is_dungeon"))
-            and si.unlock_condition < main_task_min_id
-        )
-
         row: dict[str, Any] = {
             "area": area,
             "name": name,
@@ -2417,36 +2481,50 @@ def _build_stage_loot_list(
         }
         if si.description:
             row["description"] = si.description
-        if below_progress:
-            row["below_progress"] = True
-        row["_hit_tags"] = _stage_tag_hits(
-            row, requested_tags=tags, publisher_faction=npc_faction,
-        )
-        # 自由词通道：先看关卡/区域，再看掉落物名（原有逻辑保留）
-        word_hits = _stage_word_hits(row, words)
-        if not word_hits and words:
-            if _stage_loot_row_matches_keywords(
-                {
-                    "area": area,
-                    "area_region_hint": stage_root_region_hint(area),
-                    "stage_name": name,
-                    "loot_items": loot_items,
-                },
-                words,
-                item_registry,
-                equipment_mods,
-            ):
-                word_hits = list(words)
-        row["_hit_words"] = word_hits
         rows.append(row)
+
+    if facts is None:
+        match_min_id = main_task_min_id
+    else:
+        match_cfg = get_progress_stage_config(matched_stage_for_tags(rows, stage=stage))
+        match_min_id = (match_cfg.main_task_min_id if match_cfg else 0) or 0
+    for r in rows:
+        unlock = r.get("unlock_id")
+        if (
+            not r.get("is_dungeon")
+            and isinstance(unlock, int)
+            and unlock < match_min_id
+        ):
+            r["below_progress"] = True
 
     if "掉落丰厚" in tags:
         values = sorted(float(r.get("total_loot_value") or 0) for r in rows)
         median = values[len(values) // 2] if values else 0.0
         for r in rows:
             r["_rich_loot"] = float(r.get("total_loot_value") or 0) > median
-            if r["_rich_loot"] and "掉落丰厚" not in r["_hit_tags"]:
-                r["_hit_tags"].append("掉落丰厚")
+
+    for r in rows:
+        r["_hit_tags"] = _stage_tag_hits(
+            r, requested_tags=tags, publisher_faction=npc_faction,
+        )
+        if r.get("_rich_loot") and "掉落丰厚" not in r["_hit_tags"]:
+            r["_hit_tags"].append("掉落丰厚")
+        # 自由词通道：先看关卡/区域，再看掉落物名（原有逻辑保留）
+        word_hits = _stage_word_hits(r, words)
+        if not word_hits and words:
+            if _stage_loot_row_matches_keywords(
+                {
+                    "area": r.get("area"),
+                    "area_region_hint": stage_root_region_hint(str(r.get("area") or "")),
+                    "stage_name": r.get("name"),
+                    "loot_items": r.get("loot_items") or [],
+                },
+                words,
+                item_registry,
+                equipment_mods,
+            ):
+                word_hits = list(words)
+        r["_hit_words"] = word_hits
 
     picked = _pick_stage_rows_n(rows, requirement_keywords=all_wanted)
     return _group_stage_rows_by_area(picked, stage=stage)
@@ -2915,15 +2993,18 @@ def prepare_task_context(
     requirement_keywords: Optional[list[str]] = None,
     reward_keywords: Optional[list[str]] = None,
     game_data: Optional[GameDataRegistry] = None,
+    save_info: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     prepare_task_context 工具执行器。
 
     返回 JSON 字符串，包含该任务类型所需的全部筛选后数据与规则说明。
+    ``save_info`` 是本回合绑定的存档投影；有值时关卡候选只收真实已解锁对象。
     """
     if game_data is None:
         game_data = get_game_data_registry()
 
+    facts = BindingFacts.from_save_info(save_info)
     stage = max(1, min(7, player_progress))
     cfg = get_progress_stage_config(stage)
 
@@ -2990,12 +3071,12 @@ def prepare_task_context(
     elif task_type in ("通关", "清理", "挑战"):
         context["stage_list"] = _get_all_stages_for_progress(
             game_data, stage, requirement_keywords=requirement_keywords,
-            npc_faction=npc_faction,
+            npc_faction=npc_faction, facts=facts,
         )
 
     elif task_type == "切磋":
         context["challenge_targets"] = _build_challenge_targets(
-            game_data, npc_name, npc_challenge, stage,
+            game_data, npc_name, npc_challenge, stage, facts=facts,
         )
 
     elif task_type == "资源收集":
@@ -3045,7 +3126,7 @@ def prepare_task_context(
     elif task_type in ("通关并收集", "通关并持有"):
         context["stage_loot_list"] = _build_stage_loot_list(
             game_data, stage, requirement_keywords=requirement_keywords,
-            npc_faction=npc_faction,
+            npc_faction=npc_faction, facts=facts,
         )
 
     if task_type in ("资源收集", "装备缴纳", "特殊物品获取", "通关并收集"):

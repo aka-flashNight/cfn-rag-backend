@@ -91,6 +91,9 @@ class ToolContext:
     dialogue_source_trigger: str = ""
     # 存档槽位（委派受理当刻钉死；空＝由工具回落到当前绑定）
     slot_key: str = ""
+    # 本回合绑定存档投影（slot_key/character/progress/scene/player）；
+    # 仅供任务候选与前置按真实解锁计算，不允许模型参数覆盖。
+    save_info: Optional[dict[str, Any]] = None
 
 
 @dataclass

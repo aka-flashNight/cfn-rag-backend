@@ -845,6 +845,7 @@ class TurnOrchestrator:
                         npc_states=ctx.npc_states,
                         publish_session_id=self.session_id,
                         generation_warnings=confirm_warnings,
+                        save_info=ctx.save_info,
                     )
                     if outcome.payload.get("status") == "confirmed":
                         draft_touched = True
@@ -1728,6 +1729,7 @@ class TurnOrchestrator:
             game_data=deps.game_data,
             rag_context_text=ctx.rag_context_text,
             retrieve_fn=ctx.retrieve_fn,
+            save_info=ctx.save_info,
             max_rounds=deps.task_max_rounds,
         )
         new_draft_kwargs = {

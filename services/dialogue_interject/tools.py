@@ -954,6 +954,7 @@ class DailyToolRuntime:
             game_data=self.blocks.game_data,
             rag_context_text=self.blocks.rag_context_text,
             retrieve_fn=self.blocks.retrieve_fn,
+            save_info=self.blocks.save_info,
             max_rounds=_task_max_rounds(),
         )
         transition_task: asyncio.Task | None = None
@@ -1146,6 +1147,7 @@ class DailyToolRuntime:
             npc_states=self.blocks.npc_states,
             publish_session_id=self.blocks.session_id,
             generation_warnings=warnings or None,
+            save_info=self.blocks.save_info,
         )
         payload = outcome.payload or {}
         if payload.get("status") == "confirmed":

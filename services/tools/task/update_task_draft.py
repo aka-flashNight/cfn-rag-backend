@@ -32,6 +32,7 @@ class UpdateTaskDraftTool(BaseTool):
             game_data=ctx.game_data,
             rag_context_text=ctx.rag_context_text,
             npc_states=ctx.npc_states,
+            save_info=ctx.save_info,
         )
         return ToolResult(
             result_json=outcome.result_json,

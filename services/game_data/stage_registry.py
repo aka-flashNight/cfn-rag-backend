@@ -6,7 +6,7 @@ from xml.etree import ElementTree as ET
 
 from services.game_progress import get_progress_stage_config, is_valid_stage_root
 
-from .models import EnemySpawn, LootCrate, LootDrop, StageInfo
+from .models import AltUnlockCondition, EnemySpawn, LootCrate, LootDrop, StageInfo
 from .parsers import _safe_int, discover_list_entries, parse_xml
 from .text_utils import strip_game_markup
 
@@ -62,10 +62,27 @@ class StageRegistry:
             if not name:
                 continue
             unlock_raw = el.findtext("UnlockCondition")
-            unlock = _safe_int(unlock_raw, default=0) if unlock_raw is not None else None
-            if unlock is not None and unlock <= 0:
-                # 文档规则：没有 UnlockCondition 不作为 agent 候选关卡
-                unlock = None
+            unlock: Optional[int] = None
+            if unlock_raw is not None and str(unlock_raw).strip() != "":
+                try:
+                    value = int(str(unlock_raw).strip())
+                except (TypeError, ValueError):
+                    value = -1
+                if value >= 0:
+                    unlock = value
+            alt_conditions: list[AltUnlockCondition] = []
+            for alt_el in el.findall("AltUnlockCondition"):
+                chain = (alt_el.get("chain") or "").strip()
+                min_raw = alt_el.get("min")
+                if not chain or min_raw is None or str(min_raw).strip() == "":
+                    continue
+                try:
+                    min_value = int(str(min_raw).strip())
+                except (TypeError, ValueError):
+                    continue
+                if min_value < 0:
+                    continue
+                alt_conditions.append(AltUnlockCondition(chain=chain, min=min_value))
             desc_raw = (el.findtext("Description") or "").strip()
             desc_clean = strip_game_markup(desc_raw) if desc_raw else None
             if desc_clean == "":
@@ -75,6 +92,7 @@ class StageRegistry:
                 name=name,
                 type=(el.findtext("Type") or "").strip() or None,
                 unlock_condition=unlock,
+                alt_unlock_conditions=alt_conditions,
                 description=desc_clean,
                 raw={"list_path": str(list_path)},
             )
@@ -89,9 +107,9 @@ class StageRegistry:
 
     def list_stages_for_progress(self, stage: int) -> list[StageInfo]:
         """
-        按玩家 progress_stage（1-7）筛选候选关卡：
+        按玩家 progress_stage（1-7）列出该阶段大区关卡（旧阶段区间语义，未绑定用）。
         - area 必须属于该阶段对应的大区（由 services/game_progress.py 提供）
-        - 且必须有 unlock_condition
+        - 至少存在主路径阈值或替代解锁条件
         """
 
         cfg = get_progress_stage_config(stage)
@@ -102,7 +120,7 @@ class StageRegistry:
         for (a, _), si in self._stage_infos.items():
             if a != area:
                 continue
-            if si.unlock_condition is None:
+            if si.unlock_condition is None and not si.alt_unlock_conditions:
                 continue
             out.append(si)
         return out

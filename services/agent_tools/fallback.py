@@ -23,6 +23,7 @@ from services.agent_tools.validator import (
     validate_task_draft,
 )
 from services.game_progress import get_progress_stage_config
+from services.stage_access import BindingFacts
 
 if TYPE_CHECKING:
     from services.game_data.registry import GameDataRegistry
@@ -74,6 +75,7 @@ def _prepare_candidates(
     npc_affinity: int,
     npc_states: dict[str, Any] | None,
     game_data: "GameDataRegistry",
+    save_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """调用 prepare_task_context 取候选（关键词用 direction 全文，尽量贴合方向）。"""
     keywords = [w for w in (direction or "").replace("，", " ").replace(",", " ").split() if w]
@@ -89,6 +91,7 @@ def _prepare_candidates(
         npc_states=npc_states,
         requirement_keywords=keywords or None,
         game_data=game_data,
+        save_info=save_info,
     )
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
@@ -125,7 +128,7 @@ def _pick_submit_items(
 
 def _pick_stage_requirements(
     *, task_type: str, candidates: dict[str, Any], context: DraftValidationContext,
-    game_data: "GameDataRegistry",
+    game_data: "GameDataRegistry", facts: BindingFacts | None = None,
 ) -> list[dict[str, Any]]:
     """通关族任务：取进度合法、解锁最早的关卡，难度固定「简单」。"""
     if task_type not in _FALLBACK_STAGES:
@@ -160,16 +163,17 @@ def _pick_stage_requirements(
         if not name:
             continue
         req = {"stage_name": name, "difficulty": "简单"}
-        # 用最小区间快速预检 V4（超进度直接跳过）
-        si = None
-        infos = getattr(game_data.stages, "_stage_infos", {})
-        for (_area, n), info in infos.items():
-            if n == name:
-                si = info
-                break
-        unlock = getattr(si, "unlock_condition", None) if si else None
-        if isinstance(unlock, int) and unlock > context.main_task_max_id:
-            continue
+        # 未绑定时沿用旧阶段上限快速预检；绑定时候选已按真实解锁过滤，不再二次筛。
+        if facts is None:
+            si = None
+            infos = getattr(game_data.stages, "_stage_infos", {})
+            for (_area, n), info in infos.items():
+                if n == name:
+                    si = info
+                    break
+            unlock = getattr(si, "unlock_condition", None) if si else None
+            if isinstance(unlock, int) and unlock > context.main_task_max_id:
+                continue
         return [req]
     raise FallbackDraftError("没有进度合法的关卡候选")
 
@@ -249,6 +253,7 @@ def build_fallback_draft(
     npc_affinity: int = 0,
     npc_states: dict[str, Any] | None = None,
     game_data: "GameDataRegistry | None" = None,
+    save_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 100% 通过全量校验的保守草案；失败抛 FallbackDraftError。
 
@@ -270,8 +275,10 @@ def build_fallback_draft(
         npc_affinity=npc_affinity,
         npc_states=npc_states,
         game_data=game_data,
+        save_info=save_info,
     )
 
+    facts = BindingFacts.from_save_info(save_info)
     cfg = get_progress_stage_config(max(1, min(7, player_progress)))
     context = DraftValidationContext(
         main_task_max_id=(cfg.main_task_max_id if cfg else 0) or 0,
@@ -279,6 +286,7 @@ def build_fallback_draft(
         stage=max(1, min(7, player_progress)),
         affinity=npc_affinity,
         npc_name=npc_name or None,
+        binding=facts,
     )
 
     draft: dict[str, Any] = {
@@ -291,7 +299,8 @@ def build_fallback_draft(
 
     draft["draft_id"] = str(_uuid.uuid4())[:8]
     draft["finish_requirements"] = _pick_stage_requirements(
-        task_type=task_type, candidates=candidates, context=context, game_data=game_data,
+        task_type=task_type, candidates=candidates, context=context,
+        game_data=game_data, facts=facts,
     )
     if task_type in ("资源收集", "装备缴纳", "物品持有", "特殊物品获取"):
         submit_key = "finish_submit_items" if task_type != "物品持有" else "finish_contain_items"

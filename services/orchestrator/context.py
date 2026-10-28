@@ -33,6 +33,7 @@ from services.game_progress import (
     get_progress_stage_config,
 )
 from services.integration.state import get_integration_state
+from services.stage_access import BindingFacts
 from services.llm import LLMConfig
 from services.memory.long_term import LongTermSnapshot, load_snapshot, resolve_enabled
 from services.memory.store import ChatMessage, MemoryStore, TaskDraftRow
@@ -679,6 +680,7 @@ async def assemble_context(
 
             challenge_result = _build_challenge_targets(
                 game_data, npc_name, ctx_npc_challenge, max(1, min(7, progress_stage or 1)),
+                facts=BindingFacts.from_save_info(save_info),
             )
             player_can_challenge = isinstance(challenge_result, list)
     except Exception:

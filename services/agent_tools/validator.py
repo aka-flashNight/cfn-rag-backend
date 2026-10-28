@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from services.game_progress import VALID_STAGE_ROOTS
+from services.stage_access import BindingFacts, stage_is_unlocked
 from services.game_data.reward_utils import (
     REWARD_STAGE_BASE_MAX,
     REWARD_STAGE_BASE_MIN,
@@ -100,6 +101,8 @@ class DraftValidationContext:
     npc_name: Optional[str] = None
     # 讨价还价阶段上限放大倍数，默认为 1.0 表示不放大。
     bargain_rate: float = 1.0
+    # 绑定存档事实；有值时按真实解锁判定，不做生成后的阶段/等级资格拒绝。
+    binding: Optional[BindingFacts] = None
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +286,13 @@ def _available_stage_candidates(
     *,
     stage_registry: Any,
     main_task_max_id: int,
+    binding: Optional[BindingFacts] = None,
     limit: int = _MAX_CANDIDATES,
 ) -> list[str]:
-    """V3/V4/V5 增强：当前进度下可用的关卡候选（unlock_condition ≤ 进度上限），去重后截断。"""
+    """V3/V4/V5 增强：可用关卡候选，去重后截断。
+
+    绑定时按真实解锁过滤；未绑定沿用 unlock_condition ≤ 进度上限（无解锁条件视为可用）。
+    """
     infos = getattr(stage_registry, "_stage_infos", None)
     if not isinstance(infos, dict):
         return []
@@ -294,10 +301,13 @@ def _available_stage_candidates(
     for (_area, name), si in infos.items():
         if name in seen:
             continue
-        unlock = getattr(si, "unlock_condition", None)
-        # 无解锁条件（副本等）视为可用；有解锁条件则要求 ≤ 当前进度
-        if unlock is not None and isinstance(unlock, int) and unlock > main_task_max_id:
-            continue
+        if binding is not None:
+            if not stage_is_unlocked(si, binding):
+                continue
+        else:
+            unlock = getattr(si, "unlock_condition", None)
+            if unlock is not None and isinstance(unlock, int) and unlock > main_task_max_id:
+                continue
         seen.add(name)
         out.append(name)
         if len(out) >= limit:
@@ -481,6 +491,7 @@ def _validate_v3_stage_existence_and_area(
     issues: list[ValidationIssue] = []
     candidates = _available_stage_candidates(
         stage_registry=stage_registry, main_task_max_id=context.main_task_max_id,
+        binding=context.binding,
     )
     for sr in _stage_requirement_iter(draft):
         stage_name = sr.get("stage_name")
@@ -502,11 +513,14 @@ def _validate_v3_stage_existence_and_area(
             ))
             continue
 
-        # stage_area 由筛选阶段负责；这里只确认：至少存在一个匹配关卡，且有 unlock_condition
+        # stage_area 由筛选阶段负责；这里只确认：至少存在一个匹配关卡且有可用解锁定义
         has_valid_unlock = False
         for _area, si in stage_infos:
             unlock = getattr(si, "unlock_condition", None)
-            if isinstance(unlock, int) and unlock > 0:
+            if isinstance(unlock, int) and unlock >= 0:
+                has_valid_unlock = True
+                break
+            if getattr(si, "alt_unlock_conditions", None):
                 has_valid_unlock = True
                 break
 
@@ -533,6 +547,9 @@ def _validate_v3_dungeon_recommended_level(
     - 如果某关卡在 mercenary_tasks 中存在推荐下限且推荐下限 > 玩家当前阶段上限，则拒绝。
     - 如果该关卡没有推荐等级（或 recommended_min_level 为 None），则不做推荐筛选。
     """
+    if context.binding is not None:
+        return []
+
     mercenary_registry = getattr(game_data, "mercenary_tasks", None)
     if mercenary_registry is None:
         return []
@@ -588,7 +605,11 @@ def _validate_v4_stage_unlock_condition(
     draft: Mapping[str, Any],
     stage_registry: Any,
     main_task_max_id: int,
+    binding: Optional[BindingFacts] = None,
 ) -> list[ValidationIssue]:
+    if binding is not None:
+        # 绑定存档：候选已在供给端按真实解锁过滤；这里不再做生成后资格拒绝。
+        return []
     issues: list[ValidationIssue] = []
     candidates = _available_stage_candidates(
         stage_registry=stage_registry, main_task_max_id=main_task_max_id,
@@ -666,7 +687,9 @@ def _validate_v5_replica_stage_difficulty(
             if not m.challenge_difficulty or m.challenge_difficulty == "简单":
                 continue
             cmin = m.challenge_recommended_min_level
-            if cmin is not None and int(cmin) <= max_level:
+            if context.binding is not None:
+                allowed_difficulties.add(m.challenge_difficulty)
+            elif cmin is not None and int(cmin) <= max_level:
                 allowed_difficulties.add(m.challenge_difficulty)
 
         if difficulty not in allowed_difficulties:
@@ -1153,6 +1176,7 @@ def validate_task_draft(
             draft=draft,
             stage_registry=stage_registry,
             main_task_max_id=context.main_task_max_id,
+            binding=context.binding,
         ))
         issues.extend(_validate_v5_replica_stage_difficulty(
             draft=draft, context=context, game_data=game_data,

@@ -22,6 +22,7 @@ from services.dialogue_interject.schemas import (
     TaskSummary,
 )
 from services.integration.state import get_integration_state
+from services.stage_access import BindingFacts
 from services.llm.meta import DEFAULT_EMOTION
 
 logger = logging.getLogger(__name__)
@@ -494,6 +495,7 @@ async def assemble_blocks(
 
             challenge_result = _build_challenge_targets(
                 game_data, npc_name, state.challenge, max(1, min(7, progress_stage or 1)),
+                facts=BindingFacts.from_save_info(save_info),
             )
             player_can_challenge = isinstance(challenge_result, list)
     except Exception:

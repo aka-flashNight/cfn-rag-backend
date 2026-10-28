@@ -259,6 +259,7 @@ class TaskRunner(SubagentBase):
             npc_states=self.ctx.npc_states,
             game_data=self.ctx.game_data,
             rag_context_text=self.ctx.rag_context_text,
+            save_info=self.ctx.save_info,
         )
         try:
             payload = json.loads(outcome.result_json)
@@ -313,6 +314,7 @@ class TaskRunner(SubagentBase):
         game_data: Any = None,
         rag_context_text: Optional[str] = None,
         retrieve_fn: Optional[Callable[[str], str]] = None,
+        save_info: Optional[dict[str, Any]] = None,
         max_rounds: int = 4,
     ) -> SubagentHandle:
         """构造并启动后台任务，返回 Handle。
@@ -340,6 +342,7 @@ class TaskRunner(SubagentBase):
             draft_commit_valid=draft_commit_valid,
             retrieve_fn=retrieve_fn,
             rag_context_text=rag_context_text,
+            save_info=save_info,
             skill_registry=None,  # v3：子 Agent 不再持有 skills 通道
         )
         system = build_task_system(

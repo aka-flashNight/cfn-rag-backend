@@ -101,11 +101,25 @@ class Task(BaseModel):
     raw: Optional[dict[str, Any]] = None
 
 
+class AltUnlockCondition(BaseModel):
+    """替代解锁路径：task_chains_progress[chain] >= min（与主路径 OR）。"""
+
+    chain: str
+    min: int
+
+
 class StageInfo(BaseModel):
     area: str = Field(..., description="stages 子目录名（例如 基地门口）")
     name: str = Field(..., description="关卡名（对应关卡 xml 文件名，不含 .xml）")
     type: Optional[str] = Field(default=None, description="关卡类型（__list__.xml: <Type>）")
-    unlock_condition: Optional[int] = Field(default=None, description="解锁主线任务 id（__list__.xml: <UnlockCondition>）")
+    unlock_condition: Optional[int] = Field(
+        default=None,
+        description="主线链值阈值（__list__.xml: <UnlockCondition>）；不是任务 id",
+    )
+    alt_unlock_conditions: list[AltUnlockCondition] = Field(
+        default_factory=list,
+        description="替代解锁链条件（__list__.xml: <AltUnlockCondition chain=... min=...>）",
+    )
     description: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
 
