@@ -123,8 +123,9 @@ async def test_f05_task_end_plan_after_first_line():
     plan = events[2].data
     assert plan == {
         "mute": False,
-        "end": 3,
-        "edits": [
+        "resume": 3,
+        "steps": [
+            {"n": 1, "kind": "keep"},
             {
                 "n": 2,
                 "kind": "edit",
@@ -136,6 +137,25 @@ async def test_f05_task_end_plan_after_first_line():
 
 
 @pytest.mark.asyncio
+async def test_task_add_after_original_op_waits_for_ordered_plan():
+    events = await collect_events(make_orchestrator(
+        fx.task_request(),
+        chunks=[
+            '{"type":"add","no":0,"text":"前缀","emo":"普通"}\n',
+            '{"type":"keep","no":1}\n',
+            '{"type":"add","no":0,"text":"插入","emo":"普通"}\n',
+            '{"type":"continue","no":2}\n',
+        ],
+    ))
+    assert _names(events) == ["status", "line", "plan", "done"]
+    assert events[1].data["text"] == "前缀"
+    plan = events[2].data
+    assert plan["resume"] == 2
+    assert [(step["n"], step["kind"]) for step in plan["steps"]] == [(1, "keep"), (0, "add")]
+    assert plan["steps"][1]["lines"][0]["text"] == "插入"
+
+
+@pytest.mark.asyncio
 async def test_f05b_task_edit_split_inside_plan():
     events = await collect_events(
         make_orchestrator(fx.task_request(), chunks=fx.F05B_JSONL)
@@ -143,9 +163,9 @@ async def test_f05b_task_edit_split_inside_plan():
     assert _names(events) == ["status", "line", "plan", "done"]
 
     plan = events[2].data
-    assert plan["end"] == 4
+    assert plan["resume"] == 4
     assert plan["mute"] is False
-    edit = plan["edits"][0]
+    edit = plan["steps"][2]
     assert edit["n"] == 3 and edit["kind"] == "edit"
     assert [line["split"] for line in edit["lines"]] == [
         {"index": 0, "count": 2},
@@ -159,29 +179,34 @@ async def test_f05b_task_edit_split_inside_plan():
 async def test_f06_task_remove_plan():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F06_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
-    assert plan == {"mute": False, "end": 3, "edits": [{"n": 2, "kind": "remove"}]}
+    assert plan == {
+        "mute": False,
+        "resume": 3,
+        "steps": [{"n": 1, "kind": "keep"}, {"n": 2, "kind": "remove"}],
+    }
 
 
 @pytest.mark.asyncio
-async def test_f07_task_missing_nochange_only_lists_explicit_edit():
+async def test_f07_task_explicit_keep_and_edit_are_ordered():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F07_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
     assert plan == {
         "mute": False,
-        "end": 4,
-        "edits": [
+        "resume": 4,
+        "steps": [
+            {"n": 1, "kind": "keep"},
+            {"n": 2, "kind": "keep"},
             {"n": 3, "kind": "edit", "lines": [{"text": "清单就压在柜台底下。", "emotion": "普通"}]}
         ],
     }
 
 
 @pytest.mark.asyncio
-async def test_f08_task_whole_group_replacement_has_null_end():
+async def test_f08_task_end_does_not_resume_original_tail():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F08_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
-    assert plan["end"] is None
-    # 整组替换只保留 add/edit；remove 无播放效果，不进 plan
-    assert [edit["kind"] for edit in plan["edits"]] == ["edit"]
+    assert plan["resume"] == 5
+    assert [step["kind"] for step in plan["steps"]] == ["edit", "remove", "remove", "remove"]
 
 
 @pytest.mark.asyncio
@@ -196,7 +221,7 @@ async def test_f09_mute_event_precedes_line_and_plan_keeps_mute():
     assert line["seq"] == 0
 
     plan = events[3].data
-    assert plan == {"mute": True, "end": 1, "edits": []}
+    assert plan == {"mute": True, "resume": 1, "steps": []}
 
 
 @pytest.mark.asyncio
@@ -251,7 +276,7 @@ async def test_f11_partial_then_stream_failed_keeps_line_but_no_plan():
 async def test_task_partial_stream_failure_never_emits_plan():
     orchestrator = make_orchestrator(
         fx.task_request(),
-        chunks=['{"n":2,"line":"改写到一半","emo":"普通"}\n'],
+        chunks=['{"type":"edit","no":1,"text":"改写到一半","emo":"普通"}\n'],
         error=RuntimeError("boom"),
     )
     events = await collect_events(orchestrator)
@@ -325,7 +350,10 @@ async def test_error_valid_lines_counts_model_rows_not_split_segments():
 async def test_error_valid_lines_does_not_count_mute():
     orchestrator = make_orchestrator(
         fx.task_request(),
-        chunks=['{"mute":true}\n', '{"add":"一句","emo":"普通"}\n'],
+        chunks=[
+            '{"type":"mute"}\n',
+            '{"type":"add","no":0,"text":"一句","emo":"普通"}\n',
+        ],
         error=RuntimeError("stream broke"),
     )
     events = await collect_events(orchestrator)
@@ -336,10 +364,10 @@ async def test_error_valid_lines_does_not_count_mute():
 @pytest.mark.asyncio
 async def test_turn_with_only_mute_is_not_treated_as_zero_valid():
     events = await collect_events(
-        make_orchestrator(fx.task_request(), chunks=['{"mute":true}\n'])
+        make_orchestrator(fx.task_request(), chunks=['{"type":"mute"}\n'])
     )
     assert _names(events) == ["status", "mute", "plan", "done"]
-    assert events[-2].data == {"mute": True, "end": None, "edits": []}
+    assert events[-2].data == {"mute": True, "resume": 1, "steps": []}
 
 
 @pytest.mark.asyncio

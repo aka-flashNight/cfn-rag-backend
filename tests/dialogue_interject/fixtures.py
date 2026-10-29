@@ -140,9 +140,10 @@ F02_JSONL = [
 ]
 
 F05_JSONL = [
-    '{"add":"你倒是爽快。","emo":"普通"}\n',
-    '{"n":2,"line":"北边仓库昨晚丢了一批货。","emo":"普通"}\n',
-    '{"end":3}\n',
+    '{"type":"add","no":0,"text":"你倒是爽快。","emo":"普通"}\n',
+    '{"type":"keep","no":1}\n',
+    '{"type":"edit","no":2,"text":"北边仓库昨晚丢了一批货。","emo":"普通"}\n',
+    '{"type":"continue","no":3}\n',
 ]
 
 F05B_LONG_EDIT = (
@@ -153,33 +154,41 @@ F05B_LONG_EDIT = (
     "记住，别一个人进仓库，也别碰里面的东西，那些货上有记号，少了哪一箱我都看得出来。"
 )
 F05B_JSONL = [
-    '{"add":"你倒是爽快。","emo":"普通"}\n',
-    '{"n":3,"line":"' + F05B_LONG_EDIT + '","emo":"普通"}\n',
-    '{"end":4}\n',
+    '{"type":"add","no":0,"text":"你倒是爽快。","emo":"普通"}\n',
+    '{"type":"keep","no":1}\n',
+    '{"type":"keep","no":2}\n',
+    '{"type":"edit","no":3,"text":"' + F05B_LONG_EDIT + '","emo":"普通"}\n',
+    '{"type":"continue","no":4}\n',
 ]
 
 F06_JSONL = [
-    '{"add":"这事不好办。","emo":"普通"}\n',
-    '{"n":2,"remove":true}\n',
-    '{"end":3}\n',
+    '{"type":"add","no":0,"text":"这事不好办。","emo":"普通"}\n',
+    '{"type":"keep","no":1}\n',
+    '{"type":"remove","no":2}\n',
+    '{"type":"continue","no":3}\n',
 ]
 
 F07_JSONL = [
-    '{"add":"……","emo":"普通"}\n',
-    '{"n":3,"line":"清单就压在柜台底下。","emo":"普通"}\n',
-    '{"end":4}\n',
+    '{"type":"add","no":0,"text":"……","emo":"普通"}\n',
+    '{"type":"keep","no":1}\n',
+    '{"type":"keep","no":2}\n',
+    '{"type":"edit","no":3,"text":"清单就压在柜台底下。","emo":"普通"}\n',
+    '{"type":"continue","no":4}\n',
 ]
 
 F08_JSONL = [
-    '{"add":"……","emo":"普通"}\n',
-    '{"n":1,"line":"这事我只跟你说一遍。","emo":"普通"}\n',
-    '{"n":2,"remove":true}\n',
+    '{"type":"add","no":0,"text":"……","emo":"普通"}\n',
+    '{"type":"edit","no":1,"text":"这事我只跟你说一遍。","emo":"普通"}\n',
+    '{"type":"remove","no":2}\n',
+    '{"type":"remove","no":3}\n',
+    '{"type":"remove","no":4}\n',
+    '{"type":"end"}\n',
 ]
 
 F09_JSONL = [
-    '{"mute":true}\n',
-    '{"add":"行了，这事不用你操心。","emo":"普通"}\n',
-    '{"end":1}\n',
+    '{"type":"mute"}\n',
+    '{"type":"add","no":0,"text":"行了，这事不用你操心。","emo":"普通"}\n',
+    '{"type":"continue","no":1}\n',
 ]
 
 #: F-10 零有效：必须是带 JSON 特征的坏行；完全无 JSON 特征的裸台词现在按 add 兜底。

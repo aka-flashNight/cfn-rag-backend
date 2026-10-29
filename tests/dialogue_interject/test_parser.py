@@ -63,7 +63,7 @@ def test_task_structural_marker_in_glued_line_drops_whole_line():
     parser = JSONLStreamParser(
         ParseOptions(mode="task", npc=fx.NPC, npc_emotions=("普通",))
     )
-    entries = parser.feed('{"add":"甲","n":1}{"end":2}\n')
+    entries = parser.feed('{"type":"add","no":0,"text":"甲"}{"type":"continue","no":1}\n')
 
     assert entries == []
     assert len(parser.issues) == 1
@@ -196,13 +196,13 @@ def test_emotion_falls_back_to_original_for_other_npc_edit():
             remaining=remaining,
         )
     )
-    entries = parser.feed('{"n":1,"line":"改写","emo":"疯狂"}\n')
+    entries = parser.feed('{"type":"edit","no":1,"text":"改写","emo":"疯狂"}\n')
     assert len(entries) == 1
     assert entries[0].segments[0].speaker == "老赵"
     assert entries[0].segments[0].emotion == "阴冷"
 
 
-def test_task_out_of_range_line_is_ignored_and_recorded():
+def test_task_out_of_range_edit_is_ignored_and_recorded():
     parser = JSONLStreamParser(
         ParseOptions(
             mode="task",
@@ -210,11 +210,11 @@ def test_task_out_of_range_line_is_ignored_and_recorded():
             remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
         )
     )
-    assert parser.feed('{"n":9,"line":"越界"}\n') == []
+    assert parser.feed('{"type":"edit","no":9,"text":"越界"}\n') == []
     assert any("越界" in issue.reason for issue in parser.issues)
 
 
-def test_nochange_with_body_is_marker_and_body_ignored():
+def test_task_keep_remove_and_continue_use_original_number():
     parser = JSONLStreamParser(
         ParseOptions(
             mode="task",
@@ -222,13 +222,17 @@ def test_nochange_with_body_is_marker_and_body_ignored():
             remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
         )
     )
-    entries = parser.feed('{"n":1,"nochange":true,"line":"不该出现"}\n')
-    assert [entry.kind for entry in entries] == ["nochange"]
-    assert entries[0].n == 1
-    assert any("nochange 带正文" in issue.reason for issue in parser.issues)
+    entries = parser.feed(
+        '{"type":"keep","no":1}\n'
+        '{"type":"remove","no":1}\n'
+        '{"type":"continue","no":1}\n'
+    )
+    assert [(entry.kind, entry.n) for entry in entries] == [
+        ("keep", 1), ("remove", 1), ("continue", 1),
+    ]
 
 
-def test_task_mute_add_and_end():
+def test_task_add_requires_zero_no():
     parser = JSONLStreamParser(
         ParseOptions(
             mode="task",
@@ -236,6 +240,22 @@ def test_task_mute_add_and_end():
             remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
         )
     )
-    entries = parser.feed('{"mute":true}\n{"add":"好"}\n{"end":1}\n')
-    assert [entry.kind for entry in entries] == ["mute", "add", "end"]
-    assert entries[2].end == 1
+    assert parser.feed('{"type":"add","no":1,"text":"错误编号"}\n') == []
+    assert any("必须为 0" in issue.reason for issue in parser.issues)
+
+
+def test_task_mute_add_and_continue():
+    parser = JSONLStreamParser(
+        ParseOptions(
+            mode="task",
+            npc=fx.NPC,
+            remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
+        )
+    )
+    entries = parser.feed(
+        '{"type":"mute"}\n'
+        '{"type":"add","no":0,"text":"好","emo":"普通"}\n'
+        '{"type":"continue","no":1}\n'
+    )
+    assert [entry.kind for entry in entries] == ["mute", "add", "continue"]
+    assert entries[2].n == 1

@@ -132,14 +132,17 @@ def test_task_prompt_has_discipline_output_and_only_query_tools():
     system = build_task_system_prompt(npc_name=fx.NPC, state=STATE)
     assert "【任务对话纪律】" in system
     assert "必须回到当前任务对话的原有脉络" in system
-    assert "后续内容能直接接回原文时必须用 end 提前结束" in system
-    assert "end 只按原剩余编号计，不把本轮 add 计入" in system
-    assert "如果没有编辑的情况下，且下一条无法直接接上玩家的对话时，建议先 add 一条来回应玩家" in system
-    assert "不输出 end 就是整组替换" in system
-    assert "只有在对原有信息脉络没有依赖、或整组都改完时才允许" in system
+    assert "后续内容能直接接回原文时必须用 continue 提前结束" in system
+    assert "continue 只按原剩余编号计" in system
+    assert "如果没有编辑，且下一条无法直接接上玩家的对话时，建议先 add 一条来回应玩家" in system
+    assert "只有原剩余已全部逐条处理完" in system
     assert "不得漏掉原句里的任务信息" in system
-    assert '{"mute":true}' in system
-    assert '{"end":4}' in system
+    assert '{"type":"mute"}' in system
+    assert '{"type":"add","no":0,"text":"新增台词","emo":"情绪"}' in system
+    assert '{"type":"continue","no":4}' in system
+    assert '{"type":"end"}' in system
+    for old_format in ("nochange", '"n":', '"line":', '{"end":4}', '{"mute":true}'):
+        assert old_format not in system
     assert "route_search" in system
     assert "update_long_term_memory" in system
     for forbidden in ("route_task_draft", "route_task_confirm", "delegate_dialogue_rewrite",
@@ -189,21 +192,23 @@ async def test_assemble_task_blocks_reuses_stable_blocks_without_draft(memory_st
 # ---------------------------------------------------------------------------
 
 
-async def test_f05_end_reconnects_and_only_edit_in_plan():
+async def test_f05_continue_reconnects_and_steps_keep_order():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F05_JSONL))
     assert [event.event for event in events] == ["status", "line", "plan", "done"]
     assert events[1].data["text"] == "你倒是爽快。"
     plan = events[2].data
-    assert plan["end"] == 3
-    assert [(edit["n"], edit["kind"]) for edit in plan["edits"]] == [(2, "edit")]
-    assert plan["edits"][0]["lines"][0]["text"] == "北边仓库昨晚丢了一批货。"
+    assert plan["resume"] == 3
+    assert [(step["n"], step["kind"]) for step in plan["steps"]] == [
+        (1, "keep"), (2, "edit"),
+    ]
+    assert plan["steps"][1]["lines"][0]["text"] == "北边仓库昨晚丢了一批货。"
 
 
 async def test_f05b_long_edit_is_split_in_plan():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F05B_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
-    assert plan["end"] == 4
-    edit = plan["edits"][0]
+    assert plan["resume"] == 4
+    edit = plan["steps"][2]
     assert edit["n"] == 3
     parts = edit["lines"]
     assert len(parts) == 2
@@ -215,22 +220,27 @@ async def test_f05b_long_edit_is_split_in_plan():
 async def test_f06_remove_reaches_plan():
     events = await collect_events(make_orchestrator(fx.task_request(), chunks=fx.F06_JSONL))
     plan = next(event.data for event in events if event.event == "plan")
-    assert plan["end"] == 3
-    assert plan["edits"] == [{"n": 2, "kind": "remove"}]
+    assert plan["resume"] == 3
+    assert plan["steps"] == [
+        {"n": 1, "kind": "keep"},
+        {"n": 2, "kind": "remove"},
+    ]
 
 
-async def test_f07_missing_nochange_is_implied_not_written():
+async def test_f07_explicit_keep_and_edit_are_ordered():
     plan, _ = _task_plan(fx.F07_JSONL)
-    assert plan.end == 4
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(3, "edit")]
-    assert plan.implied_nochange == [1, 2]
+    assert plan.resume == 4
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (2, "keep"), (3, "edit"),
+    ]
 
 
-async def test_f08_no_end_is_whole_group_replacement_without_remove():
+async def test_f08_end_does_not_resume_original_tail():
     plan, _ = _task_plan(fx.F08_JSONL)
-    assert plan.end is None
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(1, "edit")]
-    assert any(item.kind == "remove" and item.n == 2 for item in plan.rejected)
+    assert plan.resume == 5
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "edit"), (2, "remove"), (3, "remove"), (4, "remove"),
+    ]
 
 
 async def test_f09_mute_precedes_line_and_plan_keeps_mute():
@@ -238,7 +248,7 @@ async def test_f09_mute_precedes_line_and_plan_keeps_mute():
     assert [event.event for event in events] == ["status", "mute", "line", "plan", "done"]
     assert events[1].data == {"mute": True}
     assert events[2].data["text"] == "行了，这事不用你操心。"
-    assert events[3].data == {"mute": True, "end": 1, "edits": []}
+    assert events[3].data == {"mute": True, "resume": 1, "steps": []}
 
 
 # ---------------------------------------------------------------------------
@@ -246,51 +256,45 @@ async def test_f09_mute_precedes_line_and_plan_keeps_mute():
 # ---------------------------------------------------------------------------
 
 
-def test_end_missing_drops_nochange_and_remove_but_keeps_edit():
+def test_missing_terminator_preserves_unprocessed_tail():
     plan, _ = _task_plan([
-        '{"n":1,"nochange":true}\n',
-        '{"n":2,"line":"留下改写","emo":"普通"}\n',
-        '{"n":3,"remove":true}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"edit","no":2,"text":"留下改写","emo":"普通"}\n',
     ])
-    assert plan.end is None
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(2, "edit")]
-    assert {item.kind for item in plan.rejected} == {"nochange", "remove"}
+    assert plan.resume == 3
+    assert plan.fallback_continue is True
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "edit")]
 
 
-def test_end_pointing_to_removed_item_skips_to_next_original():
+def test_continue_with_gap_backfills_remove():
     plan, _ = _task_plan([
-        '{"n":3,"remove":true}\n',
-        '{"end":3}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"continue","no":3}\n',
     ])
-    assert plan.end == 4
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(3, "remove")]
+    assert plan.resume == 3
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "remove")]
 
 
-def test_same_n_multiple_lines_merge_into_one_edit():
+def test_same_no_consecutive_edits_merge_into_one_step():
     plan, _ = _task_plan([
-        '{"n":2,"line":"第一段","emo":"普通"}\n',
-        '{"n":2,"line":"第二段","emo":"普通"}\n',
-        '{"end":3}\n',
+        '{"type":"edit","no":1,"text":"第一段","emo":"普通"}\n',
+        '{"type":"edit","no":1,"text":"第二段","emo":"普通"}\n',
+        '{"type":"continue","no":2}\n',
     ])
-    assert plan.end == 3
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(2, "edit")]
-    assert [line.text for line in plan.edits[0].lines] == ["第一段", "第二段"]
+    assert plan.resume == 2
+    assert len(plan.steps) == 1
+    assert [line.text for line in plan.steps[0].lines] == ["第一段", "第二段"]
 
 
-def test_nochange_and_remove_with_text_are_markers():
-    plan, parser = _task_plan([
-        '{"n":2,"nochange":true,"line":"废话"}\n',
-        '{"n":3,"remove":true,"line":"还是废话"}\n',
-        '{"end":4}\n',
+def test_add_after_original_op_is_not_streamed_and_enters_steps():
+    plan, _ = _task_plan([
+        '{"type":"add","no":0,"text":"前缀","emo":"普通"}\n',
+        '{"type":"edit","no":1,"text":"改写","emo":"普通"}\n',
+        '{"type":"add","no":0,"text":"插入","emo":"普通"}\n',
+        '{"type":"continue","no":2}\n',
     ])
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(2, "nochange"), (3, "remove")]
-    reasons = " ".join(issue.reason for issue in parser.issues)
-    assert "nochange 带正文" in reasons and "remove 带正文" in reasons
-
-
-def test_nochange_and_remove_not_counted_when_no_end_direct():
-    plan, _ = _task_plan(['{"n":1,"nochange":true}\n', '{"n":2,"remove":true}\n'])
-    assert plan.end is None and plan.edits == []
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "edit"), (0, "add")]
+    assert plan.steps[1].lines[0].text == "插入"
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +341,15 @@ async def test_task_partial_failure_keeps_line_but_never_plans():
 
 
 async def test_task_valid_lines_does_not_count_control_rows_or_mute():
-    """协议 5.2：valid_lines 只计有效正文行（add/line）；remove/end/mute 不计。"""
+    """协议 5.2：valid_lines 只计有效正文行（add/edit）；其他操作不计。"""
     events = await collect_events(
         make_orchestrator(
             fx.task_request(),
             chunks=[
-                '{"mute":true}\n',
-                '{"n":2,"remove":true}\n',
-                '{"n":3,"nochange":true}\n',
-                '{"end":4}\n',
+                '{"type":"mute"}\n',
+                '{"type":"keep","no":1}\n',
+                '{"type":"remove","no":2}\n',
+                '{"type":"continue","no":3}\n',
             ],
             error=RuntimeError("stream broke"),
         )
@@ -353,14 +357,14 @@ async def test_task_valid_lines_does_not_count_control_rows_or_mute():
     assert events[-1].data["valid_lines"] == 0
 
 
-async def test_task_valid_lines_counts_add_and_line_before_split():
-    """正文行按模型输出行计、拆分前：一条超长 add + 一条 line = 2。"""
+async def test_task_valid_lines_counts_add_and_edit_before_split():
+    """正文行按模型输出行计、拆分前：一条超长 add + 一条 edit = 2。"""
     events = await collect_events(
         make_orchestrator(
             fx.task_request(),
             chunks=[
-                '{"add":"' + fx.F05B_LONG_EDIT + '","emo":"普通"}\n',
-                '{"n":2,"line":"北边仓库昨晚丢了一批货。","emo":"普通"}\n',
+                '{"type":"add","no":0,"text":"' + fx.F05B_LONG_EDIT + '","emo":"普通"}\n',
+                '{"type":"edit","no":1,"text":"北边仓库昨晚丢了一批货。","emo":"普通"}\n',
             ],
             error=RuntimeError("stream broke"),
         )
@@ -446,9 +450,10 @@ async def test_task_tool_round_emits_searching_then_final_without_tools():
     client = _ScriptedLLM([
         [(None, [SEARCH_CALL])],
         [(
-            '{"add":"暗号是北风。","emo":"普通"}\n'
-            '{"n":2,"line":"北边仓库昨晚丢了一批货。","emo":"普通"}\n'
-            '{"end":3}\n',
+            '{"type":"add","no":0,"text":"暗号是北风。","emo":"普通"}\n'
+            '{"type":"keep","no":1}\n'
+            '{"type":"edit","no":2,"text":"北边仓库昨晚丢了一批货。","emo":"普通"}\n'
+            '{"type":"continue","no":3}\n',
             None,
         )],
     ])
@@ -482,7 +487,8 @@ async def test_task_tool_round_emits_searching_then_final_without_tools():
     assert all(event.data.get("stage") != "drafting" for event in events[:2])
     assert events[2].data["text"] == "暗号是北风。"
     plan = events[3].data
-    assert plan["end"] == 3 and [edit["n"] for edit in plan["edits"]] == [2]
+    assert plan["resume"] == 3
+    assert [(step["n"], step["kind"]) for step in plan["steps"]] == [(1, "keep"), (2, "edit")]
 
     assert client.requests[0].tools == SEARCH_SCHEMA
     assert client.requests[1].tools is None  # 工具结果后不再给工具
@@ -499,7 +505,7 @@ async def test_task_stream_never_emits_drafting_status_even_for_task_tool():
             "id": "call_bad",
             "function": {"name": "route_task_draft", "arguments": "{}"},
         }])],
-        [('{"add":"回到正题。","emo":"普通"}\n', None)],
+        [('{"type":"add","no":0,"text":"回到正题。","emo":"普通"}\n{"type":"continue","no":1}\n', None)],
     ])
     executor = _FakeExecutor(
         SEARCH_SCHEMA,
@@ -558,7 +564,7 @@ def test_task_api_wires_task_blocks_and_stream(memory_store, monkeypatch):
     response = _client().post("/game/dialogue-interject", json=fx.task_request())
     events = parse_sse(response.text)
     assert [name for name, _ in events] == ["status", "line", "plan", "done"]
-    assert events[2][1]["end"] == 3
+    assert events[2][1]["resume"] == 3
     assert captured["assemble"][0] == "task"
     assert captured["stream"][0] == "task"
     assert captured["stream"][1] is blocks

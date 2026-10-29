@@ -29,7 +29,7 @@ _JSON_FEATURE_RE = re.compile(r"[{}\[\]]|\"[^\"\n]*\"\s*:")
 #: 拆分优先级（协议 5.6）：句号 → 感叹/问号/省略/分号 → 逗号/顿号/冒号 → 硬切
 _SPLIT_PRIORITIES: tuple[str, ...] = ("。", "！？…；", "，、：")
 
-ParsedKind = Literal["add", "closing", "mute", "nochange", "line", "remove", "end"]
+ParsedKind = Literal["add", "closing", "mute", "edit", "keep", "remove", "continue", "end"]
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,12 @@ class TextSegment:
 class ParsedEntry:
     """一行 JSONL 的规范化结果。
 
-    add/closing/line 带 `segments`（已拆分）；mute/nochange/remove/end 只有标记。
+    add/closing/edit 带 `segments`（已拆分）；mute/keep/remove/continue/end 只有标记。
+    任务模式的 `continue` 用 `n` 表示从原第 n 条起保留原文；`end` 不带编号。
     """
 
     kind: ParsedKind
     n: int | None = None
-    end: int | None = None
     segments: tuple[TextSegment, ...] = ()
 
 
@@ -238,7 +238,7 @@ class JSONLStreamParser:
     def _salvage_objects(self, text: str) -> tuple[list[ParsedEntry], str]:
         """从粘连/截断的一行里逐个取完整 JSON 对象，只接受正文类。
 
-        结构标记（mute/nochange/remove/end）一旦出现在粘连行里就整行不抢救，
+        结构标记（mute/keep/remove/continue/end）一旦出现在粘连行里就整行不抢救，
         避免半解析在任务改写上提前截断或误删原台词。
         """
         decoder = json.JSONDecoder()
@@ -258,7 +258,7 @@ class JSONLStreamParser:
     def _salvageable(self, obj: dict) -> bool:
         if self.options.mode == "daily":
             return isinstance(obj.get("add"), str) or isinstance(obj.get("closing"), str)
-        return isinstance(obj.get("add"), str) or isinstance(obj.get("line"), str)
+        return obj.get("type") in ("add", "edit") and isinstance(obj.get("text"), str)
 
     # ------------------------------------------------------------------
     # 日常：只接受 add / closing
@@ -275,65 +275,56 @@ class JSONLStreamParser:
         return []
 
     # ------------------------------------------------------------------
-    # 任务：mute / add / nochange / line / remove / end
+    # 任务：type = mute / add / edit / keep / remove / continue / end
     # ------------------------------------------------------------------
 
     def _parse_task(self, obj: dict, raw: str) -> list[ParsedEntry]:
-        if obj.get("mute") is True:
+        kind = obj.get("type")
+        if not isinstance(kind, str):
+            self._issue(raw, "任务模式下缺少字符串 type")
+            return []
+        kind = kind.strip()
+        if kind == "mute":
             return [ParsedEntry(kind="mute")]
+        if kind == "end":
+            return [ParsedEntry(kind="end")]
+        if kind not in ("add", "edit", "keep", "remove", "continue"):
+            self._issue(raw, f"任务模式下未知 type={kind!r}")
+            return []
 
-        if isinstance(obj.get("add"), str):
-            return self._text_entry("add", obj, obj["add"], raw, speaker=self.options.npc)
-
-        if "end" in obj:
-            end_raw = obj.get("end")
-            if isinstance(end_raw, bool) or not isinstance(end_raw, int):
-                self._issue(raw, "end 不是整数")
-                return []
-            return [ParsedEntry(kind="end", end=end_raw)]
-
-        # 标记类必须先于 line 判定：nochange/remove 可能同时带正文（协议 5.4-6）
-        if obj.get("nochange") is True:
-            n = self._parse_n(obj, raw)
-            if n is None:
-                return []
-            if isinstance(obj.get("line"), str) and obj["line"].strip():
-                self._issue(raw, "nochange 带正文，按 nochange 处理并忽略正文")
-            return [ParsedEntry(kind="nochange", n=n)]
-
-        if obj.get("remove") is True:
-            n = self._parse_n(obj, raw)
-            if n is None:
-                return []
-            if isinstance(obj.get("line"), str) and obj["line"].strip():
-                self._issue(raw, "remove 带正文，按 remove 处理并忽略正文")
-            return [ParsedEntry(kind="remove", n=n)]
-
-        if isinstance(obj.get("line"), str):
-            n = self._parse_n(obj, raw)
-            if n is None:
-                return []
-            original = self.options.remaining.get(n)
-            if original is None:
-                self._issue(raw, f"line 的 n={n} 越界（当前剩余 1..{len(self.options.remaining)}）")
+        n = self._parse_no(obj, raw)
+        if n is None:
+            return []
+        if kind == "add":
+            if n != 0:
+                self._issue(raw, "add 的 no 必须为 0")
                 return []
             return self._text_entry(
-                "line",
-                obj,
-                obj["line"],
-                raw,
-                speaker=original.name or self.options.npc,
-                n=n,
-                original_emotion=original.emotion,
+                "add", obj, obj.get("text"), raw, speaker=self.options.npc, n=0,
             )
 
-        self._issue(raw, "任务模式下无可识别字段")
-        return []
+        remaining_count = len(self.options.remaining)
+        if not (1 <= n <= remaining_count):
+            self._issue(raw, f"{kind} 的 no={n} 越界（当前剩余 1..{remaining_count}）")
+            return []
+        if kind in ("keep", "remove", "continue"):
+            return [ParsedEntry(kind=kind, n=n)]
 
-    def _parse_n(self, obj: dict, raw: str) -> int | None:
-        n_raw = obj.get("n")
+        original = self.options.remaining[n]
+        return self._text_entry(
+            "edit",
+            obj,
+            obj.get("text"),
+            raw,
+            speaker=original.name or self.options.npc,
+            n=n,
+            original_emotion=original.emotion,
+        )
+
+    def _parse_no(self, obj: dict, raw: str) -> int | None:
+        n_raw = obj.get("no")
         if isinstance(n_raw, bool) or not isinstance(n_raw, int):
-            self._issue(raw, "n 不是整数")
+            self._issue(raw, "no 不是整数")
             return None
         return n_raw
 
@@ -352,11 +343,13 @@ class JSONLStreamParser:
             TextSegment(text=piece, emotion="", speaker=self.options.npc, split=mark)
             for piece, mark in zip(pieces, marks)
         )
-        return [ParsedEntry(kind="add", segments=segments)]
+        return [ParsedEntry(
+            kind="add", n=0 if self.options.mode == "task" else None, segments=segments,
+        )]
 
     def _text_entry(
         self,
-        kind: Literal["add", "closing", "line"],
+        kind: Literal["add", "closing", "edit"],
         obj: dict,
         text: object,
         raw: str,

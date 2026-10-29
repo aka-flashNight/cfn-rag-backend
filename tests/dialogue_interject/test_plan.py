@@ -1,4 +1,4 @@
-"""plan 单测：F-05/F-05b/F-06/F-07/F-08 逐字段，以及越界/end/冲突的宽容处理。"""
+"""plan 单测：有序 steps、continue/end、跳号与缺终止符的兜底。"""
 
 from __future__ import annotations
 
@@ -25,238 +25,232 @@ def _normalize(jsonl: list[str], remaining_count: int = 4):
     return normalize_task_plan(entries, remaining_count), parser
 
 
-def test_f05_end_resume_with_edit_and_implied_nochange():
+def test_f05_continue_with_keep_and_edit():
     plan, _ = _normalize(fx.F05_JSONL)
     assert plan.mute is False
-    assert plan.end == 3
-    assert [edit.model_dump() for edit in plan.edits] == [
+    assert plan.resume == 3
+    assert plan.fallback_continue is False
+    assert [step.model_dump() for step in plan.steps] == [
+        {"n": 1, "kind": "keep", "lines": []},
         {
             "n": 2,
             "kind": "edit",
             "lines": [{"text": "北边仓库昨晚丢了一批货。", "emotion": "普通", "split": None}],
-        }
+        },
     ]
-    assert plan.implied_nochange == [1]  # end 前未提及＝nochange，但不写进 edits
 
 
 def test_f05b_edit_lines_carry_split_marks():
     plan, _ = _normalize(fx.F05B_JSONL)
-    assert plan.end == 4
-    assert len(plan.edits) == 1
-    edit = plan.edits[0]
+    assert plan.resume == 4
+    assert len(plan.steps) == 3
+    edit = plan.steps[2]
     assert edit.n == 3 and edit.kind == "edit"
     assert len(edit.lines) == 2
     assert [line.split.count for line in edit.lines] == [2, 2]
     assert [line.split.index for line in edit.lines] == [0, 1]
     assert "".join(line.text for line in edit.lines) == fx.F05B_LONG_EDIT
     assert all(len(line.text) <= 165 for line in edit.lines)
-    assert plan.implied_nochange == [1, 2]
 
 
-def test_f06_remove_before_end():
+def test_f06_remove_before_continue():
     plan, _ = _normalize(fx.F06_JSONL)
-    assert plan.end == 3
-    assert [edit.model_dump() for edit in plan.edits] == [
-        {"n": 2, "kind": "remove", "lines": []}
-    ]
-    assert plan.implied_nochange == [1]
+    assert plan.resume == 3
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "remove")]
 
 
-def test_f07_missing_nochange_is_tolerated():
+def test_f07_explicit_keep_is_preserved_in_steps():
     plan, _ = _normalize(fx.F07_JSONL)
-    assert plan.end == 4
-    assert [edit.n for edit in plan.edits] == [3]
-    assert plan.implied_nochange == [1, 2]  # 未提及的 1、2 视为 nochange
-    assert all(edit.kind != "remove" for edit in plan.edits)
+    assert plan.resume == 4
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (2, "keep"), (3, "edit"),
+    ]
 
 
-def test_f08_no_end_means_whole_group_replacement():
-    """end 缺省＝整组替换：只保留 add/edit；remove/nochange 无播放效果，记录后忽略。"""
+def test_f08_end_processes_all_originals_and_does_not_resume():
     plan, _ = _normalize(fx.F08_JSONL)
-    assert plan.end is None
-    assert [edit.model_dump() for edit in plan.edits] == [
-        {
-            "n": 1,
-            "kind": "edit",
-            "lines": [{"text": "这事我只跟你说一遍。", "emotion": "普通", "split": None}],
-        },
+    assert plan.resume == 5
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "edit"), (2, "remove"), (3, "remove"), (4, "remove"),
     ]
-    assert plan.implied_nochange == []
-    assert any(item.kind == "remove" and item.n == 2 for item in plan.rejected)
+    assert plan.fallback_continue is False
 
 
-def test_out_of_range_n_is_rejected_without_dropping_other_edits():
+def test_out_of_range_no_is_rejected_without_dropping_other_steps():
     plan, parser = _normalize([
-        '{"n":9,"line":"越界","emo":"普通"}\n',
-        '{"n":9,"remove":true}\n',
-        '{"n":2,"line":"合法","emo":"普通"}\n',
-        '{"end":3}\n',
+        '{"type":"edit","no":9,"text":"越界","emo":"普通"}\n',
+        '{"type":"remove","no":9}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"edit","no":2,"text":"合法","emo":"普通"}\n',
+        '{"type":"continue","no":3}\n',
     ])
-    assert plan.end == 3
-    assert [edit.n for edit in plan.edits] == [2]
-    # line 越界在 parser 层就丢弃；remove 越界在 plan 层记录
-    assert any("越界" in issue.reason for issue in parser.issues)
-    assert any(item.n == 9 and "越界" in item.reason for item in plan.rejected)
+    assert plan.resume == 3
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "edit")]
+    assert len([issue for issue in parser.issues if "越界" in issue.reason]) == 2
 
 
-def test_out_of_range_end_resumes_after_last_edit_and_keeps_tail():
+def test_skipped_number_is_backfilled_as_remove():
     plan, _ = _normalize([
-        '{"n":2,"line":"合法","emo":"普通"}\n',
-        '{"end":9}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"edit","no":3,"text":"只改第 3 条","emo":"普通"}\n',
+        '{"type":"continue","no":4}\n',
     ])
-    # end 接不上：已改的第 2 条算进度，从第 3 条起保留原文。
-    assert plan.end == 3
-    assert [edit.n for edit in plan.edits] == [2]
-    assert plan.implied_nochange == [1]
-    assert any(item.kind == "end" for item in plan.rejected)
-    assert any("按保留原文从第 3 条接回" in item.reason for item in plan.rejected)
-
-
-def test_out_of_range_end_without_edits_keeps_all_original():
-    plan, _ = _normalize([
-        '{"end":9}\n',
-    ])
-    assert plan.end == 1
-    assert plan.edits == []
-    assert plan.implied_nochange == []
-    assert any("按保留原文从第 1 条接回" in item.reason for item in plan.rejected)
-
-
-def test_out_of_range_end_resumes_after_remove():
-    plan, _ = _normalize([
-        '{"n":2,"remove":true}\n',
-        '{"end":9}\n',
-    ])
-    assert plan.end == 3
-    assert [edit.model_dump() for edit in plan.edits] == [
-        {"n": 2, "kind": "remove", "lines": []}
+    assert plan.resume == 4
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (2, "remove"), (3, "edit"),
     ]
-    assert plan.implied_nochange == [1]
+    assert any(item.n == 2 and "按 remove 兜底" in item.reason for item in plan.rejected)
 
 
-def test_out_of_range_end_with_edit_at_last_line_keeps_last_edit_and_ends():
+def test_continue_with_gap_backfills_removed_gap():
     plan, _ = _normalize([
-        '{"n":4,"line":"改写末条","emo":"普通"}\n',
-        '{"end":9}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"continue","no":3}\n',
     ])
-    # 保留末条编辑，覆盖全部原剩余后直接收组（end=N+1）。
-    assert plan.end == 5
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [(4, "edit")]
-    assert plan.implied_nochange == [1, 2, 3]
-    assert any("保留全部原剩余后收组" in item.reason for item in plan.rejected)
+    assert plan.resume == 3
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "remove")]
 
 
-def test_end_at_count_plus_one_applies_last_edit_and_ends():
+def test_missing_terminator_resumes_after_last_processed_original():
     plan, _ = _normalize([
-        '{"n":4,"line":"改写末条","emo":"普通"}\n',
-        '{"end":5}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"edit","no":2,"text":"合法","emo":"普通"}\n',
     ])
-    assert plan.end == 5
-    assert [edit.n for edit in plan.edits] == [4]
-    assert plan.implied_nochange == [1, 2, 3]
+    assert plan.resume == 3
+    assert plan.fallback_continue is True
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "edit")]
+    assert any("缺少 continue/end" in item.reason for item in plan.rejected)
 
 
-def test_end_at_count_plus_one_without_edits_keeps_all_original():
+def test_missing_terminator_without_original_ops_keeps_all_originals():
     plan, _ = _normalize([
-        '{"end":5}\n',
+        '{"type":"add","no":0,"text":"先回应一句。","emo":"普通"}\n',
     ])
-    assert plan.end == 5
-    assert plan.edits == []
-    assert plan.implied_nochange == [1, 2, 3, 4]
+    assert plan.resume == 1
+    assert plan.steps == []
+    assert plan.fallback_continue is True
 
 
-def test_out_of_range_end_with_only_nochange_keeps_all_original():
+def test_missing_terminator_after_last_edit_keeps_edit_and_ends():
     plan, _ = _normalize([
-        '{"n":2,"nochange":true}\n',
-        '{"end":9}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"keep","no":2}\n',
+        '{"type":"keep","no":3}\n',
+        '{"type":"edit","no":4,"text":"改写末条","emo":"普通"}\n',
     ])
-    assert plan.end == 1
-    assert plan.edits == []
-    assert any(item.n == 2 and "end=1 及之后" in item.reason for item in plan.rejected)
-
-
-def test_end_at_count_plus_one_keeps_tail_on_real_invalid_output():
-    # 实机 2026-10-29 酒保轮：剩余 3 条，模型给了 end=4、一条缺 n 的
-    # {"nochange":true} 和 nochange 2/3；end=4=N+1 合法，原剩余全部保留。
-    plan, _ = _normalize([
-        '{"nochange":true}\n',
-        '{"n":2,"nochange":true}\n',
-        '{"n":3,"nochange":true}\n',
-        '{"end":4}\n',
-    ], remaining_count=3)
-    assert plan.end == 4
-    assert [(edit.n, edit.kind) for edit in plan.edits] == [
-        (2, "nochange"),
-        (3, "nochange"),
+    assert plan.resume == 5
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (2, "keep"), (3, "keep"), (4, "edit"),
     ]
-    assert plan.implied_nochange == [1]
 
 
-def test_end_pointing_to_removed_item_jumps_to_next_original():
+def test_invalid_continue_falls_back_to_after_last_processed():
     plan, _ = _normalize([
-        '{"n":3,"remove":true}\n',
-        '{"end":3}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"edit","no":2,"text":"合法","emo":"普通"}\n',
+        '{"type":"continue","no":2}\n',
     ])
-    assert plan.end == 4
-    assert [edit.n for edit in plan.edits] == [3]
+    assert plan.resume == 3
+    assert plan.fallback_continue is True
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "edit")]
 
 
-def test_end_pointing_to_last_removed_item_removes_last_and_ends():
+def test_continue_one_keeps_all_originals():
     plan, _ = _normalize([
-        '{"n":4,"remove":true}\n',
-        '{"end":4}\n',
+        '{"type":"add","no":0,"text":"回应。","emo":"普通"}\n',
+        '{"type":"continue","no":1}\n',
     ])
-    # 末条被移除、end 跳到 N+1：保留 1..3 原文，移除第 4 条后直接收组。
-    assert plan.end == 5
-    assert [edit.model_dump() for edit in plan.edits] == [
-        {"n": 4, "kind": "remove", "lines": []}
+    assert plan.resume == 1
+    assert plan.steps == []
+    assert plan.fallback_continue is False
+
+
+def test_end_without_original_ops_removes_all_originals():
+    plan, _ = _normalize([
+        '{"type":"add","no":0,"text":"回应。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ])
+    assert plan.resume == 5
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "remove"), (2, "remove"), (3, "remove"), (4, "remove"),
     ]
-    assert plan.implied_nochange == [1, 2, 3]
 
 
-def test_edit_at_or_after_end_is_ignored():
+def test_no_remaining_allows_only_end():
     plan, _ = _normalize([
-        '{"n":2,"line":"之前","emo":"普通"}\n',
-        '{"n":3,"line":"end 本身","emo":"普通"}\n',
-        '{"end":3}\n',
-    ])
-    assert plan.end == 3
-    assert [edit.n for edit in plan.edits] == [2]
-    assert any(item.n == 3 and "end" in item.reason for item in plan.rejected)
+        '{"type":"add","no":0,"text":"回应。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ], remaining_count=0)
+    assert plan.resume == 1
+    assert plan.steps == []
 
 
-def test_multiple_lines_same_n_merge_into_one_edit():
+def test_entries_after_terminator_are_ignored():
     plan, _ = _normalize([
-        '{"n":2,"line":"第一段","emo":"普通"}\n',
-        '{"n":2,"line":"第二段","emo":"普通"}\n',
-        '{"end":3}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"continue","no":2}\n',
+        '{"type":"edit","no":2,"text":"不该出现","emo":"普通"}\n',
+        '{"type":"add","no":0,"text":"也不该出现","emo":"普通"}\n',
+        '{"type":"end"}\n',
     ])
-    assert len(plan.edits) == 1
-    assert [line.text for line in plan.edits[0].lines] == ["第一段", "第二段"]
+    assert plan.resume == 2
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep")]
+    assert len([item for item in plan.rejected if "之后" in item.reason]) == 3
 
 
-def test_nochange_and_remove_are_explicit_edits():
+def test_add_after_original_op_enters_steps_in_output_order():
     plan, _ = _normalize([
-        '{"n":1,"nochange":true}\n',
-        '{"n":2,"remove":true}\n',
-        '{"end":3}\n',
+        '{"type":"add","no":0,"text":"前缀即时回应","emo":"普通"}\n',
+        '{"type":"edit","no":1,"text":"改写 1","emo":"普通"}\n',
+        '{"type":"add","no":0,"text":"插在 1 和 2 之间","emo":"普通"}\n',
+        '{"type":"keep","no":2}\n',
+        '{"type":"add","no":0,"text":"插在 2 和 continue 之间","emo":"普通"}\n',
+        '{"type":"continue","no":3}\n',
     ])
-    assert [edit.kind for edit in plan.edits] == ["nochange", "remove"]
-    assert plan.implied_nochange == []
+    assert plan.resume == 3
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "edit"), (0, "add"), (2, "keep"), (0, "add"),
+    ]
+    assert [step.lines[0].text for step in plan.steps if step.kind == "add"] == [
+        "插在 1 和 2 之间", "插在 2 和 continue 之间",
+    ]
 
 
-def test_line_wins_over_remove_on_same_n():
+def test_consecutive_edits_same_no_merge_into_split_replacement():
     plan, _ = _normalize([
-        '{"n":2,"line":"改写","emo":"普通"}\n',
-        '{"n":2,"remove":true}\n',
-        '{"end":3}\n',
+        '{"type":"edit","no":1,"text":"第一段","emo":"普通"}\n',
+        '{"type":"edit","no":1,"text":"第二段","emo":"普通"}\n',
+        '{"type":"continue","no":2}\n',
     ])
-    assert [edit.kind for edit in plan.edits] == ["edit"]
-    assert any("按 edit 处理" in item.reason for item in plan.rejected)
+    assert len(plan.steps) == 1
+    assert [line.text for line in plan.steps[0].lines] == ["第一段", "第二段"]
+
+
+def test_nonconsecutive_or_conflicting_duplicate_is_rejected():
+    plan, _ = _normalize([
+        '{"type":"edit","no":1,"text":"第一段","emo":"普通"}\n',
+        '{"type":"add","no":0,"text":"插入","emo":"普通"}\n',
+        '{"type":"edit","no":1,"text":"不应接收","emo":"普通"}\n',
+        '{"type":"remove","no":1}\n',
+        '{"type":"continue","no":2}\n',
+    ])
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "edit"), (0, "add")]
+    assert len([item for item in plan.rejected if "重复" in item.reason]) == 2
+
+
+def test_out_of_order_original_number_is_rejected():
+    plan, _ = _normalize([
+        '{"type":"keep","no":1}\n',
+        '{"type":"keep","no":2}\n',
+        '{"type":"edit","no":1,"text":"倒退","emo":"普通"}\n',
+        '{"type":"continue","no":3}\n',
+    ])
+    assert [(step.n, step.kind) for step in plan.steps] == [(1, "keep"), (2, "keep")]
+    assert any("倒退" in item.reason for item in plan.rejected)
 
 
 def test_mute_is_carried_into_plan():
     plan, _ = _normalize(fx.F09_JSONL)
     assert plan.mute is True
-    assert plan.end == 1
-    assert plan.edits == []
+    assert plan.resume == 1
+    assert plan.steps == []

@@ -3,7 +3,7 @@
 数据流（协议 §5.2 / §5.7）：
 1. 流式 chunk 进解析器，凑齐一行立即校验/拆分；
 2. 首条有效 add/closing 立即推 `line`，不等 plan/done；
-3. 任务模式在流正常结束后归一化 `plan`（mute/add 不重复进入 plan）；
+3. 任务模式在流正常结束后归一化 `plan`；前缀 add 不重复进入 plan，后续 add 按序进入 steps；
 4. 零有效可做一次修复性重试；仍零 → `error(no_valid_lines)`，不补台词；
 5. 部分有效后断流 → 已发 `line` 保留，`error(stream_failed)`，不发 plan。
 
@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 #: 假流/真流统一接口：给请求，返回文本增量/旁路事件迭代器
 StreamFactory = Callable[[InterjectRequest], AsyncIterator[str | StreamStatus | StreamSSE]]
 
-#: valid_lines 只统计“已接受的有效正文行”（协议 5.2）：日常 add/closing，任务 add/line
-_TEXT_KINDS = ("add", "closing", "line")
+#: valid_lines 只统计“已接受的有效正文行”（协议 5.2）：日常 add/closing，任务 add/edit
+_TEXT_KINDS = ("add", "closing", "edit")
 
 
 @dataclass
@@ -65,6 +65,8 @@ class _DriveState:
     error_code: str = ""
     # 自动接取模式：发布成功但本轮不产出台词，终态改由 done.task_publish 表达
     task_publish: TaskPublishPayload | None = None
+    # 任务模式已开始处理原编号：之后的 add 不再即时发送，改由有序 plan 携带
+    original_started: bool = False
 
 
 class InterjectOrchestrator:
@@ -150,9 +152,9 @@ class InterjectOrchestrator:
         if self.request.mode == "task" and state.task_publish is None:
             plan = normalize_task_plan(state.entries, len(self.request.dialogue.remaining))
             logger.info(
-                "[interject] plan dialogue=%s turn=%s end=%s edits=%d implied_nochange=%s rejected=%s",
+                "[interject] plan dialogue=%s turn=%s resume=%s steps=%d fallback_continue=%s rejected=%s",
                 self.request.dialogue_instance_id, self.request.turn_id,
-                plan.end, len(plan.edits), plan.implied_nochange,
+                plan.resume, len(plan.steps), plan.fallback_continue,
                 [(item.kind, item.n, item.reason) for item in plan.rejected],
             )
             yield plan_event(plan.to_payload())
@@ -228,11 +230,17 @@ class InterjectOrchestrator:
                 yield mute_event()
             return
 
-        # valid_lines 只计有效正文行（拆分前）；mute/nochange/remove/end 是控制标记，不计
+        # valid_lines 只计有效正文行（拆分前）；mute/keep/remove/continue/end 是控制标记，不计
         if entry.kind in _TEXT_KINDS:
             state.valid_rows += 1
 
+        if self.request.mode == "task" and entry.kind in ("edit", "keep", "remove", "continue", "end"):
+            state.original_started = True
+
         if entry.kind in ("add", "closing"):
+            # 任务模式只即时推前缀 add；原编号操作之后的 add 由 plan.steps 按位置播放。
+            if self.request.mode == "task" and state.original_started:
+                return
             for segment in entry.segments:
                 payload = LinePayload(
                     kind=entry.kind,

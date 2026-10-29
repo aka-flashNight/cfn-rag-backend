@@ -880,7 +880,7 @@ class DailyToolRuntime:
                 logger.warning("[interject] 深度检索失败，回落到预取结果: %s", exc)
 
         instruction = (
-            "基于上面的资料，按任务 JSONL 格式（add/line/end 等）输出最终结果；"
+            "基于上面的资料，按任务 JSONL 格式输出最终结果；"
             "不要提工具，也不要解释办理过程，不要输出动作描写。"
             if self.request.mode == "task"
             else "基于上面的资料，用 JSONL 输出最终台词；"
@@ -1361,6 +1361,9 @@ def _unwrap_transition_text(raw: str) -> str:
         except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(obj, dict):
+            if obj.get("type") in ("add", "edit") and isinstance(obj.get("text"), str):
+                if obj["text"].strip():
+                    return obj["text"].strip()
             for key in ("add", "closing", "line"):
                 value = obj.get(key)
                 if isinstance(value, str) and value.strip():

@@ -51,7 +51,7 @@ class PlayedLine(BaseModel):
 
 
 class RemainingLine(BaseModel):
-    """原始剩余台词（相对编号 1..N，与模型 n 同口径）。"""
+    """原始剩余台词（相对编号 1..N，与模型 no 同口径）。"""
 
     index: int = Field(..., ge=1)
     name: str = ""
@@ -360,7 +360,7 @@ class LinePayload(BaseModel):
 
 
 class PlanLinePayload(BaseModel):
-    """plan.edits[].lines[]：改写后的逐段正文。"""
+    """plan.steps[].lines[]：新增或改写后的逐段正文。"""
 
     text: str
     emotion: str
@@ -373,9 +373,11 @@ class PlanLinePayload(BaseModel):
         return data
 
 
-class PlanEditPayload(BaseModel):
-    n: int = Field(..., ge=1)
-    kind: Literal["nochange", "edit", "remove"]
+class PlanStepPayload(BaseModel):
+    """有序播放步骤；add 的 n=0，edit/keep/remove 的 n 为原剩余编号。"""
+
+    n: int = Field(..., ge=0)
+    kind: Literal["add", "edit", "keep", "remove"]
     lines: list[PlanLinePayload] = Field(default_factory=list)
 
     def to_wire(self) -> dict[str, Any]:
@@ -386,17 +388,17 @@ class PlanEditPayload(BaseModel):
 
 
 class PlanPayload(BaseModel):
-    """SSE `plan` 事件数据（协议 8）：end 缺省＝整组替换，因此线上始终保留 end（可为 null）。"""
+    """SSE `plan`：resume 为原剩余接回点 1..N+1，N+1 表示不再接回。"""
 
     mute: bool = False
-    end: int | None = None
-    edits: list[PlanEditPayload] = Field(default_factory=list)
+    resume: int = Field(..., ge=1)
+    steps: list[PlanStepPayload] = Field(default_factory=list)
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "mute": self.mute,
-            "end": self.end,
-            "edits": [edit.to_wire() for edit in self.edits],
+            "resume": self.resume,
+            "steps": [step.to_wire() for step in self.steps],
         }
 
 
