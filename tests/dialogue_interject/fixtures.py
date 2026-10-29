@@ -74,6 +74,14 @@ TASK_REMAINING = [
     {"index": 4, "name": NPC, "text": "回来之前别让我等太久。", "emotion": "普通"},
 ]
 
+#: 玩家/NPC 交替的剩余台词：编号包含 $PC 行（测试场景不同于提示词示例）。
+TASK_REMAINING_MIXED = [
+    {"index": 1, "name": NPC, "text": "你先别急着答应。", "emotion": "普通"},
+    {"index": 2, "name": "$PC", "text": "货是在哪丢的？"},
+    {"index": 3, "name": NPC, "text": "北边仓库昨晚丢了东西。", "emotion": "普通"},
+    {"index": 4, "name": "$PC", "text": "我去看看。"},
+]
+
 
 def task_request(turn_id: str = TASK_TURN, **overrides) -> dict:
     """F-05 请求（任务前）；F-05b/F-06/F-07/F-08/F-09 复用。"""

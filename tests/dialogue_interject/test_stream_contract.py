@@ -129,7 +129,11 @@ async def test_f05_task_end_plan_after_first_line():
             {
                 "n": 2,
                 "kind": "edit",
-                "lines": [{"text": "北边仓库昨晚丢了一批货。", "emotion": "普通"}],
+                "lines": [{
+                    "text": "北边仓库昨晚丢了一批货。",
+                    "emotion": "普通",
+                    "speaker": fx.NPC,
+                }],
             }
         ],
     }
@@ -196,7 +200,11 @@ async def test_f07_task_explicit_keep_and_edit_are_ordered():
         "steps": [
             {"n": 1, "kind": "keep"},
             {"n": 2, "kind": "keep"},
-            {"n": 3, "kind": "edit", "lines": [{"text": "清单就压在柜台底下。", "emotion": "普通"}]}
+            {"n": 3, "kind": "edit", "lines": [{
+                "text": "清单就压在柜台底下。",
+                "emotion": "普通",
+                "speaker": fx.NPC,
+            }]}
         ],
     }
 

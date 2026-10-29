@@ -364,10 +364,13 @@ class PlanLinePayload(BaseModel):
 
     text: str
     emotion: str
+    speaker: str = ""
     split: SplitMark | None = None
 
     def to_wire(self) -> dict[str, Any]:
         data: dict[str, Any] = {"text": self.text, "emotion": self.emotion}
+        if self.speaker:
+            data["speaker"] = self.speaker
         if self.split is not None:
             data["split"] = self.split.model_dump()
         return data

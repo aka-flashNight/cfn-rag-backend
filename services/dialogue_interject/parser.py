@@ -292,16 +292,16 @@ class JSONLStreamParser:
             self._issue(raw, f"任务模式下未知 type={kind!r}")
             return []
 
+        if kind == "add":
+            # add 不占原编号：no 可有可无、有也忽略；name 缺省回落当前 NPC。
+            speaker = self._parse_name(obj) or self.options.npc
+            return self._text_entry(
+                "add", obj, obj.get("text"), raw, speaker=speaker, n=0,
+            )
+
         n = self._parse_no(obj, raw)
         if n is None:
             return []
-        if kind == "add":
-            if n != 0:
-                self._issue(raw, "add 的 no 必须为 0")
-                return []
-            return self._text_entry(
-                "add", obj, obj.get("text"), raw, speaker=self.options.npc, n=0,
-            )
 
         remaining_count = len(self.options.remaining)
         if not (1 <= n <= remaining_count):
@@ -311,15 +311,21 @@ class JSONLStreamParser:
             return [ParsedEntry(kind=kind, n=n)]
 
         original = self.options.remaining[n]
+        speaker = self._parse_name(obj) or original.name or self.options.npc
         return self._text_entry(
             "edit",
             obj,
             obj.get("text"),
             raw,
-            speaker=original.name or self.options.npc,
+            speaker=speaker,
             n=n,
             original_emotion=original.emotion,
         )
+
+    def _parse_name(self, obj: dict) -> str:
+        """任务操作里的 name：只做字符串归一化，不校验是否等于原说话人或有效 NPC。"""
+        name = obj.get("name")
+        return name.strip() if isinstance(name, str) else ""
 
     def _parse_no(self, obj: dict, raw: str) -> int | None:
         n_raw = obj.get("no")

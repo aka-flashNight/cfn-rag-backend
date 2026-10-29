@@ -35,7 +35,12 @@ def test_f05_continue_with_keep_and_edit():
         {
             "n": 2,
             "kind": "edit",
-            "lines": [{"text": "北边仓库昨晚丢了一批货。", "emotion": "普通", "split": None}],
+            "lines": [{
+                "text": "北边仓库昨晚丢了一批货。",
+                "emotion": "普通",
+                "speaker": fx.NPC,
+                "split": None,
+            }],
         },
     ]
 
@@ -214,6 +219,21 @@ def test_add_after_original_op_enters_steps_in_output_order():
     assert [step.lines[0].text for step in plan.steps if step.kind == "add"] == [
         "插在 1 和 2 之间", "插在 2 和 continue 之间",
     ]
+
+
+def test_plan_lines_carry_model_name_as_speaker():
+    plan, _ = _normalize([
+        '{"type":"keep","no":1,"name":"Andy Law"}\n',
+        '{"type":"add","name":"老赵","text":"插一句。","emo":"普通"}\n'
+        '{"type":"edit","no":2,"name":"$PC","text":"玩家改口。","emo":"普通"}\n'
+        '{"type":"continue","no":3,"name":"Andy Law"}\n',
+    ])
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (0, "add"), (2, "edit"),
+    ]
+    assert plan.steps[1].lines[0].speaker == "老赵"
+    assert plan.steps[2].lines[0].speaker == "$PC"
+    assert plan.to_wire()["steps"][1]["lines"][0]["speaker"] == "老赵"
 
 
 def test_consecutive_edits_same_no_merge_into_split_replacement():

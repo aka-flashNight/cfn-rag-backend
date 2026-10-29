@@ -1,8 +1,8 @@
 """任务 plan 归一化（协议 §4.4 / §8）。
 
 模型按输出顺序给出 add/edit/keep/remove，并以 continue 或 end 收尾：
-- add 的 no=0，可插在任意两个操作之间；首个原编号操作之前的 add 已即时推送，
-  不重复进入 plan，其余 add 按原顺序进入 steps。
+- add 不占原编号，可插在任意两个操作之间；首个原编号操作之前的 add 已即时推送，
+  不重复进入 plan，其余 add 按原顺序进入 steps；内部仍用 n=0 占位。
 - edit/keep/remove 的 no 必须按原剩余编号递增；跳过的编号补成 remove。
 - 同一 no 的连续 edit 合并为一条改写成多段；其他重复或倒序指令忽略并记录。
 - continue(no) 表示从原第 no 条起到组末保留原文；end 表示不再保留未处理原文。
@@ -52,7 +52,9 @@ class NormalizedPlan:
 
 def _payload_lines(entry: ParsedEntry) -> list[PlanLinePayload]:
     return [
-        PlanLinePayload(text=seg.text, emotion=seg.emotion, split=seg.split)
+        PlanLinePayload(
+            text=seg.text, emotion=seg.emotion, speaker=seg.speaker, split=seg.split,
+        )
         for seg in entry.segments
     ]
 

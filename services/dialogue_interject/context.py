@@ -8,6 +8,7 @@ session 历史不参与本轮 prompt 拼装。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
@@ -31,6 +32,40 @@ logger = logging.getLogger(__name__)
 OMISSION_MARK = "（中间省略）"
 
 _TASK_KIND_LABEL = {"task_pre": "任务前", "task_post": "任务后"}
+
+#: 玩家行在 prompt 里的统一占位符（协议 5.1）
+PLAYER_PLACEHOLDER = "$PC"
+
+_PLAYER_NOTE_TASK = (
+    "【关于 $PC】\n"
+    '"$PC"是玩家姓名的占位符，$PC说的对话即为玩家的对话。'
+    'name需要填玩家时，同样填入"$PC"。'
+    "对话文本text中则禁止出现$PC，而是直接称呼玩家的姓名、代号或称呼。"
+)
+_PLAYER_NOTE_DAILY = (
+    "【关于 $PC】\n"
+    '"$PC"是玩家姓名的占位符，$PC说的对话即为玩家的对话。'
+    "对话文本text中则禁止出现$PC，而是直接称呼玩家的姓名、代号或称呼。"
+)
+_NUMBERING_GUIDE = "\n".join([
+    "【编号与操作说明】",
+    "这里每条台词里的 no，就是前面【输出格式】里 no 要填的值；no 从 1 开始，"
+    "按从上到下的顺序排列，包含所有未播台词（玩家 $PC 行也算一条），"
+    "不是只数当前 NPC 的台词。",
+    "add 不填 no，它表示在当前播放位置插入一条新台词；可连续输出多条 add 类型的台词，"
+    "按输出顺序播放。add 可以放在处理第 1 条原台词之前、任意两条原编号操作之间，"
+    "或最后一条原编号操作之后、continue/end 之前。",
+    "除 add 外，原台词每一条都要有对应的操作：edit 用 text 替换原第 no 条的 text"
+    "（no 填被修改台词的原始 no），keep 保留该条，remove 删除该条；"
+    "continue 填写的编号以及后续台词均保持不变，后面的台词不用再逐条写操作。",
+    "处理原编号时，编号必须从 1 开始递增，不能跳号、倒序或重复；"
+    "continue 之前每一条原台词都要有 edit、keep 或 remove。",
+    "需要提前结束本组时写 end；end 之后尚未处理的原台词全部舍弃，不用再逐条写操作。"
+    "continue 和 end 只能写一个，并且必须是最后一行，写了以后立即停止。",
+    "add、edit、keep、remove、continue 都要带 name：add 填这句话的说话人；"
+    "edit、keep、remove、continue 填该编号原台词的说话人，保持一致；"
+    '玩家台词填 "$PC"。end、mute 没有对应台词，不填 name。',
+])
 
 
 @dataclass(frozen=True)
@@ -81,7 +116,7 @@ class DailyBlocks:
 
 
 def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | None = None) -> list[str]:
-    """已播历史逐行渲染：当前 NPC/ai → `NPC：…`；玩家 → `玩家：…`；其他 NPC → `【…】`。"""
+    """已播历史逐行渲染：当前 NPC/ai → `NPC：…`；玩家 → `$PC：…`；其他 NPC → `【…】`。"""
     rendered: list[str] = []
     for line in _trim(lines, max_lines):
         if line is None:
@@ -93,7 +128,7 @@ def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | Non
         if line.role in ("npc", "ai"):
             rendered.append(f"{npc}：{text}")
         elif line.role == "player":
-            rendered.append(f"玩家：{text}")
+            rendered.append(f"{PLAYER_PLACEHOLDER}：{text}")
         else:
             rendered.append(f"【{line.name or '其他NPC'}：{text}】")
     return rendered
@@ -102,14 +137,21 @@ def render_played(lines: Sequence[PlayedLine], *, npc: str, max_lines: int | Non
 def render_remaining(
     lines: Sequence[RemainingLine], *, max_lines: int | None = None, numbered: bool = True,
 ) -> list[str]:
-    """原始剩余台词：任务模式带 `[n]`；日常只作参考、不编号。"""
+    """原始剩余台词：任务模式每条一个 `{no,name,text}` JSON；日常只作参考、不编号。"""
     rendered: list[str] = []
     for line in _trim(lines, max_lines):
         if line is None:
             rendered.append(OMISSION_MARK)
             continue
-        prefix = f"[{line.index}] " if numbered else ""
-        rendered.append(f"{prefix}{line.name}：{line.text.strip()}")
+        text = line.text.strip()
+        if numbered:
+            rendered.append(json.dumps(
+                {"no": line.index, "name": line.name, "text": text},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ))
+        else:
+            rendered.append(f"{line.name}：{text}")
     return rendered
 
 
@@ -159,6 +201,8 @@ def build_user_context(
 ) -> str:
     """按实施指引 §4.2 的建议顺序拼装 user 上下文（请求现场为准）。
 
+    任务顺序：played → 任务上下文 → remaining → 参考续写 → 编号与操作说明 → 玩家输入；
+    日常顺序：played → remaining → 参考续写 → 草案摘要 → 玩家输入。
     物品块紧跟长期记忆：跨组账本（daily/task）、本组赠送明细/最近往来/待处理索取
     （仅 daily）。它们是易变现场，不进 system 稳定前缀。
     """
@@ -182,21 +226,6 @@ def build_user_context(
     if dialogue.played:
         blocks.append("【本组已播历史】\n" + "\n".join(render_played(dialogue.played, npc=request.npc)))
 
-    if dialogue.remaining:
-        if request.mode == "daily":
-            header = "【原对话剩余台词（仅作参考，不要求逐字续写）】"
-            body = render_remaining(dialogue.remaining, numbered=False)
-        else:
-            header = "【原始剩余台词（按编号）】"
-            body = render_remaining(dialogue.remaining, numbered=True)
-        blocks.append(header + "\n" + "\n".join(body))
-
-    if dialogue.reference_continuation:
-        blocks.append(
-            "【参考续写（上一轮未播，仅供参考，可不采用）】\n"
-            + "\n".join(render_reference(dialogue.reference_continuation))
-        )
-
     if request.mode == "task":
         task_lines: list[str] = []
         context = request.task_context
@@ -211,6 +240,24 @@ def build_user_context(
         else:
             blocks.append(f"【任务上下文（{kind_label}）】\n（本次没有可用的已完成/将完成任务摘要）")
 
+    if dialogue.remaining:
+        if request.mode == "daily":
+            header = "【原对话剩余台词（仅作参考，不要求逐字续写）】"
+            body = render_remaining(dialogue.remaining, numbered=False)
+        else:
+            header = "【原始剩余台词（按编号no）】"
+            body = render_remaining(dialogue.remaining, numbered=True)
+        blocks.append(header + "\n" + "\n".join(body))
+
+    if dialogue.reference_continuation:
+        blocks.append(
+            "【参考续写（上一轮未播，仅供参考，可不采用）】\n"
+            + "\n".join(render_reference(dialogue.reference_continuation))
+        )
+
+    if request.mode == "task" and dialogue.remaining:
+        blocks.append(_NUMBERING_GUIDE)
+
     if pending_draft_summary.strip():
         blocks.append(
             "【待确认的委托草案（已拟定、尚未发布）】\n"
@@ -218,8 +265,18 @@ def build_user_context(
             "玩家可能会接受、拒绝、讨价还价或岔开话题；点头之前不要说已发布。"
         )
 
+    _insert_player_note(blocks, mode=request.mode)
     blocks.append("【玩家刚刚说的话】\n" + request.player_input)
     return "\n\n".join(blocks)
+
+
+def _insert_player_note(blocks: list[str], *, mode: str) -> None:
+    """在最早出现 $PC 的块之前插入占位符说明；没有出现则不插。"""
+    note = _PLAYER_NOTE_DAILY if mode == "daily" else _PLAYER_NOTE_TASK
+    for index, block in enumerate(blocks):
+        if PLAYER_PLACEHOLDER in block:
+            blocks.insert(index, note)
+            return
 
 
 def _trim(items: Sequence, max_lines: int | None) -> Iterable:

@@ -232,7 +232,7 @@ def test_task_keep_remove_and_continue_use_original_number():
     ]
 
 
-def test_task_add_requires_zero_no():
+def test_task_add_accepts_missing_no_and_ignores_present_no():
     parser = JSONLStreamParser(
         ParseOptions(
             mode="task",
@@ -240,8 +240,49 @@ def test_task_add_requires_zero_no():
             remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
         )
     )
-    assert parser.feed('{"type":"add","no":1,"text":"错误编号"}\n') == []
-    assert any("必须为 0" in issue.reason for issue in parser.issues)
+    entries = parser.feed(
+        '{"type":"add","text":"无编号","emo":"普通","name":"老赵"}\n'
+        '{"type":"add","no":1,"text":"带编号也忽略","emo":"普通"}\n'
+    )
+    assert [(entry.kind, entry.n) for entry in entries] == [("add", 0), ("add", 0)]
+    assert entries[0].segments[0].speaker == "老赵"
+    assert entries[1].segments[0].speaker == fx.NPC
+    assert parser.issues == []
+
+
+def test_task_edit_uses_name_then_falls_back_to_original_speaker():
+    parser = JSONLStreamParser(
+        ParseOptions(
+            mode="task",
+            npc=fx.NPC,
+            remaining={1: RemainingLine(index=1, name="老赵", text="原文", emotion="阴冷")},
+        )
+    )
+    entries = parser.feed(
+        '{"type":"edit","no":1,"name":"新人","text":"改写一","emo":"普通"}\n'
+        '{"type":"edit","no":1,"name":"","text":"改写二","emo":"普通"}\n'
+    )
+    assert [entry.segments[0].speaker for entry in entries] == ["新人", "老赵"]
+    assert parser.issues == []
+
+
+def test_task_keep_remove_continue_ignore_name():
+    parser = JSONLStreamParser(
+        ParseOptions(
+            mode="task",
+            npc=fx.NPC,
+            remaining={1: RemainingLine(index=1, name=fx.NPC, text="原文")},
+        )
+    )
+    entries = parser.feed(
+        '{"type":"keep","no":1,"name":"别的名字"}\n'
+        '{"type":"remove","no":1,"name":""}\n'
+        '{"type":"continue","no":1,"name":"$PC"}\n'
+    )
+    assert [(entry.kind, entry.n) for entry in entries] == [
+        ("keep", 1), ("remove", 1), ("continue", 1),
+    ]
+    assert parser.issues == []
 
 
 def test_task_mute_add_and_continue():

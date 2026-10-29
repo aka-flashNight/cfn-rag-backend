@@ -20,6 +20,7 @@ from services.dialogue_interject.orchestrator import InterjectOrchestrator
 from services.dialogue_interject.parser import JSONLStreamParser, ParseOptions
 from services.dialogue_interject.plan import normalize_task_plan
 from services.dialogue_interject.prompts import (
+    TASK_SYSTEM_PROMPT,
     build_task_messages,
     build_task_system_prompt,
     tool_matrix_for,
@@ -133,14 +134,18 @@ def test_task_prompt_has_discipline_output_and_only_query_tools():
     assert "【任务对话纪律】" in system
     assert "必须回到当前任务对话的原有脉络" in system
     assert "后续内容能直接接回原文时必须用 continue 提前结束" in system
-    assert "continue 只按原剩余编号计" in system
-    assert "如果没有编辑，且下一条无法直接接上玩家的对话时，建议先 add 一条来回应玩家" in system
+    assert "continue 填的编号以及后续台词均保持不变" in system
+    assert "如果没有合适的 edit，且下一条无法直接接上玩家的对话时，建议先 add 一条来回应玩家" in system
     assert "只有原剩余已全部逐条处理完" in system
-    assert "不得漏掉原句里的任务信息" in system
-    assert '{"type":"mute"}' in system
-    assert '{"type":"add","no":0,"text":"新增台词","emo":"情绪"}' in system
-    assert '{"type":"continue","no":4}' in system
-    assert '{"type":"end"}' in system
+    assert "改写时不得自称可修改原句里的任务信息" in system
+    assert '"type":"add","name":' in system
+    assert '"type":"add","no":0' not in system
+    assert '"type":"continue","no":4,"name":' in system
+    assert "name：add、edit、keep、remove、continue 都必填" in system
+    # 兜底 system 仍保留完整 schema 行（主 system 的示例在输出规则末尾）。
+    assert '{"type":"mute"}' in TASK_SYSTEM_PROMPT
+    assert '{"type":"end"}' in TASK_SYSTEM_PROMPT
+    assert '"type":"add","no":0' not in TASK_SYSTEM_PROMPT
     for old_format in ("nochange", '"n":', '"line":', '{"end":4}', '{"mute":true}'):
         assert old_format not in system
     assert "route_search" in system
