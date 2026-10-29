@@ -132,7 +132,9 @@ def test_task_prompt_has_discipline_output_and_only_query_tools():
     system = build_task_system_prompt(npc_name=fx.NPC, state=STATE)
     assert "【任务对话纪律】" in system
     assert "必须回到当前任务对话的原有脉络" in system
-    assert "能直接接回原文时必须用 end" in system
+    assert "后续内容能直接接回原文时必须用 end 提前结束" in system
+    assert "end 只按原剩余编号计，不把本轮 add 计入" in system
+    assert "如果没有编辑的情况下，且下一条无法直接接上玩家的对话时，建议先 add 一条来回应玩家" in system
     assert "不输出 end 就是整组替换" in system
     assert "只有在对原有信息脉络没有依赖、或整组都改完时才允许" in system
     assert "不得漏掉原句里的任务信息" in system

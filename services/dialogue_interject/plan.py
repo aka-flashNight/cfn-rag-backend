@@ -9,9 +9,12 @@
 - 没有 `end` ＝整组替换，本轮新增＋改写构成剩余内容，不再接回原文；
   nochange/remove 此时没有可作用的对象，不进入 plan.edits（记录后忽略）。
 - `end` 指向被移除条目 → 跳到下一条未移除原文；没有则结束（end=null）。
+- `end` 取值 1..N+1：N+1 表示覆盖全部原剩余且不再接回（用于改完末条直接收组）。
 - `end` 及之后的编辑/移除一律忽略（协议 4.5：从 end 到组末用原文）。
 - `end` 之前未提及的条目视为隐含 nochange（宽容），但不写进 plan.edits。
 - 同一 n 多条 line 合并为“替换多条”；line 与 remove/nochange 冲突时按 edit 处理。
+- `end` 超过 N+1 时按最后的已编辑条目兜底：从该条目之后接回原文；
+  没有编辑则等价 end=1。不按整组替换丢尾部。
 """
 
 from __future__ import annotations
@@ -71,6 +74,8 @@ def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> Nor
     buckets: dict[int, _Bucket] = {}
     end_value: int | None = None
     end_seen = False
+    end_declared: int | None = None
+    end_failed = False
 
     for entry in entries:
         if entry.kind in ("mute", "add"):
@@ -81,10 +86,15 @@ def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> Nor
                 plan.rejected.append(PlanRejection("end", entry.end, "重复 end，只取第一条"))
                 continue
             end_seen = True
-            if entry.end is None or not (1 <= entry.end <= remaining_count):
+            end_declared = entry.end
+            if entry.end is None or not (1 <= entry.end <= remaining_count + 1):
                 plan.rejected.append(
-                    PlanRejection("end", entry.end, f"end 越界（当前剩余 1..{remaining_count}）")
+                    PlanRejection(
+                        "end", entry.end,
+                        f"end 越界（当前剩余 1..{remaining_count + 1}）",
+                    )
                 )
+                end_failed = True
                 continue
             end_value = entry.end
             continue
@@ -111,11 +121,28 @@ def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> Nor
         removed = {n for n, bucket in buckets.items() if bucket.remove and not bucket.lines}
         while end_value in removed:
             end_value += 1
-        if end_value > remaining_count:
+        if end_value > remaining_count + 1:
             plan.rejected.append(
                 PlanRejection("end", end_value, "end 指向被移除条目且后面没有可接回原文")
             )
             end_value = None
+            end_failed = True
+
+    # 模型明确要接回原文但编号接不上：按已改条目为进度保留剩余，不整组丢弃。
+    if end_failed:
+        edited_ns = sorted(
+            n for n, bucket in buckets.items() if bucket.lines or bucket.remove
+        )
+        resume_at = edited_ns[-1] + 1 if edited_ns else 1
+        end_value = min(max(resume_at, 1), remaining_count + 1)
+        plan.rejected.append(
+            PlanRejection(
+                "end", end_declared,
+                f"end 无法接回原文，按保留原文从第 {end_value} 条接回"
+                if end_value <= remaining_count
+                else "end 无法接回原文，保留全部原剩余后收组",
+            )
+        )
     plan.end = end_value
 
     edits: list[PlanEditPayload] = []

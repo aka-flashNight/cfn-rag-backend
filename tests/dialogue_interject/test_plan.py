@@ -99,14 +99,97 @@ def test_out_of_range_n_is_rejected_without_dropping_other_edits():
     assert any(item.n == 9 and "越界" in item.reason for item in plan.rejected)
 
 
-def test_out_of_range_end_is_ignored_and_edits_stay():
+def test_out_of_range_end_resumes_after_last_edit_and_keeps_tail():
     plan, _ = _normalize([
         '{"n":2,"line":"合法","emo":"普通"}\n',
         '{"end":9}\n',
     ])
-    assert plan.end is None
+    # end 接不上：已改的第 2 条算进度，从第 3 条起保留原文。
+    assert plan.end == 3
     assert [edit.n for edit in plan.edits] == [2]
+    assert plan.implied_nochange == [1]
     assert any(item.kind == "end" for item in plan.rejected)
+    assert any("按保留原文从第 3 条接回" in item.reason for item in plan.rejected)
+
+
+def test_out_of_range_end_without_edits_keeps_all_original():
+    plan, _ = _normalize([
+        '{"end":9}\n',
+    ])
+    assert plan.end == 1
+    assert plan.edits == []
+    assert plan.implied_nochange == []
+    assert any("按保留原文从第 1 条接回" in item.reason for item in plan.rejected)
+
+
+def test_out_of_range_end_resumes_after_remove():
+    plan, _ = _normalize([
+        '{"n":2,"remove":true}\n',
+        '{"end":9}\n',
+    ])
+    assert plan.end == 3
+    assert [edit.model_dump() for edit in plan.edits] == [
+        {"n": 2, "kind": "remove", "lines": []}
+    ]
+    assert plan.implied_nochange == [1]
+
+
+def test_out_of_range_end_with_edit_at_last_line_keeps_last_edit_and_ends():
+    plan, _ = _normalize([
+        '{"n":4,"line":"改写末条","emo":"普通"}\n',
+        '{"end":9}\n',
+    ])
+    # 保留末条编辑，覆盖全部原剩余后直接收组（end=N+1）。
+    assert plan.end == 5
+    assert [(edit.n, edit.kind) for edit in plan.edits] == [(4, "edit")]
+    assert plan.implied_nochange == [1, 2, 3]
+    assert any("保留全部原剩余后收组" in item.reason for item in plan.rejected)
+
+
+def test_end_at_count_plus_one_applies_last_edit_and_ends():
+    plan, _ = _normalize([
+        '{"n":4,"line":"改写末条","emo":"普通"}\n',
+        '{"end":5}\n',
+    ])
+    assert plan.end == 5
+    assert [edit.n for edit in plan.edits] == [4]
+    assert plan.implied_nochange == [1, 2, 3]
+
+
+def test_end_at_count_plus_one_without_edits_keeps_all_original():
+    plan, _ = _normalize([
+        '{"end":5}\n',
+    ])
+    assert plan.end == 5
+    assert plan.edits == []
+    assert plan.implied_nochange == [1, 2, 3, 4]
+
+
+def test_out_of_range_end_with_only_nochange_keeps_all_original():
+    plan, _ = _normalize([
+        '{"n":2,"nochange":true}\n',
+        '{"end":9}\n',
+    ])
+    assert plan.end == 1
+    assert plan.edits == []
+    assert any(item.n == 2 and "end=1 及之后" in item.reason for item in plan.rejected)
+
+
+def test_end_at_count_plus_one_keeps_tail_on_real_invalid_output():
+    # 实机 2026-10-29 酒保轮：剩余 3 条，模型给了 end=4、一条缺 n 的
+    # {"nochange":true} 和 nochange 2/3；end=4=N+1 合法，原剩余全部保留。
+    plan, _ = _normalize([
+        '{"nochange":true}\n',
+        '{"n":2,"nochange":true}\n',
+        '{"n":3,"nochange":true}\n',
+        '{"end":4}\n',
+    ], remaining_count=3)
+    assert plan.end == 4
+    assert [(edit.n, edit.kind) for edit in plan.edits] == [
+        (2, "nochange"),
+        (3, "nochange"),
+    ]
+    assert plan.implied_nochange == [1]
 
 
 def test_end_pointing_to_removed_item_jumps_to_next_original():
@@ -118,16 +201,17 @@ def test_end_pointing_to_removed_item_jumps_to_next_original():
     assert [edit.n for edit in plan.edits] == [3]
 
 
-def test_end_pointing_to_last_removed_item_ends_group():
+def test_end_pointing_to_last_removed_item_removes_last_and_ends():
     plan, _ = _normalize([
         '{"n":4,"remove":true}\n',
         '{"end":4}\n',
     ])
-    assert plan.end is None  # 后面没有可接回的原文＝结束
-    # end 解析为 None 后退回整组替换：remove 没有播放效果，不进入 edits
-    assert plan.edits == []
-    assert any("end 指向被移除条目" in item.reason for item in plan.rejected)
-    assert any(item.kind == "remove" for item in plan.rejected)
+    # 末条被移除、end 跳到 N+1：保留 1..3 原文，移除第 4 条后直接收组。
+    assert plan.end == 5
+    assert [edit.model_dump() for edit in plan.edits] == [
+        {"n": 4, "kind": "remove", "lines": []}
+    ]
+    assert plan.implied_nochange == [1, 2, 3]
 
 
 def test_edit_at_or_after_end_is_ignored():
