@@ -96,7 +96,7 @@ def test_daily_user_context_is_un_numbered_and_request_scoped():
 
 def test_task_user_context_keeps_numbering():
     context = build_user_context(make_request(fx.task_request()))
-    assert "[1] Andy Law：你先别急着答应。" in context
+    assert f'{{"no":1,"name":"{fx.NPC}","text":"你先别急着答应。"}}' in context
     assert "【任务上下文（任务前）】" in context
 
 
