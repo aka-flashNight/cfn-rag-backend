@@ -124,7 +124,7 @@ def test_daily_user_context_places_item_blocks_after_long_term():
         "【本组已赠送】",
         "【最近物品往来】",
         "【待处理的索取】",
-        "【本组已播历史】",
+        "【本组已播历史对话】",
     ]
     positions = [text.index(marker) for marker in order]
     assert positions == sorted(positions)

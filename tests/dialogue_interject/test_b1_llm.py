@@ -85,12 +85,12 @@ def test_daily_system_prompt_has_stable_blocks_and_jsonl_rules():
 
 def test_daily_user_context_is_un_numbered_and_request_scoped():
     context = build_user_context(make_request(fx.daily_request()))
-    assert "【本组已播历史】" in context
+    assert "【本组已播历史对话】" in context
     assert f"{fx.NPC}：又是你。" in context
     assert "【原对话剩余台词" in context
     assert "[1]" not in context  # 日常不编号
     assert "有事说事。" in context
-    assert "【玩家刚刚说的话】" in context
+    assert "【玩家刚刚说的话（即已播对话的最后一句，通常需要你回应）】" in context
     assert "最近怎么样？" in context
 
 

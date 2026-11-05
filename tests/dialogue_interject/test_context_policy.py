@@ -72,7 +72,7 @@ def test_task_user_context_contains_task_summary_and_player_input():
     assert "北边仓库失窃" in text
     assert "找回失窃货物" in text
     assert "金币 2400" in text
-    assert "【玩家刚刚说的话】" in text
+    assert "【玩家刚刚说的话（即已播对话的最后一句，通常需要你回应）】" in text
     assert fx.task_request()["player_input"] in text
 
 
@@ -90,14 +90,15 @@ def _mixed_task_request() -> dict:
 
 
 def test_task_user_context_block_order_and_player_note():
-    text = build_user_context(make_request(_mixed_task_request()))
+    payload = _mixed_task_request()
+    text = build_user_context(make_request(payload))
     order = [
-        "【本组已播历史】",
+        "【本组已播历史对话】",
         "【任务上下文（任务前）】",
         "【原始剩余台词（按编号no）】",
         "【参考续写",
-        "【编号与操作说明】",
-        "【玩家刚刚说的话】",
+        "【后续对话的编号与操作说明】",
+        "【玩家刚刚说的话（即已播对话的最后一句，通常需要你回应）】",
     ]
     positions = [text.index(token) for token in order]
     assert positions == sorted(positions)
@@ -105,6 +106,9 @@ def test_task_user_context_block_order_and_player_note():
     assert text.index("【关于 $PC】") < positions[0]
     assert '"$PC"是玩家姓名的占位符' in text
     assert "name需要填玩家时" in text
+    # 玩家插话拼进已播历史最后一条，且在任务上下文之前。
+    assert f"$PC：{payload['player_input']}" in text
+    assert text.index(f"$PC：{payload['player_input']}") < positions[1]
     # 剩余台词里的玩家行用 $PC，编号包含玩家行。
     assert '{"no":2,"name":"$PC","text":"货是在哪丢的？"}' in text
     assert "包含所有未播台词（玩家 $PC 行也算一条）" in text

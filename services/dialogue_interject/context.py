@@ -48,7 +48,7 @@ _PLAYER_NOTE_DAILY = (
     "对话文本text中则禁止出现$PC，而是直接称呼玩家的姓名、代号或称呼。"
 )
 _NUMBERING_GUIDE = "\n".join([
-    "【编号与操作说明】",
+    "【后续对话的编号与操作说明】",
     "这里每条台词里的 no，就是前面【输出格式】里 no 要填的值；no 从 1 开始，"
     "按从上到下的顺序排列，包含所有未播台词（玩家 $PC 行也算一条），"
     "不是只数当前 NPC 的台词。",
@@ -201,7 +201,7 @@ def build_user_context(
 ) -> str:
     """按实施指引 §4.2 的建议顺序拼装 user 上下文（请求现场为准）。
 
-    任务顺序：played → 任务上下文 → remaining → 参考续写 → 编号与操作说明 → 玩家输入；
+    任务顺序：played → 任务上下文 → remaining → 参考续写 → 后续对话的编号与操作说明 → 玩家输入；
     日常顺序：played → remaining → 参考续写 → 草案摘要 → 玩家输入。
     物品块紧跟长期记忆：跨组账本（daily/task）、本组赠送明细/最近往来/待处理索取
     （仅 daily）。它们是易变现场，不进 system 稳定前缀。
@@ -224,7 +224,9 @@ def build_user_context(
         )
 
     if dialogue.played:
-        blocks.append("【本组已播历史】\n" + "\n".join(render_played(dialogue.played, npc=request.npc)))
+        played_rendered = render_played(dialogue.played, npc=request.npc)
+        played_rendered.append(f"{PLAYER_PLACEHOLDER}：{request.player_input.strip()}")
+        blocks.append("【本组已播历史对话】\n" + "\n".join(played_rendered))
 
     if request.mode == "task":
         task_lines: list[str] = []
@@ -266,7 +268,7 @@ def build_user_context(
         )
 
     _insert_player_note(blocks, mode=request.mode)
-    blocks.append("【玩家刚刚说的话】\n" + request.player_input)
+    blocks.append("【玩家刚刚说的话（即已播对话的最后一句，通常需要你回应）】\n" + request.player_input)
     return "\n\n".join(blocks)
 
 
