@@ -408,7 +408,7 @@ def test_task_runtime_registers_search_memory_and_item_tools(monkeypatch):
     names = [item["function"]["name"] for item in (runtime.tools() or [])]
     assert names == [
         "route_search", "update_long_term_memory",
-        "give_item_to_player", "request_item_from_player",
+        "give_item_to_player", "request_item_from_player", "add_task_reward",
     ]
     assert not any(name.startswith("route_task_") for name in names)
     assert "delegate_dialogue_rewrite" not in names
@@ -714,3 +714,42 @@ def test_task_item_tool_status_waiting_and_daily_precedence_unchanged():
     assert _status_stage_for([give, confirm], mode="task") == "waiting"
     assert _status_stage_for([give, confirm], mode="daily") == "publishing"
     assert _status_stage_for([SEARCH_CALL], mode="task") == "searching"
+
+
+async def test_assemble_task_blocks_gates_reward_tool_by_kind(memory_store, monkeypatch):
+    """功能二注册条件在上下文装配层同样成立：只有任务前对话才注入工具说明。"""
+    from services.integration.state import get_integration_state
+
+    get_integration_state().unbind()
+    monkeypatch.setattr(
+        "services.dialogue.delegation.delegate_tool_or_none", lambda **_kwargs: None,
+    )
+
+    async def _blocks(payload):
+        return await assemble_task_blocks(
+            make_request(payload),
+            npc_manager=_StubNpcManager(),
+            game_data=_FakeGameData(),
+            memory=memory_store,
+            rag_enabled=False,
+            session_id=fx.TASK_DIALOGUE_ID,
+        )
+
+    pre = await _blocks(fx.task_request())
+    assert pre.task_reward_enabled is True
+    assert "add_task_reward" in pre.system_prompt
+    assert "add_task_reward" not in pre.tool_free_system_prompt
+
+    post = fx.task_request()
+    post["dialogue"]["kind"] = "task_post"
+    after = await _blocks(post)
+    assert after.task_reward_enabled is False
+    assert "add_task_reward" not in after.system_prompt
+
+    with_action = fx.task_request(action={
+        "kind": "item_take_accept", "action_id": "act-6",
+        "claim_id": "claim-6", "item_name": "普通hp药剂", "quantity": 1,
+    })
+    action_blocks = await _blocks(with_action)
+    assert action_blocks.task_reward_enabled is False
+    assert "add_task_reward" not in action_blocks.system_prompt

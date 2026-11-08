@@ -259,7 +259,10 @@ class InterjectOrchestrator:
                         state.item_round = True
                         if chunk.data.get("state") == "pending":
                             state.claim_opened = True
-                    elif chunk.event == "action" and chunk.data.get("kind") == "item_grant":
+                    elif chunk.event == "action" and chunk.data.get("kind") in (
+                        "item_grant", "task_reward_adjust",
+                    ):
+                        # 任务前临时新增奖励同样要走 end 降级，保住按编号的主干。
                         state.item_round = True
                     yield chunk.to_event()
                     continue

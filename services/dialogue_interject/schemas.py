@@ -439,6 +439,26 @@ class ActionPayload(BaseModel):
         return self.model_dump()
 
 
+class TaskRewardAdjustPayload(BaseModel):
+    """SSE `action(kind=task_reward_adjust)`：请求 Host 在自己的权威链里临时新增奖励。
+
+    后端只发决策与收回执，不写任何游戏仓文件/覆盖层。额度字段名按两仓约定用中文名，
+    `to_wire()` 用 alias 输出，保证 item_grant 载荷逐字不变。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    action_id: str
+    kind: Literal["task_reward_adjust"] = "task_reward_adjust"
+    task_id: int = Field(..., gt=0)
+    extra_rewards: list[str]
+    cap: int = Field(..., alias="额度上限", ge=1)
+    basis: dict[str, Any] = Field(..., alias="额度依据")
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump(by_alias=True)
+
+
 class ItemClaimPayload(BaseModel):
     """SSE `item_claim`：索取选项的开启/关闭；不是终态。"""
 
@@ -547,9 +567,11 @@ class StreamSSE(str):
 
 
 class StreamAction(StreamSSE):
-    """等待 Host 执行物品发放的旁路事件。"""
+    """等待 Host 执行并回执的旁路事件（物品发放 / 任务前临时新增奖励）。"""
 
-    def __new__(cls, payload: ActionPayload) -> "StreamAction":
+    def __new__(
+        cls, payload: ActionPayload | TaskRewardAdjustPayload,
+    ) -> "StreamAction":
         return super().__new__(cls, "action", payload.to_wire())
 
 
@@ -583,7 +605,7 @@ def plan_event(payload: PlanPayload) -> SSEEvent:
     return SSEEvent(event="plan", data=payload.to_wire())
 
 
-def action_event(payload: ActionPayload) -> SSEEvent:
+def action_event(payload: ActionPayload | TaskRewardAdjustPayload) -> SSEEvent:
     return SSEEvent(event="action", data=payload.to_wire())
 
 

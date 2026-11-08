@@ -71,6 +71,17 @@ from services.dialogue_interject.schemas import (
     StreamAction,
     StreamItemClaim,
     TaskPublishPayload,
+    TaskRewardAdjustPayload,
+)
+from services.dialogue_interject.task_reward import (
+    ADJUST_TOOL,
+    TASK_NUMBERED_FOLLOWUP,
+    check_extra_rewards,
+    parse_adjust_arguments,
+    reward_basis,
+    reward_cap,
+    task_reward_enabled,
+    task_reward_tool_schema,
 )
 from services.llm import ChatRequest, LLMClient, split_meta_events
 from services.llm.meta import DEFAULT_EMOTION
@@ -257,6 +268,9 @@ class DailyToolRuntime:
                 delegate_tool = None
             if delegate_tool is not None:
                 schemas = [*schemas, delegate_tool]
+        # 任务前插话专用：只在任务前对话、无选项动作、无待处理索取时注册。
+        if task_reward_enabled(self.request, self._pending_claim()):
+            schemas = [*schemas, task_reward_tool_schema()]
         return schemas or None
 
     # ------------------------------------------------------------------
@@ -269,6 +283,17 @@ class DailyToolRuntime:
         calls = list(tool_calls or [])
         if not calls:
             return ToolExecutionResult()
+
+        # 任务前临时新增奖励先判：一轮只办一件事，其余调用回「已忽略」。
+        reward_index = next(
+            (
+                index for index, call in enumerate(calls)
+                if tool_call_name(call) == ADJUST_TOOL
+            ),
+            None,
+        )
+        if reward_index is not None:
+            return await self._execute_task_reward_round(calls, reward_index, round_text)
 
         # 物品动作先于路由分派：一轮只处理一个，其余忽略（协议 §7.5.2）
         item_index = next(
@@ -402,6 +427,118 @@ class DailyToolRuntime:
     # 物品赠送 / 索取
     # ------------------------------------------------------------------
 
+    async def _execute_task_reward_round(
+        self,
+        calls: list[dict[str, Any]],
+        reward_index: int,
+        round_text: str,
+    ) -> ToolExecutionResult:
+        """任务前临时新增奖励：一轮只办一件事，工具结果回来后仍按编号收尾。"""
+        call = calls[reward_index]
+        memory_results: dict[int, str] = {}
+        for index, other in enumerate(calls):
+            if index == reward_index or tool_call_name(other) != CHAT_TOOL_NAME:
+                continue
+            try:
+                result = await apply_chat_tool(
+                    self.memory,
+                    other,
+                    snapshot=self.blocks.long_term,
+                    session_id=self.blocks.session_id,
+                )
+            except Exception as exc:  # 记忆失败不阻断本轮
+                logger.warning("[interject] 长期记忆工具失败: %s", exc)
+                result = None
+            memory_results[index] = result or "未记录"
+
+        result_block, instruction = await self._run_task_reward_adjust(call)
+        tool_messages: list[dict[str, Any]] = []
+        for index, other in enumerate(calls):
+            if index == reward_index:
+                content = result_block
+            elif index in memory_results:
+                content = memory_results[index]
+            else:
+                content = "已忽略（一轮只处理一个任务奖励动作）"
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": str(other.get("id") or ""),
+                "content": content,
+            })
+        if self._request_mode() == "task":
+            instruction += TASK_NUMBERED_FOLLOWUP
+        return ToolExecutionResult(
+            requires_followup=True,
+            messages=[
+                {"role": "assistant", "content": round_text or "", "tool_calls": calls},
+                *tool_messages,
+                {"role": "user", "content": f"{result_block}\n\n{instruction}".strip()},
+            ],
+            result_block=result_block,
+            instruction=instruction,
+            route_kind="task_reward_adjust",
+            system_prompt=self.blocks.tool_free_system_prompt,
+        )
+
+    async def _run_task_reward_adjust(
+        self, call: dict[str, Any],
+    ) -> tuple[str, str]:
+        """硬校验后发决策 action、等二态回执；后端不写盘、不重放 action。"""
+        label = "【办理结果·任务前新增奖励】"
+        failure_hint = (
+            "以角色口吻说明这次没加成；不要声称加了奖励，"
+            "不要提工具，也不要解释办理过程。"
+        )
+        if not task_reward_enabled(self.request, self._pending_claim()):
+            return f"{label}当前不能新增奖励。", failure_hint
+
+        upcoming = getattr(getattr(self.request, "task_context", None), "upcoming", None)
+        task_id = getattr(upcoming, "task_id", None)
+        if task_id is None or int(task_id) <= 0:
+            return f"{label}这次没有读到任务编号，没有新增奖励。", failure_hint
+
+        stage = int(self.blocks.progress_stage or 1)
+        favorability = int(getattr(self.blocks.npc_state, "favorability", 0) or 0)
+        cap = reward_cap(stage=stage, favorability=favorability)
+        check = check_extra_rewards(
+            self.blocks.game_data, parse_adjust_arguments(call), cap=cap,
+        )
+        if not check.ok:
+            # 超量一律拒绝，不发 action；不做自动降量，避免与游戏侧静态奖励表口径不一致。
+            return f"{label}这次没有新增奖励：{check.reason}；原有奖励不变。", failure_hint
+
+        action_id = uuid.uuid4().hex
+        payload = TaskRewardAdjustPayload.model_validate({
+            "action_id": action_id,
+            "task_id": int(task_id),
+            "extra_rewards": list(check.rewards),
+            "额度上限": cap,
+            "额度依据": reward_basis(stage=stage, favorability=favorability),
+        })
+        self._push_progress(ToolProgress(ui_hint="确认报酬中"))
+        self._push_progress(ToolProgress(action=StreamAction(payload)))
+        try:
+            result = await ACTIONS.wait(action_id, timeout=ACTION_WAIT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # 回执迟到由 ActionRegistry 按 action_id 幂等留痕，后端不写盘、不重放 action。
+            logger.warning(
+                "[interject] 任务前新增奖励回执超时 action_id=%s task=%s",
+                action_id, task_id,
+            )
+            return f"{label}游戏侧没有确认，这次没有新增奖励；原有奖励不变。", failure_hint
+        if not result.success:
+            return (
+                f"{label}{result.error or '游戏侧没有办成'}，这次没有新增奖励；原有奖励不变。",
+                failure_hint,
+            )
+        joined = "、".join(check.rewards)
+        return (
+            f"{label}已经在原有奖励之外新增 {joined}；原有奖励不变，"
+            f"总额 {check.total}，上限 {cap}。",
+            "以角色口吻说明在原有报酬之外又添了这些；不要改动原有奖励，"
+            "不要提工具，也不要解释办理过程。",
+        )
+
     async def _execute_item_round(
         self,
         calls: list[dict[str, Any]],
@@ -463,10 +600,7 @@ class DailyToolRuntime:
                     "【原始剩余台词（按编号no）】从第 1 条起原样接回。"
                 )
             else:
-                instruction += (
-                    "\n按【原始剩余台词（按编号no）】从 1 开始逐条处理，"
-                    "最后用 continue 或 end 收尾；没有原剩余时用 end。"
-                )
+                instruction += TASK_NUMBERED_FOLLOWUP
         return ToolExecutionResult(
             requires_followup=True,
             messages=[

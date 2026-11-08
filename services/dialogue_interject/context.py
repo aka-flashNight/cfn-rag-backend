@@ -114,6 +114,8 @@ class DailyBlocks:
     item_tools_enabled: bool = False
     #: 任务模式物品状态：give_take / claim / result；日常模式恒为空串
     task_item_state: str = ""
+    #: 任务前插话是否注册了「临时新增奖励」工具
+    task_reward_enabled: bool = False
     turn_no: int = 0
 
 
@@ -613,6 +615,9 @@ async def assemble_blocks(
         build_daily_system_prompt,
         build_task_system_prompt,
     )
+    from services.dialogue_interject.task_reward import (
+        task_reward_enabled as _task_reward_enabled,
+    )
 
     # 任务模式按状态选分支：无 claim 可赠送/索取、有待确认只留取消、选项直连不给工具。
     # 日常模式沿用「物品工具与任务草案互斥、pending claim 只留取消、直连轮不给工具」。
@@ -630,6 +635,7 @@ async def assemble_blocks(
         and pending_item_claim is None
         and pending_draft_row is None
     )
+    task_reward_enabled = _task_reward_enabled(request, pending_item_claim)
     common_system = dict(
         npc_name=npc_name,
         state=state,
@@ -642,10 +648,15 @@ async def assemble_blocks(
     )
     if is_task:
         system_prompt = build_task_system_prompt(
-            **common_system, item_state=task_item_state,
+            **common_system,
+            item_state=task_item_state,
+            task_reward_enabled=task_reward_enabled,
         )
         tool_free_system_prompt = build_task_system_prompt(
-            **common_system, item_state=task_item_state, include_tool_guide=False,
+            **common_system,
+            item_state=task_item_state,
+            task_reward_enabled=task_reward_enabled,
+            include_tool_guide=False,
         )
     else:
         system_prompt = build_daily_system_prompt(
@@ -711,6 +722,7 @@ async def assemble_blocks(
         pending_item_claim=pending_item_claim,
         item_tools_enabled=item_tools_enabled,
         task_item_state=task_item_state,
+        task_reward_enabled=task_reward_enabled,
         turn_no=turn_no,
     )
 

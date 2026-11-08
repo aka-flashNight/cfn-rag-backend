@@ -33,6 +33,7 @@ from services.dialogue_interject.schemas import (
     StreamStatus,
     StreamToolBoundary,
 )
+from services.dialogue_interject.task_reward import ADJUST_TOOL
 from services.dialogue_interject.tools import (
     TOOL_TIMEOUT_S,
     DailyToolError,
@@ -352,8 +353,8 @@ def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
     """
     names = {tool_call_name(call) for call in tool_calls or []}
     if mode == "task":
-        # 任务插话物品动作轮发 waiting；检索仍发 searching，绝不发 drafting。
-        if names & _ITEM_TOOLS:
+        # 任务插话物品动作与临时新增奖励轮都发 waiting；检索仍发 searching。
+        if names & _ITEM_TOOLS or ADJUST_TOOL in names:
             return "waiting"
         return "searching" if "route_search" in names else ""
     if names & _PUBLISHING_TOOLS:

@@ -338,11 +338,14 @@ def build_task_discipline(npc_name: str) -> str:
     ])
 
 
-def build_task_tool_guide(*, item_state: str = "") -> str:
-    """任务可用工具说明：按程序选定的物品状态分支，只给该状态必要的文案。
+def build_task_tool_guide(
+    *, item_state: str = "", task_reward_enabled: bool = False,
+) -> str:
+    """任务可用工具说明：按程序选定的状态分支，只给本轮注册的工具。
 
     give_take＝无待确认，可赠送/索取；claim＝有待确认索取，只留取消；
     result＝选项直连轮，不注册工具。检索与长期记忆两种模式都有。
+    task_reward_enabled＝任务前对话且注册了临时新增奖励工具时才追加该说明。
     """
     lines = [
         "【工具（本轮可用）】",
@@ -370,6 +373,12 @@ def build_task_tool_guide(*, item_state: str = "") -> str:
             "1. 当前有一笔待处理的索取：玩家拒绝就取消；玩家同意就等实际交付。",
             "2. 口头答应不等于交付；只有东西真正到手上才算。",
         ])
+    if task_reward_enabled:
+        lines.append(
+            "- add_task_reward：任务前对话里，你想在原有报酬之外额外添一点报酬时调用。"
+            "只新增奖励，任务原有奖励不变，也不减少；extra_rewards 用「名称#数量」，"
+            "最多 2 样，数量是正整数。只有办理结果确认办成，才能说加了。"
+        )
     return "\n".join(lines)
 
 
@@ -395,6 +404,7 @@ def build_task_system_prompt(
     equipment_block: str = "",
     include_tool_guide: bool = True,
     item_state: str = "",
+    task_reward_enabled: bool = False,
 ) -> str:
     """任务插话 system：复用日常稳定前缀，按物品状态选分支。
 
@@ -416,7 +426,9 @@ def build_task_system_prompt(
         ANTI_HALLUCINATION_RULE,
     ]
     if include_tool_guide:
-        parts.append(build_task_tool_guide(item_state=item_state))
+        parts.append(build_task_tool_guide(
+            item_state=item_state, task_reward_enabled=task_reward_enabled,
+        ))
     if not item_state:
         # 兜底路径（未启用物品往来）才保留原推辞口径；启用后按状态给工具说明，
         # 不再同时告诉模型「不能做」和「可以调用」，也不描述缺席状态。
