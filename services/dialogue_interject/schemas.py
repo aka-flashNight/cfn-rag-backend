@@ -270,14 +270,8 @@ class InterjectRequest(BaseModel):
         # 协议 5.1：任务模式必须有 task_context（两段都可为空，但对象必须在）
         if self.mode == "task" and self.task_context is None:
             raise ValueError("mode=task 时必须提供 task_context")
-        if self.action is not None:
-            is_task_action = self.action.kind.startswith("task_")
-            if not is_task_action and self.mode != "daily":
-                raise ValueError(f"action.kind={self.action.kind} 只允许 mode=daily")
-        if self.player_item_names and self.mode != "daily":
-            raise ValueError("player_item_names 只允许 mode=daily")
-        if self.player_item_counts and self.mode != "daily":
-            raise ValueError("player_item_counts 只允许 mode=daily")
+        # 物品动作与物品快照在任务模式同样可用；task_accept/task_decline 原本就
+        # 日常/任务都放行，此处不再保留任何按 action.kind 的模式闸。
         return self
 
 
@@ -516,6 +510,18 @@ class StreamStatus(str):
 
     def __repr__(self) -> str:  # pragma: no cover - 仅调试用
         return f"StreamStatus(stage={self.stage!r}, ui_hint={self.ui_hint!r})"
+
+
+class StreamToolBoundary(str):
+    """流内旁路信号：工具轮正文到此结束（内部边界，不产出 SSE）。
+
+    任务插话用它区分「工具轮正文」与「工具结果后的最终台词轮」：
+    边界之前误输出的原编号操作与终止符由编排器剔除，不进 plan。
+    继承 str 且内容为空串，保持现有流接口兼容。
+    """
+
+    def __new__(cls) -> "StreamToolBoundary":
+        return super().__new__(cls, "")
 
 
 class StreamSSE(str):

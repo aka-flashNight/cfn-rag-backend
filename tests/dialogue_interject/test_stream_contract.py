@@ -416,3 +416,139 @@ async def test_done_omits_task_publish_on_normal_turns():
     )
 
     assert "task_publish" not in events[-1].data
+
+
+# ---------------------------------------------------------------------------
+# 任务插话物品往来：工具轮边界、索取确认轮、物品轮 end 降级
+# ---------------------------------------------------------------------------
+
+def _task_orchestrator(chunks, payload=None) -> InterjectOrchestrator:
+    async def _stream(_request):
+        for chunk in chunks:
+            yield chunk
+
+    return InterjectOrchestrator(
+        make_request(payload or fx.task_request()),
+        session_id="session-test",
+        stream_factory=_stream,
+    )
+
+
+def _plan(events) -> dict:
+    return [event.data for event in events if event.event == "plan"][0]
+
+
+def _lines(events) -> list[str]:
+    return [event.data["text"] for event in events if event.event == "line"]
+
+
+@pytest.mark.asyncio
+async def test_task_tool_round_original_ops_dropped_at_boundary():
+    """工具轮误出 keep/end：剔除后最终轮仍即时播 add，并回到按编号收尾。"""
+    from services.dialogue_interject.schemas import StreamToolBoundary
+
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"让我想想。","emo":"普通"}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"end"}\n',
+        StreamToolBoundary(),
+        '{"type":"add","text":"查到了。","emo":"普通"}\n',
+        '{"type":"continue","no":1}\n',
+    ]))
+    assert _lines(events) == ["让我想想。", "查到了。"]
+    assert _plan(events) == {"mute": False, "resume": 1, "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_task_claim_round_forces_resume_one_and_ignores_original_ops():
+    """索取确认轮只播新增台词；原剩余从第 1 条原样接回，不挂起播放队列。"""
+    from services.dialogue_interject.schemas import (
+        ItemClaimPayload,
+        StreamItemClaim,
+        StreamToolBoundary,
+    )
+
+    pending = StreamItemClaim(ItemClaimPayload(
+        state="pending", claim_id="claim-1", npc=fx.NPC,
+        item_name="普通hp药剂", quantity=1,
+    ))
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"稍等。","emo":"普通"}\n',
+        StreamToolBoundary(),
+        pending,
+        '{"type":"add","text":"那瓶药，你愿意给我吗？","emo":"普通"}\n',
+        '{"type":"keep","no":1}\n',
+        '{"type":"end"}\n',
+    ]))
+    assert [event.data["state"] for event in events if event.event == "item_claim"] == ["pending"]
+    assert _lines(events) == ["稍等。", "那瓶药，你愿意给我吗？"]
+    assert _plan(events) == {"mute": False, "resume": 1, "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_task_item_grant_round_end_does_not_drop_originals():
+    """赠送轮模型若用 end 收尾，plan 降级为接回未处理的原文。"""
+    from services.dialogue_interject.schemas import (
+        ActionPayload,
+        StreamAction,
+        StreamToolBoundary,
+    )
+
+    grant = StreamAction(ActionPayload(
+        action_id="act-1", npc=fx.NPC, item_name="普通hp药剂",
+        quantity=1, requested_quantity=1,
+    ))
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"等一下。","emo":"普通"}\n',
+        StreamToolBoundary(),
+        grant,
+        '{"type":"add","text":"这瓶药你拿着。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ]))
+    assert _lines(events) == ["等一下。", "这瓶药你拿着。"]
+    assert _plan(events) == {"mute": False, "resume": 1, "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_task_option_direct_round_end_does_not_drop_originals():
+    """选项直连轮带 action：模型用 end 时同样保留整段原剩余。"""
+    payload = fx.task_request(action={
+        "kind": "item_take_accept",
+        "action_id": "act-2",
+        "claim_id": "claim-2",
+        "item_name": "普通hp药剂",
+        "quantity": 1,
+    })
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"收下了，多谢。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ], payload))
+    assert _lines(events) == ["收下了，多谢。"]
+    assert _plan(events) == {"mute": False, "resume": 1, "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_plain_task_round_end_semantics_unchanged():
+    """非物品轮的 end 仍按原协议放弃未处理原文，机制闸不外溢。"""
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"好。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ]))
+    plan = _plan(events)
+    assert plan["resume"] == 5
+    assert [(step["n"], step["kind"]) for step in plan["steps"]] == [
+        (1, "remove"), (2, "remove"), (3, "remove"), (4, "remove"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_draft_action_round_end_semantics_unchanged():
+    """任务草案动作直连轮不受物品机制闸影响：end 仍按原协议收尾。"""
+    payload = fx.task_request(action={"kind": "task_decline", "action_id": "act-5"})
+    events = await collect_events(_task_orchestrator([
+        '{"type":"add","text":"那就算了。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ], payload))
+    plan = _plan(events)
+    assert plan["resume"] == 5
+    assert [step["kind"] for step in plan["steps"]] == ["remove"] * 4

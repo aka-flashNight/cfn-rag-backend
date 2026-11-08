@@ -338,14 +338,39 @@ def build_task_discipline(npc_name: str) -> str:
     ])
 
 
-def build_task_tool_guide() -> str:
-    """任务可用工具说明（协议 4.1 / D-14）：只有检索与长期记忆。"""
-    return "\n".join([
+def build_task_tool_guide(*, item_state: str = "") -> str:
+    """任务可用工具说明：按程序选定的物品状态分支，只给该状态必要的文案。
+
+    give_take＝无待确认，可赠送/索取；claim＝有待确认索取，只留取消；
+    result＝选项直连轮，不注册工具。检索与长期记忆两种模式都有。
+    """
+    lines = [
         "【工具（本轮可用）】",
         "- route_search：玩家问设定、人物、关卡或物品，或你需要查证任务细节时调用。"
         "调用工具的那一轮不要输出任何任务 JSONL 操作；结果回来后用 JSONL 回答。",
         "- update_long_term_memory：需要记住重要信息时调用；可以在说话的同时调用。",
-    ])
+    ]
+    if item_state == "give_take":
+        lines.extend([
+            "- give_item_to_player：关系不错、想答谢或讨好玩家、手头宽裕等情景下，"
+            "可以送玩家东西；玩家向你要东西时，你决定给就调用。"
+            "只有办理结果确认已交付，才能说给了。",
+            "- request_item_from_player：玩家主动要给你且不要报酬、"
+            "玩家声称已经送了、你想要但不想付报酬、或只是价值不高的小东西时调用。"
+            "玩家说要送你东西时，用它核实接收；只有办理结果确认收到，才能承认收到。",
+            "【物品往来纪律】",
+            "1. 口头答应不等于交付；只有东西真正到手上才算。",
+            "2. 玩家声称已经送了，但物品往来记忆没有记录时，可以请玩家实际交付。",
+            "3. 赠送要看关系、财力和当下情景。",
+        ])
+    elif item_state == "claim":
+        lines.extend([
+            "- cancel_item_request：玩家明确拒绝当前索取时调用；调用后正常回话。",
+            "【物品往来纪律】",
+            "1. 当前有一笔待处理的索取：玩家拒绝就取消；玩家同意就等实际交付。",
+            "2. 口头答应不等于交付；只有东西真正到手上才算。",
+        ])
+    return "\n".join(lines)
 
 
 def build_task_item_rules() -> str:
@@ -369,8 +394,13 @@ def build_task_system_prompt(
     prompt_max: int = 135,
     equipment_block: str = "",
     include_tool_guide: bool = True,
+    item_state: str = "",
 ) -> str:
-    """任务插话 system：复用日常稳定前缀，换成任务纪律与任务工具说明。"""
+    """任务插话 system：复用日常稳定前缀，按物品状态选分支。
+
+    item_state 为空＝未启用物品往来的兜底路径，保留原推辞口径；
+    其余状态只注入该状态必要的工具说明，不给缺席状态描述。
+    """
     emotions = "、".join(state.emotions or ["普通"])
     tagline = format_npc_role_tagline(
         npc_name=npc_name, sex=state.sex or "", faction=state.faction or "", titles=state.titles,
@@ -386,16 +416,17 @@ def build_task_system_prompt(
         ANTI_HALLUCINATION_RULE,
     ]
     if include_tool_guide:
-        parts.append(build_task_tool_guide())
-    parts.extend([
-        build_task_item_rules(),
-        build_session_state_block(
-            progress_desc=progress_desc,
-            favorability=state.favorability,
-            relationship_level=state.relationship_level,
-            save_info=save_info,
-        ),
-    ])
+        parts.append(build_task_tool_guide(item_state=item_state))
+    if not item_state:
+        # 兜底路径（未启用物品往来）才保留原推辞口径；启用后按状态给工具说明，
+        # 不再同时告诉模型「不能做」和「可以调用」，也不描述缺席状态。
+        parts.append(build_task_item_rules())
+    parts.append(build_session_state_block(
+        progress_desc=progress_desc,
+        favorability=state.favorability,
+        relationship_level=state.relationship_level,
+        save_info=save_info,
+    ))
     scene = (scene_block or "").strip()
     if scene:
         parts.append(scene)
@@ -466,7 +497,7 @@ def build_daily_messages(request: InterjectRequest, blocks: Any) -> list[dict[st
 def build_task_messages(request: InterjectRequest, blocks: Any) -> list[dict[str, str]]:
     """P4 任务路径：system 任务块 + user 现场（RAG/长期记忆/任务上下文/played/remaining）。
 
-    任务模式不拼草案摘要与组内物品块；跨对话物品账本进入 user 现场。
+    任务模式不拼草案摘要；物品现场与日常共用同一份按组装配结果，由程序按状态选分支。
     """
     return build_messages(
         request,
@@ -474,6 +505,9 @@ def build_task_messages(request: InterjectRequest, blocks: Any) -> list[dict[str
         rag_context_text=getattr(blocks, "rag_context_text", ""),
         long_term_block=getattr(blocks, "long_term_block", ""),
         item_memory_block=getattr(blocks, "item_memory_block", ""),
+        gift_detail_block=getattr(blocks, "gift_detail_block", ""),
+        item_recent_block=getattr(blocks, "item_recent_block", ""),
+        pending_claim_block=getattr(blocks, "pending_claim_block", ""),
     )
 
 
@@ -490,10 +524,16 @@ def tool_matrix_for(
     日常：查询/检索、长期记忆、任务草案及草案存在时的 confirm/cancel/update；
     无 claim 且无草案时注册赠送/索取，有 claim 时只留取消索取；
     委派工具只在注册闸放行（有存档、无并发改写）时加入。
-    任务：只有查询/检索与长期记忆；无任务类工具、无物品工具、无委派（协议 4.1）。
+    任务：查询/检索、长期记忆，再按物品状态追加赠送/索取或取消索取；
+    无任务类工具、无委派（协议 4.1 / §7.5）。
     """
     if mode == "task":
-        return ("route_search", "update_long_term_memory")
+        names = ["route_search", "update_long_term_memory"]
+        if has_item_claim:
+            names.append("cancel_item_request")
+        elif item_tools:
+            names.extend(["give_item_to_player", "request_item_from_player"])
+        return tuple(names)
     if mode != "daily":
         return ()
     if has_item_claim:

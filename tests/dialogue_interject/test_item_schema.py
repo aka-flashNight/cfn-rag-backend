@@ -88,29 +88,31 @@ def test_task_actions_allowed_in_daily_and_task_mode(request_factory, kind):
     assert request.action is not None and request.action.kind == kind
 
 
-def test_item_take_action_requires_daily_mode():
-    with pytest.raises(ValidationError):
-        InterjectRequest.model_validate(_task(action={
-            "kind": "item_take_accept",
-            "action_id": "a1",
-            "claim_id": "c1",
-            "item_name": "M4A1",
-            "quantity": 1,
-        }))
+def test_item_take_action_allowed_in_task_mode():
+    # 任务插话物品往来：选项直连的接受/拒绝回执在任务模式同样放行。
+    request = InterjectRequest.model_validate(_task(action={
+        "kind": "item_take_accept",
+        "action_id": "a1",
+        "claim_id": "c1",
+        "item_name": "M4A1",
+        "quantity": 1,
+    }))
+    assert request.action is not None
+    assert request.action.kind == "item_take_accept"
 
 
-def test_player_item_names_normalized_and_daily_only():
+def test_player_item_names_normalized_in_both_modes():
     names = [f"物品{i}" for i in range(250)] + ["物品0", "长" * 120]
     request = InterjectRequest.model_validate(_daily(player_item_names=names))
     assert len(request.player_item_names) == 200
     assert len(set(request.player_item_names)) == 200
     assert all(len(name) <= 100 for name in request.player_item_names)
 
-    with pytest.raises(ValidationError):
-        InterjectRequest.model_validate(_task(player_item_names=["M4A1"]))
+    task = InterjectRequest.model_validate(_task(player_item_names=["M4A1"]))
+    assert task.player_item_names == ["M4A1"]
 
 
-def test_player_item_counts_normalized_and_daily_only():
+def test_player_item_counts_normalized_in_both_modes():
     counts = {"负数": -2, " 长" + "字" * 120: 3}
     for i in range(250):
         counts[f"物品{i}"] = i
@@ -119,8 +121,8 @@ def test_player_item_counts_normalized_and_daily_only():
     assert request.player_item_counts["负数"] == 0
     assert all(len(name) <= 100 for name in request.player_item_counts)
 
-    with pytest.raises(ValidationError):
-        InterjectRequest.model_validate(_task(player_item_counts={"M4A1": 1}))
+    task = InterjectRequest.model_validate(_task(player_item_counts={"M4A1": 1}))
+    assert task.player_item_counts == {"M4A1": 1}
 
 
 def test_stream_action_and_claim_shapes():

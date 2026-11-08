@@ -392,7 +392,7 @@ class _FakeRegistry:
         ]
 
 
-def test_task_runtime_registers_only_search_and_memory(monkeypatch):
+def test_task_runtime_registers_search_memory_and_item_tools(monkeypatch):
     monkeypatch.setattr(
         "services.dialogue.delegation.delegate_tool_or_none",
         lambda **_kwargs: {"type": "function", "function": {"name": "delegate_dialogue_rewrite"}},
@@ -406,7 +406,10 @@ def test_task_runtime_registers_only_search_and_memory(monkeypatch):
     )
     runtime = DailyToolRuntime(make_request(fx.task_request()), blocks)
     names = [item["function"]["name"] for item in (runtime.tools() or [])]
-    assert names == ["route_search", "update_long_term_memory"]
+    assert names == [
+        "route_search", "update_long_term_memory",
+        "give_item_to_player", "request_item_from_player",
+    ]
     assert not any(name.startswith("route_task_") for name in names)
     assert "delegate_dialogue_rewrite" not in names
 
@@ -574,3 +577,140 @@ def test_task_api_wires_task_blocks_and_stream(memory_store, monkeypatch):
     assert captured["stream"][0] == "task"
     assert captured["stream"][1] is blocks
     assert memory_store.dialogue_session_get_sync(fx.TASK_DIALOGUE_ID) is not None
+
+
+async def test_task_tool_round_emits_internal_boundary_once():
+    """任务工具轮与最终台词轮之间必须发出内部边界；日常模式不发，零外溢。"""
+    from services.dialogue_interject.llm import stream_daily_llm
+    from services.dialogue_interject.schemas import StreamToolBoundary
+
+    result = ToolExecutionResult(
+        requires_followup=True,
+        messages=[],
+        result_block="【办理结果】找到资料",
+        instruction="用 JSONL 回答",
+        route_kind="search",
+    )
+    task_factory = partial(
+        stream_task_llm,
+        client=_ScriptedLLM([
+            [(None, [SEARCH_CALL])],
+            [('{"type":"add","no":0,"text":"查到了。","emo":"普通"}\n'
+              '{"type":"continue","no":1}\n', None)],
+        ]),
+        blocks=DailyBlocks(system_prompt="SYS", task_publish_disabled=True),
+        tool_executor=_FakeExecutor(SEARCH_SCHEMA, result),
+        llm_config=_config(),
+    )
+    task_chunks = [
+        chunk async for chunk in task_factory(make_request(fx.task_request()))
+    ]
+    assert sum(isinstance(chunk, StreamToolBoundary) for chunk in task_chunks) == 1
+
+    daily_factory = partial(
+        stream_daily_llm,
+        client=_ScriptedLLM([
+            [(None, [SEARCH_CALL])],
+            [('{"add":"查到了。","emo":"普通"}\n', None)],
+        ]),
+        blocks=DailyBlocks(system_prompt="SYS"),
+        tool_executor=_FakeExecutor(SEARCH_SCHEMA, result),
+        llm_config=_config(),
+    )
+    daily_chunks = [
+        chunk async for chunk in daily_factory(make_request(fx.daily_request()))
+    ]
+    assert not any(isinstance(chunk, StreamToolBoundary) for chunk in daily_chunks)
+
+
+async def test_assemble_task_blocks_selects_item_state_by_claim_and_action(memory_store, monkeypatch):
+    """任务模式按状态隔离：程序选分支，提示词与物品现场都不描述缺席状态。"""
+    from services.dialogue_interject.item_claims import ITEM_CLAIMS
+    from services.integration.state import get_integration_state
+
+    get_integration_state().unbind()
+    monkeypatch.setattr(
+        "services.dialogue.delegation.delegate_tool_or_none",
+        lambda **_kwargs: None,
+    )
+
+    async def _blocks(payload):
+        return await assemble_task_blocks(
+            make_request(payload),
+            npc_manager=_StubNpcManager(),
+            game_data=_FakeGameData(),
+            memory=memory_store,
+            rag_enabled=False,
+            session_id=fx.TASK_DIALOGUE_ID,
+        )
+
+    give_take = await _blocks(fx.task_request(player_item_counts={"普通hp药剂": 1}))
+    assert give_take.task_item_state == "give_take"
+    assert give_take.item_tools_enabled is True
+    assert "give_item_to_player" in give_take.system_prompt
+    assert "cancel_item_request" not in give_take.system_prompt
+    assert "【物品往来】" not in give_take.system_prompt
+
+    ITEM_CLAIMS.create(
+        fx.TASK_DIALOGUE_ID, npc=fx.NPC, item_name="普通hp药剂", quantity=2, turn_no=1,
+    )
+    claim = await _blocks(fx.task_request(player_item_counts={"普通hp药剂": 1}))
+    assert claim.task_item_state == "claim"
+    assert claim.item_tools_enabled is False
+    assert "cancel_item_request" in claim.system_prompt
+    assert "give_item_to_player" not in claim.system_prompt
+    assert "【待处理的索取】" in claim.pending_claim_block
+    assert "【待处理的索取】" in build_task_messages(
+        make_request(fx.task_request()), claim,
+    )[1]["content"]
+
+    result = await _blocks(fx.task_request(action={
+        "kind": "item_take_accept",
+        "action_id": "act-3",
+        "claim_id": "claim-3",
+        "item_name": "普通hp药剂",
+        "quantity": 1,
+    }))
+    assert result.task_item_state == "result"
+    assert result.item_tools_enabled is False
+    assert result.pending_claim_block == ""
+    assert "give_item_to_player" not in result.system_prompt
+
+
+async def test_task_draft_action_round_keeps_legacy_prompt(memory_store, monkeypatch):
+    """任务草案动作直连轮不是物品轮：状态为空、推辞块与工具说明逐字保持原样。"""
+    from services.integration.state import get_integration_state
+
+    get_integration_state().unbind()
+    monkeypatch.setattr(
+        "services.dialogue.delegation.delegate_tool_or_none", lambda **_kwargs: None,
+    )
+    blocks = await assemble_task_blocks(
+        make_request(fx.task_request(action={"kind": "task_accept", "action_id": "act-4"})),
+        npc_manager=_StubNpcManager(),
+        game_data=_FakeGameData(),
+        memory=memory_store,
+        rag_enabled=False,
+        session_id=fx.TASK_DIALOGUE_ID,
+    )
+    assert blocks.task_item_state == ""
+    assert "【物品往来】" in blocks.system_prompt
+    assert "give_item_to_player" not in blocks.system_prompt
+    assert "cancel_item_request" not in blocks.system_prompt
+
+
+def test_task_item_tool_status_waiting_and_daily_precedence_unchanged():
+    """任务物品轮发 waiting；日常的混合工具轮优先级逐字不变。"""
+    from services.dialogue_interject.llm import _status_stage_for
+
+    give = {"type": "function", "id": "c1", "function": {
+        "name": "give_item_to_player", "arguments": "{}",
+    }}
+    confirm = {"type": "function", "id": "c2", "function": {
+        "name": "route_task_confirm", "arguments": "{}",
+    }}
+    assert _status_stage_for([give], mode="task") == "waiting"
+    assert _status_stage_for([give], mode="daily") == "waiting"
+    assert _status_stage_for([give, confirm], mode="task") == "waiting"
+    assert _status_stage_for([give, confirm], mode="daily") == "publishing"
+    assert _status_stage_for([SEARCH_CALL], mode="task") == "searching"

@@ -213,15 +213,29 @@ def test_pending_draft_drops_item_tools():
     assert "route_task_confirm" in names
 
 
-def test_task_mode_registers_no_item_tools():
+def test_task_mode_registers_item_tools_by_state():
+    """任务插话与日常共用物品注册链：无 claim 给赠送/索取，有 claim 只留取消。"""
     registry = FakeRegistry()
     blocks = _blocks(registry=registry, task_publish_disabled=True)
     request = make_request(fx.task_request())
     names = [item["function"]["name"] for item in DailyToolRuntime(request, blocks).tools()]
 
-    assert "give_item_to_player" not in names
-    assert "request_item_from_player" not in names
+    assert "give_item_to_player" in names
+    assert "request_item_from_player" in names
     assert "cancel_item_request" not in names
+    assert "route_task_draft" not in names
+    assert "delegate_dialogue_rewrite" not in names
+
+    ITEM_CLAIMS.create(
+        fx.TASK_DIALOGUE_ID, npc=fx.NPC, item_name="普通hp药剂", quantity=1, turn_no=1,
+    )
+    with_claim = [
+        item["function"]["name"]
+        for item in DailyToolRuntime(request, blocks).tools()
+    ]
+    assert "cancel_item_request" in with_claim
+    assert "give_item_to_player" not in with_claim
+    assert "request_item_from_player" not in with_claim
 
 
 def test_direct_action_request_registers_no_item_tools():
@@ -635,3 +649,38 @@ async def test_gift_picker_gets_filtered_random_pool_and_dialogue(monkeypatch):
     assert "稀有芯片" not in captured["random_pool"]
     assert captured["player_text"] == request.player_input
     assert captured["recent_dialogue"] == "玩家：给我点药"
+
+
+# ---------------------------------------------------------------------------
+# 任务模式物品轮：工具结果回来后仍要按编号收尾
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_task_take_followup_asks_one_line_and_resumes_from_one(monkeypatch):
+    """新索取的确认轮：只新增一句确认的话，原剩余从第 1 条原样接回。"""
+    _patch_picker(monkeypatch, "普通hp药剂")
+    request = make_request(fx.task_request(player_item_names=["普通hp药剂"]))
+    runtime = DailyToolRuntime(request, _blocks())
+
+    result = await runtime.execute([TAKE_CALL])
+
+    instructions = "".join(str(m.get("content") or "") for m in result.messages)
+    assert "只新增一句向玩家确认的话" in instructions
+    assert "continue no=1" in instructions
+    assert "从第 1 条起原样接回" in instructions
+    assert ITEM_CLAIMS.pending(fx.TASK_DIALOGUE_ID) is not None
+
+
+@pytest.mark.asyncio
+async def test_task_gift_followup_requires_numbered_processing(monkeypatch):
+    """赠送轮不破坏主干：工具结果回来后仍按编号处理并收尾。"""
+    _patch_picker(monkeypatch, "普通hp药剂")
+    request = make_request(fx.task_request())
+    runtime = DailyToolRuntime(request, _blocks(memory=FakeMemory()))
+
+    result, _ = await _execute_gift(runtime, GIVE_CALL)
+
+    instructions = "".join(str(m.get("content") or "") for m in result.messages)
+    assert "按【原始剩余台词（按编号no）】从 1 开始逐条处理" in instructions
+    assert "continue 或 end 收尾" in instructions

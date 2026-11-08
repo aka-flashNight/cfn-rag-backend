@@ -15,14 +15,16 @@ def _remaining(count: int = 4):
     }
 
 
-def _normalize(jsonl: list[str], remaining_count: int = 4):
+def _normalize(jsonl: list[str], remaining_count: int = 4, *, suppress_end: bool = False):
     remaining = _remaining(remaining_count)
     parser = JSONLStreamParser(
         ParseOptions(mode="task", npc=fx.NPC, remaining=remaining)
     )
     entries = parser.feed("".join(jsonl))
     entries.extend(parser.finish())
-    return normalize_task_plan(entries, remaining_count), parser
+    return normalize_task_plan(
+        entries, remaining_count, suppress_end=suppress_end,
+    ), parser
 
 
 def test_f05_continue_with_keep_and_edit():
@@ -274,3 +276,34 @@ def test_mute_is_carried_into_plan():
     assert plan.mute is True
     assert plan.resume == 1
     assert plan.steps == []
+
+
+def test_suppress_end_keeps_unprocessed_original_lines():
+    """物品轮用 end 收尾时降级为接回原文，不能把整段原剩余判为放弃。"""
+    plan, _ = _normalize([
+        '{"type":"add","text":"这瓶药你拿着。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ], suppress_end=True)
+    assert plan.resume == 1
+    assert plan.steps == []
+    assert plan.fallback_continue is False
+    assert any("忽略 end" in item.reason for item in plan.rejected)
+
+    ordinary, _ = _normalize([
+        '{"type":"add","text":"这瓶药你拿着。","emo":"普通"}\n',
+        '{"type":"end"}\n',
+    ])
+    assert ordinary.resume == 5
+    assert [step.kind for step in ordinary.steps] == ["remove"] * 4
+
+
+def test_suppress_end_after_all_lines_processed_matches_end():
+    """原剩余已逐条处理完时，降级不改变 end 的结果。"""
+    plan, _ = _normalize([
+        *[f'{{"type":"keep","no":{n}}}\n' for n in range(1, 5)],
+        '{"type":"end"}\n',
+    ], suppress_end=True)
+    assert plan.resume == 5
+    assert [(step.n, step.kind) for step in plan.steps] == [
+        (1, "keep"), (2, "keep"), (3, "keep"), (4, "keep"),
+    ]

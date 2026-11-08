@@ -207,14 +207,15 @@ class DailyToolRuntime:
         return str(getattr(self.request, "dialogue_instance_id", "") or "")
 
     def _pending_claim(self) -> Any:
-        if self._request_mode() != "daily" or self._request_action() is not None:
+        # 日常/任务插话共用同一份按组 id 隔离的 claim；选项直连轮不当作待处理项。
+        if self._request_action() is not None:
             return None
         return ITEM_CLAIMS.pending(self._claim_key())
 
     def _item_tools_enabled(self) -> bool:
+        # 任务模式不读草案，pending_draft_row 恒为 None；其余判据与日常一致。
         return (
-            self._request_mode() == "daily"
-            and self._request_action() is None
+            self._request_action() is None
             and self._pending_claim() is None
             and self.blocks.pending_draft_row is None
         )
@@ -453,6 +454,19 @@ class DailyToolRuntime:
             })
 
         instruction = outcome.instruction
+        if self._request_mode() == "task":
+            # 任务物品轮的工具结果回来后，仍要按编号处理原剩余台词；
+            # 新索取只说一句确认的话，原剩余从第 1 条原样接回。
+            if name == TAKE_TOOL and ITEM_CLAIMS.pending(self._claim_key()) is not None:
+                instruction += (
+                    "\n本轮只新增一句向玩家确认的话，随后用 continue no=1 收尾；"
+                    "【原始剩余台词（按编号no）】从第 1 条起原样接回。"
+                )
+            else:
+                instruction += (
+                    "\n按【原始剩余台词（按编号no）】从 1 开始逐条处理，"
+                    "最后用 continue 或 end 收尾；没有原剩余时用 end。"
+                )
         return ToolExecutionResult(
             requires_followup=True,
             messages=[
@@ -467,7 +481,8 @@ class DailyToolRuntime:
         )
 
     async def _run_item_tool(self, name: str, call: dict[str, Any]) -> _ItemOutcome:
-        if self._request_mode() != "daily" or self._request_action() is not None:
+        # 物品工具已注册进任务模式；选项直连轮不经过工具轮，无需再执行。
+        if self._request_action() is not None:
             return _ItemOutcome(
                 "【办理结果】当前不能处理物品往来。",
                 "以角色口吻正常回应，不要提工具，也不要解释办理过程。",

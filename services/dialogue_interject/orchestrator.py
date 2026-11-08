@@ -24,7 +24,11 @@ from services.dialogue_interject.parser import (
     ParseOptions,
 )
 from services.dialogue_interject.item_claims import ITEM_CLAIMS
-from services.dialogue_interject.plan import normalize_task_plan
+from services.dialogue_interject.plan import (
+    NormalizedPlan,
+    PlanRejection,
+    normalize_task_plan,
+)
 from services.dialogue_interject.schemas import (
     DonePayload,
     InterjectRequest,
@@ -34,6 +38,7 @@ from services.dialogue_interject.schemas import (
     StreamSSE,
     StreamStatus,
     StreamTaskPublish,
+    StreamToolBoundary,
     TaskPublishPayload,
     done_event,
     error_event,
@@ -53,6 +58,9 @@ StreamFactory = Callable[[InterjectRequest], AsyncIterator[str | StreamStatus | 
 #: valid_lines 只统计“已接受的有效正文行”（协议 5.2）：日常 add/closing，任务 add/edit
 _TEXT_KINDS = ("add", "closing", "edit")
 
+#: 任务模式「动到原剩余台词」的指令：工具轮误出这些会截断最终轮输出
+_TASK_ORIGINAL_KINDS = ("edit", "keep", "remove", "continue", "end")
+
 
 @dataclass
 class _DriveState:
@@ -67,6 +75,10 @@ class _DriveState:
     task_publish: TaskPublishPayload | None = None
     # 任务模式已开始处理原编号：之后的 add 不再即时发送，改由有序 plan 携带
     original_started: bool = False
+    # 本轮打开了待处理索取（item_claim.state=pending）：确认句之外不动原剩余
+    claim_opened: bool = False
+    # 本轮有物品动作（赠送/索取/取消/选项直连）：end 不得放弃未处理原剩余
+    item_round: bool = False
 
 
 class InterjectOrchestrator:
@@ -150,7 +162,28 @@ class InterjectOrchestrator:
             return
 
         if self.request.mode == "task" and state.task_publish is None:
-            plan = normalize_task_plan(state.entries, len(self.request.dialogue.remaining))
+            remaining_count = len(self.request.dialogue.remaining)
+            if state.claim_opened:
+                # 索取确认轮：新增台词已由 line 即时推送，原剩余从第 1 条原样接回。
+                # 不采纳本轮任何原编号操作，也不让 end 放弃整段后续对话。
+                plan = NormalizedPlan(
+                    mute=any(entry.kind == "mute" for entry in state.entries),
+                    resume=1,
+                    steps=[],
+                    rejected=[PlanRejection(
+                        "continue", None, "索取确认轮：原剩余从第 1 条原样接回",
+                    )],
+                )
+            else:
+                # 物品轮里模型若用 end 收尾，会把整段未处理原剩余判为放弃；
+                # 降级为「从最后处理编号之后接回原文」，主干不破。
+                action = self.request.action
+                item_round = state.item_round or (
+                    action is not None and action.kind.startswith("item_")
+                )
+                plan = normalize_task_plan(
+                    state.entries, remaining_count, suppress_end=item_round,
+                )
             logger.info(
                 "[interject] plan dialogue=%s turn=%s resume=%s steps=%d fallback_continue=%s rejected=%s",
                 self.request.dialogue_instance_id, self.request.turn_id,
@@ -175,6 +208,21 @@ class InterjectOrchestrator:
     async def _drive(self, factory: StreamFactory, state: _DriveState) -> AsyncIterator:
         """回放一次流：增量解析并即时推送可播事件。"""
         parser = JSONLStreamParser(self._options)
+
+        def accept(entry: ParsedEntry) -> bool:
+            # 索取确认轮只播新增台词；模型若仍按编号收尾，忽略该操作，
+            # 避免它把后续 add 挤进 plan.steps 而不再即时推送。
+            if (
+                self.request.mode == "task"
+                and state.claim_opened
+                and entry.kind in _TASK_ORIGINAL_KINDS
+            ):
+                logger.info(
+                    "[interject] 索取确认轮忽略 %s，原剩余原样接回", entry.kind,
+                )
+                return False
+            return True
+
         try:
             async for chunk in factory(self.request):
                 if isinstance(chunk, StreamStatus):
@@ -189,15 +237,41 @@ class InterjectOrchestrator:
                     # 自动接取标记：只折叠进 done，不单独成 SSE 事件
                     state.task_publish = chunk.payload
                     continue
+                if isinstance(chunk, StreamToolBoundary):
+                    # 工具轮正文到此为止。误出的原编号操作/终止符会让 plan 提前终止，
+                    # 把最终台词轮整体判为「收尾之后」；此处剔除并复位即时推送边界。
+                    if self.request.mode == "task":
+                        kept = [
+                            entry for entry in state.entries
+                            if entry.kind not in _TASK_ORIGINAL_KINDS
+                        ]
+                        if len(kept) != len(state.entries):
+                            logger.warning(
+                                "[interject] 工具轮输出 %d 条原编号操作/终止符，已剔除",
+                                len(state.entries) - len(kept),
+                            )
+                            state.entries = kept
+                            state.original_started = False
+                    continue
                 if isinstance(chunk, StreamSSE):
                     # action/item_claim：旁路事件，不进入 JSONL/seq；也不是终态。
+                    if chunk.event == "item_claim":
+                        state.item_round = True
+                        if chunk.data.get("state") == "pending":
+                            state.claim_opened = True
+                    elif chunk.event == "action" and chunk.data.get("kind") == "item_grant":
+                        state.item_round = True
                     yield chunk.to_event()
                     continue
                 for entry in parser.feed(chunk):
+                    if not accept(entry):
+                        continue
                     state.entries.append(entry)
                     async for event in self._entry_event(entry, state):
                         yield event
             for entry in parser.finish():
+                if not accept(entry):
+                    continue
                 state.entries.append(entry)
                 async for event in self._entry_event(entry, state):
                     yield event

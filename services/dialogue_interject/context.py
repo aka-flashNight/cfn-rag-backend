@@ -112,6 +112,8 @@ class DailyBlocks:
     pending_claim_block: str = ""
     pending_item_claim: Any = None
     item_tools_enabled: bool = False
+    #: 任务模式物品状态：give_take / claim / result；日常模式恒为空串
+    task_item_state: str = ""
     turn_no: int = 0
 
 
@@ -204,7 +206,8 @@ def build_user_context(
     任务顺序：played → 任务上下文 → remaining → 参考续写 → 后续对话的编号与操作说明 → 玩家输入；
     日常顺序：played → remaining → 参考续写 → 草案摘要 → 玩家输入。
     物品块紧跟长期记忆：跨组账本（daily/task）、本组赠送明细/最近往来/待处理索取
-    （仅 daily）。它们是易变现场，不进 system 稳定前缀。
+    （日常/任务共用同一份装配结果，由调用方按状态选分支）。它们是易变现场，
+    不进 system 稳定前缀。
     """
     blocks: list[str] = []
     dialogue = request.dialogue
@@ -455,7 +458,7 @@ async def assemble_blocks(
     except Exception as exc:
         logger.warning("插话长期记忆装配失败，降级为空: %s", exc)
 
-    # ---- 物品往来（跨组账本进 daily/task；claim 与组内明细仅 daily）----
+    # ---- 物品往来（日常/任务共用同一份现场；由程序按状态选分支）----
     item_memory_block = await load_item_ledger_block(
         memory, slot_key_value=slot_key, npc=npc_name,
     )
@@ -463,30 +466,28 @@ async def assemble_blocks(
     gift_detail_block = ""
     item_recent_block = ""
     pending_claim_block = ""
-    turn_no = 0
-    if not is_task:
-        turn_no = ITEM_CLAIMS.turn_number(request.dialogue_instance_id, request.turn_id)
-        gift_detail_block = ITEM_CLAIMS.gift_detail_block(request.dialogue_instance_id)
-        item_recent_block = ITEM_CLAIMS.recent_block(request.dialogue_instance_id)
-        # 选项直连请求正在解决 claim：不再把它当待处理项注入本轮现场
-        if request.action is None:
-            pending_item_claim = ITEM_CLAIMS.pending(request.dialogue_instance_id)
-        if pending_item_claim is not None:
-            claim_lines = [
-                "【待处理的索取】",
-                f"你正在向玩家索取 {pending_item_claim.quantity} 个 "
-                f"{pending_item_claim.item_name}，玩家还没有交付。",
-            ]
-            counts = getattr(request, "player_item_counts", None) or {}
-            try:
-                have = int(counts.get(pending_item_claim.item_name, 0) or 0)
-            except (TypeError, ValueError):
-                have = 0
-            if have <= 0:
-                claim_lines.append("玩家看起来没有这个物品。")
-            elif have < int(pending_item_claim.quantity or 0):
-                claim_lines.append("玩家看起来拥有该物品的数量不足。")
-            pending_claim_block = "\n".join(claim_lines)
+    turn_no = ITEM_CLAIMS.turn_number(request.dialogue_instance_id, request.turn_id)
+    gift_detail_block = ITEM_CLAIMS.gift_detail_block(request.dialogue_instance_id)
+    item_recent_block = ITEM_CLAIMS.recent_block(request.dialogue_instance_id)
+    # 选项直连请求正在解决 claim：不再把它当待处理项注入本轮现场
+    if request.action is None:
+        pending_item_claim = ITEM_CLAIMS.pending(request.dialogue_instance_id)
+    if pending_item_claim is not None:
+        claim_lines = [
+            "【待处理的索取】",
+            f"你正在向玩家索取 {pending_item_claim.quantity} 个 "
+            f"{pending_item_claim.item_name}，玩家还没有交付。",
+        ]
+        counts = getattr(request, "player_item_counts", None) or {}
+        try:
+            have = int(counts.get(pending_item_claim.item_name, 0) or 0)
+        except (TypeError, ValueError):
+            have = 0
+        if have <= 0:
+            claim_lines.append("玩家看起来没有这个物品。")
+        elif have < int(pending_item_claim.quantity or 0):
+            claim_lines.append("玩家看起来拥有该物品的数量不足。")
+        pending_claim_block = "\n".join(claim_lines)
 
     # ---- 待确认草案（B2 起支持 confirm/cancel/update；任务模式不读）----
     # 草案与终端共用一把钥匙：优先 MemoryStore 的 session_id；未建会话时退回
@@ -613,10 +614,19 @@ async def assemble_blocks(
         build_task_system_prompt,
     )
 
-    # 物品工具与任务草案互斥；pending claim 时只留取消索取；选项直连轮不再给物品工具
+    # 任务模式按状态选分支：无 claim 可赠送/索取、有待确认只留取消、选项直连不给工具。
+    # 日常模式沿用「物品工具与任务草案互斥、pending claim 只留取消、直连轮不给工具」。
+    task_item_state = ""
+    if is_task:
+        if request.action is not None:
+            # 只有物品选项直连轮走结果分支；任务草案动作沿用改动前的任务 system。
+            task_item_state = "result" if request.action.kind.startswith("item_") else ""
+        elif pending_item_claim is not None:
+            task_item_state = "claim"
+        else:
+            task_item_state = "give_take"
     item_tools_enabled = (
-        not is_task
-        and request.action is None
+        request.action is None
         and pending_item_claim is None
         and pending_draft_row is None
     )
@@ -631,9 +641,11 @@ async def assemble_blocks(
         equipment_block=equipment_block,
     )
     if is_task:
-        system_prompt = build_task_system_prompt(**common_system)
+        system_prompt = build_task_system_prompt(
+            **common_system, item_state=task_item_state,
+        )
         tool_free_system_prompt = build_task_system_prompt(
-            **common_system, include_tool_guide=False,
+            **common_system, item_state=task_item_state, include_tool_guide=False,
         )
     else:
         system_prompt = build_daily_system_prompt(
@@ -698,6 +710,7 @@ async def assemble_blocks(
         pending_claim_block=pending_claim_block,
         pending_item_claim=pending_item_claim,
         item_tools_enabled=item_tools_enabled,
+        task_item_state=task_item_state,
         turn_no=turn_no,
     )
 

@@ -6,8 +6,8 @@
 - 日常工具：route_search / route_task_draft / route_task_update /
   route_task_confirm / route_task_cancel / update_long_term_memory /
   delegate_dialogue_rewrite（委派只提交后台任务，不阻塞最终对话）。
-- 任务（P4）：只有 route_search + update_long_term_memory；共用流循环与工具轮，
-  status 只发 searching，工具结果后不再给工具。
+- 任务（P4）：检索 / 长期记忆 + 按物品状态追加赠送 / 索取 / 取消索取；
+  共用流循环与工具轮，物品动作发 waiting、检索发 searching，工具结果后不再给工具。
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from services.dialogue_interject.schemas import (
     InterjectRequest,
     StreamSSE,
     StreamStatus,
+    StreamToolBoundary,
 )
 from services.dialogue_interject.tools import (
     TOOL_TIMEOUT_S,
@@ -137,7 +138,7 @@ async def stream_task_llm(
     memory: Any = None,
     registry: Any = None,
 ) -> AsyncIterator[str | StreamStatus]:
-    """任务真 LLM 的正文增量流（含一次工具轮；工具只有检索与长期记忆）。
+    """任务真 LLM 的正文增量流（含一次工具轮；工具按物品状态注册）。
 
     与日常共用流循环、工具轮与降级链；任务块由 `assemble_task_blocks` 装配
     （不读草案、不开任务工具/委派）。工具结果之后不再给工具，只输出最终 JSONL。
@@ -219,6 +220,10 @@ async def _stream_with_blocks(
             logger.warning("[interject] 无工具轮出现 tool_calls，忽略")
             break
 
+        if request.mode == "task":
+            # 工具轮正文与最终台词轮拼进同一个解析器；这里标出边界，
+            # 编排器据此把工具轮里误出的原编号操作/终止符剔除，保住按编号的主干。
+            yield StreamToolBoundary()
         round_text = "".join(round_text_parts)
         stage = _status_stage_for(tool_calls, mode=request.mode)
         if stage:
@@ -341,12 +346,15 @@ async def _execute_with_progress(
 def _status_stage_for(tool_calls: list[dict[str, Any]], *, mode: str) -> str:
     """工具轮前的 status 阶段；未识别/纯记忆/委派返回空串（不发 status）。
 
-    任务模式只可能检索，绝不发 drafting（任务工具与委派本就不注册）。
+    任务模式只可能检索或物品往来，绝不发 drafting（任务工具与委派本就不注册）。
     confirm/cancel 归 publishing（派发/撤销既有草案），draft/update 才归 drafting。
     物品动作归 waiting：具体的查找/交接提示由工具运行时随后下发。
     """
     names = {tool_call_name(call) for call in tool_calls or []}
     if mode == "task":
+        # 任务插话物品动作轮发 waiting；检索仍发 searching，绝不发 drafting。
+        if names & _ITEM_TOOLS:
+            return "waiting"
         return "searching" if "route_search" in names else ""
     if names & _PUBLISHING_TOOLS:
         return "publishing"

@@ -68,6 +68,18 @@ async def stream_action_direct(
         yield StreamTaskPublish(publish)
         return
 
+    if (
+        request.mode == "task"
+        and action is not None
+        and action.kind.startswith("item_")
+    ):
+        # 任务物品选项直连轮仍要回到按编号处理剩余台词的主干，不能只说一句就收尾；
+        # 任务草案动作直连轮沿用原有 instruction。
+        instruction += (
+            "\n按【原始剩余台词（按编号no）】从 1 开始逐条处理，"
+            "最后用 continue 或 end 收尾；没有原剩余时用 end。"
+        )
+
     async for chunk in stream_final_llm(
         request,
         blocks=blocks,

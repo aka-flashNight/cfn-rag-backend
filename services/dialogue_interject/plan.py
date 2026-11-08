@@ -59,8 +59,17 @@ def _payload_lines(entry: ParsedEntry) -> list[PlanLinePayload]:
     ]
 
 
-def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> NormalizedPlan:
-    """把有序任务指令归一化为 Host 可直接顺序播放的计划。"""
+def normalize_task_plan(
+    entries: list[ParsedEntry],
+    remaining_count: int,
+    *,
+    suppress_end: bool = False,
+) -> NormalizedPlan:
+    """把有序任务指令归一化为 Host 可直接顺序播放的计划。
+
+    suppress_end：物品选项直连轮专用。模型若用 end 收尾会让 resume=N+1
+    丢掉整段原剩余，此时把 end 降级为「从最后处理编号之后接回原文」。
+    """
     plan = NormalizedPlan(mute=any(entry.kind == "mute" for entry in entries))
     steps: list[PlanStepPayload] = []
     last_n = 0
@@ -100,8 +109,16 @@ def normalize_task_plan(entries: list[ParsedEntry], remaining_count: int) -> Nor
         original_started = True
         if kind == "end":
             terminated = True
-            fill_skipped(remaining_count + 1)
-            resume = remaining_count + 1
+            if suppress_end:
+                # 物品选项直连轮：end 会把整段原剩余判为已放弃，降级为接回未处理原文。
+                resume = min(last_n + 1, remaining_count + 1)
+                fill_skipped(resume)
+                plan.rejected.append(
+                    PlanRejection("end", None, "选项直连轮忽略 end，按已处理编号后保留原文")
+                )
+            else:
+                fill_skipped(remaining_count + 1)
+                resume = remaining_count + 1
             continue
         if kind == "continue":
             terminated = True
