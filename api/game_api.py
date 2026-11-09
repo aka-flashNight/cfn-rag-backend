@@ -54,7 +54,7 @@ _SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
-    "X-CFN-Version": "3.0.0",  # 09 §4：前端可据此提示版本配套
+    "X-CFN-Version": "3.0.1",  # 09 §4：前端可据此提示版本配套
 }
 
 

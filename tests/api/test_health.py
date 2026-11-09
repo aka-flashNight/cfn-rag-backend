@@ -32,7 +32,7 @@ def test_health_fields_and_compat(state):
     body = _make_client().get("/api/health").json()
     assert body["status"] == "ok"
     assert body["app"] == "CFN-RAG Backend"  # 原字段保留兼容
-    assert body["version"] == "3.0.0"
+    assert body["version"] == "3.0.1"
     assert body["mode"] == "standalone"
     assert body["bound_slot"] is None
     assert body["frontend_url"] == "http://127.0.0.1:7077/"
