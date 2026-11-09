@@ -147,6 +147,38 @@ def search_names(
     return out
 
 
+def search_out_of_gift_pool(
+    game_data: Any,
+    pool: Sequence[str],
+    keyword: str,
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """全量物品索引里按关键词检索「合法但不在赠送池」的名字，只返回名字。
+
+    「合法」复用 `is_pool_name(direction='give')`：可计价、非战场补给／提交物／
+    测试品。用于告诉模型「物品存在但不在可赠送范围」，不返回价格、数量或池信息。
+    """
+    kw = (keyword or "").strip().lower()
+    if not kw or limit < 1:
+        return []
+    in_pool = set(pool)
+    try:
+        names = _index_for(game_data).keys()
+    except Exception:
+        return []
+    out: list[str] = []
+    for name in names:
+        if kw not in name.lower() or name in in_pool:
+            continue
+        if not is_pool_name(game_data, name, direction="give"):
+            continue
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def sample_names(
     pool: Sequence[str],
     *,

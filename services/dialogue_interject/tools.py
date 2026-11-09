@@ -675,16 +675,25 @@ class DailyToolRuntime:
         )
         if not choice.name:
             target = choice.target or args.name or args.keyword or "合适物品"
-            if choice.reason == REASON_NOT_FOUND:
+            if choice.known_names:
+                # 物品存在但不在可赠送范围：主句保留「你没有这个物品」，
+                # 额外补一句告知查到的名字（名字由后端确定性检索拼回，不取自子 Agent）。
+                names = "、".join(choice.known_names)
                 ITEM_CLAIMS.record_failure(
                     self._claim_key(),
-                    f"你赠送「{target}」给玩家失败：你没有这个物品",
+                    f"你赠送「{target}」给玩家失败：物品存在但不在可赠送范围",
+                )
+                instruction = (
+                    "你刚才是要向玩家赠送这件物品。以角色口吻说明你这边没有、给不了；"
+                    "不要改送别的物品，不要提工具，也不要解释办理过程。"
+                    if choice.reason == REASON_NOT_FOUND
+                    else "你刚才是要向玩家赠送东西。以角色口吻拒绝或换个话题；"
+                         "不要声称已经送出，不要提工具。"
                 )
                 return _ItemOutcome(
-                    f"{_GIVE_LABEL}你向玩家赠送「{target}」，"
-                    "但你没有这个物品，无法赠送。",
-                    "你刚才是要向玩家赠送这件物品。以角色口吻说明你这边没有、给不了；"
-                    "不要改送别的物品，不要提工具，也不要解释办理过程。",
+                    f"{_GIVE_LABEL}你向玩家赠送「{target}」，但你没有这个物品，无法赠送。\n"
+                    f"查询到物品「{names}」，但不在你拥有的物品范围中，无法选择。",
+                    instruction,
                 )
             if choice.reason == REASON_VALUE_EXCEEDED:
                 ITEM_CLAIMS.record_failure(

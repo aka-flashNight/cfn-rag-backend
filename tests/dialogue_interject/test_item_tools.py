@@ -341,17 +341,54 @@ async def test_gift_not_found_rejects(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_gift_specified_missing_reports_reason(monkeypatch):
-    """玩家指定的物品不在池内：失败理由进办理结果，不再随机改送。"""
+    """玩家指定的物品在全量表里也不存在：用「没有找到合适的物品」。"""
     _patch_picker(monkeypatch, PickerResult(reason="not_found", target="牛肉罐头"))
     runtime = DailyToolRuntime(_request(), _blocks())
 
     result, events = await _execute_gift(runtime, GIVE_CALL)
 
     assert all(ev.action is None for ev in events)
-    assert "你向玩家赠送「牛肉罐头」" in result.result_block
-    assert "没有这个物品，无法赠送" in result.result_block
-    assert "未找到合适的赠送物品" not in result.result_block
+    assert "你没有找到合适的物品" in result.result_block
+    assert "没有这个物品，无法赠送" not in result.result_block
+    assert "查询到物品" not in result.result_block
     assert "你赠送「牛肉罐头」给玩家失败" in ITEM_CLAIMS.recent_block(fx.DAILY_DIALOGUE_ID)
+
+
+@pytest.mark.asyncio
+async def test_gift_out_of_pool_exact_name_uses_two_line_result(monkeypatch):
+    """物品存在但不在赠送池：保留「你没有这个物品」并补一句查到的名字。"""
+    _patch_picker(monkeypatch, PickerResult(
+        reason="not_found", target="牛肉罐头", known_names=("牛肉罐头",),
+    ))
+    runtime = DailyToolRuntime(_request(), _blocks())
+
+    result, events = await _execute_gift(runtime, GIVE_CALL)
+
+    assert all(ev.action is None for ev in events)
+    assert result.result_block == (
+        "【办理结果·你给玩家】你向玩家赠送「牛肉罐头」，但你没有这个物品，无法赠送。\n"
+        "查询到物品「牛肉罐头」，但不在你拥有的物品范围中，无法选择。"
+    )
+    assert "不要改送别的物品" in result.instruction
+
+
+@pytest.mark.asyncio
+async def test_gift_out_of_pool_keyword_lists_all_names(monkeypatch):
+    """关键词检索：三个池外名字都拼回结果块；instruction 沿用兜底原文。"""
+    _patch_picker(monkeypatch, PickerResult(
+        reason="out_of_pool", target="罐头",
+        known_names=("牛肉罐头", "菠萝罐头", "白米饭罐头"),
+    ))
+    runtime = DailyToolRuntime(_request(), _blocks())
+
+    result, events = await _execute_gift(runtime, GIVE_CALL)
+
+    assert all(ev.action is None for ev in events)
+    assert result.result_block == (
+        "【办理结果·你给玩家】你向玩家赠送「罐头」，但你没有这个物品，无法赠送。\n"
+        "查询到物品「牛肉罐头、菠萝罐头、白米饭罐头」，但不在你拥有的物品范围中，无法选择。"
+    )
+    assert "以角色口吻拒绝或换个话题" in result.instruction
 
 
 @pytest.mark.asyncio

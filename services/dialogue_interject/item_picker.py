@@ -10,10 +10,12 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from services.dialogue_interject.item_pool import (
     GOLD,
+    is_pool_name,
     item_price,
     remaining_pool_counts,
     sample_names,
     search_names,
+    search_out_of_gift_pool,
 )
 from services.dialogue_interject.item_value import format_item_info
 from services.llm import ChatRequest, LLMClient
@@ -28,6 +30,7 @@ _RECENT_DIALOGUE_MAX = 1200
 #: 失败理由代码 → 由调用方映射成固定中文说明
 REASON_NOT_FOUND = "not_found"
 REASON_VALUE_EXCEEDED = "value_exceeded"
+REASON_OUT_OF_POOL = "out_of_pool"
 REASON_NONE = "none"
 
 PICKER_SYSTEM = """你是物品选择器。根据玩家的原话、近期对话和候选列表，只返回一个 JSON 对象，不要 Markdown、不要解释。
@@ -35,6 +38,7 @@ PICKER_SYSTEM = """你是物品选择器。根据玩家的原话、近期对话�
 {"action":"pick","name":"候选中的精确物品名"}
 {"action":"fail","reason":"not_found"}
 {"action":"fail","reason":"value_exceeded"}
+{"action":"fail","reason":"out_of_pool"}
 {"action":"fail","reason":"none"}
 {"action":"search","keyword":"新的检索关键词"}
 规则：
@@ -42,19 +46,26 @@ PICKER_SYSTEM = """你是物品选择器。根据玩家的原话、近期对话�
 2. 玩家明确指定了某件物品（名称或唯一可辨识的描述）时：
    - 候选和关键词检索都没有这件物品：返回 fail/not_found，不得用别的物品替代。
    - 候选中这件物品被标注“不可赠送”：返回 fail/value_exceeded，不得用别的物品替代。
+   - 这件物品出现在“注释”的不可选择清单里：返回 fail/out_of_pool，不得用别的物品替代，也不要为它 search。
 3. 玩家没有明确指定物品时，才可以根据指示从候选中自行选择可赠送的物品；没有合适的返回 fail/none。
 4. 只有认为换一个关键词可能找到更合适的物品时，才使用 search；最多一次。
 5. 第二轮只能 pick 或 fail，不能再 search。
-6. 没有合适的就 fail，不要编造物品名。"""
+6. 没有合适的就 fail，不要编造物品名。
+7. “注释”里的物品不可选择：不相关就无视；确认玩家要的正是其中某件、且候选池内没有相关物品时，返回 fail/out_of_pool。"""
 
 
 @dataclass(frozen=True)
 class PickerResult:
-    """选择结果：name 非空＝选中；否则 reason 说明失败类型。"""
+    """选择结果：name 非空＝选中；否则 reason 说明失败类型。
+
+    known_names：本次查到「存在但不在可选池」的物品名，由后端确定性检索填充，
+    不取自子 Agent 的自由文本，供调用方拼结果块。
+    """
 
     name: Optional[str] = None
     reason: str = ""
     target: str = ""
+    known_names: tuple[str, ...] = ()
 
 
 PickerCaller = Callable[[list[dict[str, str]]], Awaitable[str]]
@@ -114,15 +125,30 @@ class ItemPicker:
         """
         exact = (name or "").strip()
         target = exact or (keyword or "").strip()
+        # 只在赠送方向查「存在但不可选」：索取池已覆盖全量索引，池外命中极少。
+        out_names: tuple[str, ...] = ()
+        if direction == "give":
+            if exact:
+                if exact not in pool and is_pool_name(game_data, exact, direction="give"):
+                    out_names = (exact,)
+            elif keyword:
+                out_names = tuple(search_out_of_gift_pool(game_data, pool, keyword, limit=3))
         if exact:
             if exact in pool:
                 if self._over_cap(game_data, exact, cap):
-                    return PickerResult(reason=REASON_VALUE_EXCEEDED, target=exact)
+                    return PickerResult(
+                        reason=REASON_VALUE_EXCEEDED, target=exact,
+                        known_names=out_names,
+                    )
                 return PickerResult(name=exact, target=exact)
-            return PickerResult(reason=REASON_NOT_FOUND, target=exact)
+            return PickerResult(
+                reason=REASON_NOT_FOUND, target=exact, known_names=out_names,
+            )
 
         if not pool:
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target, known_names=out_names,
+            )
 
         keyword = (keyword or "").strip()
         instruction = (instruction or "").strip()
@@ -137,7 +163,9 @@ class ItemPicker:
                 gold_first=(direction == "take"),
             )
         if not candidates:
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target, known_names=out_names,
+            )
 
         over_cap = {
             candidate for candidate in candidates
@@ -159,6 +187,7 @@ class ItemPicker:
                     player_text=(player_text or "").strip(),
                     recent_dialogue=(recent_dialogue or "").strip(),
                     target=target,
+                    out_of_pool_names=out_names,
                 ),
                 timeout=_TOTAL_TIMEOUT_S,
             )
@@ -167,13 +196,17 @@ class ItemPicker:
                 "[interject] 物品选择子 Agent 超时 direction=%s name=%r keyword=%r instruction=%r",
                 direction, name, keyword, instruction,
             )
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target, known_names=out_names,
+            )
         except Exception as exc:  # noqa: BLE001 - 选择失败只影响本次工具
             logger.warning(
                 "[interject] 物品选择子 Agent 失败 direction=%s name=%r keyword=%r instruction=%r: %s",
                 direction, name, keyword, instruction, exc,
             )
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target, known_names=out_names,
+            )
 
     async def _run(
         self,
@@ -191,6 +224,7 @@ class ItemPicker:
         player_text: str,
         recent_dialogue: str,
         target: str,
+        out_of_pool_names: tuple[str, ...] = (),
     ) -> PickerResult:
         first = await self._call(
             self._messages(
@@ -207,6 +241,7 @@ class ItemPicker:
                 player_text=player_text,
                 recent_dialogue=recent_dialogue,
                 second_round=False,
+                out_of_pool_names=out_of_pool_names,
             )
         )
         action, value = _parse_picker_output(first)
@@ -217,21 +252,39 @@ class ItemPicker:
                 "[interject] 物品选择子 Agent fail=%s pool=%d candidates=%d",
                 value or REASON_NONE, len(pool), len(candidates),
             )
-            return PickerResult(reason=_normalize_reason(value), target=target)
+            return PickerResult(
+                reason=_normalize_reason(value), target=target,
+                known_names=out_of_pool_names,
+            )
         if action == "none":
             logger.info("[interject] 物品选择子 Agent none pool=%d candidates=%d", len(pool), len(candidates))
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target,
+                known_names=out_of_pool_names,
+            )
         if action != "search":
             logger.info("[interject] 物品选择子 Agent 非法输出=%r", first[:120])
-            return PickerResult(reason=REASON_NONE, target=target)
+            return PickerResult(
+                reason=REASON_NONE, target=target,
+                known_names=out_of_pool_names,
+            )
 
+        # 二轮用子 Agent 给的新关键词重新查池外，不能沿用首轮结果。
+        second_out: tuple[str, ...] = ()
+        if direction == "give":
+            second_out = tuple(
+                search_out_of_gift_pool(game_data, pool, value, limit=3)
+            )
         second_candidates = search_names(game_data, pool, value, limit=10)
         if not second_candidates:
             logger.info(
                 "[interject] 物品选择子 Agent 再查无结果 keyword=%r pool=%d",
                 value, len(pool),
             )
-            return PickerResult(reason=REASON_NONE, target=value or target)
+            return PickerResult(
+                reason=REASON_NONE, target=value or target,
+                known_names=second_out or out_of_pool_names,
+            )
         second_over_cap = {
             candidate for candidate in second_candidates
             if self._over_cap(game_data, candidate, cap)
@@ -251,6 +304,7 @@ class ItemPicker:
                 player_text=player_text,
                 recent_dialogue=recent_dialogue,
                 second_round=True,
+                out_of_pool_names=second_out,
             )
         )
         action, value = _parse_picker_output(second)
@@ -262,12 +316,17 @@ class ItemPicker:
                 "[interject] 物品选择子 Agent 二轮 fail=%s pool=%d candidates=%d",
                 value or REASON_NONE, len(pool), len(second_candidates),
             )
-            return PickerResult(reason=_normalize_reason(value), target=target)
+            return PickerResult(
+                reason=_normalize_reason(value), target=target,
+                known_names=second_out,
+            )
         logger.info(
             "[interject] 物品选择子 Agent 二轮 %s pool=%d candidates=%d",
             action or "非法输出", len(pool), len(second_candidates),
         )
-        return PickerResult(reason=REASON_NONE, target=target)
+        return PickerResult(
+            reason=REASON_NONE, target=target, known_names=second_out,
+        )
 
     def _picked(
         self,
@@ -315,6 +374,7 @@ class ItemPicker:
         player_text: str,
         recent_dialogue: str,
         second_round: bool,
+        out_of_pool_names: Sequence[str] = (),
     ) -> list[dict[str, str]]:
         lines = []
         for name in candidates:
@@ -337,15 +397,23 @@ class ItemPicker:
         if len(dialogue) > _RECENT_DIALOGUE_MAX:
             dialogue = dialogue[-_RECENT_DIALOGUE_MAX:]
         tail = "这是第二轮，只能返回 pick 或 fail，不能再 search。" if second_round else "请返回 pick / fail / search。"
-        content = "\n".join([
-            "\n".join(header_lines),
-            body,
+        parts = ["\n".join(header_lines), body]
+        if out_of_pool_names:
+            # 注释紧跟候选列表、位于玩家原话之前；两轮共用同一段拼接。
+            parts.append(
+                "注释：查询到以下可能相关的物品，但不在你拥有的物品池范围中，不可选择："
+                + ",".join(out_of_pool_names)
+                + "。如果这些物品不相关，无视即可。如果确认是这些不可选择的物品，"
+                "且可选候选池内无相关物品，请返回fail并给出out_of_pool这个reason。"
+            )
+        parts.extend([
             f"玩家原话：{player_text or '（无）'}",
             f"玩家近期对话（供判断是否明确指定了物品）：\n{dialogue or '（无）'}",
             f"本次关键词：{keyword or '（无）'}；池内匹配 {keyword_hits} 件。",
-            f"玩家指示：{instruction or '（无）'}",
+            f"本轮指示：{instruction or '（无）'}",
             tail,
         ])
+        content = "\n".join(parts)
         return [
             {"role": "system", "content": PICKER_SYSTEM},
             {"role": "user", "content": content},
@@ -368,7 +436,9 @@ class ItemPicker:
 
 def _normalize_reason(value: str) -> str:
     reason = (value or "").strip().lower()
-    if reason in (REASON_NOT_FOUND, REASON_VALUE_EXCEEDED, REASON_NONE):
+    if reason in (
+        REASON_NOT_FOUND, REASON_VALUE_EXCEEDED, REASON_OUT_OF_POOL, REASON_NONE,
+    ):
         return reason
     return REASON_NONE
 

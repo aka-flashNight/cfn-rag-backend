@@ -186,3 +186,32 @@ def test_giftable_names_excludes_single_over_cap():
 
     assert giftable_names(gd, pool, 500) == ["普通hp药剂", "M4A1"]
     assert giftable_names(gd, pool, 249) == []
+
+
+def test_search_out_of_gift_pool_only_returns_legal_pool_outsiders():
+    """池外检索：只给「存在且合法、但不在赠送池」的名字，不含价格/池信息。"""
+    from services.dialogue_interject.item_pool import search_out_of_gift_pool
+
+    items = [
+        Item(name="普通hp药剂", type="消耗品", use="药剂", price=250),
+        Item(name="高级治疗药剂", type="消耗品", use="药剂", price=800),
+        Item(name="战场补给药剂", type="消耗品", use="战场补给", price=100),
+        Item(name="测试用药剂", type="消耗品", use="药剂", price=100),
+    ]
+    gd = make_game_data(items, rewards=["普通hp药剂"])
+    # 直接给出「有正常获取途径」的全量索引，避免 fake 的索引只等于奖励池。
+    gd._item_source_index_cache = {
+        name: {} for name in (
+            "普通hp药剂", "高级治疗药剂", "战场补给药剂", "测试用药剂",
+        )
+    }
+    pool = build_gift_pool(gd)
+    assert pool == ["普通hp药剂"]
+
+    found = search_out_of_gift_pool(gd, pool, "药剂", limit=3)
+    assert found == ["高级治疗药剂"]
+    assert "普通hp药剂" not in found          # 池内不重复报
+    assert "战场补给药剂" not in found        # 战场补给被排除
+    assert "测试用药剂" not in found          # 测试品被排除
+    assert search_out_of_gift_pool(gd, pool, "", limit=3) == []
+    assert search_out_of_gift_pool(gd, pool, "不存在", limit=3) == []
