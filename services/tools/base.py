@@ -41,6 +41,7 @@ _VALID_CATEGORIES: tuple[str, ...] = ("route", "task", "query", "system")
 ROUTE_TOOL_NAMES: tuple[str, ...] = (
     "route_task_draft",
     "route_task_update",
+    "route_task_bargain_reject",
     "route_task_confirm",
     "route_task_cancel",
     "route_search",
@@ -52,6 +53,7 @@ ROUTE_TOOLS_DRAFT: tuple[str, ...] = (
     "route_task_confirm",
     "route_task_cancel",
     "route_task_update",
+    "route_task_bargain_reject",
     "route_task_draft",
     "route_search",
 )

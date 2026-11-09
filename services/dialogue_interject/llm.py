@@ -31,6 +31,7 @@ from services.dialogue_interject.schemas import (
     InterjectRequest,
     StreamSSE,
     StreamStatus,
+    StreamTaskPublish,
     StreamToolBoundary,
 )
 from services.dialogue_interject.task_reward import ADJUST_TOOL
@@ -50,8 +51,8 @@ from services.memory.long_term import tool_call_name
 logger = logging.getLogger(__name__)
 
 #: 工具轮状态映射（只有这两类需要让玩家等；记忆/委派不显式提示）
-#: 草案侧只含 draft/update：改稿之后还要重新确认，仍属「拟定」阶段。
-_DRAFTING_TOOLS = {"route_task_draft", "route_task_update"}
+#: 草案侧含 draft/update/bargain_reject：改稿或拒绝让步之后还要重新确认，仍属「拟定」阶段。
+_DRAFTING_TOOLS = {"route_task_draft", "route_task_update", "route_task_bargain_reject"}
 #: 确认/撤销是对既有草案的落地动作，阶段单列 publishing：游戏侧据此不再弹「接不接」，
 #: 也不再把它当成又拟了一版草案。
 _PUBLISHING_TOOLS = {"route_task_confirm", "route_task_cancel"}
@@ -267,6 +268,10 @@ async def _stream_with_blocks(
             )
         if not outcome.requires_followup:
             break
+
+        if outcome.publish is not None:
+            yield StreamTaskPublish(outcome.publish)
+            return
 
         if outcome.system_prompt:
             messages = _replace_system(messages, outcome.system_prompt)

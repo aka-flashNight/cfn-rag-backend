@@ -1,6 +1,6 @@
 """草案在途时仍可检索（工作项 3）。
 
-口径：有待确认草案时工具表给足**五个**入口（四个任务侧 + route_search）；
+口径：有待确认草案时工具表给足**六个**入口（五个任务侧 + route_search）；
 检索不改草案生命周期——既不取消、也不重置/推进 `rounds_without_task`，
 草案过期仍只由「连续 N 轮纯聊天」触发。
 """
@@ -12,7 +12,7 @@ from services.orchestrator.turn import TurnOrchestrator
 from services.tools.base import ROUTE_TOOL_NAMES, ROUTE_TOOLS_DRAFT, ROUTE_TOOLS_NEW
 from tests.orchestrator.conftest import NPC_NAME, VALID_DRAFT, collect, notices_of, tc
 
-TASK_TOOLS = ("route_task_confirm", "route_task_cancel", "route_task_update", "route_task_draft")
+TASK_TOOLS = ("route_task_confirm", "route_task_cancel", "route_task_update", "route_task_bargain_reject", "route_task_draft")
 
 
 def _orch(env, query: str) -> TurnOrchestrator:
@@ -37,7 +37,7 @@ async def _draft_turn(env) -> None:
 
 
 def test_route_tool_tables_are_fixed_and_complete():
-    """工具表定义是固定顺序的常量：有草案时＝四个任务侧 + 检索；无草案时只有两个入口。"""
+    """工具表定义是固定顺序的常量：有草案时＝五个任务侧 + 检索；无草案时只有两个入口。"""
     assert ROUTE_TOOLS_DRAFT == (*TASK_TOOLS, "route_search")
     assert ROUTE_TOOLS_NEW == ("route_task_draft", "route_search")
     # 两张表都是全量表的子集（不存在「表里有、注册表却没有」的名字）
@@ -46,7 +46,7 @@ def test_route_tool_tables_are_fixed_and_complete():
 
 
 async def test_pending_draft_offers_search_tool(env):
-    """有草案时本轮工具表同时包含 route_search 与四个任务工具（顺序固定）。"""
+    """有草案时本轮工具表同时包含 route_search 与五个任务工具（顺序固定）。"""
     await env.store.upsert_draft(env.session_id, dict(VALID_DRAFT), bargain_count=0)
     env.fake.add_stream(meta='{"emo":"普通","fav":0}', text="嗯。")
     await collect(_orch(env, "你好"))

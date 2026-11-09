@@ -142,6 +142,8 @@ class ToolExecutionResult:
     route_kind: str = ""
     #: 最终台词轮要替换的 system（tools=None 时去掉 tool guide）；空串＝沿用原 system
     system_prompt: str = ""
+    #: 路由 confirm 自动接取时非空：流循环据此跳过收尾轮，直接发 StreamTaskPublish
+    publish: TaskPublishPayload | None = None
 
 
 @dataclass
@@ -421,6 +423,7 @@ class DailyToolRuntime:
             instruction=instruction,
             route_kind=route.kind,
             system_prompt=self.blocks.tool_free_system_prompt,
+            publish=self.publish_meta,
         )
 
     # ------------------------------------------------------------------
@@ -986,8 +989,18 @@ class DailyToolRuntime:
             return await self._run_search(route)
         if route.kind in ("task_draft", "task_update"):
             return await self._run_task_runner(route)
+        if route.kind == "task_bargain_reject":
+            return (
+                "【办理结果】你拒绝了玩家的讨价还价，草案条件不变，尚未发布。",
+                "以角色口吻拒绝玩家刚才提出的条件，重申当前委托的内容/要求/报酬，"
+                "再问玩家接还是不接；最后留一句结束语（closing），"
+                "风格同草案轮：表达「不接就算了/这活就搁着」，不要求固定措辞。"
+                "玩家点头前不要说已发布，任务内容/数字以草案为准。",
+            )
         if route.kind == "task_confirm":
-            text, instruction, _meta = await self._run_confirm(route)
+            text, instruction, _meta = await self._run_confirm(
+                route, allow_auto_accept=True,
+            )
             return text, instruction
         if route.kind == "task_cancel":
             return await self._run_cancel(route)

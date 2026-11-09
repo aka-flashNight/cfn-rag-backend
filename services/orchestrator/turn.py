@@ -896,6 +896,23 @@ class TurnOrchestrator:
                 if notice:
                     yield system_notice_event(notice)
 
+            elif route.kind == "task_bargain_reject":
+                # 拒绝让步但保留草案：无 DB 操作，纯信号 → 让 NPC 重申条件再问接不接
+                yield tool_status_event("bargain_reject", "success", ui_hint="回应中")
+                reply = (
+                    "【后台结果】你拒绝了玩家的讨价还价，草案条件不变，尚未发布。",
+                    "以角色口吻拒绝玩家刚才提出的条件，重申当前委托的内容/要求/报酬，"
+                    "再问玩家接还是不接。玩家点头前不要说已发布。",
+                    "不行，条件就是这样，你接不接？",
+                    "",
+                )
+                result_block, instruction, fallback_text, notice = reply
+                async for ev in self._sync_action_reply(
+                    llm, base_messages, meta, spoken_text, result_block,
+                    instruction, fallback_text, collected_text,
+                ):
+                    yield ev
+
             elif route.kind == "search":
                 # ---- 检索：编排层先做关键词预取（检索子 Agent 的第一步）----
                 # 等待文案优先用模型自带的（「回忆中」「翻查记录中」），没给才回落「查资料中」

@@ -169,8 +169,8 @@ def build_daily_tool_guide(
         lines.append(draft_rule)
         if has_pending_draft:
             lines.append(
-                "- route_task_update / route_task_confirm / route_task_cancel："
-                "针对当前待确认草案的讨价还价/接受/拒绝。调用轮不要输出台词。"
+                "- route_task_update / route_task_bargain_reject / route_task_confirm / route_task_cancel："
+                "针对当前待确认草案的让步/拒绝让步/接受/放弃。调用轮不要输出台词。"
             )
         lines.extend([
             "【任务草案纪律】",

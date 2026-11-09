@@ -177,7 +177,7 @@ def build_routing_guide(*, has_pending_draft: bool) -> str:
             "   - 明确拒绝/放弃 → route_task_cancel；",
             "   - 讨价还价、要求小幅调整，而你愿意让步 → route_task_update；",
             "   - 要求彻底换一个任务方向 → route_task_draft（新草案会替换旧草案）；",
-            "   - 你不愿意让步 → 不调用任何工具，直接以你的口吻拒绝，并问他到底接还是不接。",
+            "   - 你不愿意让步 → route_task_bargain_reject（拒绝但保留草案，再问接不接）；",
             "   - 只是问设定、人物往事、关卡或物品信息 → route_search。草案在途时仍可检索，"
             "检索不会取消草案，也不会让它提前过期。",
             "5. 后台把调整后的方案交回来时，重新说明方案（内容/要求/报酬），并再次征询他是否接取。",
