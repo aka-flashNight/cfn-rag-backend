@@ -53,23 +53,17 @@ def item_price(game_data: Any, name: str) -> int:
         return 0
 
 
-def _task_submit_names(game_data: Any) -> set[str]:
-    tasks = getattr(game_data, "tasks", None)
-    getter = getattr(tasks, "list_core_submit_items", None)
-    if getter is None:
-        return set()
-    try:
-        return {str(name) for name in (getter() or set()) if str(name).strip()}
-    except Exception:
-        return set()
-
-
 def _is_excluded_name(name: str) -> bool:
     return any(marker in name for marker in _EXCLUDED_NAME_MARKERS)
 
 
 def is_pool_name(game_data: Any, name: str, *, direction: str) -> bool:
-    """名称能否进入指定方向的有效池（不含来源过滤）。"""
+    """名称能否进入指定方向的有效池（不含来源过滤）。
+
+    过滤仅限：无价格、战场补给、测试/调试名，以及索取侧的点数货币。
+    任务提交物名单不作为排除项：提交池只是不拿来构造候选池，
+    出现在其它池子里的同名物品照常可选。
+    """
     text = (name or "").strip()
     if not text or _is_excluded_name(text):
         return False
@@ -78,13 +72,11 @@ def is_pool_name(game_data: Any, name: str, *, direction: str) -> bool:
     item = _get_item(game_data, text)
     if item is not None and str(getattr(item, "use", "") or "") in _EXCLUDED_USES:
         return False
-    if text in _task_submit_names(game_data):
-        return False
     return item_price(game_data, text) > 0
 
 
 def build_gift_pool(game_data: Any) -> list[str]:
-    """赠送池＝核心任务奖励池全量；只过滤不可计价/战场补给/测试/提交物。"""
+    """赠送池＝核心任务奖励池全量；只过滤不可计价/战场补给/测试品。"""
     tasks = getattr(game_data, "tasks", None)
     getter = getattr(tasks, "list_core_reward_item_names", None)
     if getter is None:
@@ -156,8 +148,8 @@ def search_out_of_gift_pool(
 ) -> list[str]:
     """全量物品索引里按关键词检索「合法但不在赠送池」的名字，只返回名字。
 
-    「合法」复用 `is_pool_name(direction='give')`：可计价、非战场补给／提交物／
-    测试品。用于告诉模型「物品存在但不在可赠送范围」，不返回价格、数量或池信息。
+    「合法」复用 `is_pool_name(direction='give')`：可计价、非战场补给、非测试品。
+    用于告诉模型「物品存在但不在可赠送范围」，不返回价格、数量或池信息。
     """
     kw = (keyword or "").strip().lower()
     if not kw or limit < 1:

@@ -251,7 +251,6 @@ def _gift_game_data():
         items=FakeItems(items),
         tasks=SimpleNamespace(
             list_core_reward_item_names=lambda: {"普通hp药剂"},
-            list_core_submit_items=lambda: set(),
         ),
         equipment_mods=None,
         crafting=SimpleNamespace(_recipes=[]),

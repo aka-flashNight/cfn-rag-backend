@@ -40,21 +40,17 @@ class FakeItems:
 
 
 class FakeTasks:
-    def __init__(self, rewards=(), submits=()):
+    def __init__(self, rewards=()):
         self._rewards = set(rewards)
-        self._submits = set(submits)
 
     def list_core_reward_item_names(self):
         return set(self._rewards)
 
-    def list_core_submit_items(self):
-        return set(self._submits)
 
-
-def make_game_data(items, *, rewards=(), submits=()):
+def make_game_data(items, *, rewards=()):
     return SimpleNamespace(
         items=FakeItems(items),
-        tasks=FakeTasks(rewards, submits),
+        tasks=FakeTasks(rewards),
         equipment_mods=None,
         crafting=SimpleNamespace(_recipes=[]),
         shops=SimpleNamespace(_shops={}),
@@ -83,14 +79,14 @@ def test_gift_pool_filters_and_keeps_singleton_currency():
             "普通hp药剂", "金币", "战场口粮", "杂交测试种", "任务信物",
             "有声望", "零价物品",
         ],
-        submits=["任务信物"],
     )
     pool = build_gift_pool(gd)
     assert "普通hp药剂" in pool
     assert "金币" in pool
     assert "战场口粮" not in pool
     assert "杂交测试种" not in pool
-    assert "任务信物" not in pool
+    # 任务提交物名单不参与过滤：只要在奖励池里就必须可选。
+    assert "任务信物" in pool
     assert "有声望" not in pool
 
 
