@@ -5,6 +5,7 @@ from services.integration.state import frontend_url_for, get_integration_state
 from .game_api import router as game_router
 from .assets_api import router as assets_router
 from .integration_api import router as integration_router
+from .prompt_preview_api import router as prompt_preview_router
 from services.dialogue_interject.api import router as dialogue_interject_router
 
 api_router: APIRouter = APIRouter()
@@ -31,5 +32,6 @@ async def health_check(settings: Settings = get_settings()) -> dict:
 
 api_router.include_router(game_router, prefix="/game", tags=["GameRAG"])
 api_router.include_router(dialogue_interject_router, prefix="/game", tags=["DialogueInterject"])
+api_router.include_router(prompt_preview_router, prefix="/game", tags=["PromptPreview"])
 api_router.include_router(assets_router, prefix="/assets", tags=["Assets"])
 api_router.include_router(integration_router, prefix="/integration", tags=["Integration"])
