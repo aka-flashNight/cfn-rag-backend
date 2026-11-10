@@ -13,8 +13,8 @@
 Agent 任务文件使用空种子，避免把开发机的共享任务带进分发包。
 
 用法：
-  python scripts/build_full_zip.py --game-dir <游戏项目根> --version 3.0.1
-  python scripts/build_full_zip.py --game-dir <游戏项目根> --exe CFN-RAG.exe --version 3.0.1
+  python scripts/build_full_zip.py --game-dir <游戏项目根> --version 3.0.2
+  python scripts/build_full_zip.py --game-dir <游戏项目根> --exe CFN-RAG.exe --version 3.0.2
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ def main() -> None:
         help="游戏项目根（含 data/、docs/story/、launcher/、flashswf/）",
     )
     parser.add_argument("--exe", default=str(PROJECT_ROOT / DEFAULT_EXE_NAME), help="单文件 exe 路径")
-    parser.add_argument("--version", default="3.0.1", help="版本号（x.y.z）")
+    parser.add_argument("--version", default="3.0.2", help="版本号（x.y.z）")
     parser.add_argument(
         "--output",
         default="",
